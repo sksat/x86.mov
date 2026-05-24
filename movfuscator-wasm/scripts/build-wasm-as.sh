@@ -43,6 +43,11 @@ mkdir -p "$build"
 cd "$build"
 
 if [ ! -f Makefile ]; then
+    # CC_FOR_BUILD has to be a host compiler: binutils builds helper
+    # programs (bfd/doc/chew, ld/genscripts.sh callees, etc.) that have
+    # to run on the build machine, not the wasm target. emconfigure sets
+    # CC=emcc but leaves CC_FOR_BUILD inheriting the same value unless
+    # we override it.
     emconfigure "$src/configure" \
         --target=i386-linux-gnu \
         --disable-werror --disable-nls --disable-shared \
@@ -53,15 +58,8 @@ if [ ! -f Makefile ]; then
         --disable-sim --disable-isl-version-check \
         --disable-bootstrap \
         --without-zlib --without-zstd \
+        CC_FOR_BUILD=cc \
         > configure.log 2>&1
-fi
-
-# chew is a small doc generator in bfd/doc/. Without this it's built by
-# emcc into a Node.js shim that the binutils Makefile can't execute as a
-# host program — substitute a native binary.
-if [ ! -x "$build/bfd/doc/chew" ] || ! file "$build/bfd/doc/chew" | grep -q ELF; then
-    mkdir -p "$build/bfd/doc"
-    cc -O2 -o "$build/bfd/doc/chew" "$src/bfd/doc/chew.c"
 fi
 
 # all-gas pulls in libiberty, bfd, libsframe, opcodes etc. as
