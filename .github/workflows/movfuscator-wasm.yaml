@@ -86,9 +86,10 @@ jobs:
         run: make stage-link-libs
 
       # Each test asserts a different byte-identical property:
-      #   test          .c → .s     (wasm cpp + rcc vs committed .s goldens)
-      #   test-as       .s → .o     (wasm as vs committed .o goldens)
-      #   test-ld       .o → ELF    (wasm ld vs host /usr/bin/ld, dynamic)
+      #   test          .c → .s          (wasm cpp + rcc vs committed .s goldens)
+      #   test-as       .s → .o          (wasm as vs committed .o goldens)
+      #   test-ld       .o → ELF         (wasm ld vs host /usr/bin/ld, dynamic)
+      #   test-multi    multi-.o → ELF   (multi-input link + extraLibs/extraInputs)
       #   test-browser  full chain via the JS wrapper used in the browser demo
       - name: test (node pipeline, .c → .s)
         run: make test
@@ -98,6 +99,9 @@ jobs:
 
       - name: test-ld (.o → ELF byte-identical)
         run: make test-ld
+
+      - name: test-multi (multi-input link + extraLibs)
+        run: make test-multi
 
       - name: test-browser (full chain via wrapper)
         run: make test-browser

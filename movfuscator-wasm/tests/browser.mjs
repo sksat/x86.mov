@@ -148,6 +148,9 @@ if (preloadedLibs) {
 
     for (const file of cFiles) {
         const name = basename(file, '.c');
+        // multi-* fixtures are pieces of a multi-input link — exercised
+        // by tests/run-multi.mjs, not this single-object loop.
+        if (name.startsWith('multi-')) continue;
         const oPath = join(goldensO, `${name}.o`);
         if (!existsSync(oPath)) {
             console.log(`SKIP ${name} (no .o golden)`);

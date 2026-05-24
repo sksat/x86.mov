@@ -45,6 +45,9 @@ trap 'rm -rf "$tmp"' EXIT
 pass=0; fail=0
 for o in "$goldens_o"/*.o; do
     name="$(basename "$o" .o)"
+    # multi-* fixtures are pieces of a multi-input link — covered by
+    # tests/run-multi.mjs, not the single-object link loop here.
+    case "$name" in multi-*) continue ;; esac
     nelf="$tmp/$name.native.elf"
     welf="$tmp/$name.wasm.elf"
 

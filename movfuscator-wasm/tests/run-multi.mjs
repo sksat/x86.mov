@@ -1,0 +1,177 @@
+// Multi-input link test.
+//
+// Exercises the link()-with-multiple-objects code path (and, optionally,
+// the extraLibs / extraInputs / searchPaths options) added on top of the
+// single-object link. The .s and .o stages for each piece are already
+// covered byte-identical by tests/run.sh and tests/run-as.sh — this
+// runner asserts that the *combined* link's ELF byte-matches the same
+// link done with host /usr/bin/ld.
+//
+// Fixtures live in tests/fixtures/multi-*.c. Each pair (multi-<group>.c
+// + multi-<group>-helper.c) is linked together; the .o files come from
+// the committed tests/goldens-o/ tree.
+
+import { existsSync, readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const root = dirname(here);
+const goldensO = join(root, 'tests', 'goldens-o');
+const libDir = join(root, 'web', 'lib');
+
+const wrapper = join(root, 'web', 'movfuscator.mjs');
+const required = [
+    join(root, 'build/browser/ld.js'),
+    join(root, 'build/browser/ld.wasm'),
+    wrapper,
+    libDir,
+];
+const missing = required.filter(p => !existsSync(p));
+if (missing.length) {
+    console.error('FAIL: required artifacts missing — run');
+    console.error('  make build-wasm-as build-wasm-ld-browser stage-link-libs');
+    for (const p of missing) console.error('  missing:', p);
+    process.exit(1);
+}
+
+const { link, LIB_PATHS } = await import(wrapper);
+
+const libs = Object.fromEntries(
+    LIB_PATHS.map(p => [p, readFileSync(join(libDir, p.replace(/^\//, '')))])
+);
+
+// Native ld baseline: same flags the wrapper's link() uses, but with host
+// paths instead of MEMFS ones. Returns the linked ELF as a Buffer.
+function hostLink(objPaths, extraArgs = []) {
+    const tmp = mkdtempSync(join(tmpdir(), 'movfuscator-multi-'));
+    const out = join(tmp, 'out.elf');
+    const B  = join(root, 'vendor/movfuscator/build');
+    const SF = join(root, 'vendor/movfuscator/movfuscator/lib');
+    const args = [
+        '-m', 'elf_i386', '--hash-style=gnu',
+        '-dynamic-linker', '/lib/ld-linux.so.2',
+        '-L', B, '-L', `${B}/gcc/32`, '-L', '/usr/lib32', '-L', '/lib32',
+        '-lgcc', '-lc', '-lm',
+        ...extraArgs,
+        `${B}/crt0.o`,
+        ...objPaths,
+        `${B}/crtf.o`, `${B}/crtd.o`, `${SF}/softfloat32.o`,
+        '-o', out,
+    ];
+    const res = spawnSync('/usr/bin/ld', args, { encoding: 'buffer' });
+    if (res.status !== 0) {
+        throw new Error(
+            `native ld failed (exit ${res.status})\n${res.stderr?.toString() || ''}\n`
+            + `cmd: /usr/bin/ld ${args.join(' ')}`,
+        );
+    }
+    return readFileSync(out);
+}
+
+function bytesEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+}
+
+let pass = 0, fail = 0;
+async function runTest(name, fn) {
+    try {
+        await fn();
+        console.log(`PASS ${name}`);
+        pass++;
+    } catch (e) {
+        console.log(`FAIL ${name}`);
+        console.log('  |', String(e.message || e).split('\n').join('\n  | '));
+        fail++;
+    }
+}
+
+// --- Test 1: plain multi-object link, byte-identical vs host /usr/bin/ld ---
+await runTest('multi-add (Record<string,Uint8Array>)', async () => {
+    const aPath = join(goldensO, 'multi-add.o');
+    const bPath = join(goldensO, 'multi-add-helper.o');
+    if (!existsSync(aPath) || !existsSync(bPath)) {
+        throw new Error('multi-add goldens missing — run `make goldens-o`');
+    }
+    const a = readFileSync(aPath);
+    const b = readFileSync(bPath);
+    const wasmElf = await link({
+        'multi-add.o': a,
+        'multi-add-helper.o': b,
+    }, libs);
+    const hostElf = hostLink([aPath, bPath]);
+    if (!bytesEqual(wasmElf, hostElf)) {
+        throw new Error(`wasm ELF ${wasmElf.length} B != host ELF ${hostElf.length} B`);
+    }
+});
+
+// --- Test 2: array form — same payload, different surface ---
+await runTest('multi-add (Uint8Array[])', async () => {
+    const aPath = join(goldensO, 'multi-add.o');
+    const bPath = join(goldensO, 'multi-add-helper.o');
+    const wasmElf = await link(
+        [readFileSync(aPath), readFileSync(bPath)],
+        libs,
+    );
+    // Array form synthesizes obj0.o/obj1.o filenames, so symtab differs
+    // from the Record form. Re-link host ld with /tmp copies named the
+    // same way to keep the byte comparison meaningful.
+    const tmp = mkdtempSync(join(tmpdir(), 'movfuscator-multi-arr-'));
+    writeFileSync(join(tmp, 'obj0.o'), readFileSync(aPath));
+    writeFileSync(join(tmp, 'obj1.o'), readFileSync(bPath));
+    const hostElf = hostLink([join(tmp, 'obj0.o'), join(tmp, 'obj1.o')]);
+    if (!bytesEqual(wasmElf, hostElf)) {
+        throw new Error(`wasm ELF ${wasmElf.length} B != host ELF ${hostElf.length} B`);
+    }
+});
+
+// --- Test 3: extraLibs + extraInputs + searchPaths smoke ---
+// Stage host /usr/lib32/libpthread.a under /movfuscator/ via extraInputs,
+// add -lpthread via extraLibs. On modern glibc libpthread.a is mostly a
+// stub (everything moved into libc), so the link should still succeed
+// and produce a byte-identical ELF to the same link done with host ld.
+await runTest('extraLibs + extraInputs (-lpthread)', async () => {
+    const aPath = join(goldensO, 'multi-add.o');
+    const bPath = join(goldensO, 'multi-add-helper.o');
+    const libpthreadPath = '/usr/lib32/libpthread.a';
+    if (!existsSync(libpthreadPath)) {
+        console.log('  | SKIP: /usr/lib32/libpthread.a not installed');
+        pass--;  // undo the increment runTest will do
+        return;
+    }
+    const libpthread = readFileSync(libpthreadPath);
+    const wasmElf = await link({
+        'multi-add.o': readFileSync(aPath),
+        'multi-add-helper.o': readFileSync(bPath),
+    }, libs, {
+        extraLibs: ['pthread'],
+        extraInputs: { '/movfuscator/libpthread.a': new Uint8Array(libpthread) },
+    });
+    const hostElf = hostLink([aPath, bPath], ['-lpthread']);
+    if (!bytesEqual(wasmElf, hostElf)) {
+        throw new Error(`wasm ELF ${wasmElf.length} B != host ELF ${hostElf.length} B`);
+    }
+});
+
+// --- Test 4: compileToElf with Record<string,string> source ---
+await runTest('compileToElf (multi-source)', async () => {
+    const { compileToElf, parseElfHeader } = await import(wrapper);
+    const aSrc = readFileSync(join(root, 'tests/fixtures/multi-add.c'), 'utf8');
+    const bSrc = readFileSync(join(root, 'tests/fixtures/multi-add-helper.c'), 'utf8');
+    const elf = await compileToElf({
+        'multi-add': aSrc,
+        'multi-add-helper': bSrc,
+    });
+    const h = parseElfHeader(elf);
+    if (!h || 'raw' in h) throw new Error(`unexpected ELF header: ${JSON.stringify(h)}`);
+    if (h.type !== 'EXEC (executable)') throw new Error(`expected EXEC, got ${h.type}`);
+    if (h.machine !== 'i386')          throw new Error(`expected i386, got ${h.machine}`);
+});
+
+console.log();
+console.log(`results: ${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);

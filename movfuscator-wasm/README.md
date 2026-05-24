@@ -35,6 +35,23 @@ import { compileToElf } from 'movfuscator-wasm';
 const elf = await compileToElf('int main(void){return 42;}');  // .c → linked ELF
 ```
 
+Multi-file C and extra link inputs are supported too:
+
+```js
+const elf = await compileToElf({
+  'main':   'extern int add(int,int); int main(){return add(20,22);}',
+  'helper': 'int add(int a, int b){return a+b;}',
+});
+
+// Or use link() directly with multiple .o + extra libraries:
+import { link } from 'movfuscator-wasm';
+const elf2 = await link({ 'a.o': aObj, 'b.o': bObj }, undefined, {
+  extraLibs:   ['pthread'],
+  searchPaths: ['/myproject/lib'],
+  extraInputs: { '/myproject/lib/libthing.a': customArchiveBytes },
+});
+```
+
 Or, per-stage if you want to inspect intermediates:
 
 ```js
@@ -102,6 +119,7 @@ make build-wasm           # node-mode wasm artifacts (NODERAWFS)
 make build-wasm-browser   # browser-mode wasm artifacts (MEMFS, ES modules)
 make test                 # node pipeline vs goldens
 make test-browser         # browser pipeline (via web/movfuscator.mjs) vs goldens
+make test-multi           # multi-input link + extraLibs (byte-identical vs host ld)
 make serve                # python -m http.server 8086 → open /web/  (PORT= overrides)
 ```
 

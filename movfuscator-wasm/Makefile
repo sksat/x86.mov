@@ -1,8 +1,8 @@
 .PHONY: help setup build-native build-wasm build-wasm-rcc build-wasm-cpp \
         build-wasm-browser build-wasm-as build-wasm-as-browser \
         build-wasm-ld-browser stage-link-libs stage-deploy stage-npm \
-        goldens goldens-o test test-browser test-as test-ld bench serve \
-        clean distclean
+        goldens goldens-o test test-browser test-as test-ld test-multi \
+        bench serve clean distclean
 
 help:
 	@echo "Targets:"
@@ -24,6 +24,7 @@ help:
 	@echo "  test-browser         browser pipeline test (via wrapper) vs .s goldens"
 	@echo "  test-as              wasm-as test vs .o goldens"
 	@echo "  test-ld              wasm-ld test (links .o to ELF, compares with native ld)"
+	@echo "  test-multi           multi-input link + extraLibs/extraInputs (byte-identical)"
 	@echo "  bench                hyperfine native vs wasm-node vs wasm-browser → bench/results.md"
 	@echo "  serve                serve web/ + build/browser/ on \$$PORT (default 8086)"
 	@echo "  clean                remove build artifacts (keep vendor checkout)"
@@ -81,6 +82,9 @@ test-as:
 
 test-ld:
 	./tests/run-ld.sh
+
+test-multi:
+	node tests/run-multi.mjs
 
 bench:
 	./scripts/bench.sh

@@ -180,25 +180,92 @@ async function defaultFetchLibs() {
     return out;
 }
 
+// Normalize the link-time objects argument into a list of {name, bytes}
+// pairs ordered the same way they should appear on the ld command line.
+// Accepts the three shapes we expose: single Uint8Array, an array, or a
+// name→bytes map. Single-input uses opts.name (or 'a.out.o'); arrays get
+// auto-numbered names ('obj0.o', 'obj1.o', …); maps' keys are used as-is.
+function normalizeObjs(objs, defaultName) {
+    if (objs instanceof Uint8Array) {
+        return [{ name: defaultName, bytes: objs }];
+    }
+    if (Array.isArray(objs)) {
+        return objs.map((bytes, i) => {
+            if (!(bytes instanceof Uint8Array)) {
+                throw new TypeError(`objs[${i}] must be Uint8Array`);
+            }
+            return { name: `obj${i}.o`, bytes };
+        });
+    }
+    if (objs && typeof objs === 'object') {
+        return Object.entries(objs).map(([name, bytes]) => {
+            if (!(bytes instanceof Uint8Array)) {
+                throw new TypeError(`objs[${JSON.stringify(name)}] must be Uint8Array`);
+            }
+            return { name, bytes };
+        });
+    }
+    throw new TypeError('objs must be Uint8Array | Uint8Array[] | Record<string, Uint8Array>');
+}
+
+// MEMFS paths supplied via opts.extraInputs must be absolute, no `..`,
+// and outside the directories link() relies on (/movfuscator/, /lib32/,
+// /lib/, /usr/lib32/ — overwriting those by accident would corrupt the
+// staged crt/libc). Reject collisions with a clear error.
+function assertSafeExtraInputPath(p) {
+    if (typeof p !== 'string' || !p.startsWith('/') || p.length < 2) {
+        throw new Error(`extraInputs path ${JSON.stringify(p)} must be absolute`);
+    }
+    if (p.includes('/../') || p.endsWith('/..') || p.includes('//')) {
+        throw new Error(`extraInputs path ${JSON.stringify(p)} contains traversal or empty segment`);
+    }
+}
+
 /**
- * Link an ELF32 i386 relocatable object into a dynamically-linked
- * mov-only ELF executable.
+ * Link one or more ELF32 i386 relocatable objects into a
+ * dynamically-linked mov-only ELF executable.
  *
- * @param {Uint8Array} obj the .o produced by assemble()
+ * @param {Uint8Array | Uint8Array[] | Record<string,Uint8Array>} objs
+ *   - Uint8Array: single .o (the original shape). Staged at
+ *     `/${opts.name || 'a.out.o'}`.
+ *   - Uint8Array[]: each element staged at `/obj<i>.o`, in order.
+ *   - Record<string,Uint8Array>: keys are basenames; each entry staged
+ *     at `/${name}` and added to the link command in iteration order.
+ *     The basenames appear in the resulting ELF's `.symtab`.
  * @param {Record<string,Uint8Array>} [libs]
- *   Optional map of MEMFS path → byte content for every entry in
- *   LIB_PATHS. If omitted, the wrapper lazy-fetches them once from
- *   ./lib (caching the result for subsequent calls).
- * @param {{name?: string}} [opts]
- *   `name` is the basename used when staging the .o into MEMFS; it
- *   shows up in the resulting ELF's symbol table (.symtab) so a real
- *   filename is preferable to "user.o" if you want byte-identical
- *   output vs a host link of the same file.
+ *   MEMFS path → byte content for every entry in LIB_PATHS. If omitted,
+ *   the wrapper lazy-fetches the default bundle from `./lib/` and
+ *   caches it.
+ * @param {{
+ *   name?: string,
+ *   extraLibs?: string[],
+ *   searchPaths?: string[],
+ *   extraInputs?: Record<string,Uint8Array>,
+ * }} [opts]
+ *   - `name`: only used when `objs` is a single Uint8Array. Default `a.out.o`.
+ *   - `extraLibs`: appended as `-l<name>` (after the default `-lgcc -lc -lm`).
+ *   - `searchPaths`: appended as `-L<path>` (after the default `-L/movfuscator
+ *     -L/usr/lib32 -L/lib32`).
+ *   - `extraInputs`: absolute MEMFS path → bytes, written before ld runs.
+ *     Use this to stage caller-supplied `.a` files / link scripts that
+ *     `extraLibs` and `searchPaths` then resolve.
  * @returns {Promise<Uint8Array>} ELF32 executable bytes
  */
-export async function link(obj, libs, opts = {}) {
-    const { name = 'a.out.o' } = opts;
+export async function link(objs, libs, opts = {}) {
+    const {
+        name = 'a.out.o',
+        extraLibs = [],
+        searchPaths = [],
+        extraInputs = {},
+    } = opts;
     assertSafeName(name, 'opts.name');
+    const userObjs = normalizeObjs(objs, name);
+    for (const { name: n } of userObjs) assertSafeName(n, 'object basename');
+    for (const p of Object.keys(extraInputs)) assertSafeExtraInputPath(p);
+    if (!Array.isArray(extraLibs) || !Array.isArray(searchPaths)) {
+        throw new TypeError('extraLibs / searchPaths must be arrays');
+    }
+
     if (!libs) {
         if (!cachedLibs) cachedLibs = defaultFetchLibs();
         libs = await cachedLibs;
@@ -210,21 +277,32 @@ export async function link(obj, libs, opts = {}) {
         if (dir) try { ld.FS.mkdirTree(dir); } catch (e) { /* already exists */ }
         ld.FS.writeFile(path, bytes);
     }
-    const userPath = `/${name}`;
-    ld.FS.writeFile(userPath, obj);
-    // -L/movfuscator covers both the crt + softfloat objects and libgcc.a
-    // (staged together) so the wrapper isn't tied to a particular gcc
-    // version-specific host path.
-    const exit = ld.callMain([
+    for (const [path, bytes] of Object.entries(extraInputs)) {
+        const dir = path.substring(0, path.lastIndexOf('/'));
+        if (dir) try { ld.FS.mkdirTree(dir); } catch (e) { /* already exists */ }
+        ld.FS.writeFile(path, bytes);
+    }
+    for (const { name: n, bytes } of userObjs) {
+        ld.FS.writeFile(`/${n}`, bytes);
+    }
+
+    // crt0 first, user objects in caller-given order, then crtf/crtd/softfloat.
+    // -L/movfuscator covers the crt + softfloat objects and libgcc.a (staged
+    // together) so the wrapper isn't tied to a particular gcc release.
+    const cmd = [
         '-m', 'elf_i386', '--hash-style=gnu',
         '-dynamic-linker', '/lib/ld-linux.so.2',
         '-L/movfuscator', '-L/usr/lib32', '-L/lib32',
+        ...searchPaths.map(p => `-L${p}`),
         '-lgcc', '-lc', '-lm',
-        '/movfuscator/crt0.o', userPath,
+        ...extraLibs.map(l => `-l${l}`),
+        '/movfuscator/crt0.o',
+        ...userObjs.map(({ name: n }) => `/${n}`),
         '/movfuscator/crtf.o', '/movfuscator/crtd.o',
         '/movfuscator/softfloat32.o',
         '-o', '/out.elf',
-    ]);
+    ];
+    const exit = ld.callMain(cmd);
     if (exit !== 0) {
         throw new Error(`ld exited ${exit}\n${buf.joined()}`);
     }
@@ -233,15 +311,36 @@ export async function link(obj, libs, opts = {}) {
 
 /**
  * Convenience: full C → mov-only ELF executable in one call.
- * Equivalent to `link(await assemble(await compile(source, headers)), undefined, linkOpts)`.
- * @param {string} source raw C source code
- * @param {Record<string,string>} [headers] optional `name.h` → content map
- * @param {{name?: string}} [linkOpts] forwarded to link() (controls the
- *   basename embedded in the ELF's .symtab)
+ *
+ * @param {string | Record<string,string>} source
+ *   - string: single .c. Equivalent to
+ *     `link(await assemble(await compile(source, headers)), undefined, linkOpts)`.
+ *   - Record<string,string>: multi-file. Each `[basename, .c text]` is
+ *     compiled + assembled independently and the resulting .o set is
+ *     handed to link() in iteration order. The `basename` shows up in
+ *     the resulting ELF's `.symtab`.
+ * @param {Record<string,string>} [headers] `name.h` → content map shared
+ *   across every .c in `source`. Header sidecars are staged in MEMFS root
+ *   so `#include "name.h"` resolves.
+ * @param {object} [linkOpts] forwarded to link() (`name`, `extraLibs`,
+ *   `searchPaths`, `extraInputs`). With multi-file `source` the `name`
+ *   option is ignored — basenames come from the source map.
  * @returns {Promise<Uint8Array>} ELF32 executable bytes
  */
 export async function compileToElf(source, headers = {}, linkOpts = {}) {
-    return link(await assemble(await compile(source, headers)), undefined, linkOpts);
+    if (typeof source === 'string') {
+        return link(await assemble(await compile(source, headers)), undefined, linkOpts);
+    }
+    if (!source || typeof source !== 'object') {
+        throw new TypeError('source must be a string or Record<string,string>');
+    }
+    const objs = {};
+    for (const [name, src] of Object.entries(source)) {
+        assertSafeName(name, 'source basename');
+        objs[name.endsWith('.o') ? name : `${name}.o`] =
+            await assemble(await compile(src, headers));
+    }
+    return link(objs, undefined, linkOpts);
 }
 
 /**

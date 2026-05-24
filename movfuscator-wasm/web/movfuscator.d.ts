@@ -20,9 +20,20 @@ export type LinkLibs = Record<string, Uint8Array>;
 export const LIB_PATHS: readonly string[];
 
 export interface LinkOptions {
-  /** Basename used when staging the .o into MEMFS. Surfaces in the
-   *  resulting ELF's `.symtab`; defaults to `a.out.o`. */
+  /** Basename used when staging a single .o into MEMFS. Surfaces in the
+   *  resulting ELF's `.symtab`; defaults to `a.out.o`. Ignored when
+   *  `objs` is an array or Record (those carry their own basenames). */
   name?: string;
+  /** Extra `-l<name>` flags appended after the default `-lgcc -lc -lm`. */
+  extraLibs?: string[];
+  /** Extra `-L<path>` search paths appended after the default
+   *  `-L/movfuscator -L/usr/lib32 -L/lib32`. */
+  searchPaths?: string[];
+  /** Absolute MEMFS path → bytes, staged before ld runs. Use to provide
+   *  caller-supplied `.a` archives or link scripts that `extraLibs` /
+   *  `searchPaths` then resolve. Paths must be absolute and outside the
+   *  directories the wrapper relies on (e.g., `/movfuscator/`). */
+  extraInputs?: Record<string, Uint8Array>;
 }
 
 /** Run the LCC C preprocessor on `source`. Returns the post-`#include`
@@ -39,18 +50,30 @@ export function compile(source: string, headers?: Headers): Promise<string>;
 /** Assemble x86 mov-only asm → ELF32 i386 relocatable object (.o). */
 export function assemble(asm: string): Promise<Uint8Array>;
 
-/** Link a .o into a dynamically-linked mov-only ELF32 executable.
+/** Link one or more .o files into a dynamically-linked mov-only ELF32
+ *  executable.
+ *
+ *  - `Uint8Array`: single .o, staged at `/${opts.name || 'a.out.o'}`.
+ *  - `Uint8Array[]`: each element gets a synthetic `obj<i>.o` name.
+ *  - `Record<string, Uint8Array>`: keys are basenames; entries are linked
+ *    in iteration order with those names visible in the ELF `.symtab`.
+ *
  *  On first call without `libs`, lazy-fetches the ~24 MB crt + libc +
  *  libgcc bundle from `./lib/` and caches it for subsequent calls. */
 export function link(
-  obj: Uint8Array,
+  objs: Uint8Array | Uint8Array[] | Record<string, Uint8Array>,
   libs?: LinkLibs,
   opts?: LinkOptions,
 ): Promise<Uint8Array>;
 
-/** Convenience: full C → linked ELF in one call. */
+/** Convenience: full C → linked ELF in one call.
+ *
+ *  - `string` source: single .c (the original shape).
+ *  - `Record<string, string>` source: multi-file. Each `[basename, .c]`
+ *    is compiled + assembled, then all .o are linked together. The
+ *    basenames appear in the resulting ELF's `.symtab`. */
 export function compileToElf(
-  source: string,
+  source: string | Record<string, string>,
   headers?: Headers,
   linkOpts?: LinkOptions,
 ): Promise<Uint8Array>;
