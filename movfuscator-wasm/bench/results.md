@@ -1,6 +1,6 @@
 # movfuscator-wasm benchmark
 
-_2026-05-24T11:46:06Z · Linux 6.12.74+deb13+1-amd64 x86_64 · v24.15.0 · hyperfine 1.19.0_
+_2026-05-24T12:02:13Z · Linux 6.12.74+deb13+1-amd64 x86_64 · v24.15.0 · hyperfine 1.19.0_
 
 Three implementations of the .c → mov asm pipeline are compared per fixture:
 
@@ -17,60 +17,117 @@ Three implementations of the .c → mov asm pipeline are compared per fixture:
 | `upstream-mandelbrot` | 12179 |
 | `upstream-mersenne` | 33841 |
 | `upstream-ray3` | 69554 |
+| `upstream-md5` | 124521 |
 
 ## return42
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `native` | 2.8 ± 0.3 | 2.4 | 3.1 | 1.00 |
-| `wasm-node` | 99.0 ± 4.6 | 93.8 | 105.6 | 34.82 ± 3.54 |
-| `wasm-browser` | 85.7 ± 2.5 | 83.2 | 88.9 | 30.15 ± 2.86 |
+| `native` | 3.5 ± 0.2 | 3.3 | 3.8 | 1.00 |
+| `wasm-node` | 96.7 ± 3.1 | 93.9 | 101.6 | 27.51 ± 1.86 |
+| `wasm-browser` | 89.2 ± 3.0 | 85.6 | 93.3 | 25.38 ± 1.75 |
+
+| pipeline | peak RSS |
+|---|---:|
+| native | 3.3 MB |
+| wasm-node | 56.5 MB |
+| wasm-browser | 66.1 MB |
 
 ## hello
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `native` | 7.5 ± 1.0 | 6.7 | 9.1 | 1.00 |
-| `wasm-node` | 114.4 ± 1.2 | 113.0 | 115.8 | 15.26 ± 1.95 |
-| `wasm-browser` | 99.2 ± 1.2 | 97.7 | 100.4 | 13.23 ± 1.70 |
+| `native` | 6.9 ± 1.3 | 5.7 | 8.9 | 1.00 |
+| `wasm-node` | 113.6 ± 3.6 | 109.6 | 117.3 | 16.48 ± 3.15 |
+| `wasm-browser` | 102.0 ± 1.6 | 100.4 | 104.5 | 14.80 ± 2.80 |
+
+| pipeline | peak RSS |
+|---|---:|
+| native | 3.3 MB |
+| wasm-node | 58.7 MB |
+| wasm-browser | 69.7 MB |
 
 ## upstream-prime
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `native` | 10.6 ± 0.8 | 9.4 | 11.4 | 1.00 |
-| `wasm-node` | 141.6 ± 3.5 | 137.1 | 146.8 | 13.36 ± 1.12 |
-| `wasm-browser` | 114.5 ± 6.8 | 106.6 | 124.6 | 10.80 ± 1.07 |
+| `native` | 9.4 ± 1.7 | 7.7 | 12.1 | 1.00 |
+| `wasm-node` | 141.7 ± 2.4 | 138.5 | 145.2 | 15.12 ± 2.76 |
+| `wasm-browser` | 112.8 ± 2.2 | 109.6 | 115.4 | 12.04 ± 2.20 |
+
+| pipeline | peak RSS |
+|---|---:|
+| native | 3.3 MB |
+| wasm-node | 61.8 MB |
+| wasm-browser | 70.1 MB |
 
 ## upstream-hanoi
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `native` | 14.9 ± 1.4 | 13.7 | 17.0 | 1.00 |
-| `wasm-node` | 182.0 ± 2.3 | 179.6 | 184.7 | 12.24 ± 1.16 |
-| `wasm-browser` | 133.8 ± 3.9 | 129.1 | 139.7 | 9.00 ± 0.89 |
+| `native` | 15.4 ± 1.1 | 13.9 | 16.9 | 1.00 |
+| `wasm-node` | 179.7 ± 3.3 | 176.3 | 184.8 | 11.67 ± 0.88 |
+| `wasm-browser` | 136.4 ± 2.4 | 134.5 | 140.6 | 8.86 ± 0.67 |
+
+| pipeline | peak RSS |
+|---|---:|
+| native | 3.3 MB |
+| wasm-node | 67.9 MB |
+| wasm-browser | 75.9 MB |
 
 ## upstream-mandelbrot
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `native` | 11.7 ± 1.7 | 9.5 | 13.3 | 1.00 |
-| `wasm-node` | 154.7 ± 1.3 | 153.3 | 156.5 | 13.21 ± 1.94 |
-| `wasm-browser` | 118.6 ± 2.8 | 114.7 | 122.5 | 10.13 ± 1.50 |
+| `native` | 10.6 ± 1.3 | 8.5 | 11.7 | 1.00 |
+| `wasm-node` | 156.2 ± 2.3 | 153.6 | 158.8 | 14.76 ± 1.82 |
+| `wasm-browser` | 120.7 ± 3.2 | 117.6 | 125.8 | 11.41 ± 1.43 |
+
+| pipeline | peak RSS |
+|---|---:|
+| native | 3.3 MB |
+| wasm-node | 61.7 MB |
+| wasm-browser | 70.2 MB |
 
 ## upstream-mersenne
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `native` | 8.5 ± 0.8 | 7.4 | 9.4 | 1.00 |
-| `wasm-node` | 189.7 ± 3.3 | 186.0 | 193.9 | 22.35 ± 2.13 |
-| `wasm-browser` | 122.1 ± 2.7 | 117.3 | 123.8 | 14.38 ± 1.39 |
+| `native` | 7.9 ± 0.3 | 7.6 | 8.2 | 1.00 |
+| `wasm-node` | 187.9 ± 2.7 | 185.6 | 192.2 | 23.84 ± 0.90 |
+| `wasm-browser` | 125.8 ± 8.8 | 118.2 | 140.9 | 15.96 ± 1.25 |
+
+| pipeline | peak RSS |
+|---|---:|
+| native | 3.3 MB |
+| wasm-node | 61.9 MB |
+| wasm-browser | 69.9 MB |
 
 ## upstream-ray3
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `native` | 24.9 ± 0.5 | 24.2 | 25.4 | 1.00 |
-| `wasm-node` | 335.9 ± 5.4 | 331.6 | 344.7 | 13.48 ± 0.33 |
-| `wasm-browser` | 181.6 ± 5.7 | 175.0 | 190.1 | 7.29 ± 0.27 |
+| `native` | 25.0 ± 0.5 | 24.1 | 25.5 | 1.00 |
+| `wasm-node` | 334.9 ± 4.3 | 329.6 | 341.0 | 13.40 ± 0.34 |
+| `wasm-browser` | 181.5 ± 4.5 | 177.2 | 186.5 | 7.26 ± 0.24 |
+
+| pipeline | peak RSS |
+|---|---:|
+| native | 3.3 MB |
+| wasm-node | 72.1 MB |
+| wasm-browser | 87.2 MB |
+
+## upstream-md5
+
+| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
+|:---|---:|---:|---:|---:|
+| `native` | 72.1 ± 2.0 | 70.3 | 74.5 | 1.00 |
+| `wasm-node` | 637.6 ± 11.4 | 622.4 | 653.7 | 8.84 ± 0.29 |
+| `wasm-browser` | 264.6 ± 11.7 | 257.9 | 285.5 | 3.67 ± 0.19 |
+
+| pipeline | peak RSS |
+|---|---:|
+| native | 3.2 MB |
+| wasm-node | 73.5 MB |
+| wasm-browser | 99.8 MB |
 

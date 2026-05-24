@@ -108,18 +108,20 @@ per its attribution clause.
 
 ## Benchmarks
 
-`make bench` runs `hyperfine` over the .c → mov asm pipeline three ways
-and writes a markdown report to [bench/results.md](bench/results.md).
-On a Debian 13 / x86_64 Beelink Mini S host (snapshot in the report):
+`make bench` runs `hyperfine` and `/usr/bin/time -v` over the .c → mov asm
+pipeline three ways and writes a markdown report to
+[bench/results.md](bench/results.md). On a Debian 13 / x86_64 Beelink Mini S
+host (snapshot in the report):
 
-| fixture          | asm lines | native | wasm-browser  | ratio |
-|------------------|----------:|-------:|--------------:|------:|
-| `return42`       |       712 |  2.8 ms |  85.7 ms     |  30x |
-| `hello`          |       979 |  7.5 ms |  99.2 ms     |  13x |
-| `upstream-prime` |     9,994 | 10.6 ms | 114.5 ms    |  11x |
-| `upstream-mandelbrot` | 12,179 | 11.7 ms | 118.6 ms |  10x |
-| `upstream-mersenne` | 33,841 |  8.5 ms | 122.1 ms    |  14x |
-| `upstream-ray3`   |    69,554 | 24.9 ms | 181.6 ms    |   7x |
+| fixture          | asm lines | native | wasm-browser | time ratio | wasm-browser RSS |
+|------------------|----------:|-------:|-------------:|-----------:|-----------------:|
+| `return42`       |       712 |  3.5 ms |  89.2 ms    |       25x |          66 MB |
+| `hello`          |       979 |  6.9 ms | 102.0 ms    |       15x |          70 MB |
+| `upstream-prime` |     9,994 |  9.4 ms | 112.8 ms    |       12x |          70 MB |
+| `upstream-mandelbrot` | 12,179 | 10.6 ms | 120.7 ms  |       11x |          70 MB |
+| `upstream-mersenne` | 33,841 |  7.9 ms | 125.8 ms    |       16x |          70 MB |
+| `upstream-ray3`   |    69,554 | 25.0 ms | 181.5 ms    |        7x |          87 MB |
+| `upstream-md5`   |   124,521 | 72.1 ms | 264.6 ms    |    **3.7x** |        100 MB |
 
 Findings worth noting:
 
@@ -127,12 +129,16 @@ Findings worth noting:
   two Node processes per fixture (`node cpp.js ; node rcc.js`) while
   the browser wrapper stays in one process. Process startup dominates
   the small-fixture timings.
-- **Larger inputs amortize wasm overhead** — the ratio shrinks from 30x
-  (700-line return42) to 7x (70k-line ray3) as actual codegen time
-  grows past the fixed Node + wasm-instantiate cost.
+- **Larger inputs amortize wasm overhead** — the ratio shrinks from
+  25× (700-line return42) to **3.7×** (124k-line md5) as actual codegen
+  time grows past the fixed Node + wasm-instantiate cost.
 - **Interactive demo stays snappy** — even the heaviest fixture finishes
-  under 200 ms in the wasm-browser path. The textarea-to-asm round trip
+  under 300 ms in the wasm-browser path. The textarea-to-asm round trip
   in `web/index.html` shows the same numbers.
+- **Peak RSS**: native rcc holds steady at ~3 MB; wasm-browser hits
+  100 MB on md5 (both cpp and rcc modules in one process, vs. the
+  Node-shell pipeline that subprocesses them serially). Fine for a
+  browser tab, but worth knowing.
 
 Override the fixture set:
 ```sh

@@ -42,7 +42,7 @@ if ! command -v hyperfine > /dev/null; then
     exit 1
 fi
 
-DEFAULT_FIXTURES="return42 hello upstream-prime upstream-hanoi upstream-mandelbrot upstream-mersenne upstream-ray3"
+DEFAULT_FIXTURES="return42 hello upstream-prime upstream-hanoi upstream-mandelbrot upstream-mersenne upstream-ray3 upstream-md5"
 FIXTURES="${BENCH_FIXTURES:-$DEFAULT_FIXTURES}"
 
 CPP_FLAGS=(
@@ -57,6 +57,20 @@ CPP_FLAGS=(
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+
+# /usr/bin/time -v reports "Maximum resident set size (kbytes)" — the
+# closest cheap proxy for peak memory pressure that's portable across
+# the three pipelines we benchmark (native binary, Node, Node ESM).
+measure_rss_kb() {
+    local cmd="$1"
+    local tf="$tmp/time.out"
+    /usr/bin/time -v -o "$tf" bash -c "$cmd" > /dev/null 2>&1 || true
+    awk '/Maximum resident set size/ {print $NF}' "$tf"
+}
+
+format_mb() {
+    awk -v k="$1" 'BEGIN { if (k+0 == 0) print "n/a"; else printf "%.1f MB\n", k / 1024 }'
+}
 
 results="$out/results.md"
 {
@@ -93,10 +107,25 @@ for n in $FIXTURES; do
         -n wasm-browser "$cmd_wbrow" \
         --export-markdown "$md"
 
+    echo
+    echo "  -- peak RSS (single run via /usr/bin/time -v) --"
+    rss_native=$(measure_rss_kb "$cmd_native")
+    rss_wnode=$(measure_rss_kb  "$cmd_wnode")
+    rss_wbrow=$(measure_rss_kb  "$cmd_wbrow")
+    printf "  %-13s %s\n" "native"       "$(format_mb "$rss_native")"
+    printf "  %-13s %s\n" "wasm-node"    "$(format_mb "$rss_wnode")"
+    printf "  %-13s %s\n" "wasm-browser" "$(format_mb "$rss_wbrow")"
+
     {
         echo "## $n"
         echo
         cat "$md"
+        echo
+        echo "| pipeline | peak RSS |"
+        echo "|---|---:|"
+        echo "| native | $(format_mb "$rss_native") |"
+        echo "| wasm-node | $(format_mb "$rss_wnode") |"
+        echo "| wasm-browser | $(format_mb "$rss_wbrow") |"
         echo
     } >> "$results"
 done
