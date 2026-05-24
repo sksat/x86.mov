@@ -25,6 +25,8 @@ const required = [
     join(buildDir, 'cpp.wasm'),
     join(buildDir, 'rcc.js'),
     join(buildDir, 'rcc.wasm'),
+    join(buildDir, 'as.js'),
+    join(buildDir, 'as.wasm'),
     wrapper,
 ];
 const missing = required.filter(p => !existsSync(p));
@@ -34,11 +36,9 @@ if (missing.length) {
     process.exit(1);
 }
 
-const { compile } = await import(wrapper);
+const { compile, assemble } = await import(wrapper);
+const goldensO = join(root, 'tests', 'goldens-o');
 
-// Preload any tests/fixtures/*.h sidecars (e.g. md5.h) so MEMFS resolves
-// `#include "name.h"` the same way the native preprocess.sh does when it
-// runs from the same directory as the .c file.
 const headerFiles = readdirSync(fixtures).filter(f => f.endsWith('.h'));
 const headers = Object.fromEntries(
     headerFiles.map(h => [h, readFileSync(join(fixtures, h), 'utf8')])
@@ -46,11 +46,13 @@ const headers = Object.fromEntries(
 
 let pass = 0, fail = 0;
 const cFiles = readdirSync(fixtures).filter(f => f.endsWith('.c')).sort();
+
+console.log('— compile() (.c → .s) —');
 for (const file of cFiles) {
     const name = basename(file, '.c');
     const goldenPath = join(goldens, `${name}.s`);
     if (!existsSync(goldenPath)) {
-        console.log(`SKIP ${name} (no golden)`);
+        console.log(`SKIP ${name} (no .s golden)`);
         continue;
     }
     const source = readFileSync(join(fixtures, file), 'utf8');
@@ -70,8 +72,7 @@ for (const file of cFiles) {
         console.log(`PASS ${name} (${actual.split('\n').length - 1} lines)`);
         pass++;
     } else {
-        console.log(`FAIL ${name} — wasm output differs from golden`);
-        // Show first divergence to help debug
+        console.log(`FAIL ${name} — compile output differs from golden`);
         const aLines = actual.split('\n');
         const eLines = expected.split('\n');
         for (let i = 0; i < Math.min(aLines.length, eLines.length); i++) {
@@ -82,6 +83,37 @@ for (const file of cFiles) {
                 break;
             }
         }
+        fail++;
+    }
+}
+
+console.log();
+console.log('— assemble() (.s → .o) —');
+for (const file of cFiles) {
+    const name = basename(file, '.c');
+    const sPath = join(goldens, `${name}.s`);
+    const oPath = join(goldensO, `${name}.o`);
+    if (!existsSync(sPath) || !existsSync(oPath)) {
+        console.log(`SKIP ${name} (missing .s or .o golden)`);
+        continue;
+    }
+    const asm = readFileSync(sPath, 'utf8');
+    const expectedBytes = readFileSync(oPath);
+    let actualBytes;
+    try {
+        actualBytes = await assemble(asm);
+    } catch (e) {
+        console.log(`FAIL ${name} — assemble threw:`);
+        console.log('  |', String(e.message || e).split('\n').join('\n  | '));
+        fail++;
+        continue;
+    }
+    if (actualBytes.length === expectedBytes.length && actualBytes.every((b, i) => b === expectedBytes[i])) {
+        console.log(`PASS ${name} (${actualBytes.length} bytes)`);
+        pass++;
+    } else {
+        console.log(`FAIL ${name} — wasm .o differs from golden`);
+        console.log(`  | golden=${expectedBytes.length} actual=${actualBytes.length}`);
         fail++;
     }
 }

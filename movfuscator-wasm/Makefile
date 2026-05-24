@@ -1,5 +1,5 @@
 .PHONY: help setup build-native build-wasm build-wasm-rcc build-wasm-cpp \
-        build-wasm-browser build-wasm-as goldens goldens-o \
+        build-wasm-browser build-wasm-as build-wasm-as-browser goldens goldens-o \
         test test-browser test-as test-ld bench serve clean distclean
 
 help:
@@ -11,6 +11,7 @@ help:
 	@echo "  build-wasm-cpp       only the node cpp wasm artifact"
 	@echo "  build-wasm-browser   build browser-mode rcc.wasm + cpp.wasm (MEMFS)"
 	@echo "  build-wasm-as        build wasm as (GNU binutils 2.44 gas, Phase C)"
+	@echo "  build-wasm-as-browser  re-link wasm-as for browser (MEMFS, ES module)"
 	@echo "  goldens              regenerate tests/goldens/*.s with native rcc"
 	@echo "  goldens-o            regenerate tests/goldens-o/*.o with native as"
 	@echo "  test                 node pipeline test vs .s goldens"
@@ -41,6 +42,9 @@ build-wasm-browser:
 
 build-wasm-as:
 	./scripts/build-wasm-as.sh
+
+build-wasm-as-browser:
+	./scripts/build-wasm-as-browser.sh
 
 goldens:
 	./scripts/regen-goldens.sh

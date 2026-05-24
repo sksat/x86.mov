@@ -53,6 +53,7 @@
     </select>
   </label>
   <button id="compile" class="primary">Compile →</button>
+  <button id="download-o" disabled>Download .o</button>
   <span id="status" class="status">ready</span>
 </div>
 
@@ -68,7 +69,7 @@
 </div>
 
 <script type="module">
-import { compile } from './movfuscator.mjs';
+import { compile, assemble } from './movfuscator.mjs';
 
 const PRESETS = {
     return42: `int main(void) { return 42; }
@@ -138,14 +139,20 @@ $('preset').addEventListener('change', async (e) => {
     }
 });
 
+// Last successful compile's asm — used by Download .o so we don't re-run
+// the whole pipeline if the user just wants the object file.
+let lastAsm = null;
+
 $('compile').addEventListener('click', async () => {
     const btn = $('compile');
     const status = $('status');
     const out = $('out');
     btn.disabled = true;
+    $('download-o').disabled = true;
     status.className = 'status';
     status.textContent = 'compiling…';
     out.textContent = '';
+    lastAsm = null;
 
     const started = performance.now();
     try {
@@ -156,10 +163,39 @@ $('compile').addEventListener('click', async () => {
         const lines = asm.split('\n').length - 1;
         status.textContent = `done in ${ms} ms — ${lines} lines`;
         out.textContent = asm;
+        lastAsm = asm;
+        $('download-o').disabled = false;
     } catch (err) {
         status.className = 'status err';
         status.textContent = 'compilation failed (see output pane)';
         out.textContent = String(err.message || err);
+    } finally {
+        btn.disabled = false;
+    }
+});
+
+$('download-o').addEventListener('click', async () => {
+    const btn = $('download-o');
+    const status = $('status');
+    if (!lastAsm) return;
+    btn.disabled = true;
+    const prevText = status.textContent;
+    status.className = 'status';
+    status.textContent = 'assembling…';
+    const started = performance.now();
+    try {
+        const obj = await assemble(lastAsm);
+        const ms = Math.round(performance.now() - started);
+        const url = URL.createObjectURL(new Blob([obj], { type: 'application/x-object' }));
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'movfuscated.o';
+        a.click();
+        URL.revokeObjectURL(url);
+        status.textContent = `${prevText} · .o ready (${obj.length} bytes, ${ms} ms)`;
+    } catch (err) {
+        status.className = 'status err';
+        status.textContent = `assemble failed: ${err.message || err}`;
     } finally {
         btn.disabled = false;
     }
