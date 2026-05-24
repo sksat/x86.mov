@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>movfuscator-wasm</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github.min.css">
 <style>
   :root { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; line-height: 1.4; }
   body { margin: 0; padding: 1.5rem; }
@@ -15,19 +14,29 @@
   button, select { font: inherit; padding: 0.35rem 0.7rem; }
   button.primary { background: #1d6; border: 1px solid #0a5; color: white; cursor: pointer; }
   button.primary:disabled { background: #aaa; border-color: #888; cursor: wait; }
-  textarea, pre.out {
+  pre.out {
     box-sizing: border-box;
     width: 100%;
     font: inherit;
     border: 1px solid #ccc;
     padding: 0.5rem;
     background: #fafafa;
+    min-height: 24rem;
+    max-height: 60vh;
+    overflow: auto;
+    white-space: pre;
+    margin: 0;
+    font-size: 0.85rem;
   }
-  textarea { min-height: 24rem; resize: vertical; font-size: 0.85rem; }
-  pre.out { min-height: 24rem; max-height: 60vh; overflow: auto; white-space: pre; margin: 0; font-size: 0.85rem; }
-  /* highlight.js github theme paints its own background — keep our pre's
-     background visible by making the inner code transparent. */
-  pre.out code.hljs { background: transparent; padding: 0; }
+  /* CodeMirror panes — match the look of pre.out (border, height). */
+  .cm-host {
+    border: 1px solid #ccc;
+    height: 24rem;
+    overflow: hidden;
+    background: #fafafa;
+  }
+  .cm-host .cm-editor { height: 100%; font-size: 0.85rem; }
+  .cm-host .cm-scroller { font-family: inherit; }
   .status { font-size: 0.85rem; color: #666; }
   .status.err { color: #b00; }
   /* minmax(0, 1fr) so a long unwrappable line in one pane doesn't push the
@@ -84,11 +93,11 @@
 <div class="grid">
   <div>
     <h2>C source</h2>
-    <textarea id="src" spellcheck="false"></textarea>
+    <div id="src" class="cm-host"></div>
   </div>
   <div>
     <h2>mov-only x86 assembly</h2>
-    <pre class="out"><code id="asm-out" class="language-x86asm"></code></pre>
+    <div id="asm-out" class="cm-host"></div>
   </div>
   <div>
     <div class="tabs" id="view-tabs">
@@ -102,7 +111,11 @@
 
 <script type="module">
 import { compile, assemble, link } from './movfuscator.mjs';
-import hljs from 'https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/+esm';
+import { EditorView, basicSetup }    from 'https://esm.sh/codemirror@6.0.2';
+import { EditorState }               from 'https://esm.sh/@codemirror/state@6.6.0';
+import { cpp }                       from 'https://esm.sh/@codemirror/lang-cpp@6.0.3';
+import { StreamLanguage }            from 'https://esm.sh/@codemirror/language@6.12.3';
+import { gas }                       from 'https://esm.sh/@codemirror/legacy-modes@6.5.3/mode/gas';
 
 const PRESETS = {
     return42: `int main(void) { return 42; }
@@ -142,7 +155,34 @@ int main(void) {
 };
 
 const $ = (id) => document.getElementById(id);
-$('src').value = PRESETS.hello;
+
+// CodeMirror editors. The C pane is writable (cpp mode); the asm pane
+// is the same editor configured read-only with the legacy GAS mode
+// wrapped via StreamLanguage.
+const cEditor = new EditorView({
+    doc: PRESETS.hello,
+    extensions: [basicSetup, cpp()],
+    parent: $('src'),
+});
+const asmEditor = new EditorView({
+    doc: '',
+    extensions: [basicSetup, StreamLanguage.define(gas), EditorState.readOnly.of(true)],
+    parent: $('asm-out'),
+});
+
+function getCSource() {
+    return cEditor.state.doc.toString();
+}
+function setCSource(text) {
+    cEditor.dispatch({
+        changes: { from: 0, to: cEditor.state.doc.length, insert: text },
+    });
+}
+function setAsm(text) {
+    asmEditor.dispatch({
+        changes: { from: 0, to: asmEditor.state.doc.length, insert: text },
+    });
+}
 
 // md5 source is too long to inline; fetch lazily. The .h is grabbed
 // alongside so compile() can pass it as a sidecar when the source
@@ -160,7 +200,7 @@ $('preset').addEventListener('change', async (e) => {
     if (k === 'md5') {
         $('status').textContent = 'loading md5.c…';
         try {
-            $('src').value = await fetch('./md5.c').then(r => r.text());
+            setCSource(await fetch('./md5.c').then(r => r.text()));
             await getMd5Headers();  // warm the cache
             $('status').textContent = 'ready';
         } catch (err) {
@@ -168,7 +208,7 @@ $('preset').addEventListener('change', async (e) => {
             $('status').textContent = `failed to load md5.c: ${err.message || err}`;
         }
     } else if (k && PRESETS[k]) {
-        $('src').value = PRESETS[k];
+        setCSource(PRESETS[k]);
     }
 });
 
@@ -289,7 +329,7 @@ $('compile').addEventListener('click', async () => {
     for (const b of document.querySelectorAll('#view-tabs button')) b.disabled = true;
     status.className = 'status';
     status.textContent = 'compiling…';
-    $('asm-out').textContent = '';
+    setAsm('');
     $('bin-out').textContent = '';
     $('elf-summary').hidden = true;
     lastAsm = null;
@@ -298,16 +338,13 @@ $('compile').addEventListener('click', async () => {
 
     const started = performance.now();
     try {
-        const src = $('src').value;
+        const src = getCSource();
         const headers = src.includes('#include "md5.h"') ? await getMd5Headers() : {};
         const asm = await compile(src, headers);
         const compileMs = Math.round(performance.now() - started);
         const lines = asm.split('\n').length - 1;
         lastAsm = asm;
-        const asmEl = $('asm-out');
-        asmEl.textContent = asm;
-        asmEl.removeAttribute('data-highlighted');
-        hljs.highlightElement(asmEl);
+        setAsm(asm);
 
         // Assemble eagerly so the .o hex pane shows content immediately.
         // It's quick (~50–250 ms) and avoids a second click for the
@@ -324,7 +361,7 @@ $('compile').addEventListener('click', async () => {
     } catch (err) {
         status.className = 'status err';
         status.textContent = 'pipeline failed (see asm pane)';
-        $('asm-out').textContent = String(err.message || err);
+        setAsm(String(err.message || err));
     } finally {
         btn.disabled = false;
     }
