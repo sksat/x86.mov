@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Build GNU as (from binutils 2.44) targeting i386-linux as a wasm artifact.
+# Build GNU as and ld (from binutils 2.44) targeting i386-linux as wasm
+# artifacts.
 #
-# Output: build/as.{js,wasm} — equivalent to /usr/bin/as for our .s inputs.
-# Uses NODERAWFS so it can read host paths from Node directly (mirrors
-# build-wasm.sh / build-wasm-cpp.sh).
+# Output:
+#   build/as.{js,wasm}  — equivalent to /usr/bin/as for our .s inputs
+#   build/ld.{js,wasm}  — equivalent to /usr/bin/ld for our link step
+#
+# Both use NODERAWFS so they can read host paths from Node directly
+# (mirrors build-wasm.sh / build-wasm-cpp.sh).
 #
 # Quirks worth knowing:
 # - emconfigure compiles binutils' build-helper tools (chew etc.) as wasm,
@@ -42,7 +46,7 @@ if [ ! -f Makefile ]; then
     emconfigure "$src/configure" \
         --target=i386-linux-gnu \
         --disable-werror --disable-nls --disable-shared \
-        --disable-gold --disable-ld --disable-gdb --disable-gdbserver \
+        --disable-gold --disable-gdb --disable-gdbserver \
         --disable-libquadmath --disable-libada --disable-libstdcxx \
         --disable-libssp --disable-libgm2 --disable-gprofng \
         --disable-binutils --disable-readline --disable-libdecnumber \
@@ -61,26 +65,33 @@ if [ ! -x "$build/bfd/doc/chew" ] || ! file "$build/bfd/doc/chew" | grep -q ELF;
 fi
 
 # all-gas pulls in libiberty, bfd, libsframe, opcodes etc. as
-# dependencies. NODERAWFS at link time lets the final as-new read host
+# dependencies. NODERAWFS at link time lets the final binaries read host
 # paths directly from Node.
+LD="$build/ld/ld-new"
 emmake make -j"$(nproc)" \
     MAKEINFO=true \
     LDFLAGS="-sNODERAWFS=1 -sALLOW_MEMORY_GROWTH=1" \
-    all-gas 2> "$build/build.log" | tail -5
+    all-gas all-ld 2> "$build/build.log" | tail -5
 
 asbin="$build/gas/as-new"
-if [ ! -f "$asbin.wasm" ]; then
-    echo "as.wasm not produced; tail of build.log:" >&2
-    tail -40 "$build/build.log" >&2
-    exit 1
-fi
+ldbin="$build/ld/ld-new"
+for b in "$asbin" "$ldbin"; do
+    if [ ! -f "$b.wasm" ]; then
+        echo "${b##*/}.wasm not produced; tail of build.log:" >&2
+        tail -40 "$build/build.log" >&2
+        exit 1
+    fi
+done
 
 cp "$asbin"      "$out/as.js"
 cp "$asbin.wasm" "$out/as.wasm"
-# The emcc-generated .js bakes in the wasm filename ('as-new.wasm').
-# Patch it to use our renamed artifact so the .js is portable to
-# build/as.{js,wasm}.
-sed -i "s/'as-new\.wasm'/'as.wasm'/g" "$out/as.js"
+cp "$ldbin"      "$out/ld.js"
+cp "$ldbin.wasm" "$out/ld.wasm"
 
-echo "wasm-as build complete:"
-ls -la "$out"/as.{js,wasm}
+# The emcc-generated .js bakes in the wasm filename ('as-new.wasm' /
+# 'ld-new.wasm'). Patch them to use our renamed artifacts.
+sed -i "s/'as-new\.wasm'/'as.wasm'/g" "$out/as.js"
+sed -i "s/'ld-new\.wasm'/'ld.wasm'/g" "$out/ld.js"
+
+echo "wasm-as + wasm-ld build complete:"
+ls -la "$out"/as.{js,wasm} "$out"/ld.{js,wasm}

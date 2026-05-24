@@ -1,9 +1,9 @@
 # movfuscator → WebAssembly
 
 WebAssembly port of [movfuscator](https://github.com/xoreaxeaxeax/movfuscator)'s
-code generator and preprocessor, plus the GNU assembler — so the entire
-`.c → mov-only ELF32 .o` pipeline can run in any wasm runtime, including a
-browser tab on [x86.mov](../index.html).
+code generator and preprocessor, plus the GNU assembler and linker — so the
+entire `.c → mov-only ELF32 executable` pipeline can run in any wasm runtime,
+including a browser tab on [x86.mov](../index.html).
 
 **Scope**:
 - Phase A: `rcc` (LCC backend emitting mov-only x86 asm) → `build/rcc.wasm`
@@ -12,8 +12,12 @@ browser tab on [x86.mov](../index.html).
   `build/browser/{cpp,rcc}.{js,wasm}` + `web/movfuscator.mjs` + `web/index.html`
 - Phase C: `as` (GNU binutils 2.44 gas, i386 target) → `build/as.{js,wasm}`,
   byte-identical ELF32 .o vs host /usr/bin/as
+- Phase D: `ld` (GNU binutils 2.44, same source tree as gas) →
+  `build/ld.{js,wasm}`, byte-identical ELF32 executable vs host /usr/bin/ld
 
-The linker still stays on the host. Output is a mov-only ELF32 i386 .o.
+`.c → wasm cpp → .i → wasm rcc → .s → wasm as → .o → wasm ld → ELF`. The
+output is a real Linux x86_32 binary; on a host with multilib it runs
+unmodified.
 
 ## Layout
 
@@ -163,16 +167,26 @@ BENCH_FIXTURES="return42 upstream-ray3" make bench
   libiberty's fallback `psignal` definition take `const char *`, since
   Emscripten's `<signal.h>` declares it that way.
 
-## Phase C: wasm as
+## Phase C+D: wasm as and ld
 
-Builds GNU `as` (from binutils 2.44, gas only — no ld / gold / gprofng)
-targeting i386-linux as a wasm artifact. The byte-identical safety net
-extends through assembly: for every fixture, the test harness now also
-asserts `wasm-as < .s > .o` matches `host-as < same .s > .o` bit-for-bit.
+`scripts/build-wasm-as.sh` builds both `as` and `ld` from a single
+binutils 2.44 source tree, targeting i386-linux as wasm artifacts. The
+byte-identical safety net extends through assembly and linking:
 
-The build needs three things modern binutils doesn't give you cleanly
-in an Emscripten cross-compile and that `scripts/build-wasm-as.sh`
-papers over:
+- `make test-as`: for every fixture, `wasm-as < .s > .o` matches the
+  host `as` byte-for-byte.
+- `make test-ld`: for every fixture, `wasm-ld` linking that same .o
+  plus crt0/crtf/crtd + softfloat32 + libc/libm/libgcc references
+  produces an ELF32 executable byte-identical to host `/usr/bin/ld`'s
+  output.
+
+The resulting ELF is a real Linux x86_32 binary: it runs unmodified on
+a multilib host. (Verified: wasm-linked `upstream-hello.elf` prints
+"Hello, world!" — and its bytes match host-linked output to the
+hash.)
+
+The build needs four things modern binutils doesn't give you cleanly
+in an Emscripten cross-compile:
 
 1. `libiberty`'s fallback `psignal` definition signature clashes with
    Emscripten's `<signal.h>`. Patched.
@@ -180,10 +194,16 @@ papers over:
    `emconfigure` compiles it as wasm by default and then the Makefile
    tries to run it as a host executable. Rebuilt with the system `cc`
    after configure.
-3. `-mx86-used-note=no` keeps the assembler from emitting an
-   `.note.gnu.property` ELF section that modern binutils includes by
-   default — necessary on both sides (host and wasm) to stay
-   byte-identical.
+3. `-mx86-used-note=no` (passed to as) keeps the assembler from
+   emitting an `.note.gnu.property` ELF section that modern binutils
+   includes by default — necessary on both sides (host and wasm) to
+   stay byte-identical.
+4. `--hash-style=gnu` (passed to ld) avoids the legacy SysV `.hash`
+   section the cross-built ld defaults to including, matching the
+   host's Debian-default `gnu`.
 
-A clean build, from `make distclean` to `make test-as`, takes ~10 min
-on a modern host. The resulting `build/as.wasm` is ~2.1 MB.
+A clean build, from `make distclean` to `make test-ld`, takes ~12 min
+on a modern host. The resulting `build/as.wasm` is ~2 MB and
+`build/ld.wasm` is ~8 MB (the latter is bigger because the build keeps
+DWARF debug info that emcc warns it can't fully optimize through —
+fine for now).
