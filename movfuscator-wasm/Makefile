@@ -38,55 +38,63 @@ build-native:
 
 build-wasm: build-wasm-rcc build-wasm-cpp
 
-build-wasm-rcc:
+# All build / test / staging targets below are PHONY (no file-level
+# tracking). Each underlying script is internally idempotent — re-running
+# when artifacts are up to date is cheap (a Makefile timestamp check or a
+# fast `make -C vendor/…` pass) — so listing the producers as
+# prerequisites is enough to make `make stage-npm` / `make test-browser`
+# work from a clean tree without the caller having to memorise the build
+# graph. Worst case on a fully-warm tree is ~few seconds of dep walking.
+
+build-wasm-rcc: build-native
 	./scripts/build-wasm.sh
 
-build-wasm-cpp:
+build-wasm-cpp: build-native
 	./scripts/build-wasm-cpp.sh
 
-build-wasm-browser:
+build-wasm-browser: build-native
 	./scripts/build-wasm-browser.sh
 
 build-wasm-as:
 	./scripts/build-wasm-as.sh
 
-build-wasm-as-browser:
+build-wasm-as-browser: build-wasm-as
 	./scripts/build-wasm-as-browser.sh
 
-build-wasm-ld-browser:
+build-wasm-ld-browser: build-wasm-as
 	./scripts/build-wasm-ld-browser.sh
 
 stage-link-libs:
 	./scripts/stage-link-libs.sh
 
-stage-deploy:
+stage-deploy: build-wasm-browser build-wasm-as-browser build-wasm-ld-browser stage-link-libs
 	./scripts/stage-deploy.sh
 
-stage-npm:
+stage-npm: build-wasm-browser build-wasm-as-browser build-wasm-ld-browser stage-link-libs
 	./scripts/stage-npm.sh
 
-goldens:
+goldens: build-native
 	./scripts/regen-goldens.sh
 
-goldens-o:
+goldens-o: goldens
 	./scripts/regen-goldens-o.sh
 
-test:
+test: build-wasm
 	./tests/run.sh
 
-test-browser:
+test-browser: build-wasm-browser build-wasm-as-browser build-wasm-ld-browser stage-link-libs
 	node tests/browser.mjs
 
-test-as:
+test-as: build-wasm-as
 	./tests/run-as.sh
 
-test-ld:
+test-ld: build-native build-wasm-as
 	./tests/run-ld.sh
 
-test-multi:
+test-multi: build-wasm-as build-wasm-ld-browser stage-link-libs
 	node tests/run-multi.mjs
 
-bench:
+bench: build-wasm build-wasm-browser build-wasm-as build-wasm-as-browser build-wasm-ld-browser stage-link-libs
 	./scripts/bench.sh
 
 PORT ?= 8086
