@@ -25,6 +25,10 @@ if [ ! -f "$vendor/build/mov.c" ]; then
 fi
 
 mkdir -p "$out"
+# Emscripten's NODERAWFS .js loader is CommonJS (uses require). The npm
+# package.json one level up sets "type": "module", which would force Node
+# to parse build/*.js as ESM and crash. Pin this subtree to commonjs.
+echo '{"type":"commonjs"}' > "$out/package.json"
 cd "$vendor"
 
 # Same workaround flags as build.sh.gcc14.patch — Emscripten's clang is also

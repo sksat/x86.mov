@@ -28,6 +28,7 @@ if [ ! -d "$vendor/lcc/cpp" ]; then
 fi
 
 mkdir -p "$out"
+echo '{"type":"commonjs"}' > "$out/package.json"
 cd "$vendor"
 
 # Same relaxations as rcc — Emscripten's clang is strict by default.

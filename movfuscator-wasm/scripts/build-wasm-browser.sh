@@ -39,6 +39,10 @@ fi
 "$here/scripts/collect-headers.sh"
 
 mkdir -p "$out"
+# Browser-mode emcc output uses ES module syntax (EXPORT_ES6); make it
+# explicit so this subtree is parsed as ESM even if a future change in
+# the parent package.json drops "type": "module".
+echo '{"type":"module"}' > "$out/package.json"
 
 CFLAGS=(
     -O2 -g0

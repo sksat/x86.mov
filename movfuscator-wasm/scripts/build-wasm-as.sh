@@ -94,6 +94,9 @@ for b in "$asbin" "$ldbin"; do
     fi
 done
 
+mkdir -p "$out"
+echo '{"type":"commonjs"}' > "$out/package.json"
+
 cp "$asbin"      "$out/as.js"
 cp "$asbin.wasm" "$out/as.wasm"
 cp "$ldbin"      "$out/ld.js"

@@ -24,6 +24,7 @@ if [ -z "${EMSDK:-}" ]; then
 fi
 
 mkdir -p "$out"
+echo '{"type":"module"}' > "$out/package.json"
 
 cd "$build/gas"
 rm -f as-new as-new.wasm
