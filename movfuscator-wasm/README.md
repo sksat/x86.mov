@@ -1,17 +1,19 @@
 # movfuscator → WebAssembly
 
 WebAssembly port of [movfuscator](https://github.com/xoreaxeaxeax/movfuscator)'s
-code generator and preprocessor, so that compiling C to mov-only x86 assembly
-can run in any wasm runtime — including a browser tab on [x86.mov](../index.html).
+code generator and preprocessor, plus the GNU assembler — so the entire
+`.c → mov-only ELF32 .o` pipeline can run in any wasm runtime, including a
+browser tab on [x86.mov](../index.html).
 
 **Scope**:
 - Phase A: `rcc` (LCC backend emitting mov-only x86 asm) → `build/rcc.wasm`
 - Phase B: `cpp` (LCC's bundled C89 preprocessor) → `build/cpp.wasm`
 - Phase A-2: Browser-mode (MEMFS, ES modules, embedded headers) →
   `build/browser/{cpp,rcc}.{js,wasm}` + `web/movfuscator.mjs` + `web/index.html`
+- Phase C: `as` (GNU binutils 2.44 gas, i386 target) → `build/as.{js,wasm}`,
+  byte-identical ELF32 .o vs host /usr/bin/as
 
-Input is raw C (`.c`); output is mov-only x86 assembly text. Assembler and
-linker still stay on the host (Phase C).
+The linker still stays on the host. Output is a mov-only ELF32 i386 .o.
 
 ## Layout
 
@@ -157,3 +159,31 @@ BENCH_FIXTURES="return42 upstream-ray3" make bench
   `-Werror=implicit-int` / `-Werror=implicit-function-declaration` /
   `-Werror=int-conversion` back to warnings so LCC's K&R-era source
   compiles on modern Debian/Ubuntu hosts.
+- `patches/binutils-2.44/01-libiberty-psignal-const.patch` — makes
+  libiberty's fallback `psignal` definition take `const char *`, since
+  Emscripten's `<signal.h>` declares it that way.
+
+## Phase C: wasm as
+
+Builds GNU `as` (from binutils 2.44, gas only — no ld / gold / gprofng)
+targeting i386-linux as a wasm artifact. The byte-identical safety net
+extends through assembly: for every fixture, the test harness now also
+asserts `wasm-as < .s > .o` matches `host-as < same .s > .o` bit-for-bit.
+
+The build needs three things modern binutils doesn't give you cleanly
+in an Emscripten cross-compile and that `scripts/build-wasm-as.sh`
+papers over:
+
+1. `libiberty`'s fallback `psignal` definition signature clashes with
+   Emscripten's `<signal.h>`. Patched.
+2. `bfd/doc/chew` (binutils' own .texi generator) is a host build tool.
+   `emconfigure` compiles it as wasm by default and then the Makefile
+   tries to run it as a host executable. Rebuilt with the system `cc`
+   after configure.
+3. `-mx86-used-note=no` keeps the assembler from emitting an
+   `.note.gnu.property` ELF section that modern binutils includes by
+   default — necessary on both sides (host and wasm) to stay
+   byte-identical.
+
+A clean build, from `make distclean` to `make test-as`, takes ~10 min
+on a modern host. The resulting `build/as.wasm` is ~2.1 MB.
