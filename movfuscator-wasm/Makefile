@@ -1,6 +1,6 @@
 .PHONY: help setup build-native build-wasm build-wasm-rcc build-wasm-cpp \
         build-wasm-browser build-wasm-as build-wasm-as-browser \
-        build-wasm-ld-browser stage-link-libs stage-deploy stage-npm \
+        build-wasm-ld-browser stage-link-libs stage-deploy \
         goldens goldens-o test test-browser test-as test-ld test-multi \
         bench serve clean distclean
 
@@ -15,9 +15,8 @@ help:
 	@echo "  build-wasm-as        build wasm as (GNU binutils 2.44 gas, Phase C)"
 	@echo "  build-wasm-as-browser  re-link wasm-as for browser (MEMFS, ES module)"
 	@echo "  build-wasm-ld-browser  re-link wasm-ld for browser (MEMFS, ES module)"
-	@echo "  stage-link-libs        copy host crt + libc + libgcc into web/lib/ for demo"
+	@echo "  stage-link-libs        copy host crt + libc + libgcc into lib/ for demo / npm"
 	@echo "  stage-deploy           assemble ../dist/ for Cloudflare Pages upload"
-	@echo "  stage-npm              assemble npm-package/ for 'npm publish' (or pack)"
 	@echo "  goldens              regenerate tests/goldens/*.s with native rcc"
 	@echo "  goldens-o            regenerate tests/goldens-o/*.o with native as"
 	@echo "  test                 node pipeline test vs .s goldens"
@@ -26,7 +25,7 @@ help:
 	@echo "  test-ld              wasm-ld test (links .o to ELF, compares with native ld)"
 	@echo "  test-multi           multi-input link + extraLibs/extraInputs (byte-identical)"
 	@echo "  bench                hyperfine native vs wasm-node vs wasm-browser → bench/results.md"
-	@echo "  serve                serve web/ + build/browser/ on \$$PORT (default 8086)"
+	@echo "  serve                serve the demo + build/browser/ on \$$PORT (default 8086)"
 	@echo "  clean                remove build artifacts (keep vendor checkout)"
 	@echo "  distclean            remove build + vendor"
 
@@ -70,9 +69,6 @@ stage-link-libs:
 stage-deploy: build-wasm-browser build-wasm-as-browser build-wasm-ld-browser stage-link-libs
 	./scripts/stage-deploy.sh
 
-stage-npm: build-wasm-browser build-wasm-as-browser build-wasm-ld-browser stage-link-libs
-	./scripts/stage-npm.sh
-
 goldens: build-native
 	./scripts/regen-goldens.sh
 
@@ -98,8 +94,8 @@ bench: build-wasm build-wasm-browser build-wasm-as build-wasm-as-browser build-w
 	./scripts/bench.sh
 
 PORT ?= 8086
-serve:
-	@echo "open http://localhost:$(PORT)/web/"
+serve: build-wasm-browser build-wasm-as-browser build-wasm-ld-browser stage-link-libs
+	@echo "open http://localhost:$(PORT)/"
 	python3 -m http.server $(PORT)
 
 clean:

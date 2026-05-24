@@ -20,9 +20,9 @@ import { spawnSync } from 'node:child_process';
 const here = dirname(fileURLToPath(import.meta.url));
 const root = dirname(here);
 const goldensO = join(root, 'tests', 'goldens-o');
-const libDir = join(root, 'web', 'lib');
+const libDir = join(root, 'lib');
 
-const wrapper = join(root, 'web', 'movfuscator.mjs');
+const wrapper = join(root, 'movfuscator.mjs');
 const required = [
     join(root, 'build/browser/ld.js'),
     join(root, 'build/browser/ld.wasm'),

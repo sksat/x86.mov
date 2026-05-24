@@ -5,15 +5,16 @@
 #   dist/
 #     index.html                       (repo root landing page)
 #     movfuscator-wasm/
-#       index.html, md5.c, md5.h       (from movfuscator-wasm/web/)
-#       movfuscator.mjs                (import paths rewritten — flat layout)
-#       cpp.{js,wasm}, rcc.{js,wasm}   (from build/browser/)
-#       as.{js,wasm}, ld.{js,wasm}
-#       lib/                           (from web/lib/, the link-input bundle)
+#       index.html, md5.{c,h}          (demo)
+#       movfuscator.mjs, movfuscator.d.ts
+#       build/browser/{cpp,rcc,as,ld}.{js,wasm}
+#       build/browser/package.json     ({"type":"module"} so emcc ESM loaders parse)
+#       lib/                           (link-input bundle)
 #
-# The dev layout under movfuscator-wasm/web is intentionally untouched —
-# movfuscator.mjs there still uses ../build/browser/cpp.js etc. so `make serve`
-# keeps working; we only rewrite during deploy staging.
+# Layout matches the source tree (no path rewriting needed) — the wrapper
+# at movfuscator-wasm/movfuscator.mjs imports ./build/browser/cpp.js and
+# ./lib/, which resolve correctly both in dev (make serve) and on the
+# deployed host.
 
 set -euo pipefail
 
@@ -22,15 +23,15 @@ root="$(cd "$here/.." && pwd)"
 dist="$root/dist"
 sub="$dist/movfuscator-wasm"
 
-build_browser="$here/build/browser"
-web="$here/web"
-web_lib="$here/web/lib"
-
-for p in "$build_browser/cpp.wasm" "$build_browser/rcc.wasm" \
-         "$build_browser/as.wasm"  "$build_browser/ld.wasm" \
-         "$web/movfuscator.mjs" "$web/index.html" \
-         "$web_lib/lib32/libc.so.6"; do
-    if [ ! -f "$p" ]; then
+required=(
+    "$here/movfuscator.mjs" "$here/movfuscator.d.ts"
+    "$here/index.html" "$here/md5.c" "$here/md5.h"
+    "$here/build/browser/cpp.wasm" "$here/build/browser/rcc.wasm"
+    "$here/build/browser/as.wasm"  "$here/build/browser/ld.wasm"
+    "$here/lib/lib32/libc.so.6"
+)
+for p in "${required[@]}"; do
+    if [ ! -e "$p" ]; then
         echo "missing: $p" >&2
         echo "run: make build-wasm-browser build-wasm-as-browser build-wasm-ld-browser stage-link-libs" >&2
         exit 1
@@ -38,25 +39,23 @@ for p in "$build_browser/cpp.wasm" "$build_browser/rcc.wasm" \
 done
 
 rm -rf "$dist"
-mkdir -p "$sub"
+mkdir -p "$sub/build/browser"
 
-cp "$root/index.html" "$dist/index.html"
+cp "$root/index.html"           "$dist/index.html"
 
-cp "$web/index.html" "$sub/index.html"
-cp "$web/md5.c"      "$sub/md5.c"
-cp "$web/md5.h"      "$sub/md5.h"
+cp "$here/index.html"           "$sub/"
+cp "$here/md5.c" "$here/md5.h"  "$sub/"
+cp "$here/movfuscator.mjs"      "$sub/"
+cp "$here/movfuscator.d.ts"     "$sub/"
 
-cp "$build_browser"/cpp.js   "$build_browser"/cpp.wasm \
-   "$build_browser"/rcc.js   "$build_browser"/rcc.wasm \
-   "$build_browser"/as.js    "$build_browser"/as.wasm \
-   "$build_browser"/ld.js    "$build_browser"/ld.wasm \
-   "$sub/"
+cp "$here/build/browser"/cpp.js "$here/build/browser"/cpp.wasm \
+   "$here/build/browser"/rcc.js "$here/build/browser"/rcc.wasm \
+   "$here/build/browser"/as.js  "$here/build/browser"/as.wasm \
+   "$here/build/browser"/ld.js  "$here/build/browser"/ld.wasm \
+   "$here/build/browser/package.json" \
+   "$sub/build/browser/"
 
-# Flatten movfuscator.mjs's imports for the deploy layout.
-# In dev:  '../build/browser/cpp.js'  →  in dist:  './cpp.js'
-sed "s|\.\./build/browser/|./|g" "$web/movfuscator.mjs" > "$sub/movfuscator.mjs"
-
-cp -r "$web_lib" "$sub/lib"
+cp -r "$here/lib" "$sub/lib"
 
 bytes=$(du -sb "$dist" | cut -f1)
 files=$(find "$dist" -type f | wc -l)

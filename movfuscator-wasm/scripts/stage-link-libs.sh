@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Stage the host files wasm-ld needs into web/lib/ so the in-browser
-# demo (Phase E-2) can fetch them lazily. Gitignored — re-run after a
-# host libc upgrade or after switching machines.
+# Stage the host files wasm-ld needs into ./lib/ so the in-browser
+# demo and the npm-published wrapper can fetch them lazily.
+# Gitignored — re-run after a host libc upgrade or after switching machines.
 
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 B="$here/vendor/movfuscator/build"
 SF="$here/vendor/movfuscator/movfuscator/lib"
-out="$here/web/lib"
+out="$here/lib"
 
 if [ ! -f "$B/crt0.o" ]; then
     echo "$B/crt0.o missing — run scripts/build-native.sh first" >&2

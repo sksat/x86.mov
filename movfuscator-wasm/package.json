@@ -15,10 +15,11 @@
   "files": [
     "movfuscator.mjs",
     "movfuscator.d.ts",
-    "cpp.js", "cpp.wasm",
-    "rcc.js", "rcc.wasm",
-    "as.js",  "as.wasm",
-    "ld.js",  "ld.wasm",
+    "build/browser/package.json",
+    "build/browser/cpp.js", "build/browser/cpp.wasm",
+    "build/browser/rcc.js", "build/browser/rcc.wasm",
+    "build/browser/as.js",  "build/browser/as.wasm",
+    "build/browser/ld.js",  "build/browser/ld.wasm",
     "lib/",
     "README.md"
   ],

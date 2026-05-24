@@ -9,7 +9,7 @@ including a browser tab on [x86.mov](../index.html).
 - Phase A: `rcc` (LCC backend emitting mov-only x86 asm) → `build/rcc.wasm`
 - Phase B: `cpp` (LCC's bundled C89 preprocessor) → `build/cpp.wasm`
 - Phase A-2: Browser-mode (MEMFS, ES modules, embedded headers) →
-  `build/browser/{cpp,rcc}.{js,wasm}` + `web/movfuscator.mjs` + `web/index.html`
+  `build/browser/{cpp,rcc}.{js,wasm}` + `movfuscator.mjs` + `index.html`
 - Phase C: `as` (GNU binutils 2.44 gas, i386 target) → `build/as.{js,wasm}`,
   byte-identical ELF32 .o vs host /usr/bin/as
 - Phase D: `ld` (GNU binutils 2.44, same source tree as gas) →
@@ -18,7 +18,7 @@ including a browser tab on [x86.mov](../index.html).
   modules) → `build/browser/{as,ld}.{js,wasm}`. The wrapper exposes
   `assemble()` and `link()`; the demo gains **Download .o** and
   **Download ELF** buttons. Link inputs (crt, softfloat32, libc, libm,
-  libgcc, ld-linux.so.2 — ~24 MB) live under `web/lib/` and are
+  libgcc, ld-linux.so.2 — ~24 MB) live under `lib/` and are
   lazy-fetched the first time the user clicks Download ELF.
 
 `.c → wasm cpp → .i → wasm rcc → .s → wasm as → .o → wasm ld → ELF`. The
@@ -27,8 +27,8 @@ unmodified.
 
 ## Use it as a library
 
-The wrapper at `web/movfuscator.mjs` is also an ES module. Same code
-works under Node ≥ 18 and in the browser:
+The wrapper at `movfuscator.mjs` is an ES module. Same code works under
+Node ≥ 18 and in the browser:
 
 ```js
 import { compileToElf } from 'movfuscator-wasm';
@@ -84,23 +84,23 @@ A static-host friendly copy of the same module also lives at
 
 ```
 movfuscator-wasm/
-  scripts/         fetch / build / preprocess / golden-regen drivers
-  patches/         local patches applied to upstream by fetch.sh
+  package.json                       npm metadata, "files" lists what ships
+  movfuscator.mjs, movfuscator.d.ts  ES-module wrapper + TypeScript types
+  index.html                         in-browser demo (Compile / Download .o / Download ELF)
+  md5.c, md5.h                       md5 preset source for the demo's preset selector
+  scripts/                           fetch / build / preprocess / golden-regen drivers
+  patches/                           local patches applied to upstream by fetch.sh
   tests/
-    fixtures/      *.c programs the wasm rcc must compile
-    goldens/       *.s output produced by native rcc, committed (TDD baseline)
-    run.sh         node-mode pipeline test (NODERAWFS)
-    browser.mjs    browser-mode pipeline test (MEMFS, via the wrapper)
-  web/
-    movfuscator.mjs  ES-module wrapper: compile / assemble / link
-    index.html       in-browser demo (Compile, Download .o, Download ELF)
-    md5.c, md5.h     md5 preset source (used by the demo's preset selector)
-    lib/             (gitignored) crt + libc + libgcc bundle for Download ELF
-  Makefile         single entry point
-  vendor/          (gitignored) upstream clone at pinned SHA
-  build/           (gitignored) wasm artifacts
-    cpp.{js,wasm}, rcc.{js,wasm}              node-mode (NODERAWFS)
-    as.{js,wasm}, ld.{js,wasm}                node-mode binutils
+    fixtures/                        *.c programs the wasm rcc must compile
+    goldens/                         *.s output produced by native rcc, committed (TDD baseline)
+    run.sh                           node-mode pipeline test (NODERAWFS)
+    browser.mjs                      browser-mode pipeline test (MEMFS, via the wrapper)
+  Makefile                           single entry point
+  lib/                               (gitignored) crt + libc + libgcc bundle, ~24 MB
+  vendor/                            (gitignored) upstream clone at pinned SHA
+  build/                             (gitignored) wasm artifacts
+    cpp.{js,wasm}, rcc.{js,wasm}     node-mode (NODERAWFS)
+    as.{js,wasm}, ld.{js,wasm}       node-mode binutils
     browser/cpp.{js,wasm}, rcc.{js,wasm}      browser cpp/rcc (MEMFS, ES6)
     browser/as.{js,wasm}, ld.{js,wasm}        browser binutils (MEMFS, ES6)
     embed-headers/                            collected /usr/include subset
@@ -118,9 +118,9 @@ make build-native         # build host rcc + cpp (also generates lburg outputs)
 make build-wasm           # node-mode wasm artifacts (NODERAWFS)
 make build-wasm-browser   # browser-mode wasm artifacts (MEMFS, ES modules)
 make test                 # node pipeline vs goldens
-make test-browser         # browser pipeline (via web/movfuscator.mjs) vs goldens
+make test-browser         # browser pipeline (via movfuscator.mjs) vs goldens
 make test-multi           # multi-input link + extraLibs (byte-identical vs host ld)
-make serve                # python -m http.server 8086 → open /web/  (PORT= overrides)
+make serve                # python -m http.server 8086 → open /  (PORT= overrides)
 ```
 
 ## TDD workflow
@@ -132,19 +132,18 @@ applies to both pipelines:
 | target          | pipeline                                  | runtime          |
 |-----------------|-------------------------------------------|------------------|
 | `make test`     | `build/cpp.js` + `build/rcc.js`           | Node (NODERAWFS) |
-| `make test-browser` | `web/movfuscator.mjs` (loads `build/browser/`) | Node ESM (MEMFS, same code as in-browser) |
+| `make test-browser` | `movfuscator.mjs` (loads `build/browser/`) | Node ESM (MEMFS, same code as in-browser) |
 
 Any divergence is a bug. Tests are a `cmp` against committed golden files.
 
 ### In-browser demo
 
 ```sh
-make build-wasm-browser
 make serve
-# open http://localhost:8086/web/
+# open http://localhost:8086/
 ```
 
-The demo (`web/index.html`) shows a textarea → "Compile →" → live mov asm.
+The demo (`index.html`) shows a textarea → "Compile →" → live mov asm.
 Imports `./movfuscator.mjs` as an ES module; the wrapper instantiates fresh
 `createMovCpp` / `createMovRcc` per call.
 

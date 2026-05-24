@@ -10,14 +10,14 @@
 //   // Multi-file: provide header sidecars for `#include "name.h"` style:
 //   const asm2 = await compile(src, { 'md5.h': headerText });
 //
-// Loads the MEMFS-mode wasm artifacts from ../build/browser/. Each call
+// Loads the MEMFS-mode wasm artifacts from ./build/browser/. Each call
 // instantiates a fresh module because the underlying tools terminate via
 // exit() (EXIT_RUNTIME=1), making the runtime non-reusable.
 
-import createMovCpp from '../build/browser/cpp.js';
-import createMovRcc from '../build/browser/rcc.js';
-import createMovAs  from '../build/browser/as.js';
-import createMovLd  from '../build/browser/ld.js';
+import createMovCpp from './build/browser/cpp.js';
+import createMovRcc from './build/browser/rcc.js';
+import createMovAs  from './build/browser/as.js';
+import createMovLd  from './build/browser/ld.js';
 
 // Matches the predefined macros the native lcc driver passes to cpp.
 // Same set used by tests/run.sh so the wasm and native pipelines stay
