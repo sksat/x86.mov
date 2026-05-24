@@ -36,6 +36,14 @@ if (missing.length) {
 
 const { compile } = await import(wrapper);
 
+// Preload any tests/fixtures/*.h sidecars (e.g. md5.h) so MEMFS resolves
+// `#include "name.h"` the same way the native preprocess.sh does when it
+// runs from the same directory as the .c file.
+const headerFiles = readdirSync(fixtures).filter(f => f.endsWith('.h'));
+const headers = Object.fromEntries(
+    headerFiles.map(h => [h, readFileSync(join(fixtures, h), 'utf8')])
+);
+
 let pass = 0, fail = 0;
 const cFiles = readdirSync(fixtures).filter(f => f.endsWith('.c')).sort();
 for (const file of cFiles) {
@@ -50,7 +58,7 @@ for (const file of cFiles) {
 
     let actual;
     try {
-        actual = await compile(source);
+        actual = await compile(source, headers);
     } catch (e) {
         console.log(`FAIL ${name} — compile threw:`);
         console.log('  |', String(e.message || e).split('\n').join('\n  | '));

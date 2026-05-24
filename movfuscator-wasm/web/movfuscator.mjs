@@ -3,6 +3,8 @@
 // Usage:
 //   import { compile } from './movfuscator.mjs';
 //   const asm = await compile('int main(void){return 42;}');
+//   // Multi-file: provide header sidecars for `#include "name.h"` style:
+//   const asm2 = await compile(src, { 'md5.h': headerText });
 //
 // Loads the MEMFS-mode wasm artifacts from ../build/browser/. Each call
 // instantiates fresh cpp and rcc modules because both terminate via exit()
@@ -29,10 +31,15 @@ const CPP_FLAGS = [
 /**
  * Compile C source to mov-only x86 assembly.
  * @param {string} source raw C source code
+ * @param {Record<string,string>} [headers] optional `name.h` → content map
+ *   placed in MEMFS root so `#include "name.h"` resolves alongside the input
  * @returns {Promise<string>} mov-only x86 assembly (.s text)
  */
-export async function compile(source) {
+export async function compile(source, headers = {}) {
     const cpp = await createMovCpp();
+    for (const [name, content] of Object.entries(headers)) {
+        cpp.FS.writeFile(`/${name}`, content);
+    }
     cpp.FS.writeFile('/in.c', source);
     const cppExit = cpp.callMain([...CPP_FLAGS, '/in.c', '/in.i']);
     if (cppExit !== 0) {
