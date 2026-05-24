@@ -106,6 +106,39 @@ per its attribution clause.
 3. `make goldens` — goldens will change to track upstream.
 4. Review the diff carefully; commit.
 
+## Benchmarks
+
+`make bench` runs `hyperfine` over the .c → mov asm pipeline three ways
+and writes a markdown report to [bench/results.md](bench/results.md).
+On a Debian 13 / x86_64 Beelink Mini S host (snapshot in the report):
+
+| fixture          | asm lines | native | wasm-browser  | ratio |
+|------------------|----------:|-------:|--------------:|------:|
+| `return42`       |       712 |  2.8 ms |  85.7 ms     |  30x |
+| `hello`          |       979 |  7.5 ms |  99.2 ms     |  13x |
+| `upstream-prime` |     9,994 | 10.6 ms | 114.5 ms    |  11x |
+| `upstream-mandelbrot` | 12,179 | 11.7 ms | 118.6 ms |  10x |
+| `upstream-mersenne` | 33,841 |  8.5 ms | 122.1 ms    |  14x |
+| `upstream-ray3`   |    69,554 | 24.9 ms | 181.6 ms    |   7x |
+
+Findings worth noting:
+
+- **wasm-browser beats wasm-node** because the `make test` driver spawns
+  two Node processes per fixture (`node cpp.js ; node rcc.js`) while
+  the browser wrapper stays in one process. Process startup dominates
+  the small-fixture timings.
+- **Larger inputs amortize wasm overhead** — the ratio shrinks from 30x
+  (700-line return42) to 7x (70k-line ray3) as actual codegen time
+  grows past the fixed Node + wasm-instantiate cost.
+- **Interactive demo stays snappy** — even the heaviest fixture finishes
+  under 200 ms in the wasm-browser path. The textarea-to-asm round trip
+  in `web/index.html` shows the same numbers.
+
+Override the fixture set:
+```sh
+BENCH_FIXTURES="return42 upstream-ray3" make bench
+```
+
 ## Why golden files in the repo?
 
 - Tests run without needing `gcc-multilib` or the native rcc build.
