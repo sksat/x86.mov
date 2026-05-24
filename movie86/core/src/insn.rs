@@ -179,4 +179,10 @@ pub enum Operand {
 pub enum Insn {
     /// `mov dst, src`. `dst` and `src` must have matching widths.
     Mov { dst: Operand, src: Operand },
+    /// `jmp rel32` (opcode `E9 cd`) — unconditional near jump. The
+    /// displacement is added to the address of the **next** instruction.
+    JmpRel32(i32),
+    /// `int n` (opcode `CD ib`) — software interrupt. Only `int 0x80`
+    /// (Linux syscall) is wired to a handler; other vectors trap.
+    Int(u8),
 }

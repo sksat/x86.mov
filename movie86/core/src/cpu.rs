@@ -7,6 +7,7 @@
 
 use crate::decode::decode;
 use crate::insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
+use crate::syscall::{SyscallArgs, SyscallResult, SysHost};
 use crate::{Fault, Memory};
 
 /// Maximum length of any x86 instruction. Fetches read up to this many
@@ -40,20 +41,54 @@ impl Cpu {
         self.regs[r as usize] = v;
     }
 
-    /// Fetch one instruction at `eip`, decode and execute it, and advance
-    /// `eip` by the instruction's encoded length.
-    pub fn step<M: Memory>(&mut self, mem: &mut M) -> Result<(), Fault> {
+    /// Fetch one instruction at `eip`, decode and execute it, and update
+    /// `eip` either by the instruction's encoded length (sequential
+    /// instructions) or to a jump/branch target (control-flow instructions).
+    pub fn step<M, H>(&mut self, mem: &mut M, host: &mut H) -> Result<(), Fault>
+    where
+        M: Memory,
+        H: SysHost,
+    {
         let mut buf = [0u8; MAX_INSN_LEN];
         let n = fetch(mem, self.eip, &mut buf)?;
         let (insn, len) = decode(&buf[..n])?;
-        self.execute(insn, mem)?;
-        self.eip = self.eip.wrapping_add(u32::from(len));
+        let next_eip_default = self.eip.wrapping_add(u32::from(len));
+        self.eip = self.execute(insn, mem, host, next_eip_default)?;
         Ok(())
     }
 
-    fn execute<M: Memory>(&mut self, insn: Insn, mem: &mut M) -> Result<(), Fault> {
+    fn execute<M, H>(
+        &mut self,
+        insn: Insn,
+        mem: &mut M,
+        host: &mut H,
+        next_eip_default: u32,
+    ) -> Result<u32, Fault>
+    where
+        M: Memory,
+        H: SysHost,
+    {
         match insn {
-            Insn::Mov { dst, src } => self.exec_mov(dst, src, mem),
+            Insn::Mov { dst, src } => {
+                self.exec_mov(dst, src, mem)?;
+                Ok(next_eip_default)
+            }
+            Insn::JmpRel32(off) => {
+                // The displacement is relative to the *next* instruction,
+                // i.e. the address right after the 5-byte jmp.
+                let off_bits = u32::from_ne_bytes(off.to_ne_bytes());
+                Ok(next_eip_default.wrapping_add(off_bits))
+            }
+            Insn::Int(0x80) => {
+                let args = SyscallArgs::from_regs(&self.regs);
+                match host.syscall(&args, mem)? {
+                    SyscallResult::Return(v) => {
+                        self.set_reg(Reg32::Eax, v);
+                        Ok(next_eip_default)
+                    }
+                }
+            }
+            Insn::Int(n) => Err(Fault::UnsupportedInterrupt(n)),
         }
     }
 
@@ -232,6 +267,44 @@ mod tests {
     use crate::FlatMemory;
     use proptest::prelude::*;
 
+    /// Test host that refuses every syscall. Use for tests that aren't
+    /// supposed to issue one — keeps us honest if the CPU spuriously
+    /// invokes the host path.
+    struct PanicHost;
+    impl SysHost for PanicHost {
+        fn syscall(
+            &mut self,
+            args: &SyscallArgs,
+            _mem: &mut dyn Memory,
+        ) -> Result<SyscallResult, Fault> {
+            panic!("unexpected syscall {:#x}", args.eax);
+        }
+    }
+
+    /// Test host that records the last syscall and returns a fixed value.
+    struct RecordingHost {
+        last: Option<SyscallArgs>,
+        return_value: u32,
+    }
+    impl RecordingHost {
+        fn new(return_value: u32) -> Self {
+            Self {
+                last: None,
+                return_value,
+            }
+        }
+    }
+    impl SysHost for RecordingHost {
+        fn syscall(
+            &mut self,
+            args: &SyscallArgs,
+            _mem: &mut dyn Memory,
+        ) -> Result<SyscallResult, Fault> {
+            self.last = Some(*args);
+            Ok(SyscallResult::Return(self.return_value))
+        }
+    }
+
     /// Build a memory region and encode `mov r32, imm32` at its base.
     fn make_mov_r32_imm32(reg_idx: u8, imm: u32, base: u32) -> FlatMemory {
         let mut mem = FlatMemory::new_zeroed(base, 16);
@@ -251,7 +324,7 @@ mod tests {
     fn step_mov_eax_42() {
         let mut mem = make_mov_r32_imm32(0, 42, 0x1000);
         let mut cpu = Cpu::new(0x1000);
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.reg(Reg32::Eax), 42);
         assert_eq!(cpu.eip, 0x1005);
     }
@@ -261,7 +334,7 @@ mod tests {
         let mut mem = FlatMemory::new_zeroed(0x1000, 16);
         mem.write_u8(0x1000, 0x00).unwrap(); // unknown opcode
         let mut cpu = Cpu::new(0x1000);
-        assert_eq!(cpu.step(&mut mem).unwrap_err(), Fault::UnknownOpcode(0x00));
+        assert_eq!(cpu.step(&mut mem, &mut PanicHost).unwrap_err(), Fault::UnknownOpcode(0x00));
     }
 
     #[test]
@@ -270,7 +343,7 @@ mod tests {
         let mut mem = region_with_program(0x1000, 16, &[0x8b, 0xc1]);
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Ecx, 0xdead_beef);
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.reg(Reg32::Eax), 0xdead_beef);
         assert_eq!(cpu.reg(Reg32::Ecx), 0xdead_beef, "src should be unchanged");
         assert_eq!(cpu.eip, 0x1002);
@@ -286,7 +359,7 @@ mod tests {
             .unwrap();
         mem.write_u32(0x2000, 0xcafe_d00d).unwrap();
         let mut cpu = Cpu::new(0x1000);
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.reg(Reg32::Ecx), 0xcafe_d00d);
         assert_eq!(cpu.eip, 0x1006);
     }
@@ -299,7 +372,7 @@ mod tests {
             .unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Eax, 0x1234_5678);
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(mem.read_u32(0x2000).unwrap(), 0x1234_5678);
         assert_eq!(cpu.eip, 0x1006);
     }
@@ -312,7 +385,7 @@ mod tests {
         mem.write_u32(0x2000, 0xabcd_ef01).unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Ecx, 0x2001); // so [ecx - 1] = 0x2000
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.reg(Reg32::Eax), 0xabcd_ef01);
     }
 
@@ -329,7 +402,7 @@ mod tests {
         mem.write_u16(0x2000, 0xabcd).unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Eax, 0xdead_0000);
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.reg(Reg32::Eax), 0xdead_abcd);
         assert_eq!(cpu.eip, 0x1007);
     }
@@ -343,7 +416,7 @@ mod tests {
         mem.write_u32(0x2000, 0xdead_beef).unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Eax, 0x1234_5678);
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         // Bytes 0,1 at 0x2000 should be 0x78, 0x56 (low word of EAX, LE).
         // Upper word at 0x2002..0x2004 untouched.
         assert_eq!(mem.read_u32(0x2000).unwrap(), 0xdead_5678);
@@ -358,7 +431,7 @@ mod tests {
         mem.write_u32(0x2000, 0xdead_beef).unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Eax, 0x1234_56aa);
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         // Only byte 0 of 0x2000 should change; the surrounding 3 bytes
         // are untouched.
         assert_eq!(mem.read_u32(0x2000).unwrap(), 0xdead_beaa);
@@ -373,7 +446,7 @@ mod tests {
         mem.write_u8(0x2000, 0x77).unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Eax, 0x1234_5600);
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.reg(Reg32::Eax), 0x1234_5677);
     }
 
@@ -387,7 +460,7 @@ mod tests {
         mem.write_u8(0x2000, 0xbb).unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Eax, 0x1234_5677);
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.reg(Reg32::Eax), 0x1234_bb77, "AH should touch bits 15:8 only");
     }
 
@@ -402,7 +475,7 @@ mod tests {
         mem.write_u32(0x200c, 0xfeed_face).unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Eax, 3);
-        cpu.step(&mut mem).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.reg(Reg32::Ecx), 0xfeed_face);
         assert_eq!(cpu.eip, 0x1007);
     }
@@ -413,7 +486,7 @@ mod tests {
         // read byte 0. We must see Unmapped(0x2000), not DecodeTruncated.
         let mut mem = FlatMemory::new_zeroed(0x1000, 16);
         let mut cpu = Cpu::new(0x2000);
-        assert_eq!(cpu.step(&mut mem).unwrap_err(), Fault::Unmapped(0x2000));
+        assert_eq!(cpu.step(&mut mem, &mut PanicHost).unwrap_err(), Fault::Unmapped(0x2000));
     }
 
     #[test]
@@ -424,7 +497,62 @@ mod tests {
             .unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Eax, 42);
-        assert_eq!(cpu.step(&mut mem).unwrap_err(), Fault::Unmapped(0x9000));
+        assert_eq!(cpu.step(&mut mem, &mut PanicHost).unwrap_err(), Fault::Unmapped(0x9000));
+    }
+
+    // --- jmp + int ---
+
+    #[test]
+    fn step_jmp_rel32_targets_eip_relative_to_next_insn() {
+        // 1000: e9 0a 00 00 00   → jmp +10
+        // Next-insn address is 0x1005; target is 0x1005 + 10 = 0x100f.
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x100);
+        mem.write_bytes(0x1000, &[0xe9, 0x0a, 0x00, 0x00, 0x00]).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0x100f);
+    }
+
+    #[test]
+    fn step_jmp_rel32_negative_loops_back() {
+        // 1005: e9 f6 ff ff ff  → jmp -10  (next-insn is 0x100a; target 0x1000)
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x100);
+        mem.write_bytes(0x1005, &[0xe9, 0xf6, 0xff, 0xff, 0xff]).unwrap();
+        let mut cpu = Cpu::new(0x1005);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0x1000);
+    }
+
+    #[test]
+    fn step_int_0x80_invokes_host_with_register_snapshot() {
+        // cd 80 → int 0x80
+        let mut mem = FlatMemory::new_zeroed(0x1000, 16);
+        mem.write_bytes(0x1000, &[0xcd, 0x80]).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.set_reg(Reg32::Eax, 4); // pretend write
+        cpu.set_reg(Reg32::Ebx, 1);
+        cpu.set_reg(Reg32::Ecx, 0x2000);
+        cpu.set_reg(Reg32::Edx, 5);
+        let mut host = RecordingHost::new(/* return = */ 5);
+        cpu.step(&mut mem, &mut host).unwrap();
+        let args = host.last.expect("host saw the syscall");
+        assert_eq!(args.eax, 4);
+        assert_eq!(args.ebx, 1);
+        assert_eq!(args.ecx, 0x2000);
+        assert_eq!(args.edx, 5);
+        assert_eq!(cpu.reg(Reg32::Eax), 5, "host return value should land in EAX");
+        assert_eq!(cpu.eip, 0x1002);
+    }
+
+    #[test]
+    fn step_int_non_syscall_vector_traps() {
+        let mut mem = FlatMemory::new_zeroed(0x1000, 16);
+        mem.write_bytes(0x1000, &[0xcd, 0x03]).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        assert_eq!(
+            cpu.step(&mut mem, &mut PanicHost).unwrap_err(),
+            Fault::UnsupportedInterrupt(0x03),
+        );
     }
 
     proptest! {
@@ -446,7 +574,7 @@ mod tests {
                 cpu.regs[i as usize] = 0xDEAD_0000 + i;
             }
             let initial = cpu.regs;
-            cpu.step(&mut mem).unwrap();
+            cpu.step(&mut mem, &mut PanicHost).unwrap();
             let dst = Reg32::from_index(reg_idx);
             prop_assert_eq!(cpu.reg(dst), imm);
             for i in 0..8u8 {
@@ -477,7 +605,7 @@ mod tests {
                 cpu.regs[i as usize] = 0xBEEF_0000 + i;
             }
             let initial = cpu.regs;
-            cpu.step(&mut mem).unwrap();
+            cpu.step(&mut mem, &mut PanicHost).unwrap();
             let dst = Reg32::from_index(dst_idx);
             let src = Reg32::from_index(src_idx);
             // src always still holds its initial value (no write happened

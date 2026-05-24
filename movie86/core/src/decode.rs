@@ -45,6 +45,16 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
         // 16-bit variants: 66 89 /r and 66 8B /r
         (true, 0x89) => decode_mov_rm_r_16(rest, /* dir_to_reg */ false)?,
         (true, 0x8B) => decode_mov_rm_r_16(rest, /* dir_to_reg */ true)?,
+        // jmp rel32 — opcode E9 cd
+        (false, 0xE9) => {
+            let off = read_i32_le(rest, 1)?;
+            (Insn::JmpRel32(off), 5)
+        }
+        // int imm8 — opcode CD ib
+        (false, 0xCD) => {
+            let n = *rest.get(1).ok_or(Fault::DecodeTruncated)?;
+            (Insn::Int(n), 2)
+        }
         _ => return Err(Fault::UnknownOpcode(opcode)),
     };
     Ok((insn, body_len + prefix_len))
@@ -592,6 +602,39 @@ mod tests {
             decode(&[0x8b, 0x04, 0x85, 0x78, 0x56]).unwrap_err(),
             Fault::DecodeTruncated,
         );
+    }
+
+    // --- jmp rel32 ---
+
+    #[test]
+    fn jmp_rel32_positive() {
+        // e9 78 56 34 12 → jmp +0x12345678
+        let (insn, len) = decode(&[0xe9, 0x78, 0x56, 0x34, 0x12]).unwrap();
+        assert_eq!(len, 5);
+        assert_eq!(insn, Insn::JmpRel32(0x1234_5678));
+    }
+
+    #[test]
+    fn jmp_rel32_negative_disp() {
+        // e9 fb ff ff ff → jmp -5 (i.e. an infinite loop on a 5-byte jmp)
+        let (insn, _) = decode(&[0xe9, 0xfb, 0xff, 0xff, 0xff]).unwrap();
+        assert_eq!(insn, Insn::JmpRel32(-5));
+    }
+
+    // --- int n ---
+
+    #[test]
+    fn int_0x80_decodes_as_int_with_vector() {
+        let (insn, len) = decode(&[0xcd, 0x80]).unwrap();
+        assert_eq!(len, 2);
+        assert_eq!(insn, Insn::Int(0x80));
+    }
+
+    #[test]
+    fn int_other_vector_still_decodes() {
+        // Decoder accepts any vector; execution decides what to do.
+        let (insn, _) = decode(&[0xcd, 0x03]).unwrap();
+        assert_eq!(insn, Insn::Int(0x03));
     }
 
     #[test]
