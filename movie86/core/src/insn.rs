@@ -1,7 +1,7 @@
 //! Decoded instruction representation.
 //!
-//! Only the forms the decoder currently emits are listed. Add a variant
-//! when the decoder learns a new form — never speculatively.
+//! Only the forms the decoder currently emits are listed. Add variants /
+//! operand kinds when the decoder learns a new form — never speculatively.
 
 /// 32-bit general-purpose register, indexed by the encoded register number
 /// used in opcode-low-bits and ModR/M `reg` / `r/m` fields.
@@ -22,8 +22,8 @@ impl Reg32 {
     /// Map an encoded 3-bit register field to the corresponding register.
     ///
     /// # Panics
-    /// Panics on values > 7. The decoder is responsible for masking the
-    /// field to 3 bits before calling this.
+    /// Panics on values > 7. The decoder masks the field to 3 bits before
+    /// calling this.
     #[must_use]
     pub fn from_index(i: u8) -> Self {
         match i {
@@ -40,9 +40,68 @@ impl Reg32 {
     }
 }
 
+/// 16-bit general-purpose register (low half of the matching 32-bit reg).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Reg16 {
+    Ax = 0,
+    Cx = 1,
+    Dx = 2,
+    Bx = 3,
+    Sp = 4,
+    Bp = 5,
+    Si = 6,
+    Di = 7,
+}
+
+/// 8-bit general-purpose register.
+///
+/// Index 0..=3 are low bytes of EAX/ECX/EDX/EBX; 4..=7 are high bytes of
+/// the same four registers (AH/CH/DH/BH).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Reg8 {
+    Al = 0,
+    Cl = 1,
+    Dl = 2,
+    Bl = 3,
+    Ah = 4,
+    Ch = 5,
+    Dh = 6,
+    Bh = 7,
+}
+
+/// `base + index * scale + disp` — the general 32-bit effective address.
+///
+/// Either or both of `base` / `index` may be absent. `scale` is 1, 2, 4,
+/// or 8. `disp` is signed and zero when the encoding has no displacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveAddress {
+    pub base: Option<Reg32>,
+    pub index: Option<Reg32>,
+    pub scale: u8,
+    pub disp: i32,
+}
+
+/// One source or destination of an instruction. Variants carry their own
+/// width so a `Mov { dst, src }` with mismatched widths is a decoder bug,
+/// not a representable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operand {
+    Reg32(Reg32),
+    Reg16(Reg16),
+    Reg8(Reg8),
+    Imm32(u32),
+    Imm16(u16),
+    Imm8(u8),
+    Mem32(EffectiveAddress),
+    Mem16(EffectiveAddress),
+    Mem8(EffectiveAddress),
+}
+
 /// A decoded instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Insn {
-    /// `mov r32, imm32` — opcode `B8+rd id`.
-    MovR32Imm32 { dst: Reg32, imm: u32 },
+    /// `mov dst, src`. `dst` and `src` must have matching widths.
+    Mov { dst: Operand, src: Operand },
 }

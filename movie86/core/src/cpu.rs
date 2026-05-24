@@ -6,7 +6,7 @@
 //! decoder remains usable by tracing / disassembly callers.
 
 use crate::decode::decode;
-use crate::insn::{Insn, Reg32};
+use crate::insn::{Insn, Operand, Reg32};
 use crate::{Fault, Memory};
 
 /// Maximum length of any x86 instruction. Fetches read up to this many
@@ -51,16 +51,21 @@ impl Cpu {
         Ok(())
     }
 
-    // `execute` will start returning `Err` once any instruction touches
-    // memory or syscalls. The placeholder body for the only instruction
-    // currently implemented happens to be infallible.
-    #[allow(clippy::unnecessary_wraps)]
     fn execute<M: Memory>(&mut self, insn: Insn, _mem: &mut M) -> Result<(), Fault> {
         match insn {
-            Insn::MovR32Imm32 { dst, imm } => {
-                self.set_reg(dst, imm);
+            Insn::Mov { dst, src } => self.exec_mov(dst, src),
+        }
+    }
+
+    /// Execute a `mov dst, src`. The decoder guarantees `dst` and `src`
+    /// have matching widths; we trap with `Fault::WidthMismatch` if not.
+    fn exec_mov(&mut self, dst: Operand, src: Operand) -> Result<(), Fault> {
+        match (dst, src) {
+            (Operand::Reg32(d), Operand::Imm32(v)) => {
+                self.set_reg(d, v);
                 Ok(())
             }
+            _ => Err(Fault::UnimplementedMov),
         }
     }
 }

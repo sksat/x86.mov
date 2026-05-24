@@ -9,7 +9,7 @@ pub mod mem;
 
 pub use cpu::Cpu;
 pub use decode::decode;
-pub use insn::{Insn, Reg32};
+pub use insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
 pub use mem::{FlatMemory, Memory};
 
 /// Reasons emulation can stop in a way the caller needs to handle.
@@ -24,4 +24,7 @@ pub enum Fault {
     DecodeTruncated,
     /// First opcode byte is not in the supported set.
     UnknownOpcode(u8),
+    /// `Mov` form that the executor doesn't yet know how to evaluate.
+    /// Distinct from `UnknownOpcode` because the decoder already accepted it.
+    UnimplementedMov,
 }
