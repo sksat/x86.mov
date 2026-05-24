@@ -27,21 +27,37 @@ unmodified.
 
 ## Use it as a library
 
-The wrapper at `web/movfuscator.mjs` is also an ES module exposing
-`compile`, `assemble` and `link`. Same code works under Node ≥ 18 and
-in the browser:
+The wrapper at `web/movfuscator.mjs` is also an ES module. Same code
+works under Node ≥ 18 and in the browser:
 
 ```js
-import { compile, assemble, link } from 'movfuscator-wasm';
-
-const asm = await compile('int main(void){return 42;}');  // .c → mov asm text
-const obj = await assemble(asm);                          // .s → ELF32 .o
-const elf = await link(obj);                              // .o → linked ELF
+import { compileToElf } from 'movfuscator-wasm';
+const elf = await compileToElf('int main(void){return 42;}');  // .c → linked ELF
 ```
 
-`link()` lazy-fetches the ~24 MB crt + libc + libgcc bundle from
-`./lib/` next to the module (cached for the session). For multi-file
-inputs use `compile(src, { 'name.h': headerText })`.
+Or, per-stage if you want to inspect intermediates:
+
+```js
+import {
+  preprocess, compileAsm,
+  compile, assemble, link,
+  parseElfHeader,
+} from 'movfuscator-wasm';
+
+const i   = await preprocess(src);    // C → .i (post-#include text)
+const asm = await compileAsm(i);      // .i → mov asm  (equivalent to compile())
+const obj = await assemble(asm);      // .s → ELF32 .o
+const elf = await link(obj);          // .o → linked ELF
+const hdr = parseElfHeader(elf);      // { class, type, machine, entry, sections }
+```
+
+`link()` (and `compileToElf()`) lazy-fetches the ~24 MB crt + libc +
+libgcc bundle from `./lib/` next to the module (cached for the
+session). For multi-file inputs use
+`compile(src, { 'name.h': headerText })`.
+
+TypeScript declarations ship alongside the JS (`movfuscator.d.ts`), so
+the package is consumable without `// @ts-ignore`.
 
 A static-host friendly copy of the same module also lives at
 [https://x86.mov/movfuscator-wasm/movfuscator.mjs](https://x86.mov/movfuscator-wasm/movfuscator.mjs)

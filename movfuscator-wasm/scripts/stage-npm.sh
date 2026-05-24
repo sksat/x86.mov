@@ -48,6 +48,7 @@ cp "$build_browser"/cpp.js   "$build_browser"/cpp.wasm \
    "$out/"
 
 sed "s|\.\./build/browser/|./|g" "$web/movfuscator.mjs" > "$out/movfuscator.mjs"
+cp "$web/movfuscator.d.ts" "$out/movfuscator.d.ts"
 
 cp -r "$web_lib" "$out/lib"
 

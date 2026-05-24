@@ -4,12 +4,17 @@
   "description": "WebAssembly port of the M/o/Vfuscator C compiler — compile C to mov-only x86 assembly (and linked ELF) from JS, in Node or the browser.",
   "type": "module",
   "main": "./movfuscator.mjs",
+  "types": "./movfuscator.d.ts",
   "exports": {
-    ".": "./movfuscator.mjs",
+    ".": {
+      "types": "./movfuscator.d.ts",
+      "default": "./movfuscator.mjs"
+    },
     "./lib/*": "./lib/*"
   },
   "files": [
     "movfuscator.mjs",
+    "movfuscator.d.ts",
     "cpp.js", "cpp.wasm",
     "rcc.js", "rcc.wasm",
     "as.js",  "as.wasm",

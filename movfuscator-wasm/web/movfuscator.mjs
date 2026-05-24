@@ -1,9 +1,12 @@
 // movfuscator-wasm: in-browser (or Node ESM) C → mov-only ELF compiler.
 //
 // Usage:
-//   import { compile, assemble } from './movfuscator.mjs';
+//   import { compile, assemble, link, compileToElf } from './movfuscator.mjs';
 //   const asm = await compile('int main(void){return 42;}');  // C → .s text
 //   const obj = await assemble(asm);                          // .s → .o bytes
+//   const elf = await link(obj);                              // .o → ELF
+//   // Or all-in-one:
+//   const elf2 = await compileToElf('int main(void){return 42;}');
 //   // Multi-file: provide header sidecars for `#include "name.h"` style:
 //   const asm2 = await compile(src, { 'md5.h': headerText });
 //
@@ -52,27 +55,46 @@ function makeBuffered() {
     };
 }
 
-export async function compile(source, headers = {}) {
-    const cppBuf = makeBuffered();
-    const cpp = await createMovCpp(cppBuf.opts);
+/**
+ * Run just the C preprocessor (LCC cpp) on the input. Useful if you want
+ * to inspect the post-#include text or feed it into a non-mov backend.
+ * @param {string} source raw C source code
+ * @param {Record<string,string>} [headers] optional `name.h` → content map
+ * @returns {Promise<string>} preprocessed C source (.i text)
+ */
+export async function preprocess(source, headers = {}) {
+    const buf = makeBuffered();
+    const cpp = await createMovCpp(buf.opts);
     for (const [name, content] of Object.entries(headers)) {
         cpp.FS.writeFile(`/${name}`, content);
     }
     cpp.FS.writeFile('/in.c', source);
-    const cppExit = cpp.callMain([...CPP_FLAGS, '/in.c', '/in.i']);
-    if (cppExit !== 0) {
-        throw new Error(`cpp exited ${cppExit}\n${cppBuf.joined()}`);
+    const exit = cpp.callMain([...CPP_FLAGS, '/in.c', '/in.i']);
+    if (exit !== 0) {
+        throw new Error(`cpp exited ${exit}\n${buf.joined()}`);
     }
-    const preprocessed = cpp.FS.readFile('/in.i', { encoding: 'utf8' });
+    return cpp.FS.readFile('/in.i', { encoding: 'utf8' });
+}
 
-    const rccBuf = makeBuffered();
-    const rcc = await createMovRcc(rccBuf.opts);
+/**
+ * Run just the mov-only code generator on already-preprocessed source.
+ * Pair with preprocess() if you want to interpose between the two stages.
+ * @param {string} preprocessed C source after cpp (the kind preprocess() returns)
+ * @returns {Promise<string>} mov-only x86 assembly (.s text)
+ */
+export async function compileAsm(preprocessed) {
+    const buf = makeBuffered();
+    const rcc = await createMovRcc(buf.opts);
     rcc.FS.writeFile('/in.i', preprocessed);
-    const rccExit = rcc.callMain(['-target=x86/mov', '/in.i', '/out.s']);
-    if (rccExit !== 0) {
-        throw new Error(`rcc exited ${rccExit}\n${rccBuf.joined()}`);
+    const exit = rcc.callMain(['-target=x86/mov', '/in.i', '/out.s']);
+    if (exit !== 0) {
+        throw new Error(`rcc exited ${exit}\n${buf.joined()}`);
     }
     return rcc.FS.readFile('/out.s', { encoding: 'utf8' });
+}
+
+export async function compile(source, headers = {}) {
+    return compileAsm(await preprocess(source, headers));
 }
 
 /**
@@ -191,4 +213,60 @@ export async function link(obj, libs, opts = {}) {
         throw new Error(`ld exited ${exit}\n${buf.joined()}`);
     }
     return ld.FS.readFile('/out.elf');
+}
+
+/**
+ * Convenience: full C → mov-only ELF executable in one call.
+ * Equivalent to `link(await assemble(await compile(source, headers)), undefined, linkOpts)`.
+ * @param {string} source raw C source code
+ * @param {Record<string,string>} [headers] optional `name.h` → content map
+ * @param {{name?: string}} [linkOpts] forwarded to link() (controls the
+ *   basename embedded in the ELF's .symtab)
+ * @returns {Promise<Uint8Array>} ELF32 executable bytes
+ */
+export async function compileToElf(source, headers = {}, linkOpts = {}) {
+    return link(await assemble(await compile(source, headers)), undefined, linkOpts);
+}
+
+/**
+ * Parse the ELF32 header of a byte buffer. Returns null if the magic is
+ * wrong; `{ raw: '...' }` if the class/data combination isn't ELF32-LE
+ * (the only flavor this wrapper produces). Otherwise an object with
+ * decoded type / machine / entrypoint / section count.
+ *
+ * Exposed because the demo and downstream tools both want a quick
+ * "is this really an ELF, and what does it look like" check without
+ * pulling in a full ELF parser.
+ *
+ * @param {Uint8Array} bytes ELF candidate (typically link()'s output)
+ * @returns {null | { raw: string } | {
+ *   class: 'ELF32', data: 'little-endian',
+ *   type: string, machine: string, entry: string, sections: number,
+ * }}
+ */
+export function parseElfHeader(bytes) {
+    if (bytes.length < 52 || bytes[0] !== 0x7f
+        || bytes[1] !== 0x45 || bytes[2] !== 0x4c || bytes[3] !== 0x46) {
+        return null;
+    }
+    const ei_class = bytes[4];   // 1 = ELF32, 2 = ELF64
+    const ei_data  = bytes[5];   // 1 = LE
+    if (ei_class !== 1 || ei_data !== 1) {
+        return { raw: `unsupported ELF class=${ei_class} data=${ei_data}` };
+    }
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const type    = dv.getUint16(16, true);
+    const machine = dv.getUint16(18, true);
+    const entry   = dv.getUint32(24, true);
+    const shnum   = dv.getUint16(48, true);
+    const typeNames = { 1: 'REL (relocatable .o)', 2: 'EXEC (executable)', 3: 'DYN', 4: 'CORE' };
+    const machNames = { 3: 'i386' };
+    return {
+        class:    'ELF32',
+        data:     'little-endian',
+        type:     typeNames[type] || `unknown (${type})`,
+        machine:  machNames[machine] || `unknown (${machine})`,
+        entry:    '0x' + entry.toString(16).padStart(8, '0'),
+        sections: shnum,
+    };
 }

@@ -111,7 +111,7 @@
 </div>
 
 <script type="module">
-import { compile, assemble, link } from './movfuscator.mjs';
+import { compile, assemble, link, parseElfHeader } from './movfuscator.mjs';
 import { EditorView, basicSetup }    from 'https://esm.sh/codemirror@6.0.2';
 import { EditorState }               from 'https://esm.sh/@codemirror/state@6.6.0';
 import { cpp }                       from 'https://esm.sh/@codemirror/lang-cpp@6.0.3';
@@ -244,33 +244,6 @@ function hexDump(bytes, maxBytes = 8192) {
         lines.push('', `... ${more} more bytes truncated — use Download to fetch the full file`);
     }
     return lines.join('\n');
-}
-
-function parseElfHeader(bytes) {
-    if (bytes.length < 52 || bytes[0] !== 0x7f
-        || bytes[1] !== 0x45 || bytes[2] !== 0x4c || bytes[3] !== 0x46) {
-        return null;
-    }
-    const ei_class = bytes[4];   // 1 = ELF32, 2 = ELF64
-    const ei_data  = bytes[5];   // 1 = LE
-    if (ei_class !== 1 || ei_data !== 1) {
-        return { raw: `unsupported ELF class=${ei_class} data=${ei_data}` };
-    }
-    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const type    = dv.getUint16(16, true);
-    const machine = dv.getUint16(18, true);
-    const entry   = dv.getUint32(24, true);
-    const shnum   = dv.getUint16(48, true);
-    const typeNames = { 1: 'REL (relocatable .o)', 2: 'EXEC (executable)', 3: 'DYN', 4: 'CORE' };
-    const machNames = { 3: 'i386' };
-    return {
-        class:    'ELF32',
-        data:     'little-endian',
-        type:     typeNames[type] || `unknown (${type})`,
-        machine:  machNames[machine] || `unknown (${machine})`,
-        entry:    '0x' + entry.toString(16).padStart(8, '0'),
-        sections: shnum,
-    };
 }
 
 function formatElfSummary(bytes) {
