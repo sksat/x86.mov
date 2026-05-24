@@ -1,0 +1,59 @@
+name: llvm-mov
+
+on:
+  push:
+    branches: [mov]
+  pull_request:
+    branches: [mov]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: llvm-mov
+
+# Avoid stomping deploys: per-ref so a new push to a PR/branch supersedes
+# the in-flight run for that ref but production (mov) and PR previews
+# don't fight each other.
+concurrency:
+  group: llvm-mov-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      # llvm-19 is the latest distro `apt` carries on ubuntu-24.04 (and on
+      # Debian 13). We pin to 22 from apt.llvm.org — bumping in lockstep
+      # with upstream is cheap before the backend has shape, and the matching
+      # cmake config dir is the one CMakeLists.txt expects.
+      - name: install LLVM 22 from apt.llvm.org
+        working-directory: .
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
+          sudo apt-get install -y --no-install-recommends \
+              llvm-22-dev clang-22 lld-22 \
+              ninja-build cmake \
+              gcc-multilib libc6-dev-i386
+
+      # The cmake build artefacts are deterministic in (LLVM headers ×
+      # llvm-mov sources). Keying on both keeps the cache from sticking
+      # to a stale LLVM patch revision.
+      - name: cache build/
+        uses: actions/cache@v5.0.5
+        with:
+          path: llvm-mov/build
+          key: llvm-mov-build-${{ runner.os }}-llvm22-${{ hashFiles('llvm-mov/CMakeLists.txt', 'llvm-mov/llvm/**', 'llvm-mov/tools/**') }}
+          # Restoring a partial match is fine; ninja will rebuild what
+          # changed and the test stage doesn't trust the cache for results.
+          restore-keys: |
+            llvm-mov-build-${{ runner.os }}-llvm22-
+
+      - name: configure + build
+        run: make build
+
+      - name: test (execution)
+        run: make test-exec
