@@ -4,7 +4,7 @@
 // Used by scripts/bench.sh under hyperfine; output is discarded — we only
 // care about how long the full chain takes.
 
-import { compile, assemble, link } from '../web/movfuscator.mjs';
+import { compile, assemble, link, LIB_PATHS } from '../web/movfuscator.mjs';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,21 +29,8 @@ const headers = Object.fromEntries(
 );
 
 // Link inputs — preloaded from web/lib/ so we don't try to fetch over HTTP.
-// Same set as web/movfuscator.mjs LIB_PATHS.
-const LIB_PATHS = [
-    '/lib32/libc.so.6',
-    '/lib32/libm.so.6',
-    '/lib32/ld-linux.so.2',
-    '/lib/ld-linux.so.2',
-    '/usr/lib32/libc.so',
-    '/usr/lib32/libm.so',
-    '/usr/lib32/libc_nonshared.a',
-    '/movfuscator/libgcc.a',
-    '/movfuscator/crt0.o',
-    '/movfuscator/crtf.o',
-    '/movfuscator/crtd.o',
-    '/movfuscator/softfloat32.o',
-];
+// LIB_PATHS is re-exported from the wrapper so the bench can't drift from
+// what the production link() actually writes.
 const libs = Object.fromEntries(
     LIB_PATHS.map(p => [p, readFileSync(join(libDir, p.replace(/^\//, '')))])
 );

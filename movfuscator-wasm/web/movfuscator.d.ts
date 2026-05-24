@@ -13,6 +13,12 @@ export type Headers = Record<string, string>;
  *  lazy-fetches the default bundle from `./lib/` next to the module. */
 export type LinkLibs = Record<string, Uint8Array>;
 
+/** The default MEMFS paths the wrapper writes when `link()` runs
+ *  (matches the layout under `./lib/` shipped with the package). Exported
+ *  so test harnesses or other callers can pre-stage a `LinkLibs` map
+ *  without duplicating the list. */
+export const LIB_PATHS: readonly string[];
+
 export interface LinkOptions {
   /** Basename used when staging the .o into MEMFS. Surfaces in the
    *  resulting ELF's `.symtab`; defaults to `a.out.o`. */

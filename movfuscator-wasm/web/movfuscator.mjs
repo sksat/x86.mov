@@ -55,6 +55,19 @@ function makeBuffered() {
     };
 }
 
+// Caller-supplied names land at `/${name}` in MEMFS (header sidecars in
+// preprocess(); the .o basename in link()). Reject anything that could
+// escape the root or overwrite our staged libc / crt files.
+function assertSafeName(name, kind) {
+    if (typeof name !== 'string' || name.length === 0) {
+        throw new TypeError(`${kind} must be a non-empty string`);
+    }
+    if (name === '.' || name === '..'
+        || name.includes('/') || name.includes('\\')) {
+        throw new Error(`${kind} ${JSON.stringify(name)} must be a basename without path separators`);
+    }
+}
+
 /**
  * Run just the C preprocessor (LCC cpp) on the input. Useful if you want
  * to inspect the post-#include text or feed it into a non-mov backend.
@@ -66,6 +79,7 @@ export async function preprocess(source, headers = {}) {
     const buf = makeBuffered();
     const cpp = await createMovCpp(buf.opts);
     for (const [name, content] of Object.entries(headers)) {
+        assertSafeName(name, 'header name');
         cpp.FS.writeFile(`/${name}`, content);
     }
     cpp.FS.writeFile('/in.c', source);
@@ -119,8 +133,9 @@ export async function assemble(asm) {
 // the link command line stays close to what `/usr/bin/ld` sees on the
 // host; libgcc.a is parked under /movfuscator/ instead of its
 // gcc-version-specific host location so the wrapper isn't tied to a
-// particular gcc release.
-const LIB_PATHS = [
+// particular gcc release. Exported so test harnesses can pre-stage the
+// same set without duplicating the list.
+export const LIB_PATHS = [
     '/lib32/libc.so.6',
     '/lib32/libm.so.6',
     '/lib32/ld-linux.so.2',
@@ -183,6 +198,7 @@ async function defaultFetchLibs() {
  */
 export async function link(obj, libs, opts = {}) {
     const { name = 'a.out.o' } = opts;
+    assertSafeName(name, 'opts.name');
     if (!libs) {
         if (!cachedLibs) cachedLibs = defaultFetchLibs();
         libs = await cachedLibs;

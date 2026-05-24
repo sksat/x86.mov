@@ -266,7 +266,7 @@ function renderBinView() {
     const bytes = currentView === 'obj' ? lastObj : lastElf;
     if (!bytes) {
         out.textContent = currentView === 'obj'
-            ? '(compile first — Compile → fills the .o tab on demand)'
+            ? '(compile first — Compile → assembles and fills this tab)'
             : '(ELF view triggers a ~24 MB lib download on first click)';
         return;
     }
@@ -324,7 +324,10 @@ $('compile').addEventListener('click', async () => {
         const headers = src.includes('#include "md5.h"') ? await getMd5Headers() : {};
         const asm = await compile(src, headers);
         const compileMs = Math.round(performance.now() - started);
-        const lines = asm.split('\n').length - 1;
+        // md5 produces ~124k lines; split / match would allocate the full
+        // array just to count it. Scan for '\n' (charCode 10) directly.
+        let lines = 0;
+        for (let i = 0; i < asm.length; i++) if (asm.charCodeAt(i) === 10) lines++;
         lastAsm = asm;
         setAsm(asm);
 

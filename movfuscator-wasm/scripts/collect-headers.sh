@@ -38,22 +38,40 @@ copy_to() {
     cp -L "$src" "$dest"
 }
 
+# Multi-arch include subdir — `bits/`, `gnu/`, `sys/` live under it on
+# Debian/Ubuntu but the segment name (x86_64-linux-gnu / i386-linux-gnu /
+# …) varies. Ask gcc rather than hardcoding a triple.
+multiarch="$(gcc -print-multiarch 2>/dev/null || true)"
+if [ -z "$multiarch" ] || [ ! -d "/usr/include/$multiarch" ]; then
+    # Fallback for distros that don't use the multi-arch layout (Arch,
+    # Fedora, …) — bits/gnu/sys are already directly under /usr/include.
+    multiarch=""
+fi
+
 # Headers GNU cpp pre-includes implicitly (so they don't appear in -H
 # output) but LCC cpp requires explicitly via features.h:
 #   - stdc-predef.h
 #   - gnu/stubs-32.h (selected by stubs.h when __x86_64__ isn't defined —
 #     LCC cpp is always in that branch since we target i386)
 copy_to /usr/include/stdc-predef.h "$out/usr-include/stdc-predef.h"
-copy_to /usr/include/x86_64-linux-gnu/gnu/stubs-32.h "$out/usr-include/gnu/stubs-32.h"
+if [ -n "$multiarch" ] && [ -f "/usr/include/$multiarch/gnu/stubs-32.h" ]; then
+    copy_to "/usr/include/$multiarch/gnu/stubs-32.h" "$out/usr-include/gnu/stubs-32.h"
+elif [ -f /usr/include/gnu/stubs-32.h ]; then
+    copy_to /usr/include/gnu/stubs-32.h "$out/usr-include/gnu/stubs-32.h"
+else
+    echo "could not locate gnu/stubs-32.h (multiarch='$multiarch')" >&2
+    echo "install libc6-dev-i386 (Debian/Ubuntu) or glibc-devel.i686 (Fedora)" >&2
+    exit 1
+fi
 
-# Collected from cpp -H. We strip the x86_64-linux-gnu/ multi-arch segment
-# because /usr/include/{bits,gnu,sys} are symlinks to it on the host —
-# LCC cpp doesn't follow that and searches /usr/include/<sub>/... directly.
+# Collected from cpp -H. We strip the multi-arch segment because
+# /usr/include/{bits,gnu,sys} are symlinks to it on the host — LCC cpp
+# doesn't follow that and searches /usr/include/<sub>/... directly.
 count=2
 while read -r path; do
     case "$path" in
-        /usr/include/x86_64-linux-gnu/*)
-            rel="${path#/usr/include/x86_64-linux-gnu/}"
+        /usr/include/x86_64-linux-gnu/*|/usr/include/i386-linux-gnu/*|/usr/include/aarch64-linux-gnu/*)
+            rel="${path#/usr/include/*/}"
             copy_to "$path" "$out/usr-include/$rel"
             count=$((count+1))
             ;;

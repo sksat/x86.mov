@@ -34,7 +34,7 @@ for f in "${CRT_FILES[@]}"; do
         exit 1
     fi
 done
-if ! command -v ld > /dev/null; then
+if [ ! -x /usr/bin/ld ]; then
     echo "FAIL: host /usr/bin/ld missing — apt install binutils" >&2
     exit 1
 fi
@@ -48,7 +48,7 @@ for o in "$goldens_o"/*.o; do
     nelf="$tmp/$name.native.elf"
     welf="$tmp/$name.wasm.elf"
 
-    if ! ld "${COMMON_FLAGS[@]}" "${LIB_PATHS[@]}" \
+    if ! /usr/bin/ld "${COMMON_FLAGS[@]}" "${LIB_PATHS[@]}" \
             "$B/crt0.o" "$o" "$B/crtf.o" "$B/crtd.o" "$SF/softfloat32.o" \
             -o "$nelf" 2> "$tmp/$name.native.err"; then
         echo "FAIL $name — native ld failed"

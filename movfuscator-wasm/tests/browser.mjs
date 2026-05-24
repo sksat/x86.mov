@@ -38,26 +38,13 @@ if (missing.length) {
     process.exit(1);
 }
 
-const { compile, assemble, link } = await import(wrapper);
+const { compile, assemble, link, LIB_PATHS } = await import(wrapper);
 const goldensO = join(root, 'tests', 'goldens-o');
 const libDir = join(root, 'web', 'lib');
 
 // Pre-load the link libs from web/lib/ so we don't fetch them via HTTP in
-// Node tests. Same Uint8Array map the browser default-fetch produces.
-const LIB_PATHS = [
-    '/lib32/libc.so.6',
-    '/lib32/libm.so.6',
-    '/lib32/ld-linux.so.2',
-    '/lib/ld-linux.so.2',
-    '/usr/lib32/libc.so',
-    '/usr/lib32/libm.so',
-    '/usr/lib32/libc_nonshared.a',
-    '/movfuscator/libgcc.a',
-    '/movfuscator/crt0.o',
-    '/movfuscator/crtf.o',
-    '/movfuscator/crtd.o',
-    '/movfuscator/softfloat32.o',
-];
+// Node tests. Same Uint8Array map the browser default-fetch produces;
+// the path list is the canonical one re-exported from the wrapper.
 let preloadedLibs = null;
 if (existsSync(libDir)) {
     preloadedLibs = {};
