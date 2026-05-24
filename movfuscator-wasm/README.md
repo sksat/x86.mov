@@ -49,6 +49,12 @@ Any divergence is a bug. Tests are a `cmp` against committed golden files.
 4. `make test` should now PASS for `<name>`.
 5. Commit fixture + golden together.
 
+Fixtures whose name starts with `upstream-` are copied verbatim from
+`vendor/movfuscator/validation/<name>.c`. They exist to keep this
+test suite aligned with the codegen surface upstream itself exercises.
+`tests/fixtures/UPSTREAM_LICENSE` is the upstream BSD license retained
+per its attribution clause.
+
 ### Changing the wasm build
 
 1. Modify `scripts/build-wasm.sh` (or its inputs).
