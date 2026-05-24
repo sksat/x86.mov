@@ -49,6 +49,7 @@
       <option value="hello" selected>Hello, mov</option>
       <option value="sum10">sum 1..10</option>
       <option value="prime">primes ≤ 100</option>
+      <option value="md5">md5 (RFC 1321, ~124k lines mov asm)</option>
     </select>
   </label>
   <button id="compile" class="primary">Compile →</button>
@@ -109,9 +110,32 @@ int main(void) {
 const $ = (id) => document.getElementById(id);
 $('src').value = PRESETS.hello;
 
-$('preset').addEventListener('change', (e) => {
+// md5 source is too long to inline; fetch lazily. The .h is grabbed
+// alongside so compile() can pass it as a sidecar when the source
+// (which user may also edit by hand) contains `#include "md5.h"`.
+let md5Headers = null;
+async function getMd5Headers() {
+    if (!md5Headers) {
+        md5Headers = { 'md5.h': await fetch('./md5.h').then(r => r.text()) };
+    }
+    return md5Headers;
+}
+
+$('preset').addEventListener('change', async (e) => {
     const k = e.target.value;
-    if (k && PRESETS[k]) $('src').value = PRESETS[k];
+    if (k === 'md5') {
+        $('status').textContent = 'loading md5.c…';
+        try {
+            $('src').value = await fetch('./md5.c').then(r => r.text());
+            await getMd5Headers();  // warm the cache
+            $('status').textContent = 'ready';
+        } catch (err) {
+            $('status').className = 'status err';
+            $('status').textContent = `failed to load md5.c: ${err.message || err}`;
+        }
+    } else if (k && PRESETS[k]) {
+        $('src').value = PRESETS[k];
+    }
 });
 
 $('compile').addEventListener('click', async () => {
@@ -125,7 +149,9 @@ $('compile').addEventListener('click', async () => {
 
     const started = performance.now();
     try {
-        const asm = await compile($('src').value);
+        const src = $('src').value;
+        const headers = src.includes('#include "md5.h"') ? await getMd5Headers() : {};
+        const asm = await compile(src, headers);
         const ms = Math.round(performance.now() - started);
         const lines = asm.split('\n').length - 1;
         status.textContent = `done in ${ms} ms — ${lines} lines`;
