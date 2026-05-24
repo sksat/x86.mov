@@ -209,15 +209,28 @@ function normalizeObjs(objs, defaultName) {
 }
 
 // MEMFS paths supplied via opts.extraInputs must be absolute, no `..`,
-// and outside the directories link() relies on (/movfuscator/, /lib32/,
-// /lib/, /usr/lib32/ — overwriting those by accident would corrupt the
-// staged crt/libc). Reject collisions with a clear error.
-function assertSafeExtraInputPath(p) {
+// and outside the directories link() relies on — overwriting those would
+// corrupt the staged crt/libc. The denylist of reserved prefixes is
+// derived from the wrapper's own staging set (LIB_PATHS dirs) so it
+// stays in sync if the layout changes.
+const RESERVED_EXTRA_INPUT_PREFIXES = ['/movfuscator/', '/lib32/', '/lib/', '/usr/lib32/'];
+function assertSafeExtraInputPath(p, userObjPaths) {
     if (typeof p !== 'string' || !p.startsWith('/') || p.length < 2) {
         throw new Error(`extraInputs path ${JSON.stringify(p)} must be absolute`);
     }
     if (p.includes('/../') || p.endsWith('/..') || p.includes('//')) {
         throw new Error(`extraInputs path ${JSON.stringify(p)} contains traversal or empty segment`);
+    }
+    for (const pre of RESERVED_EXTRA_INPUT_PREFIXES) {
+        if (p.startsWith(pre)) {
+            throw new Error(
+                `extraInputs path ${JSON.stringify(p)} is under wrapper-reserved directory `
+                + `${JSON.stringify(pre)} (would overwrite staged crt / libc / libgcc)`,
+            );
+        }
+    }
+    if (userObjPaths.has(p)) {
+        throw new Error(`extraInputs path ${JSON.stringify(p)} collides with a user object basename`);
     }
 }
 
@@ -261,7 +274,10 @@ export async function link(objs, libs, opts = {}) {
     assertSafeName(name, 'opts.name');
     const userObjs = normalizeObjs(objs, name);
     for (const { name: n } of userObjs) assertSafeName(n, 'object basename');
-    for (const p of Object.keys(extraInputs)) assertSafeExtraInputPath(p);
+    const userObjPaths = new Set(userObjs.map(({ name: n }) => `/${n}`));
+    for (const p of Object.keys(extraInputs)) {
+        assertSafeExtraInputPath(p, userObjPaths);
+    }
     if (!Array.isArray(extraLibs) || !Array.isArray(searchPaths)) {
         throw new TypeError('extraLibs / searchPaths must be arrays');
     }
@@ -269,6 +285,15 @@ export async function link(objs, libs, opts = {}) {
     if (!libs) {
         if (!cachedLibs) cachedLibs = defaultFetchLibs();
         libs = await cachedLibs;
+    } else {
+        // Caller supplied a pre-staged lib map. The link command line
+        // requires every default LIB_PATHS entry to be present, so fail
+        // fast with a list of missing paths rather than letting ld emit
+        // a less helpful "file not found" later.
+        const missing = LIB_PATHS.filter(p => !(p in libs));
+        if (missing.length > 0) {
+            throw new Error(`libs map is missing required entries: ${missing.join(', ')}`);
+        }
     }
     const buf = makeBuffered();
     const ld = await createMovLd(buf.opts);

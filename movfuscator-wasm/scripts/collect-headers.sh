@@ -67,11 +67,18 @@ fi
 # Collected from cpp -H. We strip the multi-arch segment because
 # /usr/include/{bits,gnu,sys} are symlinks to it on the host — LCC cpp
 # doesn't follow that and searches /usr/include/<sub>/... directly.
+# Use the gcc-reported $multiarch as the trigger so this isn't tied to
+# any specific triple list.
+multiarch_prefix=""
+[ -n "$multiarch" ] && multiarch_prefix="/usr/include/$multiarch/"
 count=2
 while read -r path; do
     case "$path" in
-        /usr/include/x86_64-linux-gnu/*|/usr/include/i386-linux-gnu/*|/usr/include/aarch64-linux-gnu/*)
-            rel="${path#/usr/include/*/}"
+        # `$multiarch_prefix` is empty on non-multi-arch distros, so the
+        # pattern degenerates to `/*` and never matches /usr/include/...,
+        # which is exactly what we want: fall through to the plain branch.
+        ${multiarch_prefix:-/__no_match__/}*)
+            rel="${path#"$multiarch_prefix"}"
             copy_to "$path" "$out/usr-include/$rel"
             count=$((count+1))
             ;;

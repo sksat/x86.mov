@@ -77,13 +77,19 @@ function bytesEqual(a, b) {
     return true;
 }
 
-let pass = 0, fail = 0;
+let pass = 0, fail = 0, skip = 0;
+class SkipTest extends Error { constructor(reason) { super(reason); this.name = 'SkipTest'; } }
 async function runTest(name, fn) {
     try {
         await fn();
         console.log(`PASS ${name}`);
         pass++;
     } catch (e) {
+        if (e instanceof SkipTest) {
+            console.log(`SKIP ${name} — ${e.message}`);
+            skip++;
+            return;
+        }
         console.log(`FAIL ${name}`);
         console.log('  |', String(e.message || e).split('\n').join('\n  | '));
         fail++;
@@ -130,26 +136,24 @@ await runTest('multi-add (Uint8Array[])', async () => {
 });
 
 // --- Test 3: extraLibs + extraInputs + searchPaths smoke ---
-// Stage host /usr/lib32/libpthread.a under /movfuscator/ via extraInputs,
-// add -lpthread via extraLibs. On modern glibc libpthread.a is mostly a
-// stub (everything moved into libc), so the link should still succeed
-// and produce a byte-identical ELF to the same link done with host ld.
-await runTest('extraLibs + extraInputs (-lpthread)', async () => {
+// Stage host /usr/lib32/libpthread.a under a caller-chosen MEMFS dir via
+// extraInputs, point ld at it via searchPaths, and ask for it via
+// extraLibs. On modern glibc libpthread.a is mostly a stub (everything
+// moved into libc), so the link still succeeds and produces a
+// byte-identical ELF to the same link done with host ld.
+await runTest('extraLibs + extraInputs + searchPaths (-lpthread)', async () => {
     const aPath = join(goldensO, 'multi-add.o');
     const bPath = join(goldensO, 'multi-add-helper.o');
     const libpthreadPath = '/usr/lib32/libpthread.a';
-    if (!existsSync(libpthreadPath)) {
-        console.log('  | SKIP: /usr/lib32/libpthread.a not installed');
-        pass--;  // undo the increment runTest will do
-        return;
-    }
+    if (!existsSync(libpthreadPath)) throw new SkipTest('/usr/lib32/libpthread.a not installed');
     const libpthread = readFileSync(libpthreadPath);
     const wasmElf = await link({
         'multi-add.o': readFileSync(aPath),
         'multi-add-helper.o': readFileSync(bPath),
     }, libs, {
-        extraLibs: ['pthread'],
-        extraInputs: { '/movfuscator/libpthread.a': new Uint8Array(libpthread) },
+        extraLibs:   ['pthread'],
+        searchPaths: ['/extralibs'],
+        extraInputs: { '/extralibs/libpthread.a': new Uint8Array(libpthread) },
     });
     const hostElf = hostLink([aPath, bPath], ['-lpthread']);
     if (!bytesEqual(wasmElf, hostElf)) {
@@ -173,5 +177,5 @@ await runTest('compileToElf (multi-source)', async () => {
 });
 
 console.log();
-console.log(`results: ${pass} passed, ${fail} failed`);
+console.log(`results: ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ''}`);
 process.exit(fail ? 1 : 0);
