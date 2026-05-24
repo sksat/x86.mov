@@ -66,12 +66,12 @@ fi
 
 # all-gas pulls in libiberty, bfd, libsframe, opcodes etc. as
 # dependencies. NODERAWFS at link time lets the final binaries read host
-# paths directly from Node.
-LD="$build/ld/ld-new"
+# paths directly from Node. Output is teed so any failure shows up in
+# CI logs (set -e + pipefail still fail the script on make's non-zero).
 emmake make -j"$(nproc)" \
     MAKEINFO=true \
     LDFLAGS="-sNODERAWFS=1 -sALLOW_MEMORY_GROWTH=1" \
-    all-gas all-ld 2> "$build/build.log" | tail -5
+    all-gas all-ld 2>&1 | tee "$build/build.log"
 
 asbin="$build/gas/as-new"
 ldbin="$build/ld/ld-new"
