@@ -6,7 +6,7 @@
 <title>movfuscator-wasm</title>
 <style>
   :root { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; line-height: 1.4; }
-  body { margin: 0; padding: 1.5rem; max-width: 1200px; }
+  body { margin: 0; padding: 1.5rem; max-width: 1600px; }
   h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
   p.intro { margin: 0 0 1rem; color: #555; font-size: 0.9rem; }
   p.intro a { color: #06c; }
@@ -22,12 +22,13 @@
     padding: 0.5rem;
     background: #fafafa;
   }
-  textarea { min-height: 10rem; resize: vertical; }
-  pre.out { min-height: 24rem; max-height: 60vh; overflow: auto; white-space: pre; margin: 0; }
+  textarea { min-height: 24rem; resize: vertical; font-size: 0.85rem; }
+  pre.out { min-height: 24rem; max-height: 60vh; overflow: auto; white-space: pre; margin: 0; font-size: 0.85rem; }
   .status { font-size: 0.85rem; color: #666; }
   .status.err { color: #b00; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 700px)  { .grid { grid-template-columns: 1fr; } }
   h2 { font-size: 0.95rem; margin: 0.5rem 0 0.25rem; color: #333; }
   .tabs { display: flex; gap: 0.25rem; margin: 0.5rem 0 0.25rem; }
   .tabs button {
@@ -80,13 +81,16 @@
     <textarea id="src" spellcheck="false"></textarea>
   </div>
   <div>
+    <h2>mov-only x86 assembly</h2>
+    <pre id="asm-out" class="out"></pre>
+  </div>
+  <div>
     <div class="tabs" id="view-tabs">
-      <button data-view="asm" class="active">asm</button>
-      <button data-view="obj" disabled>.o hex</button>
+      <button data-view="obj" class="active" disabled>.o hex</button>
       <button data-view="elf" disabled>ELF hex</button>
     </div>
     <pre id="elf-summary" class="elf-summary" hidden></pre>
-    <pre id="out" class="out"></pre>
+    <pre id="bin-out" class="out"></pre>
   </div>
 </div>
 
@@ -166,7 +170,7 @@ $('preset').addEventListener('change', async (e) => {
 let lastAsm = null;
 let lastObj = null;
 let lastElf = null;
-let currentView = 'asm';
+let currentView = 'obj';  // .o tab is the default once compile succeeds
 
 function hexDump(bytes, maxBytes = 8192) {
     const limit = Math.min(bytes.length, maxBytes);
@@ -226,23 +230,20 @@ function formatElfSummary(bytes) {
     ].join('\n');
 }
 
-function renderView() {
-    const out = $('out');
+function renderBinView() {
+    const out = $('bin-out');
     const summary = $('elf-summary');
     summary.hidden = true;
-    if (currentView === 'asm') {
-        out.textContent = lastAsm || '';
-    } else if (currentView === 'obj') {
-        if (!lastObj) { out.textContent = '(.o not built yet)'; return; }
-        const s = formatElfSummary(lastObj);
-        if (s) { summary.textContent = s; summary.hidden = false; }
-        out.textContent = hexDump(lastObj);
-    } else if (currentView === 'elf') {
-        if (!lastElf) { out.textContent = '(ELF not built yet)'; return; }
-        const s = formatElfSummary(lastElf);
-        if (s) { summary.textContent = s; summary.hidden = false; }
-        out.textContent = hexDump(lastElf);
+    const bytes = currentView === 'obj' ? lastObj : lastElf;
+    if (!bytes) {
+        out.textContent = currentView === 'obj'
+            ? '(compile first — Compile → fills the .o tab on demand)'
+            : '(ELF view triggers a ~24 MB lib download on first click)';
+        return;
     }
+    const s = formatElfSummary(bytes);
+    if (s) { summary.textContent = s; summary.hidden = false; }
+    out.textContent = hexDump(bytes);
 }
 
 function setView(view) {
@@ -250,23 +251,12 @@ function setView(view) {
     for (const btn of document.querySelectorAll('#view-tabs button')) {
         btn.classList.toggle('active', btn.dataset.view === view);
     }
-    renderView();
+    renderBinView();
 }
 
 document.querySelectorAll('#view-tabs button').forEach(btn => {
     btn.addEventListener('click', async () => {
         const v = btn.dataset.view;
-        if (v === 'obj' && !lastObj && lastAsm) {
-            $('status').textContent = 'assembling…';
-            try {
-                lastObj = await ensureObj();
-                $('status').textContent = `ready · .o cached (${lastObj.length} bytes)`;
-            } catch (e) {
-                $('status').className = 'status err';
-                $('status').textContent = `assemble failed: ${e.message || e}`;
-                return;
-            }
-        }
         if (v === 'elf' && !lastElf && lastAsm) {
             $('status').textContent = 'linking… (first run downloads ~24 MB of libs)';
             try {
@@ -286,14 +276,14 @@ document.querySelectorAll('#view-tabs button').forEach(btn => {
 $('compile').addEventListener('click', async () => {
     const btn = $('compile');
     const status = $('status');
-    const out = $('out');
     btn.disabled = true;
     $('download-o').disabled = true;
     $('download-elf').disabled = true;
     for (const b of document.querySelectorAll('#view-tabs button')) b.disabled = true;
     status.className = 'status';
     status.textContent = 'compiling…';
-    out.textContent = '';
+    $('asm-out').textContent = '';
+    $('bin-out').textContent = '';
     $('elf-summary').hidden = true;
     lastAsm = null;
     lastObj = null;
@@ -304,18 +294,27 @@ $('compile').addEventListener('click', async () => {
         const src = $('src').value;
         const headers = src.includes('#include "md5.h"') ? await getMd5Headers() : {};
         const asm = await compile(src, headers);
-        const ms = Math.round(performance.now() - started);
+        const compileMs = Math.round(performance.now() - started);
         const lines = asm.split('\n').length - 1;
-        status.textContent = `done in ${ms} ms — ${lines} lines`;
         lastAsm = asm;
-        setView('asm');
+        $('asm-out').textContent = asm;
+
+        // Assemble eagerly so the .o hex pane shows content immediately.
+        // It's quick (~50–250 ms) and avoids a second click for the
+        // common case where the user wants to see the binary.
+        const asmStart = performance.now();
+        lastObj = await assemble(asm);
+        const asmMs = Math.round(performance.now() - asmStart);
+
+        status.textContent = `compile ${compileMs} ms (${lines} lines) · assemble ${asmMs} ms (${lastObj.length} bytes)`;
         $('download-o').disabled = false;
         $('download-elf').disabled = false;
         for (const b of document.querySelectorAll('#view-tabs button')) b.disabled = false;
+        setView('obj');
     } catch (err) {
         status.className = 'status err';
-        status.textContent = 'compilation failed (see output pane)';
-        out.textContent = String(err.message || err);
+        status.textContent = 'pipeline failed (see asm pane)';
+        $('asm-out').textContent = String(err.message || err);
     } finally {
         btn.disabled = false;
     }
