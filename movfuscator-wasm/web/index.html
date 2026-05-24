@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>movfuscator-wasm</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github.min.css">
 <style>
   :root { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; line-height: 1.4; }
   body { margin: 0; padding: 1.5rem; }
@@ -24,6 +25,9 @@
   }
   textarea { min-height: 24rem; resize: vertical; font-size: 0.85rem; }
   pre.out { min-height: 24rem; max-height: 60vh; overflow: auto; white-space: pre; margin: 0; font-size: 0.85rem; }
+  /* highlight.js github theme paints its own background — keep our pre's
+     background visible by making the inner code transparent. */
+  pre.out code.hljs { background: transparent; padding: 0; }
   .status { font-size: 0.85rem; color: #666; }
   .status.err { color: #b00; }
   /* minmax(0, 1fr) so a long unwrappable line in one pane doesn't push the
@@ -84,7 +88,7 @@
   </div>
   <div>
     <h2>mov-only x86 assembly</h2>
-    <pre id="asm-out" class="out"></pre>
+    <pre class="out"><code id="asm-out" class="language-x86asm"></code></pre>
   </div>
   <div>
     <div class="tabs" id="view-tabs">
@@ -98,6 +102,7 @@
 
 <script type="module">
 import { compile, assemble, link } from './movfuscator.mjs';
+import hljs from 'https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/+esm';
 
 const PRESETS = {
     return42: `int main(void) { return 42; }
@@ -299,7 +304,10 @@ $('compile').addEventListener('click', async () => {
         const compileMs = Math.round(performance.now() - started);
         const lines = asm.split('\n').length - 1;
         lastAsm = asm;
-        $('asm-out').textContent = asm;
+        const asmEl = $('asm-out');
+        asmEl.textContent = asm;
+        asmEl.removeAttribute('data-highlighted');
+        hljs.highlightElement(asmEl);
 
         // Assemble eagerly so the .o hex pane shows content immediately.
         // It's quick (~50–250 ms) and avoids a second click for the
