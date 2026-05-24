@@ -58,13 +58,7 @@ jobs:
           path: |
             movfuscator-wasm/vendor
             movfuscator-wasm/build/binutils-as
-          key: |
-            vendor-${{ runner.os }}-${{ hashFiles(
-              'movfuscator-wasm/scripts/fetch.sh',
-              'movfuscator-wasm/scripts/build-native.sh',
-              'movfuscator-wasm/scripts/build-wasm-as.sh',
-              'movfuscator-wasm/patches/**'
-            ) }}-v1
+          key: vendor-${{ runner.os }}-${{ hashFiles('movfuscator-wasm/scripts/fetch.sh', 'movfuscator-wasm/scripts/build-native.sh', 'movfuscator-wasm/scripts/build-wasm-as.sh', 'movfuscator-wasm/patches/**') }}-v1
 
       - name: setup (fetch + apply patches)
         if: steps.vendor-cache.outputs.cache-hit != 'true'
