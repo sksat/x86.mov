@@ -1,6 +1,6 @@
 .PHONY: help setup build-native build-wasm build-wasm-rcc build-wasm-cpp \
         build-wasm-browser build-wasm-as build-wasm-as-browser \
-        build-wasm-ld-browser stage-link-libs stage-deploy \
+        build-wasm-ld-browser stage-link-libs stage-deploy stage-npm \
         goldens goldens-o test test-browser test-as test-ld bench serve \
         clean distclean
 
@@ -17,6 +17,7 @@ help:
 	@echo "  build-wasm-ld-browser  re-link wasm-ld for browser (MEMFS, ES module)"
 	@echo "  stage-link-libs        copy host crt + libc + libgcc into web/lib/ for demo"
 	@echo "  stage-deploy           assemble ../dist/ for Cloudflare Pages upload"
+	@echo "  stage-npm              assemble npm-package/ for 'npm publish' (or pack)"
 	@echo "  goldens              regenerate tests/goldens/*.s with native rcc"
 	@echo "  goldens-o            regenerate tests/goldens-o/*.o with native as"
 	@echo "  test                 node pipeline test vs .s goldens"
@@ -59,6 +60,9 @@ stage-link-libs:
 
 stage-deploy:
 	./scripts/stage-deploy.sh
+
+stage-npm:
+	./scripts/stage-npm.sh
 
 goldens:
 	./scripts/regen-goldens.sh

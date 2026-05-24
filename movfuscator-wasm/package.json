@@ -1,0 +1,44 @@
+{
+  "name": "movfuscator-wasm",
+  "version": "0.1.0",
+  "description": "WebAssembly port of the M/o/Vfuscator C compiler — compile C to mov-only x86 assembly (and linked ELF) from JS, in Node or the browser.",
+  "type": "module",
+  "main": "./movfuscator.mjs",
+  "exports": {
+    ".": "./movfuscator.mjs",
+    "./lib/*": "./lib/*"
+  },
+  "files": [
+    "movfuscator.mjs",
+    "cpp.js", "cpp.wasm",
+    "rcc.js", "rcc.wasm",
+    "as.js",  "as.wasm",
+    "ld.js",  "ld.wasm",
+    "lib/",
+    "README.md"
+  ],
+  "keywords": [
+    "movfuscator",
+    "wasm",
+    "webassembly",
+    "compiler",
+    "c-compiler",
+    "x86",
+    "i386",
+    "elf",
+    "obfuscation",
+    "mov"
+  ],
+  "author": "sksat <sksat@sksat.net>",
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sksat/x86.mov.git",
+    "directory": "movfuscator-wasm"
+  },
+  "homepage": "https://x86.mov/movfuscator-wasm/",
+  "bugs": "https://github.com/sksat/x86.mov/issues",
+  "engines": {
+    "node": ">=18"
+  }
+}

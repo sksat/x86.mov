@@ -118,15 +118,27 @@ const LIB_PATHS = [
 let cachedLibs = null;
 
 async function defaultFetchLibs() {
-    const base = new URL('./lib', import.meta.url);
+    // The lib bundle is sibling to this module. In a browser context that
+    // resolves to https://…/lib/…; in Node (file:// import.meta.url) we
+    // need fs.readFile because the global fetch can't open file: URLs.
+    const base = new URL('./lib/', import.meta.url);
+    let readBytes;
+    if (base.protocol === 'file:') {
+        const { readFile } = await import('node:fs/promises');
+        const { fileURLToPath } = await import('node:url');
+        readBytes = async (url) =>
+            new Uint8Array(await readFile(fileURLToPath(url)));
+    } else {
+        readBytes = async (url) => {
+            const r = await fetch(url);
+            if (!r.ok) throw new Error(`fetch ${url}: ${r.status} ${r.statusText}`);
+            return new Uint8Array(await r.arrayBuffer());
+        };
+    }
     const out = {};
     await Promise.all(LIB_PATHS.map(async (p) => {
-        const url = new URL(p.replace(/^\//, ''), base + '/');
-        const buf = await fetch(url).then(r => {
-            if (!r.ok) throw new Error(`fetch ${url}: ${r.status}`);
-            return r.arrayBuffer();
-        });
-        out[p] = new Uint8Array(buf);
+        const url = new URL(p.replace(/^\//, ''), base);
+        out[p] = await readBytes(url);
     }));
     return out;
 }

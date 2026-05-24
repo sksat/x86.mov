@@ -25,6 +25,28 @@ including a browser tab on [x86.mov](../index.html).
 output is a real Linux x86_32 binary; on a host with multilib it runs
 unmodified.
 
+## Use it as a library
+
+The wrapper at `web/movfuscator.mjs` is also an ES module exposing
+`compile`, `assemble` and `link`. Same code works under Node ≥ 18 and
+in the browser:
+
+```js
+import { compile, assemble, link } from 'movfuscator-wasm';
+
+const asm = await compile('int main(void){return 42;}');  // .c → mov asm text
+const obj = await assemble(asm);                          // .s → ELF32 .o
+const elf = await link(obj);                              // .o → linked ELF
+```
+
+`link()` lazy-fetches the ~24 MB crt + libc + libgcc bundle from
+`./lib/` next to the module (cached for the session). For multi-file
+inputs use `compile(src, { 'name.h': headerText })`.
+
+A static-host friendly copy of the same module also lives at
+[https://x86.mov/movfuscator-wasm/movfuscator.mjs](https://x86.mov/movfuscator-wasm/movfuscator.mjs)
+— good for HTML imports without a bundler.
+
 ## Layout
 
 ```
