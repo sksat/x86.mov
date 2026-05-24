@@ -35,23 +35,39 @@ const CPP_FLAGS = [
  *   placed in MEMFS root so `#include "name.h"` resolves alongside the input
  * @returns {Promise<string>} mov-only x86 assembly (.s text)
  */
+// cpp and rcc both write progress notes and warnings (M/o/Vfuscator
+// banner, "Unknown preprocessor control warning", emit/mov> dump, etc.)
+// to stderr. Emscripten's default printErr routes that to console.error,
+// which the browser DevTools paints red — alarming for non-errors.
+// We capture stderr into a buffer instead: silent on success, included
+// in the thrown error on non-zero exit.
+function makeBuffered() {
+    const lines = [];
+    return {
+        opts: { print: () => {}, printErr: (s) => lines.push(s) },
+        joined: () => lines.join('\n'),
+    };
+}
+
 export async function compile(source, headers = {}) {
-    const cpp = await createMovCpp();
+    const cppBuf = makeBuffered();
+    const cpp = await createMovCpp(cppBuf.opts);
     for (const [name, content] of Object.entries(headers)) {
         cpp.FS.writeFile(`/${name}`, content);
     }
     cpp.FS.writeFile('/in.c', source);
     const cppExit = cpp.callMain([...CPP_FLAGS, '/in.c', '/in.i']);
     if (cppExit !== 0) {
-        throw new Error(`cpp exited ${cppExit}`);
+        throw new Error(`cpp exited ${cppExit}\n${cppBuf.joined()}`);
     }
     const preprocessed = cpp.FS.readFile('/in.i', { encoding: 'utf8' });
 
-    const rcc = await createMovRcc();
+    const rccBuf = makeBuffered();
+    const rcc = await createMovRcc(rccBuf.opts);
     rcc.FS.writeFile('/in.i', preprocessed);
     const rccExit = rcc.callMain(['-target=x86/mov', '/in.i', '/out.s']);
     if (rccExit !== 0) {
-        throw new Error(`rcc exited ${rccExit}`);
+        throw new Error(`rcc exited ${rccExit}\n${rccBuf.joined()}`);
     }
     return rcc.FS.readFile('/out.s', { encoding: 'utf8' });
 }

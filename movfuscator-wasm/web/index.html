@@ -158,8 +158,8 @@ $('compile').addEventListener('click', async () => {
         out.textContent = asm;
     } catch (err) {
         status.className = 'status err';
-        status.textContent = `error: ${err.message || err}`;
-        out.textContent = '';
+        status.textContent = 'compilation failed (see output pane)';
+        out.textContent = String(err.message || err);
     } finally {
         btn.disabled = false;
     }
