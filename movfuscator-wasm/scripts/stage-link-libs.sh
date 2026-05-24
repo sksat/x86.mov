@@ -22,10 +22,10 @@ mkdir -p "$out"
 # matching location and the existing link command line just works.
 ## libgcc.a lives under a gcc-version-specific path
 ## (/usr/lib/gcc/x86_64-linux-gnu/<ver>/32/libgcc.a) which differs across
-## Debian / Ubuntu releases. The MEMFS path baked into the wrapper and the
-## tests is /usr/lib/gcc/x86_64-linux-gnu/14/32/libgcc.a regardless of the
-## host's gcc version, so we just resolve the host file dynamically and
-## stage it at the canonical MEMFS location.
+## Debian / Ubuntu releases. Resolve the host file dynamically and stage
+## it at a version-agnostic MEMFS path under /movfuscator/ alongside the
+## crt + softfloat objects — the wrapper passes -L/movfuscator so ld
+## finds it regardless of host gcc version.
 host_libgcc_a=$(cc -m32 -print-libgcc-file-name 2>/dev/null || true)
 if [ -z "$host_libgcc_a" ] || [ ! -f "$host_libgcc_a" ]; then
     echo "host libgcc.a not found via 'cc -m32 -print-libgcc-file-name' — apt install gcc-multilib libc6-dev-i386" >&2
@@ -37,7 +37,7 @@ declare -A LIBS=(
     ["lib32/libm.so.6"]="/lib32/libm.so.6"
     ["usr/lib32/libc.so"]="/usr/lib32/libc.so"
     ["usr/lib32/libc_nonshared.a"]="/usr/lib32/libc_nonshared.a"
-    ["usr/lib/gcc/x86_64-linux-gnu/14/32/libgcc.a"]="$host_libgcc_a"
+    ["movfuscator/libgcc.a"]="$host_libgcc_a"
     ["lib32/ld-linux.so.2"]="/lib32/ld-linux.so.2"
     # libc.so's linker script has AS_NEEDED ( /lib/ld-linux.so.2 ) so we
     # also need the loader visible at the un-multi-arch /lib/ path.

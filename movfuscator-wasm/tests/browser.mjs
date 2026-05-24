@@ -52,7 +52,7 @@ const LIB_PATHS = [
     '/usr/lib32/libc.so',
     '/usr/lib32/libm.so',
     '/usr/lib32/libc_nonshared.a',
-    '/usr/lib/gcc/x86_64-linux-gnu/14/32/libgcc.a',
+    '/movfuscator/libgcc.a',
     '/movfuscator/crt0.o',
     '/movfuscator/crtf.o',
     '/movfuscator/crtd.o',

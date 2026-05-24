@@ -93,9 +93,11 @@ export async function assemble(asm) {
     return as.FS.readFile('/out.o');  // Uint8Array
 }
 
-// MEMFS paths wasm-ld reads at link time. Each entry mirrors a real host
-// path: the wrapper writes the byte content at the same MEMFS location so
-// the link command line works unchanged.
+// MEMFS paths wasm-ld reads at link time. Most mirror real host paths so
+// the link command line stays close to what `/usr/bin/ld` sees on the
+// host; libgcc.a is parked under /movfuscator/ instead of its
+// gcc-version-specific host location so the wrapper isn't tied to a
+// particular gcc release.
 const LIB_PATHS = [
     '/lib32/libc.so.6',
     '/lib32/libm.so.6',
@@ -104,7 +106,7 @@ const LIB_PATHS = [
     '/usr/lib32/libc.so',
     '/usr/lib32/libm.so',
     '/usr/lib32/libc_nonshared.a',
-    '/usr/lib/gcc/x86_64-linux-gnu/14/32/libgcc.a',
+    '/movfuscator/libgcc.a',
     '/movfuscator/crt0.o',
     '/movfuscator/crtf.o',
     '/movfuscator/crtd.o',
@@ -160,12 +162,13 @@ export async function link(obj, libs, opts = {}) {
     }
     const userPath = `/${name}`;
     ld.FS.writeFile(userPath, obj);
+    // -L/movfuscator covers both the crt + softfloat objects and libgcc.a
+    // (staged together) so the wrapper isn't tied to a particular gcc
+    // version-specific host path.
     const exit = ld.callMain([
         '-m', 'elf_i386', '--hash-style=gnu',
         '-dynamic-linker', '/lib/ld-linux.so.2',
-        '-L/movfuscator',
-        '-L/usr/lib/gcc/x86_64-linux-gnu/14/32',
-        '-L/usr/lib32', '-L/lib32',
+        '-L/movfuscator', '-L/usr/lib32', '-L/lib32',
         '-lgcc', '-lc', '-lm',
         '/movfuscator/crt0.o', userPath,
         '/movfuscator/crtf.o', '/movfuscator/crtd.o',
