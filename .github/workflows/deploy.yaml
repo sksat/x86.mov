@@ -33,6 +33,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.2
 
+      # wrangler-action's `npx wrangler` install requires a real node
+      # via actions/setup-node (the ubuntu-latest default node is too
+      # locked-down for npx to install on demand without `--yes`).
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: '24'
+
       - name: install host packages
         working-directory: .
         run: |
