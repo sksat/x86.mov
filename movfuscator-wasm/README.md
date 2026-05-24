@@ -64,7 +64,7 @@ make build-wasm           # node-mode wasm artifacts (NODERAWFS)
 make build-wasm-browser   # browser-mode wasm artifacts (MEMFS, ES modules)
 make test                 # node pipeline vs goldens
 make test-browser         # browser pipeline (via web/movfuscator.mjs) vs goldens
-make serve                # python -m http.server 8080 → open /web/
+make serve                # python -m http.server 8086 → open /web/  (PORT= overrides)
 ```
 
 ## TDD workflow
@@ -85,7 +85,7 @@ Any divergence is a bug. Tests are a `cmp` against committed golden files.
 ```sh
 make build-wasm-browser
 make serve
-# open http://localhost:8080/web/
+# open http://localhost:8086/web/
 ```
 
 The demo (`web/index.html`) shows a textarea → "Compile →" → live mov asm.

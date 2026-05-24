@@ -33,7 +33,7 @@ const required = [
 ];
 const missing = required.filter(p => !existsSync(p));
 if (missing.length) {
-    console.error('FAIL: required artifacts missing — run "make build-wasm-browser" first');
+    console.error('FAIL: required artifacts missing — run "make build-wasm-browser build-wasm-as-browser build-wasm-ld-browser" first');
     for (const p of missing) console.error('  missing:', p);
     process.exit(1);
 }
