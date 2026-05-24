@@ -106,10 +106,9 @@ jobs:
           # land as preview deployments at
           # <head-ref>.x86-mov.pages.dev. github.head_ref is set on PR
           # events, github.ref_name on push / workflow_dispatch.
-          command: |
-            pages deploy ../dist
-              --project-name=x86-mov
-              --branch=${{ github.head_ref || github.ref_name }}
+          # NB: keep on one line — wrangler-action splits multi-line
+          # command: blocks and silently drops anything after the first.
+          command: pages deploy ../dist --project-name=x86-mov --branch=${{ github.head_ref || github.ref_name }}
           workingDirectory: movfuscator-wasm
 
       - name: comment preview URL on PR
