@@ -1,0 +1,109 @@
+name: movfuscator-wasm
+
+on:
+  push:
+    branches: [mov]
+  pull_request:
+    branches: [mov]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: movfuscator-wasm
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      # Host toolchain bits the movfuscator + binutils builds need:
+      # - gcc-multilib + libc6-dev-i386: 32-bit cross builds inside movfuscator
+      # - time: scripts/bench.sh uses /usr/bin/time -v for peak RSS
+      - name: install host packages
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              gcc-multilib libc6-dev-i386 time make patch
+
+      # ~600 MB toolchain. Re-running install on every push is wasteful;
+      # the cache key includes the emsdk revision so a refresh is explicit.
+      - name: cache emsdk
+        uses: actions/cache@v5.0.5
+        id: emsdk-cache
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ runner.os }}-v1-latest
+
+      - name: install emsdk
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        working-directory: .
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git $HOME/emsdk
+          $HOME/emsdk/emsdk install latest
+          $HOME/emsdk/emsdk activate latest
+
+      # vendor/ holds the upstream movfuscator clone (small) and the
+      # binutils 2.44 tarball + extraction (large, ~370 MB).
+      # build/binutils-as is the configure+object+link tree, ~500 MB.
+      # All three are deterministic functions of the fetch + build scripts,
+      # so we key the cache by their hashes.
+      - name: cache vendor + binutils-as build
+        uses: actions/cache@v5.0.5
+        id: vendor-cache
+        with:
+          path: |
+            movfuscator-wasm/vendor
+            movfuscator-wasm/build/binutils-as
+          key: |
+            vendor-${{ runner.os }}-${{ hashFiles(
+              'movfuscator-wasm/scripts/fetch.sh',
+              'movfuscator-wasm/scripts/build-native.sh',
+              'movfuscator-wasm/scripts/build-wasm-as.sh',
+              'movfuscator-wasm/patches/**'
+            ) }}-v1
+
+      - name: setup (fetch + apply patches)
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        run: make setup
+
+      - name: build native (rcc + cpp + crt + softfloat)
+        run: make build-native
+
+      - name: build wasm rcc + cpp (NODERAWFS)
+        run: make build-wasm
+
+      - name: build wasm as + ld (NODERAWFS)
+        run: make build-wasm-as
+
+      - name: build wasm cpp + rcc (browser-mode MEMFS)
+        run: make build-wasm-browser
+
+      - name: build wasm as (browser-mode MEMFS)
+        run: make build-wasm-as-browser
+
+      - name: build wasm ld (browser-mode MEMFS)
+        run: make build-wasm-ld-browser
+
+      - name: stage link libs for browser ld
+        run: make stage-link-libs
+
+      # Each test asserts a different byte-identical property:
+      #   test          .c → .s     (wasm cpp + rcc vs committed .s goldens)
+      #   test-as       .s → .o     (wasm as vs committed .o goldens)
+      #   test-ld       .o → ELF    (wasm ld vs host /usr/bin/ld, dynamic)
+      #   test-browser  full chain via the JS wrapper used in the browser demo
+      - name: test (node pipeline, .c → .s)
+        run: make test
+
+      - name: test-as (.s → .o byte-identical)
+        run: make test-as
+
+      - name: test-ld (.o → ELF byte-identical)
+        run: make test-ld
+
+      - name: test-browser (full chain via wrapper)
+        run: make test-browser
