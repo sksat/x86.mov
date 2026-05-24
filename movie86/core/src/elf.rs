@@ -28,7 +28,10 @@ pub enum ElfError {
     NotLittleEndian,
     /// `e_machine` is not `EM_386`.
     NotI386,
-    /// `e_type` is neither `ET_EXEC` nor `ET_DYN`.
+    /// `e_type` is not `ET_EXEC`. `ET_DYN` (PIE) is rejected on purpose
+    /// — without dynamic relocation / load-bias support, mapping segments
+    /// at their raw `p_vaddr` would silently start execution from the
+    /// wrong addresses.
     NotExecutable,
     /// Loadable segment's `p_memsz` is smaller than `p_filesz`.
     NonsenseSegmentSizes,
@@ -69,7 +72,8 @@ pub fn parse(bytes: &[u8]) -> Result<LoadedElf<'_>, ElfError> {
 
     // --- rest of Ehdr ---
     let e_type = read_u16(bytes, 16)?;
-    if e_type != 2 && e_type != 3 {
+    if e_type != 2 {
+        // ET_EXEC only — see ElfError::NotExecutable for the rationale.
         return Err(ElfError::NotExecutable);
     }
     let e_machine = read_u16(bytes, 18)?;
@@ -234,6 +238,16 @@ mod tests {
         let mut elf = build_elf(0, &[(0, 4, &[0, 0, 0, 0])]);
         elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
         assert_eq!(parse(&elf).unwrap_err(), ElfError::NotI386);
+    }
+
+    #[test]
+    fn rejects_et_dyn_until_we_support_load_bias() {
+        // Build a normal ET_EXEC, then flip e_type to ET_DYN. The
+        // loader has no relocation / load-bias machinery, so accepting
+        // ET_DYN would silently jump to the wrong address.
+        let mut elf = build_elf(0, &[(0, 4, &[0, 0, 0, 0])]);
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        assert_eq!(parse(&elf).unwrap_err(), ElfError::NotExecutable);
     }
 
     #[test]
