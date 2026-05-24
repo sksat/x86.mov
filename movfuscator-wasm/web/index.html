@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>movfuscator-wasm</title>
+<style>
+  :root { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; line-height: 1.4; }
+  body { margin: 0; padding: 1.5rem; }
+  h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
+  p.intro { margin: 0 0 1rem; color: #555; font-size: 0.9rem; }
+  p.intro a { color: #06c; }
+  .controls { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; flex-wrap: wrap; }
+  button, select { font: inherit; padding: 0.35rem 0.7rem; }
+  button.primary { background: #1d6; border: 1px solid #0a5; color: white; cursor: pointer; }
+  button.primary:disabled { background: #aaa; border-color: #888; cursor: wait; }
+  pre.out {
+    box-sizing: border-box;
+    width: 100%;
+    font: inherit;
+    border: 1px solid #ccc;
+    padding: 0.5rem;
+    background: #fafafa;
+    min-height: 24rem;
+    max-height: 60vh;
+    overflow: auto;
+    white-space: pre;
+    margin: 0;
+    font-size: 0.85rem;
+  }
+  /* CodeMirror panes — match pre.out: grow with content up to 60 vh, then
+     CM's own scroller takes over. Min-height keeps short snippets from
+     collapsing next to the binary pane. */
+  .cm-host { border: 1px solid #ccc; background: #fafafa; }
+  .cm-host .cm-editor {
+      min-height: 24rem;
+      max-height: 60vh;
+      font-size: 0.85rem;
+  }
+  .cm-host .cm-scroller { font-family: inherit; }
+  .status { font-size: 0.85rem; color: #666; }
+  .status.err { color: #b00; }
+  /* minmax(0, 1fr) so a long unwrappable line in one pane doesn't push the
+     others narrower than their fair share. */
+  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 700px)  { .grid { grid-template-columns: minmax(0, 1fr); } }
+  h2 { font-size: 0.95rem; margin: 0.5rem 0 0.25rem; color: #333; }
+  .tabs { display: flex; gap: 0.25rem; margin: 0.5rem 0 0.25rem; }
+  .tabs button {
+      background: #eee; border: 1px solid #ccc; padding: 0.25rem 0.6rem;
+      cursor: pointer; font-size: 0.85rem; color: #444;
+  }
+  .tabs button.active { background: #1d6; border-color: #0a5; color: white; }
+  .tabs button:disabled { color: #aaa; cursor: not-allowed; }
+  .elf-summary {
+      margin: 0 0 0.5rem;
+      padding: 0.4rem 0.5rem;
+      background: #f0f4f8;
+      border: 1px solid #cfd8dc;
+      font-size: 0.85rem;
+      white-space: pre;
+      overflow-x: auto;
+  }
+</style>
+</head>
+<body>
+
+<h1>movfuscator-wasm</h1>
+<p class="intro">
+  Compile C to <code>mov</code>-only x86 assembly, right in your browser.
+  Powered by a wasm port of LCC + the
+  <a href="https://github.com/xoreaxeaxeax/movfuscator">M/o/Vfuscator</a> backend.
+  Source: <a href="https://github.com/sksat/x86.mov">github.com/sksat/x86.mov</a>.
+</p>
+
+<div class="controls">
+  <label>preset:
+    <select id="preset">
+      <option value="">(custom)</option>
+      <option value="return42">return 42</option>
+      <option value="hello" selected>Hello, mov</option>
+      <option value="sum10">sum 1..10</option>
+      <option value="prime">primes ≤ 100</option>
+      <option value="md5">md5 (RFC 1321, ~124k lines mov asm)</option>
+    </select>
+  </label>
+  <button id="compile" class="primary">Compile →</button>
+  <button id="download-o" disabled>Download .o</button>
+  <button id="download-elf" disabled>Download ELF</button>
+  <span id="status" class="status">ready</span>
+</div>
+
+<div class="grid">
+  <div>
+    <h2>C source</h2>
+    <div id="src" class="cm-host"></div>
+  </div>
+  <div>
+    <h2>mov-only x86 assembly</h2>
+    <div id="asm-out" class="cm-host"></div>
+  </div>
+  <div>
+    <div class="tabs" id="view-tabs">
+      <button data-view="obj" class="active" disabled>.o hex</button>
+      <button data-view="elf" disabled>ELF hex</button>
+    </div>
+    <pre id="elf-summary" class="elf-summary" hidden></pre>
+    <pre id="bin-out" class="out"></pre>
+  </div>
+</div>
+
+<script type="module">
+import { compile, assemble, link, parseElfHeader } from './movfuscator.mjs';
+import { EditorView, basicSetup }    from 'https://esm.sh/codemirror@6.0.2';
+import { EditorState }               from 'https://esm.sh/@codemirror/state@6.6.0';
+import { cpp }                       from 'https://esm.sh/@codemirror/lang-cpp@6.0.3';
+import { StreamLanguage }            from 'https://esm.sh/@codemirror/language@6.12.3';
+import { gas }                       from 'https://esm.sh/@codemirror/legacy-modes@6.5.3/mode/gas';
+
+const PRESETS = {
+    return42: `int main(void) { return 42; }
+`,
+    hello: `#include <stdio.h>
+
+int main(void) {
+    printf("Hello, mov!\\n");
+    return 0;
+}
+`,
+    sum10: `int main(void) {
+    int sum = 0;
+    int i;
+    for (i = 1; i <= 10; i++) sum = sum + i;
+    return sum;
+}
+`,
+    prime: `#include <stdio.h>
+
+int is_prime(int x) {
+    int i;
+    if (x < 2) return 0;
+    for (i = 2; i * i <= x; i++)
+        if (x % i == 0) return 0;
+    return 1;
+}
+
+int main(void) {
+    int i;
+    for (i = 2; i <= 100; i++)
+        if (is_prime(i)) printf("%d ", i);
+    printf("\\n");
+    return 0;
+}
+`,
+};
+
+const $ = (id) => document.getElementById(id);
+
+// CodeMirror editors. The C pane is writable (cpp mode); the asm pane
+// is the same editor configured read-only with the legacy GAS mode
+// wrapped via StreamLanguage.
+const cEditor = new EditorView({
+    doc: PRESETS.hello,
+    extensions: [basicSetup, cpp()],
+    parent: $('src'),
+});
+const asmEditor = new EditorView({
+    doc: '',
+    extensions: [basicSetup, StreamLanguage.define(gas), EditorState.readOnly.of(true)],
+    parent: $('asm-out'),
+});
+
+function getCSource() {
+    return cEditor.state.doc.toString();
+}
+function setCSource(text) {
+    cEditor.dispatch({
+        changes: { from: 0, to: cEditor.state.doc.length, insert: text },
+    });
+}
+function setAsm(text) {
+    asmEditor.dispatch({
+        changes: { from: 0, to: asmEditor.state.doc.length, insert: text },
+    });
+}
+
+async function fetchText(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`fetch ${url}: ${r.status} ${r.statusText}`);
+    return r.text();
+}
+
+// md5 source is too long to inline; fetch lazily. The .h is grabbed
+// alongside so compile() can pass it as a sidecar when the source
+// (which user may also edit by hand) contains `#include "md5.h"`.
+let md5Headers = null;
+async function getMd5Headers() {
+    if (!md5Headers) {
+        md5Headers = { 'md5.h': await fetchText('./md5.h') };
+    }
+    return md5Headers;
+}
+
+$('preset').addEventListener('change', async (e) => {
+    const k = e.target.value;
+    if (k === 'md5') {
+        const status = $('status');
+        status.className = 'status';
+        status.textContent = 'loading md5.c…';
+        try {
+            setCSource(await fetchText('./md5.c'));
+            await getMd5Headers();  // warm the cache
+            status.textContent = 'ready';
+        } catch (err) {
+            status.className = 'status err';
+            status.textContent = `failed to load md5.c: ${err.message || err}`;
+        }
+    } else if (k && PRESETS[k]) {
+        setCSource(PRESETS[k]);
+    }
+});
+
+// Last successful compile's asm and cached .o / ELF — shared by the
+// download buttons and the binary viewer tabs.
+let lastAsm = null;
+let lastObj = null;
+let lastElf = null;
+let currentView = 'obj';  // .o tab is the default once compile succeeds
+
+function hexDump(bytes, maxBytes = 8192) {
+    const limit = Math.min(bytes.length, maxBytes);
+    const lines = [];
+    for (let i = 0; i < limit; i += 16) {
+        const chunk = bytes.subarray(i, i + 16);
+        const offset = i.toString(16).padStart(8, '0');
+        const hex = Array.from(chunk).map(b => b.toString(16).padStart(2, '0')).join(' ').padEnd(48);
+        const ascii = Array.from(chunk)
+            .map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.').join('');
+        lines.push(`${offset}  ${hex}  ${ascii}`);
+    }
+    if (bytes.length > limit) {
+        const more = (bytes.length - limit).toLocaleString();
+        lines.push('', `... ${more} more bytes truncated — use Download to fetch the full file`);
+    }
+    return lines.join('\n');
+}
+
+function formatElfSummary(bytes) {
+    const h = parseElfHeader(bytes);
+    if (!h) return null;
+    if (h.raw) return h.raw;
+    return [
+        `ELF32 little-endian — ${(bytes.length / 1024 / 1024).toFixed(2)} MB total`,
+        `type:     ${h.type}`,
+        `machine:  ${h.machine}`,
+        `entry:    ${h.entry}`,
+        `sections: ${h.sections}`,
+    ].join('\n');
+}
+
+function renderBinView() {
+    const out = $('bin-out');
+    const summary = $('elf-summary');
+    summary.hidden = true;
+    const bytes = currentView === 'obj' ? lastObj : lastElf;
+    if (!bytes) {
+        out.textContent = currentView === 'obj'
+            ? '(compile first — Compile → assembles and fills this tab)'
+            : '(ELF view triggers a ~24 MB lib download on first click)';
+        return;
+    }
+    const s = formatElfSummary(bytes);
+    if (s) { summary.textContent = s; summary.hidden = false; }
+    out.textContent = hexDump(bytes);
+}
+
+function setView(view) {
+    currentView = view;
+    for (const btn of document.querySelectorAll('#view-tabs button')) {
+        btn.classList.toggle('active', btn.dataset.view === view);
+    }
+    renderBinView();
+}
+
+document.querySelectorAll('#view-tabs button').forEach(btn => {
+    btn.addEventListener('click', async () => {
+        const v = btn.dataset.view;
+        if (v === 'elf' && !lastElf && lastAsm) {
+            $('status').textContent = 'linking… (first run downloads ~24 MB of libs)';
+            try {
+                const o = await ensureObj();
+                lastElf = await link(o, undefined, { name: 'movfuscated.o' });
+                $('status').textContent = `ready · ELF cached (${(lastElf.length/1024/1024).toFixed(1)} MB)`;
+            } catch (e) {
+                $('status').className = 'status err';
+                $('status').textContent = `link failed: ${e.message || e}`;
+                return;
+            }
+        }
+        setView(v);
+    });
+});
+
+$('compile').addEventListener('click', async () => {
+    const btn = $('compile');
+    const status = $('status');
+    btn.disabled = true;
+    $('download-o').disabled = true;
+    $('download-elf').disabled = true;
+    for (const b of document.querySelectorAll('#view-tabs button')) b.disabled = true;
+    status.className = 'status';
+    status.textContent = 'compiling…';
+    setAsm('');
+    $('bin-out').textContent = '';
+    $('elf-summary').hidden = true;
+    lastAsm = null;
+    lastObj = null;
+    lastElf = null;
+
+    const started = performance.now();
+    try {
+        const src = getCSource();
+        const headers = src.includes('#include "md5.h"') ? await getMd5Headers() : {};
+        const asm = await compile(src, headers);
+        const compileMs = Math.round(performance.now() - started);
+        // md5 produces ~124k lines; split / match would allocate the full
+        // array just to count it. Scan for '\n' (charCode 10) directly.
+        let lines = 0;
+        for (let i = 0; i < asm.length; i++) if (asm.charCodeAt(i) === 10) lines++;
+        lastAsm = asm;
+        setAsm(asm);
+
+        // Assemble eagerly so the .o hex pane shows content immediately.
+        // It's quick (~50–250 ms) and avoids a second click for the
+        // common case where the user wants to see the binary.
+        const asmStart = performance.now();
+        lastObj = await assemble(asm);
+        const asmMs = Math.round(performance.now() - asmStart);
+
+        status.textContent = `compile ${compileMs} ms (${lines} lines) · assemble ${asmMs} ms (${lastObj.length} bytes)`;
+        $('download-o').disabled = false;
+        $('download-elf').disabled = false;
+        for (const b of document.querySelectorAll('#view-tabs button')) b.disabled = false;
+        setView('obj');
+    } catch (err) {
+        status.className = 'status err';
+        status.textContent = 'pipeline failed (see asm pane)';
+        setAsm(String(err.message || err));
+    } finally {
+        btn.disabled = false;
+    }
+});
+
+function triggerDownload(name, bytes, mime) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.click();
+    // Some browsers cancel the download if the blob URL is revoked before
+    // the click has dispatched the fetch — defer the revoke to the next
+    // macrotask so the download has time to actually start.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+async function ensureObj() {
+    if (lastObj) return lastObj;
+    lastObj = await assemble(lastAsm);
+    return lastObj;
+}
+
+$('download-o').addEventListener('click', async () => {
+    const btn = $('download-o');
+    const status = $('status');
+    if (!lastAsm) return;
+    btn.disabled = true;
+    const prevText = status.textContent;
+    status.className = 'status';
+    status.textContent = 'assembling…';
+    const started = performance.now();
+    try {
+        const obj = await ensureObj();
+        const ms = Math.round(performance.now() - started);
+        triggerDownload('movfuscated.o', obj, 'application/x-object');
+        status.textContent = `${prevText} · .o ready (${obj.length} bytes, ${ms} ms)`;
+    } catch (err) {
+        status.className = 'status err';
+        status.textContent = `assemble failed: ${err.message || err}`;
+    } finally {
+        btn.disabled = false;
+    }
+});
+
+$('download-elf').addEventListener('click', async () => {
+    const btn = $('download-elf');
+    const status = $('status');
+    if (!lastAsm) return;
+    btn.disabled = true;
+    const prevText = status.textContent;
+    status.className = 'status';
+    // First click of the session pulls ~24 MB of system libs + crt files
+    // from ./lib — tell the user something is happening.
+    status.textContent = 'linking… (first run downloads ~24 MB of libs)';
+    const started = performance.now();
+    try {
+        const obj = await ensureObj();
+        lastElf = lastElf || await link(obj, undefined, { name: 'movfuscated.o' });
+        const ms = Math.round(performance.now() - started);
+        triggerDownload('movfuscated.elf', lastElf, 'application/x-executable');
+        status.textContent = `${prevText} · ELF ready (${(lastElf.length/1024/1024).toFixed(1)} MB, ${ms} ms)`;
+    } catch (err) {
+        status.className = 'status err';
+        status.textContent = `link failed: ${err.message || err}`;
+    } finally {
+        btn.disabled = false;
+    }
+});
+</script>
+
+</body>
+</html>

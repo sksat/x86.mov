@@ -1,0 +1,23 @@
+From: x86.mov movfuscator-wasm
+Subject: [PATCH] libiberty: make psignal's message parameter `const char *`
+
+Emscripten's <signal.h> declares `psignal(int, const char *)`. libiberty's
+fallback definition omits the const, so when compiling for wasm via emcc
+it conflicts with the platform header and the build aborts.
+
+This patch applies to the libiberty stub itself, not to any consumer.
+The libiberty implementation is only reached when HAVE_PSIGNAL isn't
+defined — but even on hosts where it is defined, the prototype must
+still match the platform's. Adding const is strictly safer.
+
+--- a/libiberty/strsignal.c
++++ b/libiberty/strsignal.c
+@@ -551,7 +551,7 @@
+ #ifndef HAVE_PSIGNAL
+ 
+ void
+-psignal (int signo, char *message)
++psignal (int signo, const char *message)
+ {
+   if (signal_names == NULL)
+     {
