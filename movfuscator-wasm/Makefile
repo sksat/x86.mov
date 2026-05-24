@@ -12,7 +12,7 @@ help:
 	@echo "  goldens              regenerate tests/goldens/*.s with native rcc"
 	@echo "  test                 node pipeline test vs goldens"
 	@echo "  test-browser         browser pipeline test (via wrapper) vs goldens"
-	@echo "  serve                serve web/ + build/browser/ at http://localhost:8080"
+	@echo "  serve                serve web/ + build/browser/ on \$$PORT (default 8086)"
 	@echo "  clean                remove build artifacts (keep vendor checkout)"
 	@echo "  distclean            remove build + vendor"
 
@@ -42,9 +42,10 @@ test:
 test-browser:
 	node tests/browser.mjs
 
+PORT ?= 8086
 serve:
-	@echo "open http://localhost:8080/web/"
-	python3 -m http.server 8080
+	@echo "open http://localhost:$(PORT)/web/"
+	python3 -m http.server $(PORT)
 
 clean:
 	rm -rf build
