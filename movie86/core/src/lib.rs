@@ -31,8 +31,11 @@ pub enum Fault {
     /// `Mov` form that the executor doesn't yet know how to evaluate.
     /// Distinct from `UnknownOpcode` because the decoder already accepted it.
     UnimplementedMov,
-    /// Guest requested exit via a syscall. Carries the requested status code.
-    Exit(i32),
+    /// Guest requested exit via a syscall. Carries the raw status
+    /// register (typically `ebx`); the caller is responsible for masking
+    /// to the low 8 bits per Linux convention if it wants the wait(2)
+    /// status byte.
+    Exit(u32),
     /// `int n` with `n` other than 0x80. Only the Linux syscall vector
     /// is wired up.
     UnsupportedInterrupt(u8),
