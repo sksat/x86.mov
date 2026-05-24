@@ -1,0 +1,92 @@
+name: deploy
+
+on:
+  push:
+    branches: [mov]
+  workflow_dispatch:
+
+# One in-flight production deploy at a time; new pushes cancel the
+# in-flight one rather than queueing.
+concurrency:
+  group: cloudflare-pages
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: movfuscator-wasm
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: install host packages
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              gcc-multilib libc6-dev-i386 time make patch
+
+      - name: cache emsdk
+        uses: actions/cache@v5.0.5
+        id: emsdk-cache
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ runner.os }}-v1-latest
+
+      - name: install emsdk
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        working-directory: .
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git $HOME/emsdk
+          $HOME/emsdk/emsdk install latest
+          $HOME/emsdk/emsdk activate latest
+
+      # Shares the same cache key shape as the test workflow so the
+      # heavy binutils build is reused across the two pipelines.
+      - name: cache vendor + binutils-as build
+        uses: actions/cache@v5.0.5
+        id: vendor-cache
+        with:
+          path: |
+            movfuscator-wasm/vendor
+            movfuscator-wasm/build/binutils-as
+          key: |
+            vendor-${{ runner.os }}-${{ hashFiles(
+              'movfuscator-wasm/scripts/fetch.sh',
+              'movfuscator-wasm/scripts/build-native.sh',
+              'movfuscator-wasm/scripts/build-wasm-as.sh',
+              'movfuscator-wasm/patches/**'
+            ) }}-v1
+
+      - name: setup
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        run: make setup
+
+      - name: build everything needed for the demo
+        run: |
+          make build-native
+          make build-wasm-as
+          make build-wasm-browser
+          make build-wasm-as-browser
+          make build-wasm-ld-browser
+          make stage-link-libs
+
+      - name: stage dist/
+        run: make stage-deploy
+
+      - name: upload to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # `pages deploy` uploads the directory tree as-is. --project-name
+          # must match the existing Cloudflare Pages project (set in
+          # dashboard); --branch=mov keeps production-deploy behaviour.
+          command: pages deploy ../dist --project-name=x86-mov --branch=mov
+          workingDirectory: movfuscator-wasm
