@@ -124,37 +124,41 @@ per its attribution clause.
 
 ## Benchmarks
 
-`make bench` runs `hyperfine` and `/usr/bin/time -v` over the .c → mov asm
-pipeline three ways and writes a markdown report to
-[bench/results.md](bench/results.md). On a Debian 13 / x86_64 Beelink Mini S
-host (snapshot in the report):
+`make bench` runs `hyperfine` and `/usr/bin/time -v` over the full
+**`.c → ELF`** pipeline (cpp + rcc + as + ld) three ways and writes a
+markdown report to [bench/results.md](bench/results.md). On a Debian 13 /
+x86_64 Beelink Mini S host (snapshot in the report):
 
-| fixture          | asm lines | native | wasm-browser | time ratio | wasm-browser RSS |
-|------------------|----------:|-------:|-------------:|-----------:|-----------------:|
-| `return42`       |       712 |  3.5 ms |  89.2 ms    |       25x |          66 MB |
-| `hello`          |       979 |  6.9 ms | 102.0 ms    |       15x |          70 MB |
-| `upstream-prime` |     9,994 |  9.4 ms | 112.8 ms    |       12x |          70 MB |
-| `upstream-mandelbrot` | 12,179 | 10.6 ms | 120.7 ms  |       11x |          70 MB |
-| `upstream-mersenne` | 33,841 |  7.9 ms | 125.8 ms    |       16x |          70 MB |
-| `upstream-ray3`   |    69,554 | 25.0 ms | 181.5 ms    |        7x |          87 MB |
-| `upstream-md5`   |   124,521 | 72.1 ms | 264.6 ms    |    **3.7x** |        100 MB |
+| fixture           | asm lines | native | wasm-browser | time ratio | wasm-browser RSS |
+|-------------------|----------:|-------:|-------------:|-----------:|-----------------:|
+| `return42`        |       712 | 140 ms |    510 ms    |    3.6×    |        186 MB |
+| `hello`           |       979 | 148 ms |    552 ms    |    3.7×    |        197 MB |
+| `upstream-prime`  |     9,994 | 160 ms |    597 ms    |    3.7×    |        199 MB |
+| `upstream-hanoi`  |    16,766 | 170 ms |    638 ms    |    3.7×    |        202 MB |
+| `upstream-mandelbrot` | 12,179 | 166 ms |  597 ms    |    3.6×    |        187 MB |
+| `upstream-mersenne` | 33,841 | 174 ms |    625 ms    |    3.6×    |        195 MB |
+| `upstream-ray3`   |    69,554 | 207 ms |    730 ms    |    3.5×    |        201 MB |
+| `upstream-md5`    |   124,521 | 285 ms |    896 ms    |  **3.2×**  |        241 MB |
 
 Findings worth noting:
 
-- **wasm-browser beats wasm-node** because the `make test` driver spawns
-  two Node processes per fixture (`node cpp.js ; node rcc.js`) while
-  the browser wrapper stays in one process. Process startup dominates
-  the small-fixture timings.
-- **Larger inputs amortize wasm overhead** — the ratio shrinks from
-  25× (700-line return42) to **3.7×** (124k-line md5) as actual codegen
-  time grows past the fixed Node + wasm-instantiate cost.
-- **Interactive demo stays snappy** — even the heaviest fixture finishes
-  under 300 ms in the wasm-browser path. The textarea-to-asm round trip
-  in `web/index.html` shows the same numbers.
-- **Peak RSS**: native rcc holds steady at ~3 MB; wasm-browser hits
-  100 MB on md5 (both cpp and rcc modules in one process, vs. the
-  Node-shell pipeline that subprocesses them serially). Fine for a
-  browser tab, but worth knowing.
+- **wasm-browser beats wasm-node** because the wasm-node driver spawns
+  four Node processes per fixture (`cpp ; rcc ; as ; ld`) while the
+  browser wrapper stays in one process and re-uses each tool's Module
+  instance.
+- **The link step dominates the floor** — `ld` mmaps `crtd.o` (~15 MB
+  of mov tables) on every link, which is why even an empty `return 0`
+  needs ~140 ms natively. That fixed cost shrinks the wasm:native
+  ratio compared to the cpp+rcc-only bench (which was 25× for return42);
+  the wasm slowdown is now a fairly flat 3.5×–3.7× across fixture sizes.
+- **Peak RSS**: native pipeline hits ~66 MB (mostly the linker holding
+  crtd.o and the libs); wasm-browser climbs to ~200 MB for typical
+  fixtures and ~240 MB for md5 because cpp.wasm + rcc.wasm + as.wasm +
+  ld.wasm + their MEMFS images are all resident in one Node process.
+  Heavy for a tab but still under what a typical SPA uses.
+- **md5 finishes in 0.9 s end-to-end via wasm-browser** — including
+  cpp, rcc, as and ld. The browser's Compile / Download .o / Download
+  ELF buttons show the same individual stage timings live.
 
 Override the fixture set:
 ```sh
