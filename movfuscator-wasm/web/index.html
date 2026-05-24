@@ -29,6 +29,22 @@
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
   @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
   h2 { font-size: 0.95rem; margin: 0.5rem 0 0.25rem; color: #333; }
+  .tabs { display: flex; gap: 0.25rem; margin: 0.5rem 0 0.25rem; }
+  .tabs button {
+      background: #eee; border: 1px solid #ccc; padding: 0.25rem 0.6rem;
+      cursor: pointer; font-size: 0.85rem; color: #444;
+  }
+  .tabs button.active { background: #1d6; border-color: #0a5; color: white; }
+  .tabs button:disabled { color: #aaa; cursor: not-allowed; }
+  .elf-summary {
+      margin: 0 0 0.5rem;
+      padding: 0.4rem 0.5rem;
+      background: #f0f4f8;
+      border: 1px solid #cfd8dc;
+      font-size: 0.85rem;
+      white-space: pre;
+      overflow-x: auto;
+  }
 </style>
 </head>
 <body>
@@ -64,7 +80,12 @@
     <textarea id="src" spellcheck="false"></textarea>
   </div>
   <div>
-    <h2>mov-only x86 assembly</h2>
+    <div class="tabs" id="view-tabs">
+      <button data-view="asm" class="active">asm</button>
+      <button data-view="obj" disabled>.o hex</button>
+      <button data-view="elf" disabled>ELF hex</button>
+    </div>
+    <pre id="elf-summary" class="elf-summary" hidden></pre>
     <pre id="out" class="out"></pre>
   </div>
 </div>
@@ -140,10 +161,127 @@ $('preset').addEventListener('change', async (e) => {
     }
 });
 
-// Last successful compile's asm and cached .o — used by the download
-// buttons so each step doesn't redo earlier ones.
+// Last successful compile's asm and cached .o / ELF — shared by the
+// download buttons and the binary viewer tabs.
 let lastAsm = null;
 let lastObj = null;
+let lastElf = null;
+let currentView = 'asm';
+
+function hexDump(bytes, maxBytes = 8192) {
+    const limit = Math.min(bytes.length, maxBytes);
+    const lines = [];
+    for (let i = 0; i < limit; i += 16) {
+        const chunk = bytes.subarray(i, i + 16);
+        const offset = i.toString(16).padStart(8, '0');
+        const hex = Array.from(chunk).map(b => b.toString(16).padStart(2, '0')).join(' ').padEnd(48);
+        const ascii = Array.from(chunk)
+            .map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.').join('');
+        lines.push(`${offset}  ${hex}  ${ascii}`);
+    }
+    if (bytes.length > limit) {
+        const more = (bytes.length - limit).toLocaleString();
+        lines.push('', `... ${more} more bytes truncated — use Download to fetch the full file`);
+    }
+    return lines.join('\n');
+}
+
+function parseElfHeader(bytes) {
+    if (bytes.length < 52 || bytes[0] !== 0x7f
+        || bytes[1] !== 0x45 || bytes[2] !== 0x4c || bytes[3] !== 0x46) {
+        return null;
+    }
+    const ei_class = bytes[4];   // 1 = ELF32, 2 = ELF64
+    const ei_data  = bytes[5];   // 1 = LE
+    if (ei_class !== 1 || ei_data !== 1) {
+        return { raw: `unsupported ELF class=${ei_class} data=${ei_data}` };
+    }
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const type    = dv.getUint16(16, true);
+    const machine = dv.getUint16(18, true);
+    const entry   = dv.getUint32(24, true);
+    const shnum   = dv.getUint16(48, true);
+    const typeNames = { 1: 'REL (relocatable .o)', 2: 'EXEC (executable)', 3: 'DYN', 4: 'CORE' };
+    const machNames = { 3: 'i386' };
+    return {
+        class:    'ELF32',
+        data:     'little-endian',
+        type:     typeNames[type] || `unknown (${type})`,
+        machine:  machNames[machine] || `unknown (${machine})`,
+        entry:    '0x' + entry.toString(16).padStart(8, '0'),
+        sections: shnum,
+    };
+}
+
+function formatElfSummary(bytes) {
+    const h = parseElfHeader(bytes);
+    if (!h) return null;
+    if (h.raw) return h.raw;
+    return [
+        `ELF32 little-endian — ${(bytes.length / 1024 / 1024).toFixed(2)} MB total`,
+        `type:     ${h.type}`,
+        `machine:  ${h.machine}`,
+        `entry:    ${h.entry}`,
+        `sections: ${h.sections}`,
+    ].join('\n');
+}
+
+function renderView() {
+    const out = $('out');
+    const summary = $('elf-summary');
+    summary.hidden = true;
+    if (currentView === 'asm') {
+        out.textContent = lastAsm || '';
+    } else if (currentView === 'obj') {
+        if (!lastObj) { out.textContent = '(.o not built yet)'; return; }
+        const s = formatElfSummary(lastObj);
+        if (s) { summary.textContent = s; summary.hidden = false; }
+        out.textContent = hexDump(lastObj);
+    } else if (currentView === 'elf') {
+        if (!lastElf) { out.textContent = '(ELF not built yet)'; return; }
+        const s = formatElfSummary(lastElf);
+        if (s) { summary.textContent = s; summary.hidden = false; }
+        out.textContent = hexDump(lastElf);
+    }
+}
+
+function setView(view) {
+    currentView = view;
+    for (const btn of document.querySelectorAll('#view-tabs button')) {
+        btn.classList.toggle('active', btn.dataset.view === view);
+    }
+    renderView();
+}
+
+document.querySelectorAll('#view-tabs button').forEach(btn => {
+    btn.addEventListener('click', async () => {
+        const v = btn.dataset.view;
+        if (v === 'obj' && !lastObj && lastAsm) {
+            $('status').textContent = 'assembling…';
+            try {
+                lastObj = await ensureObj();
+                $('status').textContent = `ready · .o cached (${lastObj.length} bytes)`;
+            } catch (e) {
+                $('status').className = 'status err';
+                $('status').textContent = `assemble failed: ${e.message || e}`;
+                return;
+            }
+        }
+        if (v === 'elf' && !lastElf && lastAsm) {
+            $('status').textContent = 'linking… (first run downloads ~24 MB of libs)';
+            try {
+                const o = await ensureObj();
+                lastElf = await link(o, undefined, { name: 'movfuscated.o' });
+                $('status').textContent = `ready · ELF cached (${(lastElf.length/1024/1024).toFixed(1)} MB)`;
+            } catch (e) {
+                $('status').className = 'status err';
+                $('status').textContent = `link failed: ${e.message || e}`;
+                return;
+            }
+        }
+        setView(v);
+    });
+});
 
 $('compile').addEventListener('click', async () => {
     const btn = $('compile');
@@ -152,11 +290,14 @@ $('compile').addEventListener('click', async () => {
     btn.disabled = true;
     $('download-o').disabled = true;
     $('download-elf').disabled = true;
+    for (const b of document.querySelectorAll('#view-tabs button')) b.disabled = true;
     status.className = 'status';
     status.textContent = 'compiling…';
     out.textContent = '';
+    $('elf-summary').hidden = true;
     lastAsm = null;
     lastObj = null;
+    lastElf = null;
 
     const started = performance.now();
     try {
@@ -166,10 +307,11 @@ $('compile').addEventListener('click', async () => {
         const ms = Math.round(performance.now() - started);
         const lines = asm.split('\n').length - 1;
         status.textContent = `done in ${ms} ms — ${lines} lines`;
-        out.textContent = asm;
         lastAsm = asm;
+        setView('asm');
         $('download-o').disabled = false;
         $('download-elf').disabled = false;
+        for (const b of document.querySelectorAll('#view-tabs button')) b.disabled = false;
     } catch (err) {
         status.className = 'status err';
         status.textContent = 'compilation failed (see output pane)';
@@ -229,10 +371,10 @@ $('download-elf').addEventListener('click', async () => {
     const started = performance.now();
     try {
         const obj = await ensureObj();
-        const elf = await link(obj, undefined, { name: 'movfuscated.o' });
+        lastElf = lastElf || await link(obj, undefined, { name: 'movfuscated.o' });
         const ms = Math.round(performance.now() - started);
-        triggerDownload('movfuscated.elf', elf, 'application/x-executable');
-        status.textContent = `${prevText} · ELF ready (${(elf.length/1024/1024).toFixed(1)} MB, ${ms} ms)`;
+        triggerDownload('movfuscated.elf', lastElf, 'application/x-executable');
+        status.textContent = `${prevText} · ELF ready (${(lastElf.length/1024/1024).toFixed(1)} MB, ${ms} ms)`;
     } catch (err) {
         status.className = 'status err';
         status.textContent = `link failed: ${err.message || err}`;
