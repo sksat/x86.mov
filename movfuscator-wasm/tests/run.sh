@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# Test runner: for every tests/fixtures/*.c, run the wasm rcc on the
-# preprocessed form and assert the output is byte-identical to the
-# committed golden in tests/goldens/.
+# End-to-end wasm pipeline test runner.
 #
-# This is the core TDD safety net for the wasm port: any code change
-# that perturbs codegen will fail loudly here.
+# For each tests/fixtures/*.c:
+#   1. wasm cpp  → .i  (build/cpp.js)
+#   2. wasm rcc  → .s  (build/rcc.js)
+#   3. cmp .s against committed tests/goldens/*.s
+#
+# This is the core TDD safety net: a byte-level regression in either
+# wasm-compiled tool fails loudly.
 
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 fixtures="$here/tests/fixtures"
 goldens="$here/tests/goldens"
+vendor="$here/vendor/movfuscator"
+cppjs="$here/build/cpp.js"
 rccjs="$here/build/rcc.js"
 
 if [ -z "${EMSDK:-}" ] && [ -f "$HOME/emsdk/emsdk_env.sh" ]; then
@@ -18,10 +23,29 @@ if [ -z "${EMSDK:-}" ] && [ -f "$HOME/emsdk/emsdk_env.sh" ]; then
     EMSDK_QUIET=1 source "$HOME/emsdk/emsdk_env.sh" > /dev/null
 fi
 
-if [ ! -f "$rccjs" ]; then
-    echo "FAIL: $rccjs missing; run 'make build-wasm' first" >&2
+for required in "$cppjs" "$rccjs"; do
+    if [ ! -f "$required" ]; then
+        echo "FAIL: $required missing; run 'make build-wasm' first" >&2
+        exit 1
+    fi
+done
+
+inc1="$vendor/build/include"
+inc2="$vendor/build/gcc/include"
+if [ ! -d "$inc1" ] || [ ! -d "$inc2" ]; then
+    echo "FAIL: lcc include dirs missing; run 'make build-native' first" >&2
     exit 1
 fi
+
+# Same predefined macros and include search order the native lcc driver uses.
+CPP_FLAGS=(
+    -U__GNUC__ -D_POSIX_SOURCE -D__STRICT_ANSI__
+    -Dunix -Di386 -Dlinux
+    -D__unix__ -D__i386__ -D__linux__
+    -D__signed__=signed
+    -D__LCC__
+    -I"$inc1" -I"$inc2" -I/usr/include
+)
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -37,7 +61,13 @@ for c in "$fixtures"/*.c; do
     fi
     i="$tmp/$name.i"
     s="$tmp/$name.s"
-    "$here/scripts/preprocess.sh" "$c" "$i" 2> "$tmp/$name.cpp.err"
+
+    if ! node "$cppjs" "${CPP_FLAGS[@]}" "$c" "$i" > "$tmp/$name.cpp.out" 2>&1; then
+        echo "FAIL $name — wasm cpp failed"
+        sed 's/^/  | /' "$tmp/$name.cpp.out"
+        fail=$((fail+1))
+        continue
+    fi
     node "$rccjs" -target=x86/mov "$i" "$s" > "$tmp/$name.rcc.out" 2>&1 || true
     if [ ! -f "$s" ]; then
         echo "FAIL $name — wasm rcc produced no output"

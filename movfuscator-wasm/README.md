@@ -1,12 +1,15 @@
-# movfuscator → WebAssembly (Phase A)
+# movfuscator → WebAssembly (Phase A + B)
 
 WebAssembly port of [movfuscator](https://github.com/xoreaxeaxeax/movfuscator)'s
-code generator (`rcc`), so that compiling C to mov-only x86 assembly can run in
-any wasm runtime — including a browser tab on [x86.mov](../index.html).
+code generator and preprocessor, so that compiling C to mov-only x86 assembly
+can run in any wasm runtime — including a browser tab on [x86.mov](../index.html).
 
-**Phase A scope**: only `rcc` (the LCC backend that emits mov-only asm) is
-ported. Input is preprocessed C (`.i`); output is mov-only x86 assembly text.
-The preprocessor (`cpp`), assembler, and linker stay on the host.
+**Scope**:
+- Phase A: `rcc` (LCC backend emitting mov-only x86 asm) → `build/rcc.wasm`
+- Phase B: `cpp` (LCC's bundled C89 preprocessor) → `build/cpp.wasm`
+
+Input is raw C (`.c`); output is mov-only x86 assembly text. Assembler and
+linker still stay on the host (Phase C).
 
 ## Layout
 
@@ -17,10 +20,10 @@ movfuscator-wasm/
   tests/
     fixtures/      *.c programs the wasm rcc must compile
     goldens/       *.s output produced by native rcc, committed (TDD baseline)
-    run.sh         runs wasm rcc on each fixture, asserts byte-identical
+    run.sh         runs wasm cpp + wasm rcc on each fixture, asserts byte-identical
   Makefile         single entry point
   vendor/          (gitignored) upstream clone at pinned SHA
-  build/           (gitignored) wasm artifacts (rcc.js + rcc.wasm)
+  build/           (gitignored) wasm artifacts (rcc.{js,wasm}, cpp.{js,wasm})
 ```
 
 ## Quick start
@@ -31,14 +34,15 @@ movfuscator-wasm/
 #   - emsdk activated in $HOME/emsdk  (or EMSDK in env)
 
 make setup         # fetch upstream + apply patches
-make build-native  # build host rcc (also generates lburg outputs)
-make build-wasm    # build rcc.js + rcc.wasm
-make test          # assert wasm output == committed goldens
+make build-native  # build host rcc + cpp (also generates lburg outputs)
+make build-wasm    # build rcc.{js,wasm} + cpp.{js,wasm}
+make test          # full wasm pipeline (cpp → rcc) vs committed goldens
 ```
 
 ## TDD workflow
 
-The premise: **wasm rcc must produce byte-identical output to native rcc**.
+The premise: **the full wasm pipeline (wasm cpp + wasm rcc) on a .c fixture
+produces .s byte-identical to native LCC cpp + native rcc on the same input**.
 Any divergence is a bug. Tests are a `cmp` against committed golden files.
 
 ### Adding a new C fixture
@@ -57,7 +61,8 @@ per its attribution clause.
 
 ### Changing the wasm build
 
-1. Modify `scripts/build-wasm.sh` (or its inputs).
+1. Modify `scripts/build-wasm.sh` or `scripts/build-wasm-cpp.sh` (or their
+   inputs).
 2. `make build-wasm && make test`.
 3. If a test fails: either the change is a bug (fix it), or codegen
    legitimately changed (regen goldens with `make goldens`, review the
