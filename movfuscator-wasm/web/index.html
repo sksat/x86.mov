@@ -28,14 +28,15 @@
     margin: 0;
     font-size: 0.85rem;
   }
-  /* CodeMirror panes — match the look of pre.out (border, height). */
-  .cm-host {
-    border: 1px solid #ccc;
-    height: 24rem;
-    overflow: hidden;
-    background: #fafafa;
+  /* CodeMirror panes — match pre.out: grow with content up to 60 vh, then
+     CM's own scroller takes over. Min-height keeps short snippets from
+     collapsing next to the binary pane. */
+  .cm-host { border: 1px solid #ccc; background: #fafafa; }
+  .cm-host .cm-editor {
+      min-height: 24rem;
+      max-height: 60vh;
+      font-size: 0.85rem;
   }
-  .cm-host .cm-editor { height: 100%; font-size: 0.85rem; }
   .cm-host .cm-scroller { font-family: inherit; }
   .status { font-size: 0.85rem; color: #666; }
   .status.err { color: #b00; }
