@@ -31,8 +31,41 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
         0x89 => decode_mov_rm_r_32(bytes, /* dir_to_reg */ false),
         // mov r32, r/m32 — opcode 8B /r
         0x8B => decode_mov_rm_r_32(bytes, /* dir_to_reg */ true),
+        // mov r/m32, imm32 — opcode C7 /0
+        0xC7 => decode_mov_rm32_imm32(bytes),
         _ => Err(Fault::UnknownOpcode(b0)),
     }
+}
+
+fn decode_mov_rm32_imm32(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
+    let modrm_byte = *bytes.get(1).ok_or(Fault::DecodeTruncated)?;
+    let m = parse_modrm(modrm_byte);
+    // The ModR/M `reg` field is a /digit selector for C7. /0 is mov;
+    // other digits are reserved encodings (UD).
+    if m.reg != 0 {
+        return Err(Fault::UnknownOpcode(0xC7));
+    }
+    if m.mod_ == 0b11 {
+        let imm = read_u32_le(bytes, 2)?;
+        return Ok((
+            Insn::Mov {
+                dst: Operand::Reg32(Reg32::from_index(m.rm)),
+                src: Operand::Imm32(imm),
+            },
+            6,
+        ));
+    }
+    let (ea, ea_extra) = parse_effective_address_32(m.mod_, m.rm, &bytes[2..])?;
+    let imm_off = 2 + usize::from(ea_extra);
+    let imm = read_u32_le(bytes, imm_off)?;
+    let total_len = 2 + ea_extra + 4;
+    Ok((
+        Insn::Mov {
+            dst: Operand::Mem32(ea),
+            src: Operand::Imm32(imm),
+        },
+        total_len,
+    ))
 }
 
 /// Shared decoder for the two ModR/M-encoded 32-bit mov forms:
@@ -442,6 +475,43 @@ mod tests {
                 dst: Operand::Reg32(Reg32::Eax),
                 src: mem32_sib(Some(Reg32::Esp), None, 1, 4),
             }
+        );
+    }
+
+    // --- C7 /0 — mov r/m32, imm32 ---
+
+    #[test]
+    fn mov_mem_disp32_imm32_via_c7() {
+        // c7 05 78 56 34 12 ef be ad de
+        //   →  mov dword [0x12345678], 0xdeadbeef
+        let (insn, len) = decode(&[
+            0xc7, 0x05, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad, 0xde,
+        ])
+        .unwrap();
+        assert_eq!(len, 10);
+        assert_eq!(
+            insn,
+            Insn::Mov {
+                dst: mem32(0x1234_5678_i32),
+                src: Operand::Imm32(0xdead_beef),
+            }
+        );
+    }
+
+    #[test]
+    fn mov_reg_imm32_via_c7_mod11_is_equivalent_to_b8() {
+        // c7 c0 2a 00 00 00  →  mov eax, 42  (reg=000 mod=11 r/m=000)
+        let (insn, len) = decode(&[0xc7, 0xc0, 0x2a, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!(len, 6);
+        assert_eq!(insn, mov_r32_imm32(Reg32::Eax, 42));
+    }
+
+    #[test]
+    fn c7_with_nonzero_reg_field_is_reserved() {
+        // c7 /1 ... — /1 is not mov; reserved encoding.
+        assert_eq!(
+            decode(&[0xc7, 0xc8, 0x00, 0x00, 0x00, 0x00]).unwrap_err(),
+            Fault::UnknownOpcode(0xC7),
         );
     }
 
