@@ -71,6 +71,45 @@ pub enum Reg8 {
     Bh = 7,
 }
 
+impl Reg8 {
+    /// Map an encoded 3-bit register field (under no REX prefix) to the
+    /// corresponding 8-bit register.
+    ///
+    /// # Panics
+    /// Panics on values > 7.
+    #[must_use]
+    pub fn from_index(i: u8) -> Self {
+        match i {
+            0 => Self::Al,
+            1 => Self::Cl,
+            2 => Self::Dl,
+            3 => Self::Bl,
+            4 => Self::Ah,
+            5 => Self::Ch,
+            6 => Self::Dh,
+            7 => Self::Bh,
+            _ => panic!("Reg8::from_index: 3-bit field expected, got {i}"),
+        }
+    }
+
+    /// The 32-bit register this 8-bit register aliases, and the bit shift
+    /// at which its byte sits within that register's value (0 for low
+    /// bytes, 8 for AH/CH/DH/BH).
+    #[must_use]
+    pub fn parent(self) -> (Reg32, u8) {
+        match self {
+            Self::Al => (Reg32::Eax, 0),
+            Self::Cl => (Reg32::Ecx, 0),
+            Self::Dl => (Reg32::Edx, 0),
+            Self::Bl => (Reg32::Ebx, 0),
+            Self::Ah => (Reg32::Eax, 8),
+            Self::Ch => (Reg32::Ecx, 8),
+            Self::Dh => (Reg32::Edx, 8),
+            Self::Bh => (Reg32::Ebx, 8),
+        }
+    }
+}
+
 /// `base + index * scale + disp` — the general 32-bit effective address.
 ///
 /// Either or both of `base` / `index` may be absent. `scale` is 1, 2, 4,

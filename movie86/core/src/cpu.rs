@@ -6,7 +6,7 @@
 //! decoder remains usable by tracing / disassembly callers.
 
 use crate::decode::decode;
-use crate::insn::{EffectiveAddress, Insn, Operand, Reg32};
+use crate::insn::{EffectiveAddress, Insn, Operand, Reg32, Reg8};
 use crate::{Fault, Memory};
 
 /// Maximum length of any x86 instruction. Fetches read up to this many
@@ -58,15 +58,25 @@ impl Cpu {
     }
 
     /// Execute a `mov dst, src`. The decoder guarantees `dst` and `src`
-    /// have matching widths.
+    /// have matching widths. We dispatch on the *destination* width and
+    /// fault if `src` doesn't agree.
     fn exec_mov<M: Memory>(
         &mut self,
         dst: Operand,
         src: Operand,
         mem: &mut M,
     ) -> Result<(), Fault> {
-        let val = self.read_operand_u32(src, mem)?;
-        self.write_operand_u32(dst, val, mem)
+        match dst {
+            Operand::Reg32(_) | Operand::Mem32(_) => {
+                let v = self.read_operand_u32(src, mem)?;
+                self.write_operand_u32(dst, v, mem)
+            }
+            Operand::Reg8(_) | Operand::Mem8(_) => {
+                let v = self.read_operand_u8(src, mem)?;
+                self.write_operand_u8(dst, v, mem)
+            }
+            _ => Err(Fault::UnimplementedMov),
+        }
     }
 
     /// Read a 32-bit-wide source operand. Unsupported widths trap.
@@ -94,6 +104,49 @@ impl Cpu {
             Operand::Mem32(ea) => mem.write_u32(self.compute_ea(ea), val),
             _ => Err(Fault::UnimplementedMov),
         }
+    }
+
+    /// Read an 8-bit source operand.
+    fn read_operand_u8<M: Memory>(&self, op: Operand, mem: &M) -> Result<u8, Fault> {
+        match op {
+            Operand::Reg8(r) => Ok(self.read_reg8(r)),
+            Operand::Imm8(v) => Ok(v),
+            Operand::Mem8(ea) => mem.read_u8(self.compute_ea(ea)),
+            _ => Err(Fault::UnimplementedMov),
+        }
+    }
+
+    /// Write to an 8-bit destination operand.
+    fn write_operand_u8<M: Memory>(
+        &mut self,
+        op: Operand,
+        val: u8,
+        mem: &mut M,
+    ) -> Result<(), Fault> {
+        match op {
+            Operand::Reg8(r) => {
+                self.write_reg8(r, val);
+                Ok(())
+            }
+            Operand::Mem8(ea) => mem.write_u8(self.compute_ea(ea), val),
+            _ => Err(Fault::UnimplementedMov),
+        }
+    }
+
+    /// Read an 8-bit GPR. AH/CH/DH/BH alias the high byte of EAX/ECX/EDX/EBX;
+    /// AL/CL/DL/BL alias the low byte of the same registers.
+    fn read_reg8(&self, r: Reg8) -> u8 {
+        let (parent, shift) = r.parent();
+        ((self.reg(parent) >> shift) & 0xff) as u8
+    }
+
+    /// Write an 8-bit GPR, preserving the surrounding 24 bits of the
+    /// aliasing 32-bit register.
+    fn write_reg8(&mut self, r: Reg8, val: u8) {
+        let (parent, shift) = r.parent();
+        let mask = !(0xffu32 << shift);
+        let new = (self.reg(parent) & mask) | (u32::from(val) << shift);
+        self.set_reg(parent, new);
     }
 
     /// `base + index * scale + disp`, all modular over u32. `disp` is
@@ -218,6 +271,50 @@ mod tests {
         cpu.set_reg(Reg32::Ecx, 0x2001); // so [ecx - 1] = 0x2000
         cpu.step(&mut mem).unwrap();
         assert_eq!(cpu.reg(Reg32::Eax), 0xabcd_ef01);
+    }
+
+    // --- 8-bit mov ---
+
+    #[test]
+    fn step_mov_al_to_memory_writes_low_byte_only() {
+        // 88 05 00 20 00 00 → mov byte [0x2000], al
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x2000);
+        mem.write_bytes(0x1000, &[0x88, 0x05, 0x00, 0x20, 0x00, 0x00])
+            .unwrap();
+        mem.write_u32(0x2000, 0xdead_beef).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.set_reg(Reg32::Eax, 0x1234_56aa);
+        cpu.step(&mut mem).unwrap();
+        // Only byte 0 of 0x2000 should change; the surrounding 3 bytes
+        // are untouched.
+        assert_eq!(mem.read_u32(0x2000).unwrap(), 0xdead_beaa);
+    }
+
+    #[test]
+    fn step_mov_mem_to_al_preserves_upper_24_bits_of_eax() {
+        // 8a 05 00 20 00 00 → mov al, byte [0x2000]
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x2000);
+        mem.write_bytes(0x1000, &[0x8a, 0x05, 0x00, 0x20, 0x00, 0x00])
+            .unwrap();
+        mem.write_u8(0x2000, 0x77).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.set_reg(Reg32::Eax, 0x1234_5600);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.reg(Reg32::Eax), 0x1234_5677);
+    }
+
+    #[test]
+    fn mov_ah_writes_bits_15_8_not_low_byte() {
+        // 8a 25 00 20 00 00 → mov ah, byte [0x2000]
+        // ModR/M reg=4 (AH), mod=00, r/m=101 (disp32)
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x2000);
+        mem.write_bytes(0x1000, &[0x8a, 0x25, 0x00, 0x20, 0x00, 0x00])
+            .unwrap();
+        mem.write_u8(0x2000, 0xbb).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.set_reg(Reg32::Eax, 0x1234_5677);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.reg(Reg32::Eax), 0x1234_bb77, "AH should touch bits 15:8 only");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! flows through here so the same decoder can drive execution, a future
 //! disassembler, and any coverage tooling.
 
-use crate::insn::{EffectiveAddress, Insn, Operand, Reg32};
+use crate::insn::{EffectiveAddress, Insn, Operand, Reg32, Reg8};
 use crate::Fault;
 
 /// Decode one instruction from `bytes` starting at offset 0.
@@ -27,14 +27,47 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
                 5,
             ))
         }
+        // mov r/m8, r8 — opcode 88 /r
+        0x88 => decode_mov_rm_r_8(bytes, /* dir_to_reg */ false),
         // mov r/m32, r32 — opcode 89 /r
         0x89 => decode_mov_rm_r_32(bytes, /* dir_to_reg */ false),
+        // mov r8, r/m8 — opcode 8A /r
+        0x8A => decode_mov_rm_r_8(bytes, /* dir_to_reg */ true),
         // mov r32, r/m32 — opcode 8B /r
         0x8B => decode_mov_rm_r_32(bytes, /* dir_to_reg */ true),
         // mov r/m32, imm32 — opcode C7 /0
         0xC7 => decode_mov_rm32_imm32(bytes),
         _ => Err(Fault::UnknownOpcode(b0)),
     }
+}
+
+/// 8-bit twin of [`decode_mov_rm_r_32`]: handles `88 /r` and `8A /r`.
+/// Effective-address shape is identical to the 32-bit case (the address
+/// is always 32-bit; only the operand width differs), so the SIB / disp
+/// parser is shared.
+fn decode_mov_rm_r_8(bytes: &[u8], dir_to_reg: bool) -> Result<(Insn, u8), Fault> {
+    let modrm_byte = *bytes.get(1).ok_or(Fault::DecodeTruncated)?;
+    let m = parse_modrm(modrm_byte);
+    let reg_side = Operand::Reg8(Reg8::from_index(m.reg));
+
+    if m.mod_ == 0b11 {
+        let rm_side = Operand::Reg8(Reg8::from_index(m.rm));
+        let (dst, src) = if dir_to_reg {
+            (reg_side, rm_side)
+        } else {
+            (rm_side, reg_side)
+        };
+        return Ok((Insn::Mov { dst, src }, 2));
+    }
+
+    let (ea, ea_extra) = parse_effective_address_32(m.mod_, m.rm, &bytes[2..])?;
+    let rm_side = Operand::Mem8(ea);
+    let (dst, src) = if dir_to_reg {
+        (reg_side, rm_side)
+    } else {
+        (rm_side, reg_side)
+    };
+    Ok((Insn::Mov { dst, src }, 2 + ea_extra))
 }
 
 fn decode_mov_rm32_imm32(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
