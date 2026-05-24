@@ -62,12 +62,25 @@ if [ ! -f Makefile ]; then
         > configure.log 2>&1
 fi
 
+# Belt + suspenders for build-time helpers. configure-side CC_FOR_BUILD
+# above should be enough on a sensible host, but on the GitHub Actions
+# runner emconfigure still routed chew's compile through emcc, so:
+#   1. pre-build chew natively before make starts, so the rule's first
+#      "is up-to-date" check passes without invoking the CCLD recipe;
+#   2. pass CC_FOR_BUILD=cc to make explicitly so any other helper that
+#      needs rebuilding (genscripts, etc.) doesn't slip back to emcc.
+if [ ! -x "$build/bfd/doc/chew" ] || ! file "$build/bfd/doc/chew" | grep -q ELF; then
+    mkdir -p "$build/bfd/doc"
+    cc -O2 -o "$build/bfd/doc/chew" "$src/bfd/doc/chew.c"
+fi
+
 # all-gas pulls in libiberty, bfd, libsframe, opcodes etc. as
 # dependencies. NODERAWFS at link time lets the final binaries read host
 # paths directly from Node. Output is teed so any failure shows up in
 # CI logs (set -e + pipefail still fail the script on make's non-zero).
 emmake make -j"$(nproc)" \
     MAKEINFO=true \
+    CC_FOR_BUILD=cc \
     LDFLAGS="-sNODERAWFS=1 -sALLOW_MEMORY_GROWTH=1" \
     all-gas all-ld 2>&1 | tee "$build/build.log"
 
