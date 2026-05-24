@@ -14,6 +14,12 @@ including a browser tab on [x86.mov](../index.html).
   byte-identical ELF32 .o vs host /usr/bin/as
 - Phase D: `ld` (GNU binutils 2.44, same source tree as gas) →
   `build/ld.{js,wasm}`, byte-identical ELF32 executable vs host /usr/bin/ld
+- Phase E: Browser-mode `as` and `ld` (re-linked with MEMFS / ES6
+  modules) → `build/browser/{as,ld}.{js,wasm}`. The wrapper exposes
+  `assemble()` and `link()`; the demo gains **Download .o** and
+  **Download ELF** buttons. Link inputs (crt, softfloat32, libc, libm,
+  libgcc, ld-linux.so.2 — ~24 MB) live under `web/lib/` and are
+  lazy-fetched the first time the user clicks Download ELF.
 
 `.c → wasm cpp → .i → wasm rcc → .s → wasm as → .o → wasm ld → ELF`. The
 output is a real Linux x86_32 binary; on a host with multilib it runs
@@ -31,14 +37,18 @@ movfuscator-wasm/
     run.sh         node-mode pipeline test (NODERAWFS)
     browser.mjs    browser-mode pipeline test (MEMFS, via the wrapper)
   web/
-    movfuscator.mjs  ES-module wrapper: compile(c: string) → Promise<string>
-    index.html       in-browser demo (textarea → click → mov asm)
+    movfuscator.mjs  ES-module wrapper: compile / assemble / link
+    index.html       in-browser demo (Compile, Download .o, Download ELF)
+    md5.c, md5.h     md5 preset source (used by the demo's preset selector)
+    lib/             (gitignored) crt + libc + libgcc bundle for Download ELF
   Makefile         single entry point
   vendor/          (gitignored) upstream clone at pinned SHA
   build/           (gitignored) wasm artifacts
-    cpp.{js,wasm}, rcc.{js,wasm}         node-mode (NODERAWFS)
-    browser/cpp.{js,wasm}, rcc.{js,wasm} browser-mode (MEMFS, EXPORT_ES6)
-    embed-headers/                        collected /usr/include subset
+    cpp.{js,wasm}, rcc.{js,wasm}              node-mode (NODERAWFS)
+    as.{js,wasm}, ld.{js,wasm}                node-mode binutils
+    browser/cpp.{js,wasm}, rcc.{js,wasm}      browser cpp/rcc (MEMFS, ES6)
+    browser/as.{js,wasm}, ld.{js,wasm}        browser binutils (MEMFS, ES6)
+    embed-headers/                            collected /usr/include subset
 ```
 
 ## Quick start

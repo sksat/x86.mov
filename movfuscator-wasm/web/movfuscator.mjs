@@ -14,6 +14,7 @@
 import createMovCpp from '../build/browser/cpp.js';
 import createMovRcc from '../build/browser/rcc.js';
 import createMovAs  from '../build/browser/as.js';
+import createMovLd  from '../build/browser/ld.js';
 
 // Matches the predefined macros the native lcc driver passes to cpp.
 // Same set used by tests/run.sh so the wasm and native pipelines stay
@@ -90,4 +91,89 @@ export async function assemble(asm) {
         throw new Error(`as exited ${exit}\n${buf.joined()}`);
     }
     return as.FS.readFile('/out.o');  // Uint8Array
+}
+
+// MEMFS paths wasm-ld reads at link time. Each entry mirrors a real host
+// path: the wrapper writes the byte content at the same MEMFS location so
+// the link command line works unchanged.
+const LIB_PATHS = [
+    '/lib32/libc.so.6',
+    '/lib32/libm.so.6',
+    '/lib32/ld-linux.so.2',
+    '/lib/ld-linux.so.2',         // alias the libc.so script's AS_NEEDED expects
+    '/usr/lib32/libc.so',
+    '/usr/lib32/libm.so',
+    '/usr/lib32/libc_nonshared.a',
+    '/usr/lib/gcc/x86_64-linux-gnu/14/32/libgcc.a',
+    '/movfuscator/crt0.o',
+    '/movfuscator/crtf.o',
+    '/movfuscator/crtd.o',
+    '/movfuscator/softfloat32.o',
+];
+
+// Cached lib bundle promise — populated on the first link() call so the
+// ~24 MB worth of files only travels the network once per tab session.
+let cachedLibs = null;
+
+async function defaultFetchLibs() {
+    const base = new URL('./lib', import.meta.url);
+    const out = {};
+    await Promise.all(LIB_PATHS.map(async (p) => {
+        const url = new URL(p.replace(/^\//, ''), base + '/');
+        const buf = await fetch(url).then(r => {
+            if (!r.ok) throw new Error(`fetch ${url}: ${r.status}`);
+            return r.arrayBuffer();
+        });
+        out[p] = new Uint8Array(buf);
+    }));
+    return out;
+}
+
+/**
+ * Link an ELF32 i386 relocatable object into a dynamically-linked
+ * mov-only ELF executable.
+ *
+ * @param {Uint8Array} obj the .o produced by assemble()
+ * @param {Record<string,Uint8Array>} [libs]
+ *   Optional map of MEMFS path → byte content for every entry in
+ *   LIB_PATHS. If omitted, the wrapper lazy-fetches them once from
+ *   ./lib (caching the result for subsequent calls).
+ * @param {{name?: string}} [opts]
+ *   `name` is the basename used when staging the .o into MEMFS; it
+ *   shows up in the resulting ELF's symbol table (.symtab) so a real
+ *   filename is preferable to "user.o" if you want byte-identical
+ *   output vs a host link of the same file.
+ * @returns {Promise<Uint8Array>} ELF32 executable bytes
+ */
+export async function link(obj, libs, opts = {}) {
+    const { name = 'a.out.o' } = opts;
+    if (!libs) {
+        if (!cachedLibs) cachedLibs = defaultFetchLibs();
+        libs = await cachedLibs;
+    }
+    const buf = makeBuffered();
+    const ld = await createMovLd(buf.opts);
+    for (const [path, bytes] of Object.entries(libs)) {
+        const dir = path.substring(0, path.lastIndexOf('/'));
+        if (dir) try { ld.FS.mkdirTree(dir); } catch (e) { /* already exists */ }
+        ld.FS.writeFile(path, bytes);
+    }
+    const userPath = `/${name}`;
+    ld.FS.writeFile(userPath, obj);
+    const exit = ld.callMain([
+        '-m', 'elf_i386', '--hash-style=gnu',
+        '-dynamic-linker', '/lib/ld-linux.so.2',
+        '-L/movfuscator',
+        '-L/usr/lib/gcc/x86_64-linux-gnu/14/32',
+        '-L/usr/lib32', '-L/lib32',
+        '-lgcc', '-lc', '-lm',
+        '/movfuscator/crt0.o', userPath,
+        '/movfuscator/crtf.o', '/movfuscator/crtd.o',
+        '/movfuscator/softfloat32.o',
+        '-o', '/out.elf',
+    ]);
+    if (exit !== 0) {
+        throw new Error(`ld exited ${exit}\n${buf.joined()}`);
+    }
+    return ld.FS.readFile('/out.elf');
 }

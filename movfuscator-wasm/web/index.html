@@ -54,6 +54,7 @@
   </label>
   <button id="compile" class="primary">Compile →</button>
   <button id="download-o" disabled>Download .o</button>
+  <button id="download-elf" disabled>Download ELF</button>
   <span id="status" class="status">ready</span>
 </div>
 
@@ -69,7 +70,7 @@
 </div>
 
 <script type="module">
-import { compile, assemble } from './movfuscator.mjs';
+import { compile, assemble, link } from './movfuscator.mjs';
 
 const PRESETS = {
     return42: `int main(void) { return 42; }
@@ -139,9 +140,10 @@ $('preset').addEventListener('change', async (e) => {
     }
 });
 
-// Last successful compile's asm — used by Download .o so we don't re-run
-// the whole pipeline if the user just wants the object file.
+// Last successful compile's asm and cached .o — used by the download
+// buttons so each step doesn't redo earlier ones.
 let lastAsm = null;
+let lastObj = null;
 
 $('compile').addEventListener('click', async () => {
     const btn = $('compile');
@@ -149,10 +151,12 @@ $('compile').addEventListener('click', async () => {
     const out = $('out');
     btn.disabled = true;
     $('download-o').disabled = true;
+    $('download-elf').disabled = true;
     status.className = 'status';
     status.textContent = 'compiling…';
     out.textContent = '';
     lastAsm = null;
+    lastObj = null;
 
     const started = performance.now();
     try {
@@ -165,6 +169,7 @@ $('compile').addEventListener('click', async () => {
         out.textContent = asm;
         lastAsm = asm;
         $('download-o').disabled = false;
+        $('download-elf').disabled = false;
     } catch (err) {
         status.className = 'status err';
         status.textContent = 'compilation failed (see output pane)';
@@ -173,6 +178,21 @@ $('compile').addEventListener('click', async () => {
         btn.disabled = false;
     }
 });
+
+function triggerDownload(name, bytes, mime) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+async function ensureObj() {
+    if (lastObj) return lastObj;
+    lastObj = await assemble(lastAsm);
+    return lastObj;
+}
 
 $('download-o').addEventListener('click', async () => {
     const btn = $('download-o');
@@ -184,18 +204,38 @@ $('download-o').addEventListener('click', async () => {
     status.textContent = 'assembling…';
     const started = performance.now();
     try {
-        const obj = await assemble(lastAsm);
+        const obj = await ensureObj();
         const ms = Math.round(performance.now() - started);
-        const url = URL.createObjectURL(new Blob([obj], { type: 'application/x-object' }));
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'movfuscated.o';
-        a.click();
-        URL.revokeObjectURL(url);
+        triggerDownload('movfuscated.o', obj, 'application/x-object');
         status.textContent = `${prevText} · .o ready (${obj.length} bytes, ${ms} ms)`;
     } catch (err) {
         status.className = 'status err';
         status.textContent = `assemble failed: ${err.message || err}`;
+    } finally {
+        btn.disabled = false;
+    }
+});
+
+$('download-elf').addEventListener('click', async () => {
+    const btn = $('download-elf');
+    const status = $('status');
+    if (!lastAsm) return;
+    btn.disabled = true;
+    const prevText = status.textContent;
+    status.className = 'status';
+    // First click of the session pulls ~24 MB of system libs + crt files
+    // from ./lib — tell the user something is happening.
+    status.textContent = 'linking… (first run downloads ~24 MB of libs)';
+    const started = performance.now();
+    try {
+        const obj = await ensureObj();
+        const elf = await link(obj, undefined, { name: 'movfuscated.o' });
+        const ms = Math.round(performance.now() - started);
+        triggerDownload('movfuscated.elf', elf, 'application/x-executable');
+        status.textContent = `${prevText} · ELF ready (${(elf.length/1024/1024).toFixed(1)} MB, ${ms} ms)`;
+    } catch (err) {
+        status.className = 'status err';
+        status.textContent = `link failed: ${err.message || err}`;
     } finally {
         btn.disabled = false;
     }

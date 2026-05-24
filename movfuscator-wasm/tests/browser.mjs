@@ -27,6 +27,8 @@ const required = [
     join(buildDir, 'rcc.wasm'),
     join(buildDir, 'as.js'),
     join(buildDir, 'as.wasm'),
+    join(buildDir, 'ld.js'),
+    join(buildDir, 'ld.wasm'),
     wrapper,
 ];
 const missing = required.filter(p => !existsSync(p));
@@ -36,8 +38,38 @@ if (missing.length) {
     process.exit(1);
 }
 
-const { compile, assemble } = await import(wrapper);
+const { compile, assemble, link } = await import(wrapper);
 const goldensO = join(root, 'tests', 'goldens-o');
+const libDir = join(root, 'web', 'lib');
+
+// Pre-load the link libs from web/lib/ so we don't fetch them via HTTP in
+// Node tests. Same Uint8Array map the browser default-fetch produces.
+const LIB_PATHS = [
+    '/lib32/libc.so.6',
+    '/lib32/libm.so.6',
+    '/lib32/ld-linux.so.2',
+    '/lib/ld-linux.so.2',
+    '/usr/lib32/libc.so',
+    '/usr/lib32/libm.so',
+    '/usr/lib32/libc_nonshared.a',
+    '/usr/lib/gcc/x86_64-linux-gnu/14/32/libgcc.a',
+    '/movfuscator/crt0.o',
+    '/movfuscator/crtf.o',
+    '/movfuscator/crtd.o',
+    '/movfuscator/softfloat32.o',
+];
+let preloadedLibs = null;
+if (existsSync(libDir)) {
+    preloadedLibs = {};
+    for (const p of LIB_PATHS) {
+        const stagedPath = join(libDir, p.replace(/^\//, ''));
+        if (!existsSync(stagedPath)) {
+            console.error(`web/lib missing: ${stagedPath} — run 'make stage-link-libs'`);
+            process.exit(1);
+        }
+        preloadedLibs[p] = readFileSync(stagedPath);
+    }
+}
 
 const headerFiles = readdirSync(fixtures).filter(f => f.endsWith('.h'));
 const headers = Object.fromEntries(
@@ -115,6 +147,61 @@ for (const file of cFiles) {
         console.log(`FAIL ${name} — wasm .o differs from golden`);
         console.log(`  | golden=${expectedBytes.length} actual=${actualBytes.length}`);
         fail++;
+    }
+}
+
+if (preloadedLibs) {
+    console.log();
+    console.log('— link() (.o → ELF) —');
+    // Pre-stage required vendor build artifacts for native ld reference link.
+    const childProcess = await import('node:child_process');
+    const { spawnSync } = childProcess;
+    const B = join(root, 'vendor/movfuscator/build');
+    const SF = join(root, 'vendor/movfuscator/movfuscator/lib');
+
+    for (const file of cFiles) {
+        const name = basename(file, '.c');
+        const oPath = join(goldensO, `${name}.o`);
+        if (!existsSync(oPath)) {
+            console.log(`SKIP ${name} (no .o golden)`);
+            continue;
+        }
+        const obj = readFileSync(oPath);
+
+        // Reference: native ld linking the same .o + libs.
+        const tmpNativeElf = `/tmp/test-browser-${name}-native.elf`;
+        const native = spawnSync('/usr/bin/ld', [
+            '-m', 'elf_i386', '--hash-style=gnu',
+            '-dynamic-linker', '/lib/ld-linux.so.2',
+            '-L', B, '-L', `${B}/gcc/32`, '-L', '/usr/lib32', '-L', '/lib32',
+            '-lgcc', '-lc', '-lm',
+            `${B}/crt0.o`, oPath, `${B}/crtf.o`, `${B}/crtd.o`, `${SF}/softfloat32.o`,
+            '-o', tmpNativeElf,
+        ]);
+        if (native.status !== 0) {
+            console.log(`SKIP ${name} (native ld failed — likely missing host tooling)`);
+            continue;
+        }
+        const expected = readFileSync(tmpNativeElf);
+
+        let actual;
+        try {
+            actual = await link(obj, preloadedLibs, { name: `${name}.o` });
+        } catch (e) {
+            console.log(`FAIL ${name} — link threw:`);
+            console.log('  |', String(e.message || e).split('\n').join('\n  | '));
+            fail++;
+            continue;
+        }
+
+        if (actual.length === expected.length && actual.every((b, i) => b === expected[i])) {
+            console.log(`PASS ${name} (${actual.length} bytes)`);
+            pass++;
+        } else {
+            console.log(`FAIL ${name} — wasm ELF differs from native ld`);
+            console.log(`  | native=${expected.length} wasm=${actual.length}`);
+            fail++;
+        }
     }
 }
 
