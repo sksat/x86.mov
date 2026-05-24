@@ -51,7 +51,13 @@ if [ ! -f Makefile ]; then
     # tee instead of plain `> configure.log` so a configure failure
     # surfaces in CI logs (otherwise `make: Error 1` from this step is
     # opaque — happened on the first post-merge deploy run).
+    # --host=wasm32-unknown-emscripten makes autoconf treat this as a
+    # cross-build (build != host), skipping the "can we run a compiled
+    # program?" check that otherwise fails with emcc-produced wasm.
+    # emconfigure sets CC=emcc but doesn't pass --host on its own, so
+    # binutils' configure would see the native build triple and crash.
     emconfigure "$src/configure" \
+        --host=wasm32-unknown-emscripten \
         --target=i386-linux-gnu \
         --disable-werror --disable-nls --disable-shared \
         --disable-gold --disable-gdb --disable-gdbserver \
