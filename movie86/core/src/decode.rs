@@ -10,8 +10,9 @@ use crate::Fault;
 /// Decode one instruction from `bytes` starting at offset 0.
 ///
 /// On success returns the decoded instruction and the number of bytes it
-/// consumed. On failure returns a [`Fault`] describing what went wrong.
-pub fn decode(bytes: &[u8]) -> Result<(Insn, usize), Fault> {
+/// consumed. The length is `u8` because an x86 instruction is at most 15
+/// bytes — see Intel SDM Vol. 2 "Instruction Length Limit".
+pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
     let b0 = *bytes.first().ok_or(Fault::DecodeTruncated)?;
     match b0 {
         // mov r32, imm32 — opcode B8+rd id
@@ -89,7 +90,13 @@ mod tests {
         for (i, expected) in regs.iter().enumerate() {
             let opcode = 0xB8 + u8::try_from(i).unwrap();
             let (insn, _) = decode(&[opcode, 0, 0, 0, 0]).unwrap();
-            assert_eq!(insn, Insn::MovR32Imm32 { dst: *expected, imm: 0 });
+            assert_eq!(
+                insn,
+                Insn::MovR32Imm32 {
+                    dst: *expected,
+                    imm: 0
+                }
+            );
         }
     }
 

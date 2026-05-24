@@ -2,10 +2,12 @@
 
 extern crate alloc;
 
+pub mod cpu;
 pub mod decode;
 pub mod insn;
 pub mod mem;
 
+pub use cpu::Cpu;
 pub use decode::decode;
 pub use insn::{Insn, Reg32};
 pub use mem::{FlatMemory, Memory};
