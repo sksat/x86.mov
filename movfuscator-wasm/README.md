@@ -11,7 +11,7 @@ The preprocessor (`cpp`), assembler, and linker stay on the host.
 ## Layout
 
 ```
-wasm/
+movfuscator-wasm/
   scripts/         fetch / build / preprocess / golden-regen drivers
   patches/         local patches applied to upstream by fetch.sh
   tests/
