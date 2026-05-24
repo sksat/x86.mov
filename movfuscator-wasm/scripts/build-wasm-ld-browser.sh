@@ -29,13 +29,15 @@ mkdir -p "$out"
 
 cd "$build/ld"
 rm -f ld-new ld-new.wasm
+# tee — not `| tail` — so a failed relink shows its actual diagnostic
+# in CI logs. set -e + pipefail still aborts on emmake's non-zero.
 emmake make LDFLAGS="-sMODULARIZE=1 -sEXPORT_ES6=1 \
         -sEXPORT_NAME=createMovLd \
         -sENVIRONMENT=web,node,worker \
         -sFORCE_FILESYSTEM=1 -sEXIT_RUNTIME=1 -sALLOW_MEMORY_GROWTH=1 \
         -sINVOKE_RUN=0 \
         -sEXPORTED_RUNTIME_METHODS=['callMain','FS']" \
-    ld-new 2>&1 | tail -3
+    ld-new 2>&1 | tee "$build/relink-browser.log"
 
 cp ld-new      "$out/ld.js"
 cp ld-new.wasm "$out/ld.wasm"
@@ -43,7 +45,7 @@ sed -i "s/'ld-new\.wasm'/'ld.wasm'/g" "$out/ld.js"
 
 # Restore the NODERAWFS variant so 'make test-ld' keeps working.
 rm -f ld-new ld-new.wasm
-emmake make LDFLAGS="-sNODERAWFS=1 -sALLOW_MEMORY_GROWTH=1" ld-new 2>&1 | tail -3
+emmake make LDFLAGS="-sNODERAWFS=1 -sALLOW_MEMORY_GROWTH=1" ld-new 2>&1 | tee "$build/relink-noderawfs.log"
 cp ld-new      "$here/build/ld.js"
 cp ld-new.wasm "$here/build/ld.wasm"
 sed -i "s/'ld-new\.wasm'/'ld.wasm'/g" "$here/build/ld.js"

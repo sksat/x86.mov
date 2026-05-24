@@ -27,13 +27,15 @@ mkdir -p "$out"
 
 cd "$build/gas"
 rm -f as-new as-new.wasm
+# tee — not `| tail` — so a failed relink shows its actual diagnostic
+# in CI logs. set -e + pipefail still aborts on emmake's non-zero.
 emmake make LDFLAGS="-sMODULARIZE=1 -sEXPORT_ES6=1 \
         -sEXPORT_NAME=createMovAs \
         -sENVIRONMENT=web,node,worker \
         -sFORCE_FILESYSTEM=1 -sEXIT_RUNTIME=1 -sALLOW_MEMORY_GROWTH=1 \
         -sINVOKE_RUN=0 \
         -sEXPORTED_RUNTIME_METHODS=['callMain','FS']" \
-    as-new 2>&1 | tail -3
+    as-new 2>&1 | tee "$build/relink-browser.log"
 
 cp as-new      "$out/as.js"
 cp as-new.wasm "$out/as.wasm"
@@ -41,7 +43,7 @@ sed -i "s/'as-new\.wasm'/'as.wasm'/g" "$out/as.js"
 
 # Restore the NODERAWFS as-new (re-link so 'make test-as' keeps working).
 rm -f as-new as-new.wasm
-emmake make LDFLAGS="-sNODERAWFS=1 -sALLOW_MEMORY_GROWTH=1" as-new 2>&1 | tail -3
+emmake make LDFLAGS="-sNODERAWFS=1 -sALLOW_MEMORY_GROWTH=1" as-new 2>&1 | tee "$build/relink-noderawfs.log"
 cp as-new      "$here/build/as.js"
 cp as-new.wasm "$here/build/as.wasm"
 sed -i "s/'as-new\.wasm'/'as.wasm'/g" "$here/build/as.js"
