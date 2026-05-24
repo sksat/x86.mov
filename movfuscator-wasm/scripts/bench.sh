@@ -5,7 +5,7 @@
 #   native        host cpp + rcc + as + ld (the reference)
 #   wasm-node     build/{cpp,rcc,as,ld}.js under Node + NODERAWFS, one
 #                 subprocess per stage (typical CI shape)
-#   wasm-browser  web/movfuscator.mjs (MEMFS, fresh module per call) —
+#   wasm-browser  movfuscator.mjs (MEMFS, fresh module per call) —
 #                 the path users actually hit in the browser, minus the
 #                 over-the-network fetch
 #
@@ -25,7 +25,7 @@ wasm_cpp_js="$here/build/cpp.js"
 wasm_rcc_js="$here/build/rcc.js"
 wasm_as_js="$here/build/as.js"
 wasm_ld_js="$here/build/ld.js"
-browser_wrapper="$here/web/movfuscator.mjs"
+browser_wrapper="$here/movfuscator.mjs"
 B="$vendor/build"
 SF="$vendor/movfuscator/lib"
 
@@ -34,7 +34,7 @@ required=(
     "$wasm_cpp_js" "$wasm_rcc_js" "$wasm_as_js" "$wasm_ld_js"
     "$browser_wrapper"
     "$B/crt0.o" "$B/crtf.o" "$B/crtd.o" "$SF/softfloat32.o"
-    "$here/web/lib"
+    "$here/lib"
 )
 for p in "${required[@]}"; do
     if [ ! -e "$p" ]; then
@@ -99,7 +99,7 @@ results="$out/results.md"
     echo
     echo "- **native**: host \`cpp\`, \`rcc\`, \`/usr/bin/as\`, \`/usr/bin/ld\` (host x86_64)"
     echo "- **wasm-node**: \`build/{cpp,rcc,as,ld}.js\` under Node (NODERAWFS), one subprocess per stage"
-    echo "- **wasm-browser**: \`web/movfuscator.mjs\` under Node ESM (MEMFS — same code as in-browser, minus network fetch)"
+    echo "- **wasm-browser**: \`movfuscator.mjs\` under Node ESM (MEMFS — same code as in-browser, minus network fetch)"
     echo
     echo "| fixture | asm lines |"
     echo "|---|---:|"

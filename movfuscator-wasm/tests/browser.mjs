@@ -1,7 +1,7 @@
 // End-to-end browser-mode test runner.
 //
 // Drives the MEMFS-mode wasm pipeline (build/browser/cpp.{js,wasm} +
-// build/browser/rcc.{js,wasm}) via the JS wrapper at web/movfuscator.mjs.
+// build/browser/rcc.{js,wasm}) via the JS wrapper at movfuscator.mjs.
 // For every tests/fixtures/*.c, calls compile() and asserts the returned
 // string is byte-identical to the committed tests/goldens/*.s.
 //
@@ -16,7 +16,7 @@ import { dirname, join, basename } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const root = dirname(here);
 const buildDir = join(root, 'build', 'browser');
-const wrapper = join(root, 'web', 'movfuscator.mjs');
+const wrapper = join(root, 'movfuscator.mjs');
 const fixtures = join(root, 'tests', 'fixtures');
 const goldens = join(root, 'tests', 'goldens');
 
@@ -40,9 +40,9 @@ if (missing.length) {
 
 const { compile, assemble, link, LIB_PATHS } = await import(wrapper);
 const goldensO = join(root, 'tests', 'goldens-o');
-const libDir = join(root, 'web', 'lib');
+const libDir = join(root, 'lib');
 
-// Pre-load the link libs from web/lib/ so we don't fetch them via HTTP in
+// Pre-load the link libs from ./lib/ so we don't fetch them via HTTP in
 // Node tests. Same Uint8Array map the browser default-fetch produces;
 // the path list is the canonical one re-exported from the wrapper.
 let preloadedLibs = null;
@@ -51,7 +51,7 @@ if (existsSync(libDir)) {
     for (const p of LIB_PATHS) {
         const stagedPath = join(libDir, p.replace(/^\//, ''));
         if (!existsSync(stagedPath)) {
-            console.error(`web/lib missing: ${stagedPath} — run 'make stage-link-libs'`);
+            console.error(`lib/ missing: ${stagedPath} — run 'make stage-link-libs'`);
             process.exit(1);
         }
         preloadedLibs[p] = readFileSync(stagedPath);
