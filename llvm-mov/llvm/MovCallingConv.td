@@ -18,6 +18,11 @@ def RetCC_Mov : CallingConv<[
   CCIfType<[i32], CCAssignToReg<[EAX]>>
 ]>;
 
-// Callee-saved: cdecl says EBX, ESI, EDI, EBP. We keep ESP unsaved (stack
-// pointer) and EAX/ECX/EDX as scratch.
-def CSR_Mov : CalleeSavedRegs<(add EBX, ESI, EDI, EBP)>;
+// Callee-saved: cdecl ultimately wants EBX, ESI, EDI, EBP preserved across
+// calls — but until [[MovFrameLowering]] emits a real prologue/epilogue
+// (stage 4+) we cannot honour that contract. Advertising a CSR set we can't
+// preserve is worse than admitting none: register allocation would happily
+// hand a value EBX, the function would clobber it, and the caller's invariant
+// would break silently. Empty set keeps the contract truthful at stage 0–3;
+// re-add the cdecl set the same commit that lands prologue/epilogue.
+def CSR_Mov : CalleeSavedRegs<(add)>;

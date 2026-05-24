@@ -71,8 +71,37 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Resolve the effective triple. Three sources, in priority order:
+  //   1. explicit -mtriple on the command line
+  //   2. the input module's `target triple = "..."`
+  //   3. the cl::opt default ("mov-unknown-linux-gnu")
+  //
+  // Silently overwriting the module's triple (the old behaviour) would
+  // miscompile any frontend-produced IR — e.g. `rustc --emit=llvm-ir`
+  // emits `i686-...` and we'd reinterpret pointer/aggregate layout as
+  // a Mov module without diagnosing the mismatch. So if the module has
+  // a triple and the user did NOT pass -mtriple, we honour the module's
+  // — but its architecture must be `mov`, otherwise we refuse.
+  Triple TheTriple;
+  if (MTriple.getNumOccurrences() > 0) {
+    TheTriple = Triple(MTriple);
+  } else if (!M->getTargetTriple().str().empty()) {
+    TheTriple = M->getTargetTriple();
+  } else {
+    TheTriple = Triple(MTriple); // cl::opt default
+  }
+
+  // Refuse anything that isn't a Mov triple — both arch-name and
+  // legacy-arch-enum, since older IR can use either form.
+  if (TheTriple.getArchName() != "mov" &&
+      TheTriple.getArch() != Triple::UnknownArch) {
+    WithColor::error(errs(), argv[0])
+        << "input module triple '" << TheTriple.str()
+        << "' is not a Mov triple; pass -mtriple=mov-... to override.\n";
+    return 1;
+  }
+
   std::string ErrorString;
-  Triple TheTriple(MTriple);
   const Target *TheTarget =
       TargetRegistry::lookupTarget(/*ArchName=*/"mov", TheTriple, ErrorString);
   if (!TheTarget) {
@@ -89,6 +118,16 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Same story for data layout: if the module supplied one and it differs
+  // from ours, refuse rather than silently re-laying-out the program.
+  std::string TargetLayout = TM->createDataLayout().getStringRepresentation();
+  const std::string &ModuleLayout = M->getDataLayoutStr();
+  if (!ModuleLayout.empty() && ModuleLayout != TargetLayout) {
+    WithColor::error(errs(), argv[0])
+        << "input module data layout '" << ModuleLayout
+        << "' does not match the Mov target's '" << TargetLayout << "'.\n";
+    return 1;
+  }
   M->setDataLayout(TM->createDataLayout());
   M->setTargetTriple(TheTriple);
 
