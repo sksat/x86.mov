@@ -4,12 +4,14 @@ extern crate alloc;
 
 pub mod cpu;
 pub mod decode;
+pub mod elf;
 pub mod insn;
 pub mod mem;
 pub mod syscall;
 
 pub use cpu::Cpu;
 pub use decode::decode;
+pub use elf::{ElfError, LoadSegment, LoadedElf};
 pub use insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
 pub use mem::{FlatMemory, Memory};
 pub use syscall::{SyscallArgs, SyscallResult, SysHost};
