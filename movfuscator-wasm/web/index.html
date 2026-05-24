@@ -6,7 +6,7 @@
 <title>movfuscator-wasm</title>
 <style>
   :root { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; line-height: 1.4; }
-  body { margin: 0; padding: 1.5rem; max-width: 1600px; }
+  body { margin: 0; padding: 1.5rem; }
   h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
   p.intro { margin: 0 0 1rem; color: #555; font-size: 0.9rem; }
   p.intro a { color: #06c; }
@@ -26,9 +26,11 @@
   pre.out { min-height: 24rem; max-height: 60vh; overflow: auto; white-space: pre; margin: 0; font-size: 0.85rem; }
   .status { font-size: 0.85rem; color: #666; }
   .status.err { color: #b00; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
-  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr 1fr; } }
-  @media (max-width: 700px)  { .grid { grid-template-columns: 1fr; } }
+  /* minmax(0, 1fr) so a long unwrappable line in one pane doesn't push the
+     others narrower than their fair share. */
+  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 700px)  { .grid { grid-template-columns: minmax(0, 1fr); } }
   h2 { font-size: 0.95rem; margin: 0.5rem 0 0.25rem; color: #333; }
   .tabs { display: flex; gap: 0.25rem; margin: 0.5rem 0 0.25rem; }
   .tabs button {
