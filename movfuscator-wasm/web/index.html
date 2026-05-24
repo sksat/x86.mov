@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>movfuscator-wasm</title>
+<style>
+  :root { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; line-height: 1.4; }
+  body { margin: 0; padding: 1.5rem; max-width: 1200px; }
+  h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
+  p.intro { margin: 0 0 1rem; color: #555; font-size: 0.9rem; }
+  p.intro a { color: #06c; }
+  .controls { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; flex-wrap: wrap; }
+  button, select { font: inherit; padding: 0.35rem 0.7rem; }
+  button.primary { background: #1d6; border: 1px solid #0a5; color: white; cursor: pointer; }
+  button.primary:disabled { background: #aaa; border-color: #888; cursor: wait; }
+  textarea, pre.out {
+    box-sizing: border-box;
+    width: 100%;
+    font: inherit;
+    border: 1px solid #ccc;
+    padding: 0.5rem;
+    background: #fafafa;
+  }
+  textarea { min-height: 10rem; resize: vertical; }
+  pre.out { min-height: 24rem; max-height: 60vh; overflow: auto; white-space: pre; margin: 0; }
+  .status { font-size: 0.85rem; color: #666; }
+  .status.err { color: #b00; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  h2 { font-size: 0.95rem; margin: 0.5rem 0 0.25rem; color: #333; }
+</style>
+</head>
+<body>
+
+<h1>movfuscator-wasm</h1>
+<p class="intro">
+  Compile C to <code>mov</code>-only x86 assembly, right in your browser.
+  Powered by a wasm port of LCC + the
+  <a href="https://github.com/xoreaxeaxeax/movfuscator">M/o/Vfuscator</a> backend.
+  Source: <a href="https://github.com/sksat/x86.mov">github.com/sksat/x86.mov</a>.
+</p>
+
+<div class="controls">
+  <label>preset:
+    <select id="preset">
+      <option value="">(custom)</option>
+      <option value="return42">return 42</option>
+      <option value="hello" selected>Hello, mov</option>
+      <option value="sum10">sum 1..10</option>
+      <option value="prime">primes ≤ 100</option>
+    </select>
+  </label>
+  <button id="compile" class="primary">Compile →</button>
+  <span id="status" class="status">ready</span>
+</div>
+
+<div class="grid">
+  <div>
+    <h2>C source</h2>
+    <textarea id="src" spellcheck="false"></textarea>
+  </div>
+  <div>
+    <h2>mov-only x86 assembly</h2>
+    <pre id="out" class="out"></pre>
+  </div>
+</div>
+
+<script type="module">
+import { compile } from './movfuscator.mjs';
+
+const PRESETS = {
+    return42: `int main(void) { return 42; }
+`,
+    hello: `#include <stdio.h>
+
+int main(void) {
+    printf("Hello, mov!\\n");
+    return 0;
+}
+`,
+    sum10: `int main(void) {
+    int sum = 0;
+    int i;
+    for (i = 1; i <= 10; i++) sum = sum + i;
+    return sum;
+}
+`,
+    prime: `#include <stdio.h>
+
+int is_prime(int x) {
+    int i;
+    if (x < 2) return 0;
+    for (i = 2; i * i <= x; i++)
+        if (x % i == 0) return 0;
+    return 1;
+}
+
+int main(void) {
+    int i;
+    for (i = 2; i <= 100; i++)
+        if (is_prime(i)) printf("%d ", i);
+    printf("\\n");
+    return 0;
+}
+`,
+};
+
+const $ = (id) => document.getElementById(id);
+$('src').value = PRESETS.hello;
+
+$('preset').addEventListener('change', (e) => {
+    const k = e.target.value;
+    if (k && PRESETS[k]) $('src').value = PRESETS[k];
+});
+
+$('compile').addEventListener('click', async () => {
+    const btn = $('compile');
+    const status = $('status');
+    const out = $('out');
+    btn.disabled = true;
+    status.className = 'status';
+    status.textContent = 'compiling…';
+    out.textContent = '';
+
+    const started = performance.now();
+    try {
+        const asm = await compile($('src').value);
+        const ms = Math.round(performance.now() - started);
+        const lines = asm.split('\n').length - 1;
+        status.textContent = `done in ${ms} ms — ${lines} lines`;
+        out.textContent = asm;
+    } catch (err) {
+        status.className = 'status err';
+        status.textContent = `error: ${err.message || err}`;
+        out.textContent = '';
+    } finally {
+        btn.disabled = false;
+    }
+});
+</script>
+
+</body>
+</html>

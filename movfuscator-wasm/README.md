@@ -1,4 +1,4 @@
-# movfuscator → WebAssembly (Phase A + B)
+# movfuscator → WebAssembly
 
 WebAssembly port of [movfuscator](https://github.com/xoreaxeaxeax/movfuscator)'s
 code generator and preprocessor, so that compiling C to mov-only x86 assembly
@@ -7,6 +7,8 @@ can run in any wasm runtime — including a browser tab on [x86.mov](../index.ht
 **Scope**:
 - Phase A: `rcc` (LCC backend emitting mov-only x86 asm) → `build/rcc.wasm`
 - Phase B: `cpp` (LCC's bundled C89 preprocessor) → `build/cpp.wasm`
+- Phase A-2: Browser-mode (MEMFS, ES modules, embedded headers) →
+  `build/browser/{cpp,rcc}.{js,wasm}` + `web/movfuscator.mjs` + `web/index.html`
 
 Input is raw C (`.c`); output is mov-only x86 assembly text. Assembler and
 linker still stay on the host (Phase C).
@@ -20,10 +22,17 @@ movfuscator-wasm/
   tests/
     fixtures/      *.c programs the wasm rcc must compile
     goldens/       *.s output produced by native rcc, committed (TDD baseline)
-    run.sh         runs wasm cpp + wasm rcc on each fixture, asserts byte-identical
+    run.sh         node-mode pipeline test (NODERAWFS)
+    browser.mjs    browser-mode pipeline test (MEMFS, via the wrapper)
+  web/
+    movfuscator.mjs  ES-module wrapper: compile(c: string) → Promise<string>
+    index.html       in-browser demo (textarea → click → mov asm)
   Makefile         single entry point
   vendor/          (gitignored) upstream clone at pinned SHA
-  build/           (gitignored) wasm artifacts (rcc.{js,wasm}, cpp.{js,wasm})
+  build/           (gitignored) wasm artifacts
+    cpp.{js,wasm}, rcc.{js,wasm}         node-mode (NODERAWFS)
+    browser/cpp.{js,wasm}, rcc.{js,wasm} browser-mode (MEMFS, EXPORT_ES6)
+    embed-headers/                        collected /usr/include subset
 ```
 
 ## Quick start
@@ -33,17 +42,39 @@ movfuscator-wasm/
 #   - gcc-multilib, libc6-dev-i386  (apt)
 #   - emsdk activated in $HOME/emsdk  (or EMSDK in env)
 
-make setup         # fetch upstream + apply patches
-make build-native  # build host rcc + cpp (also generates lburg outputs)
-make build-wasm    # build rcc.{js,wasm} + cpp.{js,wasm}
-make test          # full wasm pipeline (cpp → rcc) vs committed goldens
+make setup                # fetch upstream + apply patches
+make build-native         # build host rcc + cpp (also generates lburg outputs)
+make build-wasm           # node-mode wasm artifacts (NODERAWFS)
+make build-wasm-browser   # browser-mode wasm artifacts (MEMFS, ES modules)
+make test                 # node pipeline vs goldens
+make test-browser         # browser pipeline (via web/movfuscator.mjs) vs goldens
+make serve                # python -m http.server 8080 → open /web/
 ```
 
 ## TDD workflow
 
-The premise: **the full wasm pipeline (wasm cpp + wasm rcc) on a .c fixture
-produces .s byte-identical to native LCC cpp + native rcc on the same input**.
+The premise: **the wasm pipeline (cpp + rcc) on a .c fixture produces .s
+byte-identical to native LCC cpp + native rcc on the same input**. This
+applies to both pipelines:
+
+| target          | pipeline                                  | runtime          |
+|-----------------|-------------------------------------------|------------------|
+| `make test`     | `build/cpp.js` + `build/rcc.js`           | Node (NODERAWFS) |
+| `make test-browser` | `web/movfuscator.mjs` (loads `build/browser/`) | Node ESM (MEMFS, same code as in-browser) |
+
 Any divergence is a bug. Tests are a `cmp` against committed golden files.
+
+### In-browser demo
+
+```sh
+make build-wasm-browser
+make serve
+# open http://localhost:8080/web/
+```
+
+The demo (`web/index.html`) shows a textarea → "Compile →" → live mov asm.
+Imports `./movfuscator.mjs` as an ES module; the wrapper instantiates fresh
+`createMovCpp` / `createMovRcc` per call.
 
 ### Adding a new C fixture
 

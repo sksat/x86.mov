@@ -1,5 +1,5 @@
 .PHONY: help setup build-native build-wasm build-wasm-rcc build-wasm-cpp \
-        build-wasm-browser goldens test test-browser clean distclean
+        build-wasm-browser goldens test test-browser serve clean distclean
 
 help:
 	@echo "Targets:"
@@ -12,6 +12,7 @@ help:
 	@echo "  goldens              regenerate tests/goldens/*.s with native rcc"
 	@echo "  test                 node pipeline test vs goldens"
 	@echo "  test-browser         browser pipeline test (via wrapper) vs goldens"
+	@echo "  serve                serve web/ + build/browser/ at http://localhost:8080"
 	@echo "  clean                remove build artifacts (keep vendor checkout)"
 	@echo "  distclean            remove build + vendor"
 
@@ -40,6 +41,10 @@ test:
 
 test-browser:
 	node tests/browser.mjs
+
+serve:
+	@echo "open http://localhost:8080/web/"
+	python3 -m http.server 8080
 
 clean:
 	rm -rf build
