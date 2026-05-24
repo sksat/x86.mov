@@ -48,6 +48,9 @@ if [ ! -f Makefile ]; then
     # to run on the build machine, not the wasm target. emconfigure sets
     # CC=emcc but leaves CC_FOR_BUILD inheriting the same value unless
     # we override it.
+    # tee instead of plain `> configure.log` so a configure failure
+    # surfaces in CI logs (otherwise `make: Error 1` from this step is
+    # opaque — happened on the first post-merge deploy run).
     emconfigure "$src/configure" \
         --target=i386-linux-gnu \
         --disable-werror --disable-nls --disable-shared \
@@ -59,7 +62,7 @@ if [ ! -f Makefile ]; then
         --disable-bootstrap \
         --without-zlib --without-zstd \
         CC_FOR_BUILD=cc \
-        > configure.log 2>&1
+        2>&1 | tee configure.log
 fi
 
 # Belt + suspenders for build-time helpers. configure-side CC_FOR_BUILD
