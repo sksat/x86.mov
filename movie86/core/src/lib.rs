@@ -2,8 +2,12 @@
 
 extern crate alloc;
 
+pub mod decode;
+pub mod insn;
 pub mod mem;
 
+pub use decode::decode;
+pub use insn::{Insn, Reg32};
 pub use mem::{FlatMemory, Memory};
 
 /// Reasons emulation can stop in a way the caller needs to handle.
@@ -14,4 +18,8 @@ pub use mem::{FlatMemory, Memory};
 pub enum Fault {
     /// Memory access to an address not covered by any mapped region.
     Unmapped(u32),
+    /// Ran out of bytes before a full instruction could be decoded.
+    DecodeTruncated,
+    /// First opcode byte is not in the supported set.
+    UnknownOpcode(u8),
 }
