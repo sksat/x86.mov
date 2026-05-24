@@ -27,6 +27,4 @@ pub enum Fault {
     /// `Mov` form that the executor doesn't yet know how to evaluate.
     /// Distinct from `UnknownOpcode` because the decoder already accepted it.
     UnimplementedMov,
-    /// ModR/M addressing form the decoder doesn't yet handle (e.g. SIB).
-    UnsupportedAddressing,
 }

@@ -221,6 +221,22 @@ mod tests {
     }
 
     #[test]
+    fn step_mov_via_sib_table_lookup() {
+        // 8b 0c 85 00 20 00 00 → mov ecx, [eax*4 + 0x2000]
+        // Mimics the table-dispatch pattern movfuscator emits everywhere.
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x2000);
+        mem.write_bytes(0x1000, &[0x8b, 0x0c, 0x85, 0x00, 0x20, 0x00, 0x00])
+            .unwrap();
+        // Table[3] = 0xfeedface at 0x2000 + 3*4 = 0x200c
+        mem.write_u32(0x200c, 0xfeed_face).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.set_reg(Reg32::Eax, 3);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.reg(Reg32::Ecx), 0xfeed_face);
+        assert_eq!(cpu.eip, 0x1007);
+    }
+
+    #[test]
     fn step_with_unmapped_eip_reports_unmapped_not_truncated() {
         // Region at 0x1000, but eip points at 0x2000 — fetch can't even
         // read byte 0. We must see Unmapped(0x2000), not DecodeTruncated.

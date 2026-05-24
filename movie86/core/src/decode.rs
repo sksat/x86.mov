@@ -84,69 +84,105 @@ fn parse_modrm(b: u8) -> ModRm {
 /// Parse the post-ModR/M bytes of a 32-bit memory operand.
 ///
 /// Returns the resolved effective address plus the number of extra bytes
-/// consumed (displacement and/or SIB). Caller is responsible for the
+/// consumed (SIB and/or displacement). Caller is responsible for the
 /// `mod=11` register-direct case before invoking this.
-///
-/// SIB-byte forms (`r/m == 0b100` with `mod != 0b11`) are not yet supported
-/// and trap with [`Fault::UnsupportedAddressing`].
 fn parse_effective_address_32(
     mod_: u8,
     rm: u8,
     rest: &[u8],
 ) -> Result<(EffectiveAddress, u8), Fault> {
-    // SIB byte indicator — handled by a separate commit.
     if rm == 0b100 {
-        return Err(Fault::UnsupportedAddressing);
+        // SIB byte follows the ModR/M byte.
+        let sib = *rest.first().ok_or(Fault::DecodeTruncated)?;
+        let (ea, disp_bytes) = parse_sib_address(mod_, sib, &rest[1..])?;
+        return Ok((ea, 1 + disp_bytes));
     }
 
     match mod_ {
         0b00 if rm == 0b101 => {
             // disp32 only — no base, no index.
             let disp = read_i32_le(rest, 0)?;
-            Ok((
-                EffectiveAddress {
-                    base: None,
-                    index: None,
-                    scale: 1,
-                    disp,
-                },
-                4,
-            ))
+            Ok((no_base_disp(disp), 4))
         }
-        0b00 => Ok((
-            EffectiveAddress {
-                base: Some(Reg32::from_index(rm)),
-                index: None,
-                scale: 1,
-                disp: 0,
-            },
-            0,
-        )),
+        0b00 => Ok((base_only(Reg32::from_index(rm)), 0)),
         0b01 => {
             let disp = i32::from(read_i8(rest, 0)?);
-            Ok((
-                EffectiveAddress {
-                    base: Some(Reg32::from_index(rm)),
-                    index: None,
-                    scale: 1,
-                    disp,
-                },
-                1,
-            ))
+            Ok((base_disp(Reg32::from_index(rm), disp), 1))
         }
         0b10 => {
             let disp = read_i32_le(rest, 0)?;
-            Ok((
-                EffectiveAddress {
-                    base: Some(Reg32::from_index(rm)),
-                    index: None,
-                    scale: 1,
-                    disp,
-                },
-                4,
-            ))
+            Ok((base_disp(Reg32::from_index(rm), disp), 4))
         }
         _ => unreachable!("mod=11 handled by caller"),
+    }
+}
+
+/// Parse the SIB-byte family of effective addresses. `rest` starts with
+/// the displacement bytes (if any) — the SIB byte itself has already been
+/// consumed by the caller. Returns the `EffectiveAddress` and the number
+/// of displacement bytes consumed (does NOT include the SIB byte).
+fn parse_sib_address(mod_: u8, sib: u8, rest: &[u8]) -> Result<(EffectiveAddress, u8), Fault> {
+    let scale = 1u8 << ((sib >> 6) & 0b11);
+    let index_field = (sib >> 3) & 0b111;
+    let base_field = sib & 0b111;
+
+    // index == 100 means "no index" (encoded ESP slot is reused as the
+    // sentinel — see Intel SDM Vol. 2A, Table 2-3).
+    let index = if index_field == 0b100 {
+        None
+    } else {
+        Some(Reg32::from_index(index_field))
+    };
+
+    // base == 101 with mod == 00 means "no base, disp32 follows".
+    // For mod == 01 / 10 the base IS EBP, with disp8 / disp32 as usual.
+    let (base, disp, disp_bytes) = match (mod_, base_field) {
+        (0b00, 0b101) => (None, read_i32_le(rest, 0)?, 4),
+        (0b00, b) => (Some(Reg32::from_index(b)), 0, 0),
+        (0b01, b) => (
+            Some(Reg32::from_index(b)),
+            i32::from(read_i8(rest, 0)?),
+            1,
+        ),
+        (0b10, b) => (Some(Reg32::from_index(b)), read_i32_le(rest, 0)?, 4),
+        _ => unreachable!("mod=11 has no SIB byte"),
+    };
+
+    Ok((
+        EffectiveAddress {
+            base,
+            index,
+            scale,
+            disp,
+        },
+        disp_bytes,
+    ))
+}
+
+fn no_base_disp(disp: i32) -> EffectiveAddress {
+    EffectiveAddress {
+        base: None,
+        index: None,
+        scale: 1,
+        disp,
+    }
+}
+
+fn base_only(base: Reg32) -> EffectiveAddress {
+    EffectiveAddress {
+        base: Some(base),
+        index: None,
+        scale: 1,
+        disp: 0,
+    }
+}
+
+fn base_disp(base: Reg32, disp: i32) -> EffectiveAddress {
+    EffectiveAddress {
+        base: Some(base),
+        index: None,
+        scale: 1,
+        disp,
     }
 }
 
@@ -333,13 +369,88 @@ mod tests {
         );
     }
 
+    // --- SIB ---
+
+    fn mem32_sib(
+        base: Option<Reg32>,
+        index: Option<Reg32>,
+        scale: u8,
+        disp: i32,
+    ) -> Operand {
+        Operand::Mem32(EffectiveAddress {
+            base,
+            index,
+            scale,
+            disp,
+        })
+    }
+
     #[test]
-    fn sib_form_currently_unsupported() {
-        // mod=00 r/m=100 means a SIB byte follows. Not yet implemented;
-        // we want a distinct fault, not UnknownOpcode.
+    fn sib_no_base_with_index_scale_disp32() {
+        // 8b 04 85 78 56 34 12  →  mov eax, [eax*4 + 0x12345678]
+        // reg=000 mod=00 r/m=100  SIB: ss=10 index=000 base=101  disp32
+        let (insn, len) = decode(&[0x8b, 0x04, 0x85, 0x78, 0x56, 0x34, 0x12]).unwrap();
+        assert_eq!(len, 7);
         assert_eq!(
-            decode(&[0x8b, 0x04, 0x00]).unwrap_err(),
-            Fault::UnsupportedAddressing,
+            insn,
+            Insn::Mov {
+                dst: Operand::Reg32(Reg32::Eax),
+                src: mem32_sib(None, Some(Reg32::Eax), 4, 0x1234_5678_i32),
+            }
+        );
+    }
+
+    #[test]
+    fn sib_base_plus_index_scale1() {
+        // 8b 14 0a  →  mov edx, [edx + ecx]
+        // reg=010 mod=00 r/m=100  SIB: ss=00 index=001 base=010
+        let (insn, len) = decode(&[0x8b, 0x14, 0x0a]).unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(
+            insn,
+            Insn::Mov {
+                dst: Operand::Reg32(Reg32::Edx),
+                src: mem32_sib(Some(Reg32::Edx), Some(Reg32::Ecx), 1, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn sib_base_esp_no_index() {
+        // 8b 04 24  →  mov eax, [esp]
+        // reg=000 mod=00 r/m=100  SIB: ss=00 index=100 (none) base=100 (esp)
+        let (insn, len) = decode(&[0x8b, 0x04, 0x24]).unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(
+            insn,
+            Insn::Mov {
+                dst: Operand::Reg32(Reg32::Eax),
+                src: mem32_sib(Some(Reg32::Esp), None, 1, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn sib_base_disp8() {
+        // 8b 44 24 04  →  mov eax, [esp + 4]
+        // reg=000 mod=01 r/m=100  SIB: ss=00 index=100 base=100  disp8=04
+        let (insn, len) = decode(&[0x8b, 0x44, 0x24, 0x04]).unwrap();
+        assert_eq!(len, 4);
+        assert_eq!(
+            insn,
+            Insn::Mov {
+                dst: Operand::Reg32(Reg32::Eax),
+                src: mem32_sib(Some(Reg32::Esp), None, 1, 4),
+            }
+        );
+    }
+
+    #[test]
+    fn sib_disp32_truncated_is_decode_error() {
+        // SIB with mod=00 base=101 (disp32) but disp truncated to 2 bytes
+        assert_eq!(
+            decode(&[0x8b, 0x04, 0x85, 0x78, 0x56]).unwrap_err(),
+            Fault::DecodeTruncated,
         );
     }
 
