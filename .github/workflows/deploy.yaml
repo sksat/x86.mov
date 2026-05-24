@@ -3,12 +3,15 @@ name: deploy
 on:
   push:
     branches: [mov]
+  pull_request:
+    branches: [mov]
   workflow_dispatch:
 
-# One in-flight production deploy at a time; new pushes cancel the
-# in-flight one rather than queueing.
+# Per-ref concurrency: a new push to the same branch/PR supersedes the
+# in-flight deploy for that ref, but production (mov) and a PR preview
+# don't fight each other.
 concurrency:
-  group: cloudflare-pages
+  group: cloudflare-pages-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -21,6 +24,11 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+      pull-requests: write   # for sticking the preview URL on the PR
+    # Skip deploys triggered by PRs from forks — they don't carry the
+    # secrets and would only ever fail. Same-repo PRs (our current
+    # workflow) and pushes to mov still run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
 
     steps:
       - uses: actions/checkout@v6.0.2
@@ -81,12 +89,43 @@ jobs:
         run: make stage-deploy
 
       - name: upload to Cloudflare Pages
+        id: deploy
         uses: cloudflare/wrangler-action@v4.0.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # `pages deploy` uploads the directory tree as-is. --project-name
-          # must match the existing Cloudflare Pages project (set in
-          # dashboard); --branch=mov keeps production-deploy behaviour.
-          command: pages deploy ../dist --project-name=x86-mov --branch=mov
+          # CF Pages production branch is configured on the dashboard
+          # (currently `mov`). `--branch=<head-ref>` makes other refs
+          # land as preview deployments at
+          # <head-ref>.x86-mov.pages.dev. github.head_ref is set on PR
+          # events, github.ref_name on push / workflow_dispatch.
+          command: |
+            pages deploy ../dist
+              --project-name=x86-mov
+              --branch=${{ github.head_ref || github.ref_name }}
           workingDirectory: movfuscator-wasm
+
+      - name: comment preview URL on PR
+        if: github.event_name == 'pull_request' && steps.deploy.outputs.deployment-url
+        uses: actions/github-script@v9.0.0
+        env:
+          URL: ${{ steps.deploy.outputs.deployment-url }}
+        with:
+          script: |
+            // Find an existing preview comment by its HTML-comment marker
+            // and edit it in place; otherwise post fresh. Keeps the PR
+            // thread from accumulating one comment per push.
+            const marker = '<!-- cloudflare-pages-preview -->';
+            const url = process.env.URL;
+            const body = `${marker}\n🚀 **Preview deployed**: ${url}\n\n- Root: ${url}/\n- movfuscator-wasm demo: ${url}/movfuscator-wasm/\n`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(
+              github.rest.issues.listComments, { owner, repo, issue_number }
+            );
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
