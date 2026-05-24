@@ -37,8 +37,21 @@ pub struct FlatMemory {
 
 impl FlatMemory {
     /// Allocate `size` zero bytes mapped at `base`.
+    ///
+    /// # Panics
+    /// Panics if the region would extend past the 32-bit address space
+    /// (`base + size > 1 << 32`) — guest pointers are `u32`, so a region
+    /// running past `0xffff_ffff` would expose bytes with no valid guest
+    /// address.
     #[must_use]
     pub fn new_zeroed(base: u32, size: usize) -> Self {
+        let end = u64::from(base)
+            .checked_add(size as u64)
+            .expect("FlatMemory size overflows u64");
+        assert!(
+            end <= u64::from(u32::MAX) + 1,
+            "FlatMemory region [{base:#x}, {base:#x}+{size:#x}) runs past the 32-bit address space"
+        );
         Self {
             base,
             bytes: vec![0u8; size],
@@ -179,6 +192,23 @@ mod tests {
             m.read_u32(0xffff_fffe).unwrap_err(),
             Fault::Unmapped(0xffff_fffe)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "runs past the 32-bit address space")]
+    fn region_extending_past_4gb_is_rejected_at_construction() {
+        // Bytes 2 and 3 of this region would live at 0x1_0000_0000 and
+        // 0x1_0000_0001 — addresses with no valid u32 representation.
+        // The constructor must refuse rather than letting later accesses
+        // wrap silently.
+        let _ = FlatMemory::new_zeroed(0xffff_fffe, 4);
+    }
+
+    #[test]
+    fn region_filling_exactly_to_top_is_allowed() {
+        // 0xffff_fff0..=0xffff_ffff is a valid 16-byte region.
+        let m = FlatMemory::new_zeroed(0xffff_fff0, 16);
+        assert_eq!(m.len(), 16);
     }
 
     #[test]

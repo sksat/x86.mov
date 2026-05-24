@@ -44,7 +44,7 @@ impl Cpu {
     /// `eip` by the instruction's encoded length.
     pub fn step<M: Memory>(&mut self, mem: &mut M) -> Result<(), Fault> {
         let mut buf = [0u8; MAX_INSN_LEN];
-        let n = fetch(mem, self.eip, &mut buf);
+        let n = fetch(mem, self.eip, &mut buf)?;
         let (insn, len) = decode(&buf[..n])?;
         self.execute(insn, mem)?;
         self.eip = self.eip.wrapping_add(u32::from(len));
@@ -113,16 +113,21 @@ impl Cpu {
 /// Greedy fetch: copy up to `buf.len()` bytes starting at `addr`, stopping
 /// at the first byte that faults. Used so an instruction near the end of a
 /// mapped region still decodes if enough bytes are available.
-fn fetch<M: Memory>(mem: &M, addr: u32, buf: &mut [u8]) -> usize {
+///
+/// Returns the original fault if even the **first** byte is unmapped —
+/// otherwise an unmapped `eip` would degenerate into `DecodeTruncated`
+/// and hide a bad-PC bug.
+fn fetch<M: Memory>(mem: &M, addr: u32, buf: &mut [u8]) -> Result<usize, Fault> {
     for (i, slot) in buf.iter_mut().enumerate() {
         // MAX_INSN_LEN is 15 so `i` always fits in u32.
         let off = u32::try_from(i).unwrap_or(u32::MAX);
         match mem.read_u8(addr.wrapping_add(off)) {
             Ok(b) => *slot = b,
-            Err(_) => return i,
+            Err(e) if i == 0 => return Err(e),
+            Err(_) => return Ok(i),
         }
     }
-    buf.len()
+    Ok(buf.len())
 }
 
 #[cfg(test)]
@@ -213,6 +218,15 @@ mod tests {
         cpu.set_reg(Reg32::Ecx, 0x2001); // so [ecx - 1] = 0x2000
         cpu.step(&mut mem).unwrap();
         assert_eq!(cpu.reg(Reg32::Eax), 0xabcd_ef01);
+    }
+
+    #[test]
+    fn step_with_unmapped_eip_reports_unmapped_not_truncated() {
+        // Region at 0x1000, but eip points at 0x2000 — fetch can't even
+        // read byte 0. We must see Unmapped(0x2000), not DecodeTruncated.
+        let mut mem = FlatMemory::new_zeroed(0x1000, 16);
+        let mut cpu = Cpu::new(0x2000);
+        assert_eq!(cpu.step(&mut mem).unwrap_err(), Fault::Unmapped(0x2000));
     }
 
     #[test]
