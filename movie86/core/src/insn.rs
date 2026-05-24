@@ -54,6 +54,42 @@ pub enum Reg16 {
     Di = 7,
 }
 
+impl Reg16 {
+    /// Map an encoded 3-bit register field to the corresponding 16-bit register.
+    ///
+    /// # Panics
+    /// Panics on values > 7.
+    #[must_use]
+    pub fn from_index(i: u8) -> Self {
+        match i {
+            0 => Self::Ax,
+            1 => Self::Cx,
+            2 => Self::Dx,
+            3 => Self::Bx,
+            4 => Self::Sp,
+            5 => Self::Bp,
+            6 => Self::Si,
+            7 => Self::Di,
+            _ => panic!("Reg16::from_index: 3-bit field expected, got {i}"),
+        }
+    }
+
+    /// The 32-bit register this 16-bit register aliases (always the low half).
+    #[must_use]
+    pub fn parent(self) -> Reg32 {
+        match self {
+            Self::Ax => Reg32::Eax,
+            Self::Cx => Reg32::Ecx,
+            Self::Dx => Reg32::Edx,
+            Self::Bx => Reg32::Ebx,
+            Self::Sp => Reg32::Esp,
+            Self::Bp => Reg32::Ebp,
+            Self::Si => Reg32::Esi,
+            Self::Di => Reg32::Edi,
+        }
+    }
+}
+
 /// 8-bit general-purpose register.
 ///
 /// Index 0..=3 are low bytes of EAX/ECX/EDX/EBX; 4..=7 are high bytes of

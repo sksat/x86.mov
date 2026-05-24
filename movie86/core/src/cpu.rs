@@ -6,7 +6,7 @@
 //! decoder remains usable by tracing / disassembly callers.
 
 use crate::decode::decode;
-use crate::insn::{EffectiveAddress, Insn, Operand, Reg32, Reg8};
+use crate::insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
 use crate::{Fault, Memory};
 
 /// Maximum length of any x86 instruction. Fetches read up to this many
@@ -71,6 +71,10 @@ impl Cpu {
                 let v = self.read_operand_u32(src, mem)?;
                 self.write_operand_u32(dst, v, mem)
             }
+            Operand::Reg16(_) | Operand::Mem16(_) => {
+                let v = self.read_operand_u16(src, mem)?;
+                self.write_operand_u16(dst, v, mem)
+            }
             Operand::Reg8(_) | Operand::Mem8(_) => {
                 let v = self.read_operand_u8(src, mem)?;
                 self.write_operand_u8(dst, v, mem)
@@ -104,6 +108,45 @@ impl Cpu {
             Operand::Mem32(ea) => mem.write_u32(self.compute_ea(ea), val),
             _ => Err(Fault::UnimplementedMov),
         }
+    }
+
+    /// Read a 16-bit source operand.
+    fn read_operand_u16<M: Memory>(&self, op: Operand, mem: &M) -> Result<u16, Fault> {
+        match op {
+            Operand::Reg16(r) => Ok(self.read_reg16(r)),
+            Operand::Imm16(v) => Ok(v),
+            Operand::Mem16(ea) => mem.read_u16(self.compute_ea(ea)),
+            _ => Err(Fault::UnimplementedMov),
+        }
+    }
+
+    /// Write to a 16-bit destination operand.
+    fn write_operand_u16<M: Memory>(
+        &mut self,
+        op: Operand,
+        val: u16,
+        mem: &mut M,
+    ) -> Result<(), Fault> {
+        match op {
+            Operand::Reg16(r) => {
+                self.write_reg16(r, val);
+                Ok(())
+            }
+            Operand::Mem16(ea) => mem.write_u16(self.compute_ea(ea), val),
+            _ => Err(Fault::UnimplementedMov),
+        }
+    }
+
+    /// Read the low 16 bits of the parent 32-bit register.
+    fn read_reg16(&self, r: Reg16) -> u16 {
+        (self.reg(r.parent()) & 0xffff) as u16
+    }
+
+    /// Write the low 16 bits, preserving the upper 16 bits.
+    fn write_reg16(&mut self, r: Reg16, val: u16) {
+        let parent = r.parent();
+        let new = (self.reg(parent) & 0xffff_0000) | u32::from(val);
+        self.set_reg(parent, new);
     }
 
     /// Read an 8-bit source operand.
@@ -274,6 +317,37 @@ mod tests {
     }
 
     // --- 8-bit mov ---
+
+    // --- 16-bit mov (66 prefix) ---
+
+    #[test]
+    fn step_movw_mem_to_ax_preserves_upper_16_bits_of_eax() {
+        // 66 8b 05 00 20 00 00 → mov ax, word [0x2000]
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x2000);
+        mem.write_bytes(0x1000, &[0x66, 0x8b, 0x05, 0x00, 0x20, 0x00, 0x00])
+            .unwrap();
+        mem.write_u16(0x2000, 0xabcd).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.set_reg(Reg32::Eax, 0xdead_0000);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.reg(Reg32::Eax), 0xdead_abcd);
+        assert_eq!(cpu.eip, 0x1007);
+    }
+
+    #[test]
+    fn step_movw_ax_to_memory_writes_low_word_only() {
+        // 66 89 05 00 20 00 00 → mov word [0x2000], ax
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x2000);
+        mem.write_bytes(0x1000, &[0x66, 0x89, 0x05, 0x00, 0x20, 0x00, 0x00])
+            .unwrap();
+        mem.write_u32(0x2000, 0xdead_beef).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.set_reg(Reg32::Eax, 0x1234_5678);
+        cpu.step(&mut mem).unwrap();
+        // Bytes 0,1 at 0x2000 should be 0x78, 0x56 (low word of EAX, LE).
+        // Upper word at 0x2002..0x2004 untouched.
+        assert_eq!(mem.read_u32(0x2000).unwrap(), 0xdead_5678);
+    }
 
     #[test]
     fn step_mov_al_to_memory_writes_low_byte_only() {
