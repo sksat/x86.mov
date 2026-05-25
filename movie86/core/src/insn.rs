@@ -185,4 +185,12 @@ pub enum Insn {
     /// `int n` (opcode `CD ib`) — software interrupt. Only `int 0x80`
     /// (Linux syscall) is wired to a handler; other vectors trap.
     Int(u8),
+    /// `push r32` (opcode `50+rd`). Decrements ESP by 4 then stores the
+    /// register; for `push esp` the stored value is the **original** ESP
+    /// (Intel SDM, modern post-8086 behavior).
+    PushR32(Reg32),
+    /// `pop r32` (opcode `58+rd`). Loads `[esp]` into the register and
+    /// increments ESP by 4. For `pop esp` the final ESP is the popped
+    /// value, not `old_esp + 4`.
+    PopR32(Reg32),
 }

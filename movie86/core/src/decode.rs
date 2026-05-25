@@ -55,6 +55,16 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
             let n = *rest.get(1).ok_or(Fault::DecodeTruncated)?;
             (Insn::Int(n), 2)
         }
+        // push r32 — opcode 50+rd
+        (false, 0x50..=0x57) => {
+            let r = Reg32::from_index(opcode - 0x50);
+            (Insn::PushR32(r), 1)
+        }
+        // pop r32 — opcode 58+rd
+        (false, 0x58..=0x5F) => {
+            let r = Reg32::from_index(opcode - 0x58);
+            (Insn::PopR32(r), 1)
+        }
         _ => return Err(Fault::UnknownOpcode(opcode)),
     };
     Ok((insn, body_len + prefix_len))

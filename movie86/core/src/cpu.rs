@@ -89,6 +89,26 @@ impl Cpu {
                 }
             }
             Insn::Int(n) => Err(Fault::UnsupportedInterrupt(n)),
+            Insn::PushR32(r) => {
+                // Read the value BEFORE moving ESP — for `push esp`,
+                // the pushed value must be the original ESP (Intel
+                // SDM: post-8086 behavior).
+                let val = self.reg(r);
+                let new_esp = self.reg(Reg32::Esp).wrapping_sub(4);
+                mem.write_u32(new_esp, val)?;
+                self.set_reg(Reg32::Esp, new_esp);
+                Ok(next_eip_default)
+            }
+            Insn::PopR32(r) => {
+                let esp = self.reg(Reg32::Esp);
+                let val = mem.read_u32(esp)?;
+                // Increment ESP first, then write the destination. If
+                // r == Esp, the final write to ESP wins — so the new
+                // ESP is the popped value, matching Intel SDM "pop esp".
+                self.set_reg(Reg32::Esp, esp.wrapping_add(4));
+                self.set_reg(r, val);
+                Ok(next_eip_default)
+            }
         }
     }
 
@@ -513,6 +533,58 @@ mod tests {
         );
     }
 
+    // --- push / pop ---
+
+    /// Place an instruction sequence at `entry`, allocate a stack
+    /// adjacent to it, and seed ESP at the top.
+    fn cpu_with_stack(entry: u32, program: &[u8], stack_size: u32) -> (Cpu, FlatMemory) {
+        let total = u32::try_from(program.len()).unwrap() + stack_size;
+        let mut mem = FlatMemory::new_zeroed(entry, total as usize);
+        mem.write_bytes(entry, program).unwrap();
+        let mut cpu = Cpu::new(entry);
+        cpu.set_reg(Reg32::Esp, entry + total);
+        (cpu, mem)
+    }
+
+    #[test]
+    fn step_push_pop_roundtrip_preserves_value_and_esp() {
+        // 50 → push eax ; 5b → pop ebx
+        let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[0x50, 0x5b], 64);
+        let initial_esp = cpu.reg(Reg32::Esp);
+        cpu.set_reg(Reg32::Eax, 0xdead_beef);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.reg(Reg32::Esp), initial_esp - 4);
+        assert_eq!(mem.read_u32(initial_esp - 4).unwrap(), 0xdead_beef);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.reg(Reg32::Ebx), 0xdead_beef);
+        assert_eq!(cpu.reg(Reg32::Esp), initial_esp);
+    }
+
+    #[test]
+    fn push_esp_stores_original_esp() {
+        // 54 → push esp ; the value pushed is the ORIGINAL esp,
+        // not the post-decrement esp (Intel SDM, post-8086 behavior).
+        let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[0x54], 64);
+        let initial_esp = cpu.reg(Reg32::Esp);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(mem.read_u32(initial_esp - 4).unwrap(), initial_esp);
+        assert_eq!(cpu.reg(Reg32::Esp), initial_esp - 4);
+    }
+
+    #[test]
+    fn pop_esp_replaces_esp_with_popped_value() {
+        // 5c → pop esp ; final esp is the popped value, not old + 4.
+        // Manually shift ESP to simulate a prior push, then plant the
+        // value that pop will read at the new top of stack.
+        let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[0x5c], 64);
+        let top = cpu.reg(Reg32::Esp);
+        let pushed_addr = top - 4;
+        cpu.set_reg(Reg32::Esp, pushed_addr);
+        mem.write_u32(pushed_addr, 0xcafe_d00d).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.reg(Reg32::Esp), 0xcafe_d00d);
+    }
+
     // --- jmp + int ---
 
     #[test]
@@ -575,6 +647,25 @@ mod tests {
     }
 
     proptest! {
+        /// For every (push reg, pop reg) pair (excluding ESP, which has
+        /// special-case semantics tested separately): pushing X then
+        /// popping recovers X and ESP nets out to its starting value.
+        #[test]
+        fn pbt_push_pop_roundtrip(src_idx in 0u8..8, dst_idx in 0u8..8, val: u32) {
+            let src = Reg32::from_index(src_idx);
+            let dst = Reg32::from_index(dst_idx);
+            prop_assume!(src != Reg32::Esp && dst != Reg32::Esp);
+            let push = 0x50 + src_idx;
+            let pop = 0x58 + dst_idx;
+            let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[push, pop], 64);
+            let initial_esp = cpu.reg(Reg32::Esp);
+            cpu.set_reg(src, val);
+            cpu.step(&mut mem, &mut PanicHost).unwrap();
+            cpu.step(&mut mem, &mut PanicHost).unwrap();
+            prop_assert_eq!(cpu.reg(dst), val);
+            prop_assert_eq!(cpu.reg(Reg32::Esp), initial_esp);
+        }
+
         /// For every encoding of `mov r32, imm32`:
         /// - the named register receives `imm`,
         /// - every other register is unchanged from its initial value,
