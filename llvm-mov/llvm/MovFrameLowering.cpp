@@ -58,3 +58,29 @@ void MovFrameLowering::emitEpilogue(MachineFunction &MF,
   //   pop  ebp
   BuildMI(MBB, MBBI, DL, TII.get(Mov::POP32r), Mov::EBP);
 }
+
+MachineBasicBlock::iterator
+MovFrameLowering::eliminateCallFramePseudoInstr(
+    MachineFunction &MF, MachineBasicBlock &MBB,
+    MachineBasicBlock::iterator MI) const {
+  const auto &STI = MF.getSubtarget<MovSubtarget>();
+  const TargetInstrInfo &TII = *STI.getInstrInfo();
+
+  // Operand 0 of ADJCALLSTACKDOWN/UP is the byte count for that side of the
+  // call frame. cdecl is caller-cleaned, so the same byte count goes both
+  // ways; operand 1 (the callee-pop amount) is always 0 for us.
+  const uint64_t Amount = MI->getOperand(0).getImm();
+  const DebugLoc DL = MI->getDebugLoc();
+  const unsigned Opc = MI->getOpcode();
+
+  if (Amount > 0) {
+    //  DOWN -> reserve   args:  sub esp, Amount
+    //  UP   -> release   args:  add esp, Amount
+    const unsigned RealOp =
+        (Opc == Mov::ADJCALLSTACKDOWN) ? Mov::SUB32ri : Mov::ADD32ri;
+    BuildMI(MBB, MI, DL, TII.get(RealOp), Mov::ESP)
+        .addReg(Mov::ESP)
+        .addImm(Amount);
+  }
+  return MBB.erase(MI);
+}

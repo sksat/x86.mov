@@ -52,10 +52,11 @@ public:
 
   void Select(SDNode *Node) override;
 
-  // Address-mode selector referenced from MovInstrInfo.td's `addr_fi`
-  // ComplexPattern. Stage 2 only matches plain FrameIndex addresses;
-  // (base+disp) and (base+index*scale) come in at later stages.
-  bool SelectAddrFI(SDValue Addr, SDValue &Base, SDValue &Disp);
+  // Address-mode selector for MovInstrInfo.td's `addr` ComplexPattern.
+  // Matches plain FrameIndex (stage 2/4 form), FrameIndex + imm
+  // displacement (stage 4 spill/local), and reg + imm displacement
+  // (stage 6a outgoing-arg stores via ESP).
+  bool SelectAddr(SDValue Addr, SDValue &Base, SDValue &Disp);
 
 // Auto-generated `SelectCode` (used by `Select`).
 #include "MovGenDAGISel.inc"
@@ -78,6 +79,33 @@ public:
 char MovDAGToDAGISelLegacy::ID = 0;
 
 void MovDAGToDAGISel::Select(SDNode *Node) {
+  // MovISD::CALL: emit
+  //     CALL32d <callee_symbol>     ; Uses=[ESP], Defs=[EAX/ECX/EDX/EFLAGS]
+  //
+  // The original SDNode operands are (Chain, Callee, RegMask[, ...InGlue]).
+  // We rebuild the machine-node operand list as
+  //     (Callee, RegMask, Chain[, ...InGlue])
+  // — Callee first because it's our only explicit input on CALL32d, then
+  // the regmask + the chain/glue tail as implicit attachments.
+  if (Node->getOpcode() == MovISD::CALL) {
+    SDLoc DL(Node);
+    SDValue Chain  = Node->getOperand(0);
+    SDValue Callee = Node->getOperand(1);
+
+    SmallVector<SDValue, 8> Ops;
+    Ops.push_back(Callee);
+    // Forward regmask + any other tail operands (chain glue from earlier
+    // CopyToReg sequences) verbatim.
+    for (unsigned i = 2, e = Node->getNumOperands(); i != e; ++i)
+      Ops.push_back(Node->getOperand(i));
+    Ops.push_back(Chain);
+
+    SDVTList NodeTys = CurDAG->getVTList(MVT::Other, MVT::Glue);
+    SDNode *MICall = CurDAG->getMachineNode(Mov::CALL32d, DL, NodeTys, Ops);
+    ReplaceNode(Node, MICall);
+    return;
+  }
+
   // MovISD::BR_CC: emit
   //     CMP32r{r,i} LHS, RHS    ; Defs = [EFLAGS]   (glue1)
   //     Jcc<CC> target          ; Uses = [EFLAGS]   (consumes glue1)
@@ -162,14 +190,40 @@ void MovDAGToDAGISel::Select(SDNode *Node) {
   SelectCode(Node);
 }
 
-bool MovDAGToDAGISel::SelectAddrFI(SDValue Addr, SDValue &Base, SDValue &Disp) {
+bool MovDAGToDAGISel::SelectAddr(SDValue Addr, SDValue &Base, SDValue &Disp) {
+  const SDLoc DL(Addr);
+  const EVT PtrTy = TLI->getPointerTy(CurDAG->getDataLayout());
+
+  // Case 1: plain FrameIndex.
   if (auto *FIN = dyn_cast<FrameIndexSDNode>(Addr)) {
-    Base = CurDAG->getTargetFrameIndex(FIN->getIndex(),
-                                       TLI->getPointerTy(CurDAG->getDataLayout()));
-    Disp = CurDAG->getTargetConstant(0, SDLoc(Addr), MVT::i32);
+    Base = CurDAG->getTargetFrameIndex(FIN->getIndex(), PtrTy);
+    Disp = CurDAG->getTargetConstant(0, DL, MVT::i32);
     return true;
   }
-  return false;
+
+  // Case 2/3: ADD(base, imm). DAGCombine canonicalises constants to the
+  // RHS, so we only check that side. Base may itself be a FrameIndex
+  // (alloca + GEP-style offset) — handled inline.
+  if (Addr.getOpcode() == ISD::ADD) {
+    SDValue LHS = Addr.getOperand(0);
+    SDValue RHS = Addr.getOperand(1);
+    if (auto *C = dyn_cast<ConstantSDNode>(RHS)) {
+      const int64_t Off = C->getSExtValue();
+      Disp = CurDAG->getTargetConstant(Off, DL, MVT::i32);
+      if (auto *FIN = dyn_cast<FrameIndexSDNode>(LHS)) {
+        Base = CurDAG->getTargetFrameIndex(FIN->getIndex(), PtrTy);
+      } else {
+        Base = LHS;
+      }
+      return true;
+    }
+  }
+
+  // Case 4: bare register (e.g. CopyFromReg ESP at the head of an
+  // outgoing-arg store-list). disp = 0.
+  Base = Addr;
+  Disp = CurDAG->getTargetConstant(0, DL, MVT::i32);
+  return true;
 }
 
 FunctionPass *llvm::createMovISelDag(MovTargetMachine &TM,

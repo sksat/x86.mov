@@ -14,8 +14,8 @@ using namespace llvm;
 MovInstrInfo::MovInstrInfo(const TargetSubtargetInfo &STI,
                            const TargetRegisterInfo &TRI)
     : MovGenInstrInfo(STI, TRI,
-                      /*CFSetupOpcode=*/~0u,
-                      /*CFDestroyOpcode=*/~0u,
+                      /*CFSetupOpcode=*/Mov::ADJCALLSTACKDOWN,
+                      /*CFDestroyOpcode=*/Mov::ADJCALLSTACKUP,
                       /*CatchRetOpcode=*/~0u,
                       /*ReturnOpcode=*/Mov::RET) {}
 

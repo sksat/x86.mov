@@ -15,9 +15,10 @@
 
 using namespace llvm;
 
-// CSR_Mov is declared in MovCallingConv.td; the table is emitted into
+// CSR_Mov is declared in MovCallingConv.td; the tables are emitted into
 // MovGenRegisterInfo.inc by TableGen.
 extern const MCPhysReg CSR_Mov_SaveList[];
+extern const uint32_t CSR_Mov_RegMask[];
 
 MovRegisterInfo::MovRegisterInfo()
     : MovGenRegisterInfo(/*RA=*/0) {}
@@ -25,6 +26,16 @@ MovRegisterInfo::MovRegisterInfo()
 const MCPhysReg *
 MovRegisterInfo::getCalleeSavedRegs(const MachineFunction * /*MF*/) const {
   return CSR_Mov_SaveList;
+}
+
+const uint32_t *
+MovRegisterInfo::getCallPreservedMask(const MachineFunction & /*MF*/,
+                                      CallingConv::ID /*CC*/) const {
+  // We only model one CC (cdecl) at stage 6a, so the mask is constant.
+  // Returning nullptr from this hook (the default) leaves CALL with no
+  // regmask, and live-reg-units tracking in MachineCopyPropagation /
+  // RA winds up dereferencing a null pointer for the call clobber set.
+  return CSR_Mov_RegMask;
 }
 
 BitVector MovRegisterInfo::getReservedRegs(const MachineFunction & /*MF*/) const {
@@ -47,10 +58,11 @@ bool MovRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   const MachineFunction &MF = *MI.getParent()->getParent();
   const MachineFrameInfo &MFI = MF.getFrameInfo();
 
-  // SPAdj is reserved for call-frame-pseudo bookkeeping that we don't have
-  // yet — assert that it stays zero so a stage-6 regression (lost stack
-  // adjustment around calls) is loud.
-  assert(SPAdj == 0 && "Mov: SPAdj!=0 unexpected before stage 6");
+  // Stage 6: SPAdj is non-zero between ADJCALLSTACKDOWN and its matching
+  // ADJCALLSTACKUP — PEI uses it to compensate for the temporary stack
+  // movement so frame-relative loads stay correct. Our frame accesses are
+  // EBP-based (not ESP-based), so we don't actually need to add SPAdj to
+  // the disp; we just stop asserting it.
 
   const int FrameIndex = MI.getOperand(FIOperandNum).getIndex();
 

@@ -22,6 +22,12 @@ enum NodeType : unsigned {
   // MovDAGToDAGISel::Select and emit `CMP + Jcc` directly, with the
   // EFLAGS dependence pinned via SDValue glue.
   BR_CC,
+
+  // Direct cdecl call. Operand 0 is the callee symbol (MO_GlobalAddress
+  // or MO_ExternalSymbol); the variadic tail carries the register-mask
+  // operand and any CopyToReg chain LowerCall set up. Selection picks
+  // CALL32d.
+  CALL,
 };
 } // namespace MovISD
 
@@ -40,6 +46,13 @@ public:
                       const SmallVectorImpl<SDValue> &OutVals,
                       const SDLoc &DL,
                       SelectionDAG &DAG) const override;
+
+  // Stage 6a: lower a direct cdecl call. Scope is tight on purpose —
+  // CallingConv::C only, fixed args (no vararg), scalar i1/i8/i16/i32
+  // args and return, no sret/byval/tailcall/fastcc. Anything outside
+  // the supported set raises report_fatal_error.
+  SDValue LowerCall(CallLoweringInfo &CLI,
+                    SmallVectorImpl<SDValue> &InVals) const override;
 
   // Custom-lowered operations: ISD::BRCOND and ISD::BR_CC both fold
   // into MovISD::BR_CC; the selector then emits a CMP + Jcc pair.

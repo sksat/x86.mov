@@ -18,6 +18,26 @@ def SDT_MovRet     : SDTypeProfile<0, 0, []>;
 def MovRet         : SDNode<"MovISD::RET", SDT_MovRet,
                             [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
 
+// Direct cdecl call: a single operand carrying the callee's symbol. Variadic
+// chain operands carry the register-mask, ESP def/use, and CopyToReg chain
+// that LowerCall builds up. Selection in MovISelDAGToDAG emits CALL32d.
+def SDT_MovCall    : SDTypeProfile<0, 1, [SDTCisVT<0, iPTR>]>;
+def MovCall        : SDNode<"MovISD::CALL", SDT_MovCall,
+                            [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue,
+                             SDNPVariadic]>;
+
+// Call-frame setup / teardown pseudos. PEI sees these around every CALL,
+// and MovFrameLowering::eliminateCallFramePseudoInstr turns them into the
+// real SP adjustments (`sub esp, N` / `add esp, N`). The opcodes must be
+// passed to MovGenInstrInfo's ctor (CFSetupOpcode / CFDestroyOpcode), so
+// the InstrInfo<-> CodeGen wiring knows which opcodes to use.
+def SDT_MovCallSeqStart : SDCallSeqStart<[SDTCisVT<0, i32>, SDTCisVT<1, i32>]>;
+def SDT_MovCallSeqEnd   : SDCallSeqEnd<[SDTCisVT<0, i32>, SDTCisVT<1, i32>]>;
+def MovCallSeqStart : SDNode<"ISD::CALLSEQ_START", SDT_MovCallSeqStart,
+                             [SDNPHasChain, SDNPOutGlue]>;
+def MovCallSeqEnd   : SDNode<"ISD::CALLSEQ_END",   SDT_MovCallSeqEnd,
+                             [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue]>;
+
 //===----------------------------------------------------------------------===//
 // Operand kinds
 //===----------------------------------------------------------------------===//
@@ -32,6 +52,13 @@ def brtarget : Operand<OtherVT> {
   let OperandType = "OPERAND_PCREL";
 }
 
+// Call-target operand for CALL32d: a global symbol. AsmPrinter::lower
+// translates MO_GlobalAddress / MO_ExternalSymbol into an MCSymbolRef
+// expression (with optional offset folded in).
+def calltarget : Operand<iPTR> {
+  let OperandType = "OPERAND_PCREL";
+}
+
 // Minimum addressing mode for stage 2: base register + 32-bit displacement.
 // Stack-slot reads (`[esp + 4]`) need exactly this; base+index*scale shapes
 // come later and will fold in as additional ComplexPattern matchers.
@@ -40,10 +67,19 @@ def MovMemOperand : Operand<i32> {
   let PrintMethod   = "printMemOperand";
 }
 
-// Match a load whose address is a FrameIndex. SelectAddrFI lives in
-// MovISelDAGToDAG.cpp; it pulls the FI out and emits (base=FI, disp=0)
-// so PEI's eliminateFrameIndex can rewrite the pair to (ESP, off).
-def addr_fi : ComplexPattern<i32, 2, "SelectAddrFI", [frameindex]>;
+// Address selector for memory ops. Stage 6a generalises beyond
+// frame-index-only addresses: outgoing-arg stores arrive as
+// `(add (CopyFromReg ESP), imm)`, which is a register-base + displacement.
+//
+// SelectAddr (in MovISelDAGToDAG.cpp) handles three shapes:
+//   1. plain FrameIndex             → (TargetFrameIndex, 0)
+//   2. ADD(FrameIndex, imm)         → (TargetFrameIndex, imm)
+//   3. ADD(reg, imm)                → (reg, imm)
+//   4. any other reg                → (reg, 0)
+// Cases (1)/(2) feed eliminateFrameIndex (EBP-relative resolution); cases
+// (3)/(4) bypass it and emit straight register-base addresses.
+def addr : ComplexPattern<i32, 2, "SelectAddr",
+                          [frameindex, add]>;
 
 //===----------------------------------------------------------------------===//
 // Instruction base class
@@ -76,7 +112,7 @@ def MOV32rr : MovInst<(outs GPR32:$dst), (ins GPR32:$src),
 let mayLoad = 1 in
 def MOV32rm : MovInst<(outs GPR32:$dst), (ins MovMemOperand:$src),
                       "mov\t$dst, dword ptr $src",
-                      [(set GPR32:$dst, (load addr_fi:$src))]>;
+                      [(set GPR32:$dst, (load addr:$src))]>;
 
 // MOV32mr — store form. Used by the spill machinery (storeRegToStackSlot
 // in MovInstrInfo.cpp) and, at stage 4c+, by `store i32 ..., ptr ...`
@@ -84,7 +120,7 @@ def MOV32rm : MovInst<(outs GPR32:$dst), (ins MovMemOperand:$src),
 let mayStore = 1 in
 def MOV32mr : MovInst<(outs), (ins MovMemOperand:$dst, GPR32:$src),
                       "mov\tdword ptr $dst, $src",
-                      [(store GPR32:$src, addr_fi:$dst)]>;
+                      [(store GPR32:$src, addr:$dst)]>;
 
 //===----------------------------------------------------------------------===//
 // Integer arithmetic + bitwise — stage 3 (mov-heavy bootstrap).
@@ -172,6 +208,36 @@ def PUSH32r : MovInst<(outs), (ins GPR32:$src),
 let Defs = [ESP], Uses = [ESP], mayLoad = 1 in
 def POP32r  : MovInst<(outs GPR32:$dst), (ins),
                       "pop\t$dst", []>;
+
+//===----------------------------------------------------------------------===//
+// CALL / CALLSEQ_START / CALLSEQ_END  (stage 6a)
+//
+// CALLSEQ_START/END bracket each call so PEI can track ESP movement that
+// the caller's argument-pushing introduces. eliminateCallFramePseudoInstr
+// in MovFrameLowering rewrites them into the real `sub esp, N` / `add esp, N`
+// adjustments at codegen-finalisation time.
+//
+// CALL32d is the direct-call form. Operand 0 is the callee symbol;
+// additional operands (regmask, implicit ESP/EAX uses/defs) get attached
+// by LowerCall + selection. isCall = 1 makes the regmask / call-clobber
+// machinery kick in. We model the cdecl preserves via the EAX-clobbering
+// Defs list (caller-saved are ECX, EDX, EAX; selection passes the explicit
+// regmask too).
+//===----------------------------------------------------------------------===//
+
+let Defs = [ESP], Uses = [ESP], hasSideEffects = 0,
+    isCodeGenOnly = 1, mayLoad = 0, mayStore = 0 in {
+def ADJCALLSTACKDOWN : MovInst<(outs), (ins i32imm_op:$amt1, i32imm_op:$amt2),
+                               "# ADJCALLSTACKDOWN $amt1",
+                               [(MovCallSeqStart timm:$amt1, timm:$amt2)]>;
+def ADJCALLSTACKUP   : MovInst<(outs), (ins i32imm_op:$amt1, i32imm_op:$amt2),
+                               "# ADJCALLSTACKUP $amt1",
+                               [(MovCallSeqEnd timm:$amt1, timm:$amt2)]>;
+}
+
+let isCall = 1, Defs = [EAX, ECX, EDX, EFLAGS], Uses = [ESP] in
+def CALL32d : MovInst<(outs), (ins calltarget:$dst),
+                      "call\t$dst", []>;
 
 //===----------------------------------------------------------------------===//
 // CMP — sets EFLAGS for the following Jcc. Patternless: selection (stage

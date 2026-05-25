@@ -93,6 +93,11 @@ void MovAsmPrinter::lower(const MachineInstr *MI, MCInst &OutMI) const {
       MCOp = MCOperand::createExpr(Expr);
       break;
     }
+    case MachineOperand::MO_RegisterMask:
+      // Call regmask: not part of the printed asm, but the MachineOperand
+      // exists so RA / liveness know which registers the call clobbers.
+      // Skip silently — the asm just prints `call <callee>`.
+      continue;
     default:
       llvm_unreachable("unexpected MachineOperand kind in Mov asm printer");
     }

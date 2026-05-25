@@ -128,6 +128,7 @@ const char *MovTargetLowering::getTargetNodeName(unsigned Opcode) const {
   switch (Opcode) {
   case MovISD::RET:   return "MovISD::RET";
   case MovISD::BR_CC: return "MovISD::BR_CC";
+  case MovISD::CALL:  return "MovISD::CALL";
   default:            return nullptr;
   }
 }
@@ -233,4 +234,148 @@ SDValue MovTargetLowering::LowerReturn(
     RetOps.push_back(Glue);
 
   return DAG.getNode(MovISD::RET, DL, MVT::Other, RetOps);
+}
+
+//===----------------------------------------------------------------------===//
+// LowerCall — stage 6a, cdecl, direct, scalar-only.
+//===----------------------------------------------------------------------===//
+
+SDValue MovTargetLowering::LowerCall(CallLoweringInfo &CLI,
+                                     SmallVectorImpl<SDValue> &InVals) const {
+  SelectionDAG &DAG = CLI.DAG;
+  SDLoc &DL = CLI.DL;
+  SDValue Chain = CLI.Chain;
+  SDValue Callee = CLI.Callee;
+  CallingConv::ID CallConv = CLI.CallConv;
+  bool &IsTailCall = CLI.IsTailCall;
+  const auto &Outs = CLI.Outs;
+  const auto &OutVals = CLI.OutVals;
+  const auto &Ins = CLI.Ins;
+  MachineFunction &MF = DAG.getMachineFunction();
+
+  // Stage 6a scope guards. Codex's stage-6 design pass insisted on hard
+  // rejection here so any out-of-scope IR fails with a readable diagnostic
+  // rather than mis-compiling.
+  if (CallConv != CallingConv::C)
+    report_fatal_error(
+        "Mov: only CallingConv::C supported (stage 6a; fastcall/etc. later)");
+  if (CLI.IsVarArg)
+    report_fatal_error("Mov: vararg calls not yet supported (stage 6+)");
+  for (const ISD::OutputArg &O : Outs) {
+    if (O.Flags.isSRet() || O.Flags.isByVal())
+      report_fatal_error(
+          "Mov: sret/byval call args not yet supported (stage 6+)");
+    if (O.VT != MVT::i1 && O.VT != MVT::i8 && O.VT != MVT::i16 &&
+        O.VT != MVT::i32)
+      report_fatal_error(
+          "Mov: only i1/i8/i16/i32 scalar call args supported (stage 6a)");
+  }
+  if (Ins.size() > 1)
+    report_fatal_error("Mov: multi-value call returns not yet supported");
+
+  // Tail-call elimination not implemented; CallLoweringInfo asks us to
+  // unset the flag rather than silently keep emitting a tail call.
+  IsTailCall = false;
+
+  // Analyze outgoing args against CC_Mov.
+  SmallVector<CCValAssign, 8> ArgLocs;
+  CCState CCInfo(CallConv, /*IsVarArg=*/false, MF, ArgLocs, *DAG.getContext());
+  CCInfo.AnalyzeCallOperands(Outs, CC_Mov);
+  const unsigned NumBytes = CCInfo.getStackSize();
+
+  // CALLSEQ_START(NumBytes, 0) — reserves the outgoing-arg area.
+  Chain = DAG.getCALLSEQ_START(Chain, NumBytes, 0, DL);
+
+  // For each stack-passed arg, compute its address as ESP + offset and emit
+  // a store. cdecl pushes are caller-cleaned; we emit them as plain stores
+  // so DAGCombine can keep them in order via the chain.
+  SmallVector<SDValue, 8> MemOpChains;
+  const SDValue StackPtr =
+      DAG.getCopyFromReg(Chain, DL, Mov::ESP,
+                         getPointerTy(DAG.getDataLayout()));
+
+  for (size_t i = 0; i < ArgLocs.size(); ++i) {
+    CCValAssign &VA = ArgLocs[i];
+    SDValue Arg = OutVals[i];
+
+    // CC_Mov stamps the LocInfo for promoted narrow args; widen back to
+    // i32 before storing so the slot is 4 bytes wide.
+    switch (VA.getLocInfo()) {
+    case CCValAssign::Full:
+      break;
+    case CCValAssign::AExt:
+      Arg = DAG.getNode(ISD::ANY_EXTEND, DL, VA.getLocVT(), Arg);
+      break;
+    case CCValAssign::ZExt:
+      Arg = DAG.getNode(ISD::ZERO_EXTEND, DL, VA.getLocVT(), Arg);
+      break;
+    case CCValAssign::SExt:
+      Arg = DAG.getNode(ISD::SIGN_EXTEND, DL, VA.getLocVT(), Arg);
+      break;
+    default:
+      report_fatal_error("Mov: unexpected LocInfo in LowerCall");
+    }
+
+    if (!VA.isMemLoc())
+      report_fatal_error("Mov: register-passed call args unexpected (stage 6+)");
+
+    // store i32 Arg, ptr [esp + VA.getLocMemOffset()]
+    SDValue Offset = DAG.getIntPtrConstant(VA.getLocMemOffset(), DL);
+    SDValue Addr =
+        DAG.getNode(ISD::ADD, DL, getPointerTy(DAG.getDataLayout()), StackPtr,
+                    Offset);
+    MemOpChains.push_back(
+        DAG.getStore(Chain, DL, Arg, Addr,
+                     MachinePointerInfo::getStack(MF, VA.getLocMemOffset())));
+  }
+
+  if (!MemOpChains.empty())
+    Chain = DAG.getNode(ISD::TokenFactor, DL, MVT::Other, MemOpChains);
+
+  // Translate the callee operand to a usable form. We only handle
+  // GlobalAddress (direct symbol) and ExternalSymbol — function pointers
+  // (indirect via register) wait for stage 6c.
+  if (auto *G = dyn_cast<GlobalAddressSDNode>(Callee)) {
+    Callee = DAG.getTargetGlobalAddress(G->getGlobal(), DL,
+                                        getPointerTy(DAG.getDataLayout()),
+                                        /*offset=*/0);
+  } else if (auto *E = dyn_cast<ExternalSymbolSDNode>(Callee)) {
+    Callee = DAG.getTargetExternalSymbol(
+        E->getSymbol(), getPointerTy(DAG.getDataLayout()));
+  } else {
+    report_fatal_error(
+        "Mov: indirect calls not yet supported (stage 6c will add CALL32r)");
+  }
+
+  // Build the MovISD::CALL: chain, callee, regmask, [glue].
+  const auto *TRI = MF.getSubtarget().getRegisterInfo();
+  const uint32_t *Mask = TRI->getCallPreservedMask(MF, CallConv);
+  assert(Mask && "Mov: getCallPreservedMask must return non-null");
+
+  SmallVector<SDValue, 4> Ops = {Chain, Callee, DAG.getRegisterMask(Mask)};
+
+  SDVTList NodeTys = DAG.getVTList(MVT::Other, MVT::Glue);
+  Chain = DAG.getNode(MovISD::CALL, DL, NodeTys, Ops);
+  SDValue Glue = Chain.getValue(1);
+
+  // CALLSEQ_END(NumBytes, 0) closes the call frame.
+  Chain = DAG.getCALLSEQ_END(Chain, NumBytes, 0, Glue, DL);
+  Glue = Chain.getValue(1);
+
+  // Read back the return value (EAX) if there is one.
+  SmallVector<CCValAssign, 2> RVLocs;
+  CCState RetCCInfo(CallConv, /*IsVarArg=*/false, MF, RVLocs, *DAG.getContext());
+  RetCCInfo.AnalyzeCallResult(Ins, RetCC_Mov);
+
+  for (CCValAssign &VA : RVLocs) {
+    assert(VA.isRegLoc() && "stage 6 RetCC always assigns to a register");
+    SDValue Val = DAG.getCopyFromReg(Chain, DL, VA.getLocReg(),
+                                     VA.getLocVT(), Glue);
+    Chain = Val.getValue(1);
+    Glue = Val.getValue(2);
+    if (VA.getLocInfo() != CCValAssign::Full)
+      Val = DAG.getNode(ISD::TRUNCATE, DL, VA.getValVT(), Val);
+    InVals.push_back(Val);
+  }
+  return Chain;
 }
