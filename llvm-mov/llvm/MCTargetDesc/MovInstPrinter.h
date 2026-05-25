@@ -24,5 +24,10 @@ public:
 
   void printRegName(raw_ostream &O, MCRegister Reg) override;
   void printOperand(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+
+  // Two-operand printer for MovMemOperand: emits `[base + disp]` in Intel
+  // syntax. Called from the TableGen-generated printInstruction whenever
+  // it encounters an operand whose `let PrintMethod = "printMemOperand"`.
+  void printMemOperand(const MCInst *MI, unsigned OpNo, raw_ostream &O);
 };
 } // namespace llvm

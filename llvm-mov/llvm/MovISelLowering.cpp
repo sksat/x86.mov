@@ -10,6 +10,7 @@
 #include "MCTargetDesc/MovMCTargetDesc.h"
 #include "MovSubtarget.h"
 #include "llvm/CodeGen/CallingConvLower.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/SelectionDAG.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
@@ -42,13 +43,40 @@ const char *MovTargetLowering::getTargetNodeName(unsigned Opcode) const {
 }
 
 SDValue MovTargetLowering::LowerFormalArguments(
-    SDValue Chain, CallingConv::ID /*CC*/, bool /*IsVarArg*/,
-    const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc & /*DL*/,
-    SelectionDAG & /*DAG*/, SmallVectorImpl<SDValue> & /*InVals*/) const {
-  // @main has no formal arguments at stage 0; reject anything else loudly so
-  // a slipped stage boundary is visible.
-  if (!Ins.empty())
-    report_fatal_error("Mov: LowerFormalArguments not implemented (stage 2)");
+    SDValue Chain, CallingConv::ID CallConv, bool /*IsVarArg*/,
+    const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &DL,
+    SelectionDAG &DAG, SmallVectorImpl<SDValue> &InVals) const {
+  MachineFunction &MF = DAG.getMachineFunction();
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+
+  SmallVector<CCValAssign, 8> ArgLocs;
+  CCState CCInfo(CallConv, /*IsVarArg=*/false, MF, ArgLocs,
+                 *DAG.getContext());
+  CCInfo.AnalyzeFormalArguments(Ins, CC_Mov);
+
+  for (CCValAssign &VA : ArgLocs) {
+    if (!VA.isMemLoc()) {
+      // Register-passed args land at stage 6 — until then CC_Mov assigns
+      // everything to the stack, so a reg-loc here means the CC table and
+      // this lowering have diverged.
+      report_fatal_error("Mov: register-passed formal arg unexpected");
+    }
+
+    // cdecl: each i32 arg occupies one 4-byte stack slot. Right after
+    // `call`, callee's [esp+0] holds the return address and [esp+4]
+    // holds arg0 — VA.getLocMemOffset() is the offset *from arg0*, so
+    // the on-stack location of this arg is (4 + LocMemOffset). That's
+    // exactly what eliminateFrameIndex resolves later (frame size is 0
+    // at stage 2 so the fixed-object offset translates 1:1).
+    const unsigned Size = VA.getLocVT().getStoreSize();
+    const int FI = MFI.CreateFixedObject(Size, 4 + VA.getLocMemOffset(),
+                                         /*IsImmutable=*/true);
+
+    SDValue FIN = DAG.getFrameIndex(FI, getPointerTy(DAG.getDataLayout()));
+    SDValue Arg = DAG.getLoad(VA.getLocVT(), DL, Chain, FIN,
+                              MachinePointerInfo::getFixedStack(MF, FI));
+    InVals.push_back(Arg);
+  }
   return Chain;
 }
 

@@ -34,3 +34,25 @@ void MovInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
     llvm_unreachable("unexpected MCOperand kind");
   }
 }
+
+void MovInstPrinter::printMemOperand(const MCInst *MI, unsigned OpNo,
+                                     raw_ostream &O) {
+  const MCOperand &Base = MI->getOperand(OpNo);
+  const MCOperand &Disp = MI->getOperand(OpNo + 1);
+  O << '[';
+  bool HasBase = Base.isReg() && Base.getReg() != 0;
+  if (HasBase)
+    printRegName(O, Base.getReg());
+  if (Disp.isImm()) {
+    int64_t V = Disp.getImm();
+    if (!HasBase) {
+      O << V;
+    } else if (V > 0) {
+      O << " + " << V;
+    } else if (V < 0) {
+      O << " - " << -V;
+    }
+    // V == 0 with a base: omit the displacement entirely.
+  }
+  O << ']';
+}

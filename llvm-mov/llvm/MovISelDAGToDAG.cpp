@@ -29,6 +29,11 @@ public:
 
   void Select(SDNode *Node) override;
 
+  // Address-mode selector referenced from MovInstrInfo.td's `addr_fi`
+  // ComplexPattern. Stage 2 only matches plain FrameIndex addresses;
+  // (base+disp) and (base+index*scale) come in at later stages.
+  bool SelectAddrFI(SDValue Addr, SDValue &Base, SDValue &Disp);
+
 // Auto-generated `SelectCode` (used by `Select`).
 #include "MovGenDAGISel.inc"
 };
@@ -51,8 +56,18 @@ char MovDAGToDAGISelLegacy::ID = 0;
 
 void MovDAGToDAGISel::Select(SDNode *Node) {
   // If pre-selection custom matching is ever needed (e.g. fancier ADDR modes),
-  // do it here. For stage 0 the TableGen-generated patterns cover everything.
+  // do it here. For stage 0–2 the TableGen-generated patterns cover everything.
   SelectCode(Node);
+}
+
+bool MovDAGToDAGISel::SelectAddrFI(SDValue Addr, SDValue &Base, SDValue &Disp) {
+  if (auto *FIN = dyn_cast<FrameIndexSDNode>(Addr)) {
+    Base = CurDAG->getTargetFrameIndex(FIN->getIndex(),
+                                       TLI->getPointerTy(CurDAG->getDataLayout()));
+    Disp = CurDAG->getTargetConstant(0, SDLoc(Addr), MVT::i32);
+    return true;
+  }
+  return false;
 }
 
 FunctionPass *llvm::createMovISelDag(MovTargetMachine &TM,

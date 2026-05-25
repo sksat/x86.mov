@@ -24,6 +24,19 @@ def MovRet         : SDNode<"MovISD::RET", SDT_MovRet,
 
 def i32imm_op : Operand<i32>;
 
+// Minimum addressing mode for stage 2: base register + 32-bit displacement.
+// Stack-slot reads (`[esp + 4]`) need exactly this; base+index*scale shapes
+// come later and will fold in as additional ComplexPattern matchers.
+def MovMemOperand : Operand<i32> {
+  let MIOperandInfo = (ops GPR32:$base, i32imm:$disp);
+  let PrintMethod   = "printMemOperand";
+}
+
+// Match a load whose address is a FrameIndex. SelectAddrFI lives in
+// MovISelDAGToDAG.cpp; it pulls the FI out and emits (base=FI, disp=0)
+// so PEI's eliminateFrameIndex can rewrite the pair to (ESP, off).
+def addr_fi : ComplexPattern<i32, 2, "SelectAddrFI", [frameindex]>;
+
 //===----------------------------------------------------------------------===//
 // Instruction base class
 //===----------------------------------------------------------------------===//
@@ -51,6 +64,11 @@ let isMoveReg = 1 in
 def MOV32rr : MovInst<(outs GPR32:$dst), (ins GPR32:$src),
                       "mov\t$dst, $src",
                       []>;
+
+let mayLoad = 1 in
+def MOV32rm : MovInst<(outs GPR32:$dst), (ins MovMemOperand:$src),
+                      "mov\t$dst, dword ptr $src",
+                      [(set GPR32:$dst, (load addr_fi:$src))]>;
 
 //===----------------------------------------------------------------------===//
 // RET

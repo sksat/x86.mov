@@ -19,17 +19,17 @@ the result is assembled by stock `as`/`ld`.
 
 Bootstrap. Goals listed in roughly increasing difficulty:
 
-| stage  | scope                                              | gate                                                     |
-|--------|----------------------------------------------------|----------------------------------------------------------|
-| 0      | `define i32 @main() { ret i32 0 }`                 | linked ELF exits 0                                       |
-| 1      | `ret i32 <imm>` for any 32-bit constant            | exit code matches lower 8 bits                           |
-| 2      | one i32 argument, cdecl                            | call from a tiny `_start` runtime                        |
-| 3      | i32 `add/sub/and/or/xor/shl/lshr/ashr`             | execution tests                                          |
-| 4      | `alloca/load/store` on a local stack frame         | execution tests                                          |
-| 5      | `icmp + br`                                        | execution tests + MIR tests                              |
-| 6      | `call` between user-defined functions              | execution tests                                          |
-| 7      | mov-only legalization pass (compare/branch/arith)  | objdump gate: no non-`mov` opcodes in `.text`            |
-| 8      | bigger fixtures (movfuscator's `upstream-*` set)   | side-by-side bench vs movfuscator                        |
+| stage  | scope                                              | gate                                                     | done? |
+|--------|----------------------------------------------------|----------------------------------------------------------|-------|
+| 0      | `define i32 @main() { ret i32 0 }`                 | linked ELF exits 0                                       | ✅    |
+| 1      | `ret i32 <imm>` for any 32-bit constant            | exit code matches lower 8 bits                           | ✅    |
+| 2      | one i32 argument, cdecl                            | call from a synthesised `_start` (see `test/Execution/run.sh`) | ✅ |
+| 3      | i32 `add/sub/and/or/xor/shl/lshr/ashr`             | execution tests                                          |       |
+| 4      | `alloca/load/store` on a local stack frame         | execution tests                                          |       |
+| 5      | `icmp + br`                                        | execution tests + MIR tests                              |       |
+| 6      | `call` between user-defined functions              | execution tests                                          |       |
+| 7      | mov-only legalization pass (compare/branch/arith)  | objdump gate: no non-`mov` opcodes in `.text`            |       |
+| 8      | bigger fixtures (movfuscator's `upstream-*` set)   | side-by-side bench vs movfuscator                        |       |
 
 At stage 0–6 the emitter is "mov-heavy" — `jmp/call/ret/cmp` are still allowed.
 At stage 7 the dedicated legalization pass eliminates them. Splitting that wall

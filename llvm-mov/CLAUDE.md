@@ -75,10 +75,21 @@ test/
 - **Don't depend on `llc --load`**: the apt-installed `llc-22` doesn't reliably accept
   out-of-tree target plugins (stripped/unstable symbols, link form differs). Always go
   through `llvm-mov-llc` instead.
-- **Static `_start` for execution tests**: the test runner ([`test/Execution/run.sh`](test/Execution/run.sh))
-  links a hand-written `_start` that calls `main` then issues `mov eax,1; mov ebx,<retval>;
-  int 0x80`. This sidesteps the runner's 32-bit dynamic loader, glibc CRT, etc. Don't try
-  to upgrade to a libc-linked binary before stage 6.
+- **Synthesised `_start` for execution tests**: the test runner
+  ([`test/Execution/run.sh`](test/Execution/run.sh)) **generates** a per-fixture
+  `_start.s` on the fly: by default it calls `main()`; if a `<name>.callargs`
+  file exists, the runner parses its `<func> [args…]` line and pushes the
+  args cdecl-style before `call`. The runner owns the cdecl convention,
+  not the fixture set. Then `mov ebx, eax; mov eax, 1; int 0x80` exits.
+  This sidesteps the runner's 32-bit dynamic loader, glibc CRT, etc. Don't
+  try to upgrade to a libc-linked binary before stage 6.
+- **Frameless leaf functions at stage 2**: `MovFrameLowering` still emits
+  no prologue/epilogue and `CSR_Mov` is still empty. Formal args are
+  read directly from `[esp + n]` via fixed `MachineFrameInfo` objects
+  whose SP-relative offsets are `4 + LocMemOffset` (the `+4` accounts
+  for the return address `call` pushes). `eliminateFrameIndex` rewrites
+  FrameIndex operands to `(ESP, off)` with no SP adjustment. EBP-based
+  frame, prologue, and CSR re-enable all land together at stage 4.
 - **Where to stop adding "mov-only" hacks during bootstrap**: stages 0–6 are allowed to emit
   `jmp/call/ret/cmp`. The dedicated `MovOnlyLegalize` MachineFunctionPass at stage 7 is
   what eliminates them. Don't preemptively encode mov-only patterns into TableGen — it'll
