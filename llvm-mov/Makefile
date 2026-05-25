@@ -49,7 +49,7 @@ configure:
 build: configure
 	ninja -C $(BUILD_DIR)
 
-test: test-exec test-codegen
+test: test-exec test-codegen test-mov-only
 
 test-exec: build
 	@./test/Execution/run.sh $(BUILD_DIR)

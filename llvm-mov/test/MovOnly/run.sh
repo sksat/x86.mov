@@ -37,7 +37,6 @@ ALLOWED='^(mov|movabs|movzx|movsx)$'
 
 pass=0
 fail=0
-skipped=0
 fail_names=()
 
 shopt -s nullglob
@@ -54,17 +53,22 @@ for ll in "${fixtures[@]}"; do
     s="${WORK}/${name}.s"
     o="${WORK}/${name}.o"
 
+    # Codex's stage-7a0 review (P1) flagged that build failures used to
+    # report SKIP and the harness still exited 0 — that lets a regression
+    # silently take a mov-only fixture offline. Now they count as FAILs.
     if ! "${DRIVER}" "${ll}" -o "${s}" 2>"${WORK}/${name}.driver.log"; then
-        echo "SKIP  ${name}: llvm-mov-llc failed:"
+        echo "FAIL  ${name}: llvm-mov-llc failed:"
         sed 's/^/  /' "${WORK}/${name}.driver.log"
-        skipped=$((skipped + 1))
+        fail=$((fail + 1))
+        fail_names+=("${name}")
         continue
     fi
 
     if ! as --32 -o "${o}" "${s}" 2>"${WORK}/${name}.as.log"; then
-        echo "SKIP  ${name}: as failed:"
+        echo "FAIL  ${name}: as failed:"
         sed 's/^/  /' "${WORK}/${name}.as.log"
-        skipped=$((skipped + 1))
+        fail=$((fail + 1))
+        fail_names+=("${name}")
         continue
     fi
 
@@ -93,7 +97,7 @@ for ll in "${fixtures[@]}"; do
 done
 
 echo
-echo "----- ${pass} mov-only, ${fail} non-mov-violating, ${skipped} skipped -----"
+echo "----- ${pass} mov-only, ${fail} failed -----"
 if [ "${fail}" -gt 0 ]; then
     printf 'failed: %s\n' "${fail_names[@]}"
     exit 1
