@@ -1,10 +1,60 @@
 //===-- MovFrameLowering.cpp ----------------------------------------------===//
-//
-// Stage 0 has no prologue/epilogue work — everything is declared in the
-// header. This .cpp exists so CMake can link MovFrameLowering as a unit
-// and so later stages have a place to grow the body without churn in the
-// component library's source list.
-//
-//===----------------------------------------------------------------------===//
-
 #include "MovFrameLowering.h"
+#include "MCTargetDesc/MovMCTargetDesc.h"
+#include "MovInstrInfo.h"
+#include "MovSubtarget.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/Support/ErrorHandling.h"
+
+using namespace llvm;
+
+void MovFrameLowering::emitPrologue(MachineFunction &MF,
+                                    MachineBasicBlock &MBB) const {
+  const auto &STI = MF.getSubtarget<MovSubtarget>();
+  const TargetInstrInfo &TII = *STI.getInstrInfo();
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+
+  // We don't model variable-sized allocations (alloca with non-constant
+  // size, i.e. VLAs) at stage 4. Reject loudly rather than emit code that
+  // tracks ESP-after-alloca without restoring it.
+  if (MFI.hasVarSizedObjects())
+    report_fatal_error(
+        "Mov: variable-sized stack objects (VLAs / dynamic alloca) not "
+        "yet supported. Stage 4 covers static alloca only.");
+
+  MachineBasicBlock::iterator MBBI = MBB.begin();
+  DebugLoc DL = MBBI != MBB.end() ? MBBI->getDebugLoc() : DebugLoc();
+
+  //   push ebp
+  BuildMI(MBB, MBBI, DL, TII.get(Mov::PUSH32r))
+      .addReg(Mov::EBP, RegState::Kill);
+
+  //   mov  ebp, esp
+  BuildMI(MBB, MBBI, DL, TII.get(Mov::MOV32rr), Mov::EBP).addReg(Mov::ESP);
+
+  //   sub  esp, <local_size>   ; skip when empty
+  uint64_t StackSize = MFI.getStackSize();
+  if (StackSize > 0) {
+    BuildMI(MBB, MBBI, DL, TII.get(Mov::SUB32ri), Mov::ESP)
+        .addReg(Mov::ESP)
+        .addImm(StackSize);
+  }
+}
+
+void MovFrameLowering::emitEpilogue(MachineFunction &MF,
+                                    MachineBasicBlock &MBB) const {
+  const auto &STI = MF.getSubtarget<MovSubtarget>();
+  const TargetInstrInfo &TII = *STI.getInstrInfo();
+
+  // Insert before the terminator (which is the RET pseudo).
+  MachineBasicBlock::iterator MBBI = MBB.getFirstTerminator();
+  DebugLoc DL = MBBI != MBB.end() ? MBBI->getDebugLoc() : DebugLoc();
+
+  //   mov  esp, ebp     ; reverses both `sub esp, N` and any alloca-shrink
+  BuildMI(MBB, MBBI, DL, TII.get(Mov::MOV32rr), Mov::ESP).addReg(Mov::EBP);
+
+  //   pop  ebp
+  BuildMI(MBB, MBBI, DL, TII.get(Mov::POP32r), Mov::EBP);
+}

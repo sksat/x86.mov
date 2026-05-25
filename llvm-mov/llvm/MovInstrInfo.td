@@ -143,6 +143,21 @@ def SHR32rCL : ShiftRCL<"shr">;
 def SAR32rCL : ShiftRCL<"sar">;
 
 //===----------------------------------------------------------------------===//
+// PUSH / POP — used by emitPrologue/emitEpilogue (stage 4a) to save and
+// restore EBP for the frame pointer. No DAG patterns: these are
+// target-only, emitted directly via BuildMI from FrameLowering. The
+// `Defs/Uses [ESP]` make ESP's implicit modification visible to RA.
+//===----------------------------------------------------------------------===//
+
+let Defs = [ESP], Uses = [ESP], mayStore = 1 in
+def PUSH32r : MovInst<(outs), (ins GPR32:$src),
+                      "push\t$src", []>;
+
+let Defs = [ESP], Uses = [ESP], mayLoad = 1 in
+def POP32r  : MovInst<(outs GPR32:$dst), (ins),
+                      "pop\t$dst", []>;
+
+//===----------------------------------------------------------------------===//
 // RET
 //===----------------------------------------------------------------------===//
 //
