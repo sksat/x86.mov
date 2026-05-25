@@ -152,7 +152,24 @@ pub fn run_elf_with_host<H: SysHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
     };
     let mut cpu = Cpu::new(elf.entry);
     cpu.set_reg(Reg32::Esp, esp_initial);
+    // Per-instruction tracing is gated on an env var so the hot path
+    // costs at most an integer load in the common case. Set
+    // `MOVIE86_TRACE=1` to dump `eip eax ebx ecx edx esp` before each
+    // step — useful for tracking down where a real movfuscator binary
+    // diverges.
+    let trace = std::env::var_os("MOVIE86_TRACE").is_some();
     loop {
+        if trace {
+            eprintln!(
+                "eip={:08x} eax={:08x} ebx={:08x} ecx={:08x} edx={:08x} esp={:08x}",
+                cpu.eip,
+                cpu.reg(Reg32::Eax),
+                cpu.reg(Reg32::Ebx),
+                cpu.reg(Reg32::Ecx),
+                cpu.reg(Reg32::Edx),
+                cpu.reg(Reg32::Esp),
+            );
+        }
         match cpu.step(&mut mem, host) {
             Ok(()) => {}
             Err(Fault::Exit(status)) => return RunOutcome::Exit(status),
