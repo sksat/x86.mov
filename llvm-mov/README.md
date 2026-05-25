@@ -27,7 +27,7 @@ Bootstrap. Goals listed in roughly increasing difficulty:
 | 3      | i32 `add/sub/and/or/xor`, shift-imm                | execution tests (incl. 2-address chain coverage)         | ✅    |
 | 3.5    | reg-shift (CL constraint), narrow-int promotion    | execution tests (incl. i8/i16 wrap-around)               | ✅    |
 | 4      | `alloca/load/store` on a local stack frame + EBP frame + real spill | exec: `rmw` (no-arg alloca → `[ebp-4]`) + `spill_chain` (PEI spill) | ✅ |
-| 5      | `icmp + br`                                        | execution tests + MIR tests                              |       |
+| 5      | `icmp + br` (CMP + Jcc 10 predicates, EBP frame interop) | execution: is_42 (eq) + is_not_42 + min (slt) + abs + is_lt_unsigned (ult) | ✅ |
 | 6      | `call` between user-defined functions              | execution tests                                          |       |
 | 7      | mov-only legalization pass (compare/branch/arith)  | objdump gate: no non-`mov` opcodes in `.text`            |       |
 | 8      | bigger fixtures (movfuscator's `upstream-*` set)   | side-by-side bench vs movfuscator                        |       |

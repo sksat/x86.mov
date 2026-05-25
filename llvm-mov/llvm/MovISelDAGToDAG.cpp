@@ -93,6 +93,17 @@ void MovDAGToDAGISel::Select(SDNode *Node) {
     SDValue RHS    = Node->getOperand(3);
     SDValue Target = Node->getOperand(4);
 
+    // x86 CMP only has a `reg, imm` form (CMP32ri) — not `imm, reg`. If
+    // the user wrote `icmp eq 42, %x` and DAGCombine didn't canonicalise,
+    // the constant ends up on LHS and we'd otherwise pick CMP32rr with a
+    // ConstantSDNode in the first GPR32 slot — crash. Swap operands and
+    // flip the predicate to keep semantics. (Caught by codex's stage-5b
+    // review of 1eeb8a0.)
+    if (isa<ConstantSDNode>(LHS) && !isa<ConstantSDNode>(RHS)) {
+      std::swap(LHS, RHS);
+      CC = ISD::getSetCCSwappedOperands(CC);
+    }
+
     SDNode *Cmp;
     if (auto *CRHS = dyn_cast<ConstantSDNode>(RHS)) {
       // CMP32ri  lhs, imm
