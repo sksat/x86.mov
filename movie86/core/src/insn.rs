@@ -193,4 +193,13 @@ pub enum Insn {
     /// increments ESP by 4. For `pop esp` the final ESP is the popped
     /// value, not `old_esp + 4`.
     PopR32(Reg32),
+    /// `call rel32` (opcode `E8 cd`). Pushes the address of the next
+    /// instruction (so `ret` can return there) and jumps to
+    /// `next_eip + disp`.
+    CallRel32(i32),
+    /// `ret` near (opcode `C3`). Pops a 32-bit return address from
+    /// `[esp]` and sets EIP to it; ESP increments by 4. Does not
+    /// handle `ret imm16` (opcode `C2 iw`), which movfuscator output
+    /// doesn't emit (cdecl callers pop their own args).
+    Ret,
 }

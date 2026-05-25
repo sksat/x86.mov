@@ -109,6 +109,21 @@ impl Cpu {
                 self.set_reg(r, val);
                 Ok(next_eip_default)
             }
+            Insn::CallRel32(off) => {
+                // Push the return address (the address of the
+                // instruction right after the call), then jump.
+                let new_esp = self.reg(Reg32::Esp).wrapping_sub(4);
+                mem.write_u32(new_esp, next_eip_default)?;
+                self.set_reg(Reg32::Esp, new_esp);
+                let off_bits = u32::from_ne_bytes(off.to_ne_bytes());
+                Ok(next_eip_default.wrapping_add(off_bits))
+            }
+            Insn::Ret => {
+                let esp = self.reg(Reg32::Esp);
+                let target = mem.read_u32(esp)?;
+                self.set_reg(Reg32::Esp, esp.wrapping_add(4));
+                Ok(target)
+            }
         }
     }
 
@@ -585,6 +600,67 @@ mod tests {
         assert_eq!(cpu.reg(Reg32::Esp), 0xcafe_d00d);
     }
 
+    // --- call + ret ---
+
+    #[test]
+    fn step_call_pushes_return_address_and_jumps() {
+        // 1000: e8 0a 00 00 00   → call +10
+        // Next-insn address (= return address) is 0x1005;
+        // target is 0x1005 + 10 = 0x100f.
+        let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[0xe8, 0x0a, 0x00, 0x00, 0x00], 64);
+        let initial_esp = cpu.reg(Reg32::Esp);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0x100f, "EIP should jump to target");
+        assert_eq!(
+            cpu.reg(Reg32::Esp),
+            initial_esp - 4,
+            "call should push 4 bytes"
+        );
+        assert_eq!(
+            mem.read_u32(initial_esp - 4).unwrap(),
+            0x1005,
+            "pushed return address must be the addr of the insn AFTER the call"
+        );
+    }
+
+    #[test]
+    fn step_ret_pops_and_jumps_to_top_of_stack() {
+        // c3 → ret. Plant a return address at the top of the stack.
+        let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[0xc3], 64);
+        let top = cpu.reg(Reg32::Esp);
+        let pushed_addr = top - 4;
+        cpu.set_reg(Reg32::Esp, pushed_addr);
+        mem.write_u32(pushed_addr, 0x2000).unwrap();
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0x2000);
+        assert_eq!(cpu.reg(Reg32::Esp), top, "esp should be restored after ret");
+    }
+
+    #[test]
+    fn call_then_ret_returns_to_instruction_after_call() {
+        // Layout (entry = 0x1000):
+        //   0x1000: e8 02 00 00 00       call +2   ;  → 0x1007
+        //   0x1005: cd 80                int 0x80  (would exit; never reached)
+        //   0x1007: c3                   ret
+        // After call: eip=0x1007, return addr 0x1005 on stack.
+        // After ret:  eip=0x1005, esp restored.
+        let (mut cpu, mut mem) = cpu_with_stack(
+            0x1000,
+            &[
+                0xe8, 0x02, 0x00, 0x00, 0x00, // call +2
+                0xcd, 0x80, //                  int 0x80 (return target)
+                0xc3, //                        ret
+            ],
+            64,
+        );
+        let initial_esp = cpu.reg(Reg32::Esp);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0x1007);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0x1005);
+        assert_eq!(cpu.reg(Reg32::Esp), initial_esp);
+    }
+
     // --- jmp + int ---
 
     #[test]
@@ -647,6 +723,41 @@ mod tests {
     }
 
     proptest! {
+        /// For every signed displacement, call followed by ret comes
+        /// back to the address right after the call, with esp restored.
+        /// The displacement is bounded so the call target stays inside
+        /// the mapped region (we don't fetch from it — just verify EIP).
+        #[test]
+        fn pbt_call_ret_returns_to_after_call(disp in -1024i32..=1024) {
+            // 5-byte call at entry, then `ret` immediately so the
+            // call's "next instruction" address survives one ret cycle.
+            // We skip the body between call target and ret — the ret
+            // instruction is placed at the call's target.
+            let entry = 0x4000u32;
+            let return_addr = entry + 5;
+            // Place the `ret` at (entry + 5 + disp), which is the call's
+            // target. To make that legal we constrain disp so the target
+            // sits inside our region.
+            let target = return_addr.wrapping_add(u32::from_ne_bytes(disp.to_ne_bytes()));
+            // Skip cases where the target would overlap the call bytes
+            // or the ret would land where we don't want it.
+            prop_assume!(target >= entry + 5 && target < entry + 0x2000 - 1);
+            let mut bytes = alloc::vec![0u8; 0x2000];
+            let d = disp.to_le_bytes();
+            bytes[0..5].copy_from_slice(&[0xe8, d[0], d[1], d[2], d[3]]); // call disp
+            bytes[(target - entry) as usize] = 0xc3; // ret at target
+            let mut mem = FlatMemory::new_zeroed(entry, 0x2000 + 64);
+            mem.write_bytes(entry, &bytes).unwrap();
+            let mut cpu = Cpu::new(entry);
+            cpu.set_reg(Reg32::Esp, entry + 0x2000 + 64);
+            let initial_esp = cpu.reg(Reg32::Esp);
+            cpu.step(&mut mem, &mut PanicHost).unwrap(); // call
+            prop_assert_eq!(cpu.eip, target);
+            cpu.step(&mut mem, &mut PanicHost).unwrap(); // ret
+            prop_assert_eq!(cpu.eip, return_addr);
+            prop_assert_eq!(cpu.reg(Reg32::Esp), initial_esp);
+        }
+
         /// For every (push reg, pop reg) pair (excluding ESP, which has
         /// special-case semantics tested separately): pushing X then
         /// popping recovers X and ESP nets out to its starting value.

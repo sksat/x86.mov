@@ -65,6 +65,13 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
             let r = Reg32::from_index(opcode - 0x58);
             (Insn::PopR32(r), 1)
         }
+        // call rel32 — opcode E8 cd
+        (false, 0xE8) => {
+            let off = read_i32_le(rest, 1)?;
+            (Insn::CallRel32(off), 5)
+        }
+        // ret near — opcode C3
+        (false, 0xC3) => (Insn::Ret, 1),
         _ => return Err(Fault::UnknownOpcode(opcode)),
     };
     Ok((insn, body_len + prefix_len))
