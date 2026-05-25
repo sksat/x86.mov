@@ -15,6 +15,7 @@
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
 #include "llvm/MC/MCStreamer.h"
@@ -66,17 +67,32 @@ void MovAsmPrinter::lower(const MachineInstr *MI, MCInst &OutMI) const {
       MCOp = MCOperand::createExpr(MCSymbolRefExpr::create(
           MO.getMBB()->getSymbol(), OutContext));
       break;
-    case MachineOperand::MO_GlobalAddress:
+    case MachineOperand::MO_GlobalAddress: {
       // Stage 5a doesn't emit any calls yet, but adding the case now
       // keeps lower() honest for stage 6: `call <global>` is the next
-      // thing that lands here.
-      MCOp = MCOperand::createExpr(MCSymbolRefExpr::create(
-          getSymbol(MO.getGlobal()), OutContext));
+      // thing that lands here. Fold MO.getOffset() into the MCExpr so
+      // `@g + C` shapes (e.g. constant GEPs into a global) reference
+      // the right byte — codex's stage-5a review flagged that dropping
+      // the offset would silently misaddress.
+      const MCExpr *Expr = MCSymbolRefExpr::create(
+          getSymbol(MO.getGlobal()), OutContext);
+      if (int64_t Off = MO.getOffset()) {
+        Expr = MCBinaryExpr::createAdd(
+            Expr, MCConstantExpr::create(Off, OutContext), OutContext);
+      }
+      MCOp = MCOperand::createExpr(Expr);
       break;
-    case MachineOperand::MO_ExternalSymbol:
-      MCOp = MCOperand::createExpr(MCSymbolRefExpr::create(
-          GetExternalSymbolSymbol(MO.getSymbolName()), OutContext));
+    }
+    case MachineOperand::MO_ExternalSymbol: {
+      const MCExpr *Expr = MCSymbolRefExpr::create(
+          GetExternalSymbolSymbol(MO.getSymbolName()), OutContext);
+      if (int64_t Off = MO.getOffset()) {
+        Expr = MCBinaryExpr::createAdd(
+            Expr, MCConstantExpr::create(Off, OutContext), OutContext);
+      }
+      MCOp = MCOperand::createExpr(Expr);
       break;
+    }
     default:
       llvm_unreachable("unexpected MachineOperand kind in Mov asm printer");
     }
