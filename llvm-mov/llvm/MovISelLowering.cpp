@@ -66,19 +66,6 @@ SDValue MovTargetLowering::LowerFormalArguments(
                  *DAG.getContext());
   CCInfo.AnalyzeFormalArguments(Ins, CC_Mov);
 
-  // Reject anything that isn't a real i32 in the IR. SelectionDAG type-
-  // legalizes i1/i8/i16 → i32 before CC dispatch, so CC_Mov / ArgLocs
-  // can't see the original narrow type — but DAGCombiner can still fold
-  // a downstream trunc+ext into an extending load that MOV32rm doesn't
-  // match, and we'd silently miscompile. Ins[i].ArgVT preserves the
-  // pre-legalization type, so check there.
-  for (size_t i = 0; i < Ins.size(); ++i) {
-    if (Ins[i].ArgVT.getSimpleVT() != MVT::i32)
-      report_fatal_error(
-          "Mov: only i32 formal args supported at stage 2 "
-          "(narrow integer args land at stage 3 with extending-load patterns)");
-  }
-
   for (CCValAssign &VA : ArgLocs) {
     if (!VA.isMemLoc()) {
       // Register-passed args land at stage 6 — until then CC_Mov assigns
@@ -87,12 +74,13 @@ SDValue MovTargetLowering::LowerFormalArguments(
       report_fatal_error("Mov: register-passed formal arg unexpected");
     }
 
-    // cdecl: each i32 arg occupies one 4-byte stack slot. Right after
-    // `call`, callee's [esp+0] holds the return address and [esp+4]
-    // holds arg0 — VA.getLocMemOffset() is the offset *from arg0*, so
-    // the on-stack location of this arg is (4 + LocMemOffset). That's
-    // exactly what eliminateFrameIndex resolves later (frame size is 0
-    // at stage 2 so the fixed-object offset translates 1:1).
+    // cdecl: each i32 (incl. promoted i1/i8/i16) arg occupies one 4-byte
+    // stack slot. Right after `call`, callee's [esp+0] holds the return
+    // address and [esp+4] holds arg0 — VA.getLocMemOffset() is the offset
+    // *from arg0*, so the on-stack location of this arg is
+    // (4 + LocMemOffset). eliminateFrameIndex resolves the FI to the
+    // matching [esp + n] later (frame size is 0 at stage 2/3 so the
+    // fixed-object offset translates 1:1).
     const unsigned Size = VA.getLocVT().getStoreSize();
     const int FI = MFI.CreateFixedObject(Size, 4 + VA.getLocMemOffset(),
                                          /*IsImmutable=*/true);
@@ -100,6 +88,15 @@ SDValue MovTargetLowering::LowerFormalArguments(
     SDValue FIN = DAG.getFrameIndex(FI, getPointerTy(DAG.getDataLayout()));
     SDValue Arg = DAG.getLoad(VA.getLocVT(), DL, Chain, FIN,
                               MachinePointerInfo::getFixedStack(MF, FI));
+
+    // Stage 3.5: if CC_Mov promoted a narrow integer to i32, the load
+    // returned an i32 but the IR-level consumer expects the original
+    // narrow VT — TRUNCATE back so SelectionDAGBuilder's bookkeeping
+    // lines up. (LocInfo distinguishes Full from {AExt, ZExt, SExt}; in
+    // all three "Ext" cases the in-register value's low bits are the
+    // payload, so a plain truncate is correct.)
+    if (VA.getLocInfo() != CCValAssign::Full)
+      Arg = DAG.getNode(ISD::TRUNCATE, DL, VA.getValVT(), Arg);
     InVals.push_back(Arg);
   }
   return Chain;
@@ -122,7 +119,29 @@ SDValue MovTargetLowering::LowerReturn(
   for (unsigned i = 0, e = RVLocs.size(); i != e; ++i) {
     CCValAssign &VA = RVLocs[i];
     assert(VA.isRegLoc() && "stage 0 RetCC always assigns to a register");
-    Chain = DAG.getCopyToReg(Chain, DL, VA.getLocReg(), OutVals[i], Glue);
+    SDValue Val = OutVals[i];
+    // Stage 3.5: narrow returns (i1/i8/i16) get promoted by RetCC_Mov to
+    // i32 in EAX. The caller only looks at the low bits — `i8 add` of
+    // 250+10 has to truncate-wrap to 4 — but we still need to widen
+    // the value before CopyToReg because EAX is i32. ANY_EXTEND keeps
+    // the high bits as don't-care, which is what the cdecl return
+    // contract allows.
+    switch (VA.getLocInfo()) {
+    case CCValAssign::Full:
+      break;
+    case CCValAssign::AExt:
+      Val = DAG.getNode(ISD::ANY_EXTEND, DL, VA.getLocVT(), Val);
+      break;
+    case CCValAssign::ZExt:
+      Val = DAG.getNode(ISD::ZERO_EXTEND, DL, VA.getLocVT(), Val);
+      break;
+    case CCValAssign::SExt:
+      Val = DAG.getNode(ISD::SIGN_EXTEND, DL, VA.getLocVT(), Val);
+      break;
+    default:
+      report_fatal_error("Mov: unexpected CCValAssign::LocInfo in LowerReturn");
+    }
+    Chain = DAG.getCopyToReg(Chain, DL, VA.getLocReg(), Val, Glue);
     Glue  = Chain.getValue(1);
     RetOps.push_back(DAG.getRegister(VA.getLocReg(), VA.getLocVT()));
   }

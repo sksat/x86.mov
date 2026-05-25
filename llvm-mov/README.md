@@ -25,7 +25,7 @@ Bootstrap. Goals listed in roughly increasing difficulty:
 | 1      | `ret i32 <imm>` for any 32-bit constant            | exit code matches lower 8 bits                           | ✅    |
 | 2      | one i32 argument, cdecl                            | call from a synthesised `_start` (see `test/Execution/run.sh`) | ✅ |
 | 3      | i32 `add/sub/and/or/xor`, shift-imm                | execution tests (incl. 2-address chain coverage)         | ✅    |
-| 3.5    | reg-shift (CL constraint), narrow-int promotion    | execution tests                                          |       |
+| 3.5    | reg-shift (CL constraint), narrow-int promotion    | execution tests (incl. i8/i16 wrap-around)               | ✅    |
 | 4      | `alloca/load/store` on a local stack frame         | execution tests                                          |       |
 | 5      | `icmp + br`                                        | execution tests + MIR tests                              |       |
 | 6      | `call` between user-defined functions              | execution tests                                          |       |
