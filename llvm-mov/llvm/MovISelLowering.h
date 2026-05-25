@@ -30,6 +30,16 @@ public:
                       const SDLoc &DL,
                       SelectionDAG &DAG) const override;
 
+  // Stop DAGCombiner from rewriting `(and (load i32), 0xFF)` or
+  // `(lshr (load i32), 16)` into a narrow ext-load — our backend has no
+  // movzx/movsx-style instruction yet, so a narrow load is unrepresentable.
+  // See MovISelLowering.cpp for the why (codex stage-3 review feedback).
+  bool shouldReduceLoadWidth(
+      SDNode *Load, ISD::LoadExtType ExtTy, EVT NewVT,
+      std::optional<unsigned> ByteOffset = std::nullopt) const override {
+    return false;
+  }
+
   const char *getTargetNodeName(unsigned Opcode) const override;
 };
 } // namespace llvm

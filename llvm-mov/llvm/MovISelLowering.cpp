@@ -31,8 +31,20 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setStackPointerRegisterToSaveRestore(Mov::ESP);
   setBooleanContents(ZeroOrOneBooleanContent);
 
-  // Stage 0 reuses LLVM's default expansions; we only override what we need
-  // explicitly. Add Custom hooks here as later stages introduce them.
+  // Without these, DAGCombine cheerfully folds `(and (load i32), 255)` and
+  // `(lshr (load i32), 16)` into ZEXTLOAD/SEXTLOAD/EXTLOAD-from-i8/i16
+  // patterns that MOV32rm doesn't match — codex's stage-3 review caught
+  // both `and i32 %x, 255` and `lshr %x, 16` crashing with "Cannot select"
+  // on the resulting narrow ext-load. Marking the narrow ext-load forms
+  // Expand keeps DAGCombine from forming them in the first place, so the
+  // arithmetic stays as a plain `load + and/lshr` pair that our existing
+  // MOV32rm + ADD32ri/AND32ri/etc. patterns cover. Narrow loads
+  // re-enable as Legal at stage 3.5 alongside narrow-int support proper.
+  for (MVT MemVT : {MVT::i1, MVT::i8, MVT::i16}) {
+    setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MemVT, Expand);
+    setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MemVT, Expand);
+    setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MemVT, Expand);
+  }
 }
 
 const char *MovTargetLowering::getTargetNodeName(unsigned Opcode) const {
