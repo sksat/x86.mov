@@ -70,3 +70,154 @@ void MovInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
       .addFrameIndex(FrameIndex)
       .addImm(0);
 }
+
+//===----------------------------------------------------------------------===//
+// Branch manipulation — analyzeBranch / removeBranch / insertBranch /
+// reverseBranchCondition. Cond[0] carries the Jcc opcode as an i32 immediate
+// so insertBranch and reverseBranchCondition can round-trip without
+// re-reasoning about the original ISD::CondCode.
+//===----------------------------------------------------------------------===//
+
+namespace {
+// Flip the predicate of a Jcc opcode. EQ↔NE, signed L↔GE / G↔LE,
+// unsigned B↔AE / A↔BE. Each pair is true ⇔ ¬other.
+unsigned reverseJccOpcode(unsigned Opc) {
+  switch (Opc) {
+  case Mov::JE:  return Mov::JNE;
+  case Mov::JNE: return Mov::JE;
+  case Mov::JL:  return Mov::JGE;
+  case Mov::JGE: return Mov::JL;
+  case Mov::JG:  return Mov::JLE;
+  case Mov::JLE: return Mov::JG;
+  case Mov::JB:  return Mov::JAE;
+  case Mov::JAE: return Mov::JB;
+  case Mov::JA:  return Mov::JBE;
+  case Mov::JBE: return Mov::JA;
+  }
+  llvm_unreachable("Mov: unknown Jcc opcode in reverseJccOpcode");
+}
+
+bool isJcc(unsigned Opc) {
+  switch (Opc) {
+  case Mov::JE:  case Mov::JNE:
+  case Mov::JL:  case Mov::JGE:
+  case Mov::JG:  case Mov::JLE:
+  case Mov::JB:  case Mov::JAE:
+  case Mov::JA:  case Mov::JBE:
+    return true;
+  default:
+    return false;
+  }
+}
+} // namespace
+
+bool MovInstrInfo::analyzeBranch(MachineBasicBlock &MBB,
+                                 MachineBasicBlock *&TBB,
+                                 MachineBasicBlock *&FBB,
+                                 SmallVectorImpl<MachineOperand> &Cond,
+                                 bool /*AllowModify*/) const {
+  TBB = nullptr;
+  FBB = nullptr;
+  Cond.clear();
+
+  // Walk back from the end past debug instrs to the last "real" insn.
+  MachineBasicBlock::iterator I = MBB.end();
+  while (I != MBB.begin()) {
+    --I;
+    if (!I->isDebugInstr())
+      break;
+  }
+  if (I == MBB.end() || !I->isTerminator())
+    return false; // falls through to layout successor
+
+  // Inspect the trailing terminators in reverse: at most one unconditional
+  // JMP, optionally preceded by one conditional Jcc. Anything else (e.g. RET
+  // alone, or a chain we don't recognise) bails to "can't analyze".
+  MachineInstr *Last = &*I;
+  unsigned LastOpc = Last->getOpcode();
+
+  if (LastOpc == Mov::JMP) {
+    TBB = Last->getOperand(0).getMBB();
+    if (I == MBB.begin())
+      return false; // just an unconditional jump
+    --I;
+    while (I != MBB.begin() && I->isDebugInstr())
+      --I;
+    if (I->isDebugInstr() || !I->isTerminator())
+      return false;
+    if (isJcc(I->getOpcode())) {
+      // Jcc <target1> ; JMP <target2>
+      FBB = TBB;
+      TBB = I->getOperand(0).getMBB();
+      Cond.push_back(MachineOperand::CreateImm(I->getOpcode()));
+      return false;
+    }
+    return true; // unknown second-to-last terminator
+  }
+
+  if (isJcc(LastOpc)) {
+    // Falls through on the false side.
+    TBB = Last->getOperand(0).getMBB();
+    Cond.push_back(MachineOperand::CreateImm(LastOpc));
+    return false;
+  }
+
+  // Some other terminator (RET, etc.) — we can't help.
+  return true;
+}
+
+unsigned MovInstrInfo::removeBranch(MachineBasicBlock &MBB,
+                                    int *BytesRemoved) const {
+  if (BytesRemoved)
+    *BytesRemoved = 0;
+  unsigned Count = 0;
+  MachineBasicBlock::iterator I = MBB.end();
+  while (I != MBB.begin()) {
+    --I;
+    if (I->isDebugInstr())
+      continue;
+    if (I->getOpcode() != Mov::JMP && !isJcc(I->getOpcode()))
+      break;
+    I = MBB.erase(I);
+    ++Count;
+    // erase returns the iterator after the removed element; we want to
+    // re-position to the previous element for the next loop.
+    if (I == MBB.begin())
+      break;
+  }
+  return Count;
+}
+
+unsigned MovInstrInfo::insertBranch(MachineBasicBlock &MBB,
+                                    MachineBasicBlock *TBB,
+                                    MachineBasicBlock *FBB,
+                                    ArrayRef<MachineOperand> Cond,
+                                    const DebugLoc &DL,
+                                    int *BytesAdded) const {
+  if (BytesAdded)
+    *BytesAdded = 0;
+  // Mirror of removeBranch's shape.
+  // Conditional shapes:
+  //   - Cond empty, FBB null:   single JMP TBB
+  //   - Cond non-empty, FBB null: single Jcc TBB        (fall through on false)
+  //   - Cond non-empty, FBB set:  Jcc TBB ; JMP FBB
+  // The opcode in Cond[0] (the Jcc) was stamped by analyzeBranch.
+  if (Cond.empty()) {
+    BuildMI(&MBB, DL, get(Mov::JMP)).addMBB(TBB);
+    return 1;
+  }
+  unsigned JccOpc = Cond[0].getImm();
+  BuildMI(&MBB, DL, get(JccOpc)).addMBB(TBB);
+  if (!FBB)
+    return 1;
+  BuildMI(&MBB, DL, get(Mov::JMP)).addMBB(FBB);
+  return 2;
+}
+
+bool MovInstrInfo::reverseBranchCondition(
+    SmallVectorImpl<MachineOperand> &Cond) const {
+  if (Cond.size() != 1)
+    return true; // can't reverse
+  Cond[0].setImm(reverseJccOpcode(Cond[0].getImm()));
+  return false;
+}

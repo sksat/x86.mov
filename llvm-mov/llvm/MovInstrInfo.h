@@ -33,5 +33,34 @@ public:
       int FrameIndex, const TargetRegisterClass *RC, Register VReg,
       unsigned SubReg = 0,
       MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
+
+  // Branch manipulation hooks used by BranchFolder, MachineBlockPlacement,
+  // etc. analyzeBranch + removeBranch + insertBranch + reverseBranchCondition
+  // form a quartet that the codegen-side passes treat as a unit; returning
+  // "can't analyze" from analyzeBranch is not enough because some passes
+  // (notably BranchFolder's tail-merge path) still call removeBranch on
+  // blocks they want to mutate, and the default removeBranch / insertBranch
+  // are `llvm_unreachable`. So we implement all four together.
+  //
+  // Conditional shape we emit at stage 5b is exactly
+  //     (optional Jcc target1) (optional JMP target2)
+  // where Jcc takes its EFLAGS-defining CMP via glue. Cond[0] carries the
+  // Jcc opcode as an i32 immediate so insertBranch / reverseBranchCondition
+  // can re-emit the matching mnemonic without going back to LLVM IR.
+  bool analyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
+                     MachineBasicBlock *&FBB,
+                     SmallVectorImpl<MachineOperand> &Cond,
+                     bool AllowModify = false) const override;
+
+  unsigned removeBranch(MachineBasicBlock &MBB,
+                        int *BytesRemoved = nullptr) const override;
+
+  unsigned insertBranch(MachineBasicBlock &MBB, MachineBasicBlock *TBB,
+                        MachineBasicBlock *FBB, ArrayRef<MachineOperand> Cond,
+                        const DebugLoc &DL,
+                        int *BytesAdded = nullptr) const override;
+
+  bool reverseBranchCondition(
+      SmallVectorImpl<MachineOperand> &Cond) const override;
 };
 } // namespace llvm

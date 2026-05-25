@@ -56,12 +56,79 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i1, Expand);
   setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i8, Expand);
   setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i16, Expand);
+
+  // Stage 5: fold (BRCOND (SETCC a, b, cc) bb) into MovISD::BR_CC so the
+  // selector can emit a glued CMP + Jcc pair. SETCC on its own (without
+  // a BRCOND consumer — e.g. `select` or `zext i1`) isn't supported yet;
+  // that's stage 5.5.
+  //
+  // We mark BOTH BRCOND and BR_CC Custom because the DAG legalizer
+  // sometimes rewrites BRCOND(SETCC(...)) into BR_CC before our hook
+  // gets a turn (especially when SETCC.i32 is Expand). Hooking both
+  // sides means either shape ends up in MovISD::BR_CC.
+  setOperationAction(ISD::BRCOND, MVT::Other, Custom);
+  setOperationAction(ISD::BR_CC,  MVT::i32,   Custom);
+  setOperationAction(ISD::SETCC,  MVT::i32,   Expand);
+}
+
+SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
+  switch (Op.getOpcode()) {
+  case ISD::BRCOND:
+    return LowerBRCOND(Op, DAG);
+  case ISD::BR_CC:
+    return LowerBR_CC(Op, DAG);
+  default:
+    llvm_unreachable("Mov: LowerOperation called on unhandled opcode");
+  }
+}
+
+SDValue MovTargetLowering::LowerBRCOND(SDValue Op, SelectionDAG &DAG) const {
+  // BRCOND operand layout: (chain, cond, target_bb)
+  SDValue Chain  = Op.getOperand(0);
+  SDValue Cond   = Op.getOperand(1);
+  SDValue Target = Op.getOperand(2);
+  SDLoc DL(Op);
+
+  ISD::CondCode CC;
+  SDValue LHS, RHS;
+  if (Cond.getOpcode() == ISD::SETCC) {
+    // The common case: `br i1 (icmp cc a, b)` lowers as
+    // BRCOND(SETCC(a, b, cc), bb). Pull cc/a/b out and pack them into
+    // MovISD::BR_CC so we can emit a single CMP + Jcc pair.
+    LHS = Cond.getOperand(0);
+    RHS = Cond.getOperand(1);
+    CC  = cast<CondCodeSDNode>(Cond.getOperand(2))->get();
+  } else {
+    // `br i1 %v` where %v isn't a SETCC: branch when %v is non-zero.
+    // We synthesize `CMP %v, 0; JNE` by lowering through BR_CC with
+    // SETNE against a literal 0.
+    LHS = Cond;
+    RHS = DAG.getConstant(0, DL, MVT::i32);
+    CC  = ISD::SETNE;
+  }
+
+  return DAG.getNode(MovISD::BR_CC, DL, MVT::Other, Chain,
+                     DAG.getCondCode(CC), LHS, RHS, Target);
+}
+
+SDValue MovTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
+  // ISD::BR_CC operand layout: (chain, cc, lhs, rhs, target_bb).
+  // Repack as MovISD::BR_CC; the selector emits CMP + Jcc.
+  SDValue Chain  = Op.getOperand(0);
+  SDValue CCNode = Op.getOperand(1);
+  SDValue LHS    = Op.getOperand(2);
+  SDValue RHS    = Op.getOperand(3);
+  SDValue Target = Op.getOperand(4);
+  SDLoc DL(Op);
+  return DAG.getNode(MovISD::BR_CC, DL, MVT::Other,
+                     Chain, CCNode, LHS, RHS, Target);
 }
 
 const char *MovTargetLowering::getTargetNodeName(unsigned Opcode) const {
   switch (Opcode) {
-  case MovISD::RET: return "MovISD::RET";
-  default:          return nullptr;
+  case MovISD::RET:   return "MovISD::RET";
+  case MovISD::BR_CC: return "MovISD::BR_CC";
+  default:            return nullptr;
   }
 }
 
@@ -150,7 +217,12 @@ SDValue MovTargetLowering::LowerReturn(
       Val = DAG.getNode(ISD::SIGN_EXTEND, DL, VA.getLocVT(), Val);
       break;
     default:
-      report_fatal_error("Mov: unexpected CCValAssign::LocInfo in LowerReturn");
+      report_fatal_error(Twine("Mov: unexpected CCValAssign::LocInfo=") +
+                         Twine(static_cast<int>(VA.getLocInfo())) +
+                         " in LowerReturn (ValVT=" +
+                         Twine(VA.getValVT().SimpleTy) +
+                         ", LocVT=" +
+                         Twine(VA.getLocVT().SimpleTy) + ")");
     }
     Chain = DAG.getCopyToReg(Chain, DL, VA.getLocReg(), Val, Glue);
     Glue  = Chain.getValue(1);

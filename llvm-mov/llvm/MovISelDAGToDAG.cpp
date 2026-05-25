@@ -11,15 +11,38 @@
 //===----------------------------------------------------------------------===//
 
 #include "MCTargetDesc/MovMCTargetDesc.h"
+#include "MovISelLowering.h"
 #include "MovSubtarget.h"
 #include "MovTargetMachine.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/SelectionDAG.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #define DEBUG_TYPE "mov-isel"
 
 using namespace llvm;
+
+namespace {
+// Map an LLVM CondCode to the matching x86-style Jcc opcode.
+unsigned getJccForCondCode(ISD::CondCode CC) {
+  switch (CC) {
+  case ISD::SETEQ:  return Mov::JE;
+  case ISD::SETNE:  return Mov::JNE;
+  case ISD::SETLT:  return Mov::JL;
+  case ISD::SETGT:  return Mov::JG;
+  case ISD::SETLE:  return Mov::JLE;
+  case ISD::SETGE:  return Mov::JGE;
+  case ISD::SETULT: return Mov::JB;
+  case ISD::SETUGT: return Mov::JA;
+  case ISD::SETULE: return Mov::JBE;
+  case ISD::SETUGE: return Mov::JAE;
+  default: break;
+  }
+  llvm_unreachable("Mov: unsupported CondCode in BR_CC selection");
+}
+} // namespace
 
 namespace {
 class MovDAGToDAGISel : public SelectionDAGISel {
@@ -55,6 +78,42 @@ public:
 char MovDAGToDAGISelLegacy::ID = 0;
 
 void MovDAGToDAGISel::Select(SDNode *Node) {
+  // MovISD::BR_CC: emit
+  //     CMP32r{r,i} LHS, RHS    ; Defs = [EFLAGS]   (glue1)
+  //     Jcc<CC> target          ; Uses = [EFLAGS]   (consumes glue1)
+  // Glue keeps the pair adjacent so the scheduler can't interleave a
+  // flag-clobbering instruction between them — Defs/Uses alone would
+  // not pin the ordering tightly enough (codex's stage-5 design note).
+  if (Node->getOpcode() == MovISD::BR_CC) {
+    SDLoc DL(Node);
+    SDValue Chain  = Node->getOperand(0);
+    ISD::CondCode CC =
+        cast<CondCodeSDNode>(Node->getOperand(1))->get();
+    SDValue LHS    = Node->getOperand(2);
+    SDValue RHS    = Node->getOperand(3);
+    SDValue Target = Node->getOperand(4);
+
+    SDNode *Cmp;
+    if (auto *CRHS = dyn_cast<ConstantSDNode>(RHS)) {
+      // CMP32ri  lhs, imm
+      SDValue Imm = CurDAG->getTargetConstant(
+          CRHS->getSExtValue(), DL, MVT::i32);
+      Cmp = CurDAG->getMachineNode(
+          Mov::CMP32ri, DL, MVT::Glue, {LHS, Imm});
+    } else {
+      // CMP32rr  lhs, rhs
+      Cmp = CurDAG->getMachineNode(
+          Mov::CMP32rr, DL, MVT::Glue, {LHS, RHS});
+    }
+
+    SDValue Glue = SDValue(Cmp, 0);
+    SDNode *Jcc = CurDAG->getMachineNode(
+        getJccForCondCode(CC), DL, MVT::Other,
+        {Target, Chain, Glue});
+    ReplaceNode(Node, Jcc);
+    return;
+  }
+
   // Variable-amount shifts: x86 requires the count in CL, so before falling
   // back to TableGen patterns (which only know `shift reg, imm`) we
   // intercept (shl/srl/sra GPR32, GPR32) and emit

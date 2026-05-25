@@ -11,6 +11,17 @@ namespace MovISD {
 enum NodeType : unsigned {
   FIRST_NUMBER = ISD::BUILTIN_OP_END,
   RET,  // Custom return node — picked up by the RET pattern in MovInstrInfo.td.
+
+  // Branch-on-condition. Operand layout (after the chain):
+  //   0: CondCode (ISD::CondCode wrapped in OtherVT)
+  //   1: LHS (i32)
+  //   2: RHS (i32)
+  //   3: target MachineBasicBlock
+  //
+  // Mirrors ISD::BR_CC but is a target node so we can intercept it in
+  // MovDAGToDAGISel::Select and emit `CMP + Jcc` directly, with the
+  // EFLAGS dependence pinned via SDValue glue.
+  BR_CC,
 };
 } // namespace MovISD
 
@@ -29,6 +40,12 @@ public:
                       const SmallVectorImpl<SDValue> &OutVals,
                       const SDLoc &DL,
                       SelectionDAG &DAG) const override;
+
+  // Custom-lowered operations: ISD::BRCOND and ISD::BR_CC both fold
+  // into MovISD::BR_CC; the selector then emits a CMP + Jcc pair.
+  SDValue LowerOperation(SDValue Op, SelectionDAG &DAG) const override;
+  SDValue LowerBRCOND(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
 
   // Stop DAGCombiner from rewriting `(and (load i32), 0xFF)` or
   // `(lshr (load i32), 16)` into a narrow ext-load — our backend has no
