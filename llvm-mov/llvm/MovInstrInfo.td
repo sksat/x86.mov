@@ -70,6 +70,14 @@ def MOV32rm : MovInst<(outs GPR32:$dst), (ins MovMemOperand:$src),
                       "mov\t$dst, dword ptr $src",
                       [(set GPR32:$dst, (load addr_fi:$src))]>;
 
+// MOV32mr — store form. Used by the spill machinery (storeRegToStackSlot
+// in MovInstrInfo.cpp) and, at stage 4c+, by `store i32 ..., ptr ...`
+// patterns. Stage 4b adds the C++ side; the DAG pattern grows in 4c.
+let mayStore = 1 in
+def MOV32mr : MovInst<(outs), (ins MovMemOperand:$dst, GPR32:$src),
+                      "mov\tdword ptr $dst, $src",
+                      [(store GPR32:$src, addr_fi:$dst)]>;
+
 //===----------------------------------------------------------------------===//
 // Integer arithmetic + bitwise — stage 3 (mov-heavy bootstrap).
 //

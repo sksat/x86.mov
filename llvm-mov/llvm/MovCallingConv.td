@@ -19,11 +19,10 @@ def RetCC_Mov : CallingConv<[
   CCIfType<[i32], CCAssignToReg<[EAX]>>
 ]>;
 
-// Callee-saved: cdecl ultimately wants EBX, ESI, EDI, EBP preserved across
-// calls — but until [[MovFrameLowering]] emits a real prologue/epilogue
-// (stage 4+) we cannot honour that contract. Advertising a CSR set we can't
-// preserve is worse than admitting none: register allocation would happily
-// hand a value EBX, the function would clobber it, and the caller's invariant
-// would break silently. Empty set keeps the contract truthful at stage 0–3;
-// re-add the cdecl set the same commit that lands prologue/epilogue.
-def CSR_Mov : CalleeSavedRegs<(add)>;
+// Callee-saved: cdecl says EBX, ESI, EDI, EBP. EBP is excluded from this
+// list because MovFrameLowering owns it as the frame pointer (always
+// reserved, always saved/restored in emitPrologue/emitEpilogue with the
+// PUSH32r/POP32r pair). Adding EBP here on top would result in a double
+// save. PEI uses storeRegToStackSlot/loadRegFromStackSlot (the stage-4b
+// real implementations) to spill the CSRs it actually finds used.
+def CSR_Mov : CalleeSavedRegs<(add EBX, ESI, EDI)>;

@@ -33,24 +33,40 @@ void MovInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
   llvm_unreachable("Mov::copyPhysReg: only GPR32->GPR32 supported");
 }
 
-void MovInstrInfo::storeRegToStackSlot(MachineBasicBlock &,
-                                       MachineBasicBlock::iterator, Register,
-                                       bool, int, const TargetRegisterClass *,
-                                       Register,
-                                       MachineInstr::MIFlag) const {
-  report_fatal_error(
-      "Mov: storeRegToStackSlot — register spill not yet supported. "
-      "Greedy RA hit pressure that the stage-3.5 register-shift lowering "
-      "can't satisfy without spill machinery. Real spill (MOV32mr + an "
-      "ESP-adjusting prologue/epilogue) lands at stage 4.");
+void MovInstrInfo::storeRegToStackSlot(MachineBasicBlock &MBB,
+                                       MachineBasicBlock::iterator MI,
+                                       Register SrcReg, bool isKill,
+                                       int FrameIndex,
+                                       const TargetRegisterClass *RC,
+                                       Register /*VReg*/,
+                                       MachineInstr::MIFlag Flags) const {
+  if (!Mov::GPR32RegClass.hasSubClassEq(RC))
+    llvm_unreachable("Mov::storeRegToStackSlot: only GPR32 supported");
+
+  DebugLoc DL = MBB.findDebugLoc(MI);
+  // mov dword ptr [FI + 0], SrcReg
+  // PEI rewrites the FrameIndex operand pair to (EBP, offset) via
+  // MovRegisterInfo::eliminateFrameIndex once the local frame is laid out.
+  BuildMI(MBB, MI, DL, get(Mov::MOV32mr))
+      .setMIFlag(Flags)
+      .addFrameIndex(FrameIndex)
+      .addImm(0)
+      .addReg(SrcReg, getKillRegState(isKill));
 }
 
-void MovInstrInfo::loadRegFromStackSlot(MachineBasicBlock &,
-                                        MachineBasicBlock::iterator, Register,
-                                        int, const TargetRegisterClass *,
-                                        Register, unsigned,
-                                        MachineInstr::MIFlag) const {
-  report_fatal_error(
-      "Mov: loadRegFromStackSlot — register reload not yet supported. "
-      "Pairs with storeRegToStackSlot; both land at stage 4.");
+void MovInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
+                                        MachineBasicBlock::iterator MI,
+                                        Register DestReg, int FrameIndex,
+                                        const TargetRegisterClass *RC,
+                                        Register /*VReg*/, unsigned /*SubReg*/,
+                                        MachineInstr::MIFlag Flags) const {
+  if (!Mov::GPR32RegClass.hasSubClassEq(RC))
+    llvm_unreachable("Mov::loadRegFromStackSlot: only GPR32 supported");
+
+  DebugLoc DL = MBB.findDebugLoc(MI);
+  // mov DestReg, dword ptr [FI + 0]
+  BuildMI(MBB, MI, DL, get(Mov::MOV32rm), DestReg)
+      .setMIFlag(Flags)
+      .addFrameIndex(FrameIndex)
+      .addImm(0);
 }
