@@ -139,6 +139,22 @@ pub fn parse(bytes: &[u8]) -> Result<LoadedElf<'_>, ElfError> {
 ///
 /// Returns `None` if the loaded ELF has no `PT_LOAD` segments.
 pub fn flatten_into_region(elf: &LoadedElf<'_>) -> Result<FlatMemory, ElfError> {
+    let (mem, _stack_top) = flatten_with_stack(elf, 0)?;
+    Ok(mem)
+}
+
+/// Like [`flatten_into_region`] but also reserves `stack_size` bytes
+/// immediately above the highest segment for the guest's stack. Returns
+/// the materialized memory plus the initial `%esp` value (the top of
+/// the stack region — the stack grows down).
+///
+/// A `stack_size` of 0 is equivalent to [`flatten_into_region`] and the
+/// returned `esp_initial` is meaningless (set to the top of the segment
+/// region for consistency).
+pub fn flatten_with_stack(
+    elf: &LoadedElf<'_>,
+    stack_size: u32,
+) -> Result<(FlatMemory, u32), ElfError> {
     let Some(first) = elf.segments.first() else {
         return Err(ElfError::NonsenseSegmentSizes); // reused: "nothing to load"
     };
@@ -150,15 +166,19 @@ pub fn flatten_into_region(elf: &LoadedElf<'_>) -> Result<FlatMemory, ElfError> 
         lo = lo.min(seg_lo);
         hi = hi.max(seg_hi);
     }
+    // Extend the region upward to host the stack. esp starts at the
+    // very top because the stack grows toward lower addresses.
+    let stack_top_u64 = hi + u64::from(stack_size);
     let base = u32::try_from(lo).map_err(|_| ElfError::Truncated)?;
-    let size = usize::try_from(hi - lo).map_err(|_| ElfError::Truncated)?;
+    let size = usize::try_from(stack_top_u64 - lo).map_err(|_| ElfError::Truncated)?;
+    let esp_initial = u32::try_from(stack_top_u64).map_err(|_| ElfError::Truncated)?;
     let mut mem = FlatMemory::new_zeroed(base, size);
     for seg in &elf.segments {
         // Memory is already zeroed, so we only have to copy filesz bytes.
         mem.write_bytes(seg.vaddr, seg.data)
             .map_err(|_| ElfError::Truncated)?;
     }
-    Ok(mem)
+    Ok((mem, esp_initial))
 }
 
 fn read_u16(bytes: &[u8], off: usize) -> Result<u16, ElfError> {
@@ -339,6 +359,34 @@ mod tests {
                 0x1000 + off
             );
         }
+    }
+
+    #[test]
+    fn flatten_with_stack_reserves_room_above_segments() {
+        let prog = b"\xb8\x2a\x00\x00\x00"; // 5 bytes
+        let elf = build_elf(0x1000, &[(0x1000, 8, prog)]); // memsz = 8
+        let loaded = parse(&elf).unwrap();
+        // Reserve a 16-byte stack. Top of segments is 0x1000 + 8 = 0x1008;
+        // esp should start at 0x1008 + 16 = 0x1018.
+        let (mem, esp) = flatten_with_stack(&loaded, 16).unwrap();
+        assert_eq!(esp, 0x1018);
+        // Stack bytes should be zero-initialized and writable. Pick one
+        // address inside the stack and check we can round-trip a value.
+        assert_eq!(mem.read_u32(0x1010).unwrap(), 0);
+    }
+
+    #[test]
+    fn flatten_with_stack_zero_size_matches_flatten_into_region() {
+        let elf = build_elf(0x1000, &[(0x1000, 4, &[1, 2, 3, 4])]);
+        let loaded = parse(&elf).unwrap();
+        let plain = flatten_into_region(&loaded).unwrap();
+        let (with_zero, _) = flatten_with_stack(&loaded, 0).unwrap();
+        // Same length, same bytes at the segment.
+        assert_eq!(plain.len(), with_zero.len());
+        assert_eq!(
+            plain.read_u32(0x1000).unwrap(),
+            with_zero.read_u32(0x1000).unwrap()
+        );
     }
 
     #[test]

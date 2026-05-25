@@ -4,9 +4,15 @@
 
 use std::io::{self, Write};
 
-use movie86_core::elf::{flatten_into_region, parse, ElfError};
+use movie86_core::elf::{flatten_with_stack, parse, ElfError};
 use movie86_core::syscall::{SysHost, SyscallArgs, SyscallResult};
-use movie86_core::{Cpu, Fault, Memory};
+use movie86_core::{Cpu, Fault, Memory, Reg32};
+
+/// Stack size reserved by the CLI for every program. 64 KiB is enough
+/// for any hand-assembled fixture we run today and well within the
+/// host's tolerance even when stacked on top of a movfuscator binary's
+/// already-large segment range.
+const DEFAULT_STACK_SIZE: u32 = 64 * 1024;
 
 #[cfg(test)]
 mod tests;
@@ -141,11 +147,12 @@ pub fn run_elf_with_host<H: SysHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
         Ok(e) => e,
         Err(e) => return RunOutcome::LoadError(e),
     };
-    let mut mem = match flatten_into_region(&elf) {
-        Ok(m) => m,
+    let (mut mem, esp_initial) = match flatten_with_stack(&elf, DEFAULT_STACK_SIZE) {
+        Ok(pair) => pair,
         Err(e) => return RunOutcome::LoadError(e),
     };
     let mut cpu = Cpu::new(elf.entry);
+    cpu.set_reg(Reg32::Esp, esp_initial);
     loop {
         match cpu.step(&mut mem, host) {
             Ok(()) => {}
