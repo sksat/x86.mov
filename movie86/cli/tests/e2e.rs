@@ -2,7 +2,9 @@
 //! the CLI library, and assert the outcome. Mirrors the byte-identical
 //! TDD style the rest of the repo uses.
 
-use movie86_cli::{run_elf, RunOutcome};
+use movie86_cli::{run_elf, run_elf_with_host, RunOutcome};
+use movie86_core::syscall::{SysHost, SyscallArgs, SyscallResult};
+use movie86_core::{Fault, Memory};
 
 /// Build a minimal ELF32-LE-i386 `ET_EXEC` whose entry runs `program`.
 /// One `PT_LOAD` segment covering exactly the program bytes.
@@ -40,6 +42,39 @@ fn build_elf(entry: u32, program: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// Test host that buffers all `write(1, ...)` bytes and treats `exit(1)`
+/// the same way `StdHost` does. Lets us assert on captured stdout
+/// without spawning a subprocess.
+struct CapturingHost {
+    stdout: Vec<u8>,
+}
+
+impl CapturingHost {
+    fn new() -> Self {
+        Self { stdout: Vec::new() }
+    }
+}
+
+impl SysHost for CapturingHost {
+    fn syscall(
+        &mut self,
+        args: &SyscallArgs,
+        mem: &mut dyn Memory,
+    ) -> Result<SyscallResult, Fault> {
+        match args.eax {
+            1 => Err(Fault::Exit(args.ebx)),
+            4 => {
+                assert_eq!(args.ebx, 1, "test only captures stdout");
+                let mut buf = vec![0u8; args.edx as usize];
+                mem.read_bytes(args.ecx, &mut buf)?;
+                self.stdout.extend_from_slice(&buf);
+                Ok(SyscallResult::Return(args.edx))
+            }
+            n => Err(Fault::UnknownSyscall(n)),
+        }
+    }
+}
+
 #[test]
 fn runs_minimal_exit_42_elf() {
     // The shortest meaningful program: set up exit(42) and trap.
@@ -56,6 +91,38 @@ fn runs_minimal_exit_42_elf() {
         RunOutcome::Exit(status) => assert_eq!(status, 42),
         other => panic!("expected Exit(42), got {other:?}"),
     }
+}
+
+#[test]
+fn writes_hello_to_stdout_and_exits_zero() {
+    // Layout: one PT_LOAD covering [code | data] at 0x08048000.
+    //   code: write(1, msg_addr, 6); exit(0)    (34 bytes)
+    //   data: "Hello\n"                          (6 bytes at code+34)
+    const ENTRY: u32 = 0x0804_8000;
+    const MSG_OFF: u32 = 34;
+    let msg_addr = ENTRY + MSG_OFF;
+    let m = msg_addr.to_le_bytes();
+    let program: Vec<u8> = vec![
+        // mov eax, 4    (SYS_write)
+        0xb8, 0x04, 0x00, 0x00, 0x00, // mov ebx, 1    (fd = stdout)
+        0xbb, 0x01, 0x00, 0x00, 0x00, // mov ecx, msg_addr
+        0xb9, m[0], m[1], m[2], m[3], // mov edx, 6    (count)
+        0xba, 0x06, 0x00, 0x00, 0x00, // int 0x80
+        0xcd, 0x80, // mov eax, 1    (SYS_exit)
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov ebx, 0
+        0xbb, 0x00, 0x00, 0x00, 0x00, // int 0x80
+        0xcd, 0x80, // data:
+        b'H', b'e', b'l', b'l', b'o', b'\n',
+    ];
+    assert_eq!(program.len(), (MSG_OFF + 6) as usize);
+
+    let elf = build_elf(ENTRY, &program);
+    let mut host = CapturingHost::new();
+    match run_elf_with_host(&elf, &mut host) {
+        RunOutcome::Exit(0) => {}
+        other => panic!("expected Exit(0), got {other:?}"),
+    }
+    assert_eq!(host.stdout, b"Hello\n");
 }
 
 #[test]

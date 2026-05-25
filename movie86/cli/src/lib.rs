@@ -129,6 +129,14 @@ fn errno_to_eax(errno: u32) -> u32 {
 /// outcome. Syscalls go through [`StdHost`] (stdio + exit).
 #[must_use]
 pub fn run_elf(bytes: &[u8]) -> RunOutcome {
+    let mut host = StdHost;
+    run_elf_with_host(bytes, &mut host)
+}
+
+/// Same as [`run_elf`] but with a caller-supplied host. Lets integration
+/// tests substitute a recording host (capture stdout, assert no syscall
+/// happens, etc.) without spawning a subprocess.
+pub fn run_elf_with_host<H: SysHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
     let elf = match parse(bytes) {
         Ok(e) => e,
         Err(e) => return RunOutcome::LoadError(e),
@@ -138,9 +146,8 @@ pub fn run_elf(bytes: &[u8]) -> RunOutcome {
         Err(e) => return RunOutcome::LoadError(e),
     };
     let mut cpu = Cpu::new(elf.entry);
-    let mut host = StdHost;
     loop {
-        match cpu.step(&mut mem, &mut host) {
+        match cpu.step(&mut mem, host) {
             Ok(()) => {}
             Err(Fault::Exit(status)) => return RunOutcome::Exit(status),
             Err(e) => return RunOutcome::Fault(e),
