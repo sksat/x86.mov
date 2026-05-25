@@ -32,3 +32,25 @@ void MovInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
   }
   llvm_unreachable("Mov::copyPhysReg: only GPR32->GPR32 supported");
 }
+
+void MovInstrInfo::storeRegToStackSlot(MachineBasicBlock &,
+                                       MachineBasicBlock::iterator, Register,
+                                       bool, int, const TargetRegisterClass *,
+                                       Register,
+                                       MachineInstr::MIFlag) const {
+  report_fatal_error(
+      "Mov: storeRegToStackSlot — register spill not yet supported. "
+      "Greedy RA hit pressure that the stage-3.5 register-shift lowering "
+      "can't satisfy without spill machinery. Real spill (MOV32mr + an "
+      "ESP-adjusting prologue/epilogue) lands at stage 4.");
+}
+
+void MovInstrInfo::loadRegFromStackSlot(MachineBasicBlock &,
+                                        MachineBasicBlock::iterator, Register,
+                                        int, const TargetRegisterClass *,
+                                        Register, unsigned,
+                                        MachineInstr::MIFlag) const {
+  report_fatal_error(
+      "Mov: loadRegFromStackSlot — register reload not yet supported. "
+      "Pairs with storeRegToStackSlot; both land at stage 4.");
+}
