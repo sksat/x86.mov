@@ -54,6 +54,19 @@ SDValue MovTargetLowering::LowerFormalArguments(
                  *DAG.getContext());
   CCInfo.AnalyzeFormalArguments(Ins, CC_Mov);
 
+  // Reject anything that isn't a real i32 in the IR. SelectionDAG type-
+  // legalizes i1/i8/i16 → i32 before CC dispatch, so CC_Mov / ArgLocs
+  // can't see the original narrow type — but DAGCombiner can still fold
+  // a downstream trunc+ext into an extending load that MOV32rm doesn't
+  // match, and we'd silently miscompile. Ins[i].ArgVT preserves the
+  // pre-legalization type, so check there.
+  for (size_t i = 0; i < Ins.size(); ++i) {
+    if (Ins[i].ArgVT.getSimpleVT() != MVT::i32)
+      report_fatal_error(
+          "Mov: only i32 formal args supported at stage 2 "
+          "(narrow integer args land at stage 3 with extending-load patterns)");
+  }
+
   for (CCValAssign &VA : ArgLocs) {
     if (!VA.isMemLoc()) {
       // Register-passed args land at stage 6 — until then CC_Mov assigns
