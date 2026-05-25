@@ -90,6 +90,21 @@ test/
   for the return address `call` pushes). `eliminateFrameIndex` rewrites
   FrameIndex operands to `(ESP, off)` with no SP adjustment. EBP-based
   frame, prologue, and CSR re-enable all land together at stage 4.
+- **EBX/ESI/EDI/EBP reserved through stage 3** (`MovRegisterInfo::getReservedRegs`):
+  these are the cdecl callee-saved set, but with `CSR_Mov` still empty
+  and prologue/epilogue still no-op, leaving them allocatable would let
+  RA silently clobber the caller. Reserving them constrains stage 3
+  arithmetic to `EAX/ECX/EDX` (plenty for the current fixtures) and
+  makes the callee-save contract truthful. Drop the reservation in the
+  same commit that lands the prologue/epilogue at stage 4.
+- **All stage 3 binops are 2-address** (`Constraints = "$src1 = $dst"`
+  in `MovInstrInfo.td`). x86 `add reg, src` is `dst = dst + src`, not
+  `dst = src1 + src2`; without the tie, RA freely picks distinct
+  physical regs for `$src1` and `$dst` and the emitted asm is wrong.
+  The `BinOpRR`/`BinOpRI`/`ShiftRI` helper classes enforce this — any
+  new mov-heavy binop should go through them so the tie can't be
+  forgotten. (Codex's stage-3 review surfaced this as one of the two
+  main traps; the other was callee-saved invisibility, handled above.)
 - **Where to stop adding "mov-only" hacks during bootstrap**: stages 0–6 are allowed to emit
   `jmp/call/ret/cmp`. The dedicated `MovOnlyLegalize` MachineFunctionPass at stage 7 is
   what eliminates them. Don't preemptively encode mov-only patterns into TableGen — it'll

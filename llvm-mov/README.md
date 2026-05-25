@@ -24,7 +24,8 @@ Bootstrap. Goals listed in roughly increasing difficulty:
 | 0      | `define i32 @main() { ret i32 0 }`                 | linked ELF exits 0                                       | ✅    |
 | 1      | `ret i32 <imm>` for any 32-bit constant            | exit code matches lower 8 bits                           | ✅    |
 | 2      | one i32 argument, cdecl                            | call from a synthesised `_start` (see `test/Execution/run.sh`) | ✅ |
-| 3      | i32 `add/sub/and/or/xor/shl/lshr/ashr`             | execution tests                                          |       |
+| 3      | i32 `add/sub/and/or/xor`, shift-imm                | execution tests (incl. 2-address chain coverage)         | ✅    |
+| 3.5    | reg-shift (CL constraint), narrow-int promotion    | execution tests                                          |       |
 | 4      | `alloca/load/store` on a local stack frame         | execution tests                                          |       |
 | 5      | `icmp + br`                                        | execution tests + MIR tests                              |       |
 | 6      | `call` between user-defined functions              | execution tests                                          |       |

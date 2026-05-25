@@ -71,6 +71,60 @@ def MOV32rm : MovInst<(outs GPR32:$dst), (ins MovMemOperand:$src),
                       [(set GPR32:$dst, (load addr_fi:$src))]>;
 
 //===----------------------------------------------------------------------===//
+// Integer arithmetic + bitwise — stage 3 (mov-heavy bootstrap).
+//
+// x86 integer ops are 2-address (`add reg, src` is `dst = dst + src`), so
+// every binop here ties `$src1` to `$dst`. Register allocation honours the
+// tie by coalescing the two virtual registers; without it RA would freely
+// pick distinct physical regs for `$src1` and `$dst` and the resulting asm
+// would be wrong.
+//
+// Shift forms are immediate-only at stage 3; reg-shift hits the x86 `CL`
+// register-class constraint and lives in stage 3.5.
+//
+// Mov-only legalization (stage 7+) will replace these with mov-table
+// lookups. Don't add commutative simplifications or addressing-mode
+// folds here that the legalization pass would have to unpick.
+//===----------------------------------------------------------------------===//
+
+class BinOpRR<string OpStr, SDNode OpNode, bit Commutable = 0>
+  : MovInst<(outs GPR32:$dst), (ins GPR32:$src1, GPR32:$src2),
+            !strconcat(OpStr, "\t$dst, $src2"),
+            [(set GPR32:$dst, (OpNode GPR32:$src1, GPR32:$src2))]> {
+  let Constraints = "$src1 = $dst";
+  let isCommutable = Commutable;
+}
+
+class BinOpRI<string OpStr, SDNode OpNode>
+  : MovInst<(outs GPR32:$dst), (ins GPR32:$src1, i32imm_op:$src2),
+            !strconcat(OpStr, "\t$dst, $src2"),
+            [(set GPR32:$dst, (OpNode GPR32:$src1, imm:$src2))]> {
+  let Constraints = "$src1 = $dst";
+}
+
+class ShiftRI<string OpStr, SDNode OpNode>
+  : MovInst<(outs GPR32:$dst), (ins GPR32:$src1, i32imm_op:$amt),
+            !strconcat(OpStr, "\t$dst, $amt"),
+            [(set GPR32:$dst, (OpNode GPR32:$src1, (i32 imm:$amt)))]> {
+  let Constraints = "$src1 = $dst";
+}
+
+def ADD32rr : BinOpRR<"add", add, /*Commutable=*/1>;
+def ADD32ri : BinOpRI<"add", add>;
+def SUB32rr : BinOpRR<"sub", sub>;
+def SUB32ri : BinOpRI<"sub", sub>;
+def AND32rr : BinOpRR<"and", and, /*Commutable=*/1>;
+def AND32ri : BinOpRI<"and", and>;
+def OR32rr  : BinOpRR<"or",  or,  /*Commutable=*/1>;
+def OR32ri  : BinOpRI<"or",  or>;
+def XOR32rr : BinOpRR<"xor", xor, /*Commutable=*/1>;
+def XOR32ri : BinOpRI<"xor", xor>;
+
+def SHL32ri : ShiftRI<"shl", shl>;
+def SHR32ri : ShiftRI<"shr", srl>;
+def SAR32ri : ShiftRI<"sar", sra>;
+
+//===----------------------------------------------------------------------===//
 // RET
 //===----------------------------------------------------------------------===//
 //

@@ -30,8 +30,17 @@ MovRegisterInfo::getCalleeSavedRegs(const MachineFunction * /*MF*/) const {
 BitVector MovRegisterInfo::getReservedRegs(const MachineFunction & /*MF*/) const {
   BitVector Reserved(getNumRegs());
   Reserved.set(Mov::ESP);
-  // EBP is reserved only when we actually need a frame pointer. Stage 0–4
-  // don't, but flipping this on later is a single line.
+  // Stage 3 reserves the cdecl callee-saved set on top of ESP. CSR_Mov is
+  // still empty (no prologue/epilogue to actually save them), so leaving
+  // EBX/ESI/EDI/EBP allocatable would silently let register allocation
+  // pick them, clobber the caller's invariant, and pass every fixture in
+  // this directory — none of which observes those registers. The reserve
+  // is the cheapest correctness wedge until stage 4 introduces real
+  // prologue/epilogue and we can re-enable them in CSR_Mov.
+  Reserved.set(Mov::EBX);
+  Reserved.set(Mov::ESI);
+  Reserved.set(Mov::EDI);
+  Reserved.set(Mov::EBP);
   return Reserved;
 }
 
