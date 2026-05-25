@@ -45,6 +45,17 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
     setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MemVT, Expand);
     setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MemVT, Expand);
   }
+
+  // x86 normally lowers `sign_extend_inreg` to `movsx`, which we don't
+  // have. Without an action, signed narrow consumers — `sext i8 to i32`,
+  // `signext i8` returns, `ashr i8` — would crash with "Cannot select
+  // sign_extend_inreg" the moment stage 3.5 enabled narrow ABI values.
+  // Expand lets the legalizer rewrite the node into the standard
+  // `shl-N; sar-N` pair (which our SHL32ri/SAR32ri already cover) and
+  // keeps the mov-heavy ISA honest about not having movsx.
+  setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i1, Expand);
+  setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i8, Expand);
+  setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i16, Expand);
 }
 
 const char *MovTargetLowering::getTargetNodeName(unsigned Opcode) const {
