@@ -235,7 +235,8 @@ def ADJCALLSTACKUP   : MovInst<(outs), (ins i32imm_op:$amt1, i32imm_op:$amt2),
                                [(MovCallSeqEnd timm:$amt1, timm:$amt2)]>;
 }
 
-let isCall = 1, Defs = [EAX, ECX, EDX, EFLAGS], Uses = [ESP] in
+let isCall = 1, Defs = [EAX, ECX, EDX, EFLAGS], Uses = [ESP],
+    mayLoad = 1, mayStore = 1, hasSideEffects = 1 in
 def CALL32d : MovInst<(outs), (ins calltarget:$dst),
                       "call\t$dst", []>;
 
