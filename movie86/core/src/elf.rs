@@ -35,6 +35,11 @@ pub enum ElfError {
     NotExecutable,
     /// Loadable segment's `p_memsz` is smaller than `p_filesz`.
     NonsenseSegmentSizes,
+    /// ELF references a dynamic linker (`PT_INTERP`) or dynamic linking
+    /// metadata (`PT_DYNAMIC`). movie86 has no dynamic-linking
+    /// machinery yet, so silently mapping the static segments would
+    /// jump into code that relies on missing relocations / interpreter.
+    DynamicLinkingUnsupported,
 }
 
 /// One `PT_LOAD` segment from the ELF.
@@ -86,12 +91,19 @@ pub fn parse(bytes: &[u8]) -> Result<LoadedElf<'_>, ElfError> {
     let e_phnum = read_u16(bytes, 44)?;
 
     // --- program headers ---
+    //
+    // PT_LOAD = 1, PT_DYNAMIC = 2, PT_INTERP = 3. We accept only PT_LOAD;
+    // a PT_INTERP / PT_DYNAMIC entry means the ELF expects a dynamic
+    // linker (typically /lib/ld-linux.so.2 and a libc) — we have neither.
     let mut segments = Vec::new();
     for i in 0..e_phnum {
         let off = e_phoff as usize + usize::from(i) * usize::from(e_phentsize);
         let p_type = read_u32(bytes, off)?;
+        if p_type == 2 || p_type == 3 {
+            return Err(ElfError::DynamicLinkingUnsupported);
+        }
         if p_type != 1 {
-            // not PT_LOAD
+            // PT_NOTE / PT_GNU_STACK / PT_PHDR etc. — ignored, not an error
             continue;
         }
         let p_offset = read_u32(bytes, off + 4)?;
@@ -252,6 +264,49 @@ mod tests {
         let mut elf = build_elf(0, &[(0, 4, &[0, 0, 0, 0])]);
         elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
         assert_eq!(parse(&elf).unwrap_err(), ElfError::NotExecutable);
+    }
+
+    /// Override the `p_type` of program header `phdr_index` (0-based) in
+    /// an ELF built by `build_elf`. Returns a fresh copy.
+    fn elf_with_phdr_type(elf: &[u8], phdr_index: usize, p_type: u32) -> Vec<u8> {
+        const EHDR_SIZE: usize = 52;
+        const PHDR_SIZE: usize = 32;
+        let mut bytes = elf.to_vec();
+        let off = EHDR_SIZE + phdr_index * PHDR_SIZE;
+        bytes[off..off + 4].copy_from_slice(&p_type.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn rejects_pt_interp_segment() {
+        let elf = build_elf(0, &[(0, 4, &[0, 0, 0, 0])]);
+        let elf = elf_with_phdr_type(&elf, 0, 3); // PT_INTERP
+        assert_eq!(
+            parse(&elf).unwrap_err(),
+            ElfError::DynamicLinkingUnsupported,
+        );
+    }
+
+    #[test]
+    fn rejects_pt_dynamic_segment() {
+        let elf = build_elf(0, &[(0, 4, &[0, 0, 0, 0])]);
+        let elf = elf_with_phdr_type(&elf, 0, 2); // PT_DYNAMIC
+        assert_eq!(
+            parse(&elf).unwrap_err(),
+            ElfError::DynamicLinkingUnsupported,
+        );
+    }
+
+    #[test]
+    fn ignores_unrecognized_pt_note_segment() {
+        // p_type = 4 (PT_NOTE) is harmless — should be silently skipped.
+        let elf = build_elf(0x1000, &[(0x1000, 4, &[0, 0, 0, 0])]);
+        let elf = elf_with_phdr_type(&elf, 0, 4); // PT_NOTE
+        let loaded = parse(&elf).unwrap();
+        assert!(
+            loaded.segments.is_empty(),
+            "PT_NOTE shouldn't load segments"
+        );
     }
 
     #[test]
