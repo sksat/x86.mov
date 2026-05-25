@@ -126,6 +126,59 @@ fn writes_hello_to_stdout_and_exits_zero() {
 }
 
 #[test]
+fn call_function_that_writes_and_rets_then_exits() {
+    // Exercises call + ret end-to-end alongside the syscall path.
+    // Layout (entry at 0x08048000):
+    //   00 .. 04: call func        (5 bytes; relative)
+    //   05 .. 0e: mov eax,1; mov ebx,0; int 0x80   (12 bytes; exit)
+    //   11 .. 27: func: write(1, msg, 3); ret      (23 bytes)
+    //   28 .. 2a: data "Hi\n"                       (3 bytes)
+    const ENTRY: u32 = 0x0804_8000;
+    const FUNC_OFF: u32 = 17;
+    const MSG_OFF: u32 = 40;
+    let msg_addr = ENTRY + MSG_OFF;
+    // call rel32: displacement is from the instruction AFTER the call
+    // (at ENTRY + 5) to the target (func_addr).
+    let call_disp: i32 = i32::try_from(FUNC_OFF).unwrap() - 5;
+    let cd = call_disp.to_le_bytes();
+    let m = msg_addr.to_le_bytes();
+    #[rustfmt::skip]
+    let program: Vec<u8> = vec![
+        // 00: call func
+        0xe8, cd[0], cd[1], cd[2], cd[3],
+        // 05: mov eax, 1
+        0xb8, 0x01, 0x00, 0x00, 0x00,
+        // 0a: mov ebx, 0
+        0xbb, 0x00, 0x00, 0x00, 0x00,
+        // 0f: int 0x80
+        0xcd, 0x80,
+        // 11: func: mov eax, 4
+        0xb8, 0x04, 0x00, 0x00, 0x00,
+        // 16: mov ebx, 1
+        0xbb, 0x01, 0x00, 0x00, 0x00,
+        // 1b: mov ecx, msg
+        0xb9, m[0], m[1], m[2], m[3],
+        // 20: mov edx, 3
+        0xba, 0x03, 0x00, 0x00, 0x00,
+        // 25: int 0x80
+        0xcd, 0x80,
+        // 27: ret
+        0xc3,
+        // 28: data "Hi\n"
+        b'H', b'i', b'\n',
+    ];
+    assert_eq!(program.len(), (MSG_OFF + 3) as usize);
+
+    let elf = build_elf(ENTRY, &program);
+    let mut host = CapturingHost::new();
+    match run_elf_with_host(&elf, &mut host) {
+        RunOutcome::Exit(0) => {}
+        other => panic!("expected Exit(0), got {other:?}"),
+    }
+    assert_eq!(host.stdout, b"Hi\n");
+}
+
+#[test]
 fn fault_on_unsupported_syscall() {
     // mov eax, 999 ; int 0x80  → syscall 999 is unimplemented
     let program: &[u8] = &[
