@@ -59,6 +59,24 @@ void MovAsmPrinter::lower(const MachineInstr *MI, MCInst &OutMI) const {
     case MachineOperand::MO_Immediate:
       MCOp = MCOperand::createImm(MO.getImm());
       break;
+    case MachineOperand::MO_MachineBasicBlock:
+      // Branch targets — `jcc target_block` / `jmp target_block`. The
+      // `.Lfunc_endN` machinery in AsmPrinter already names the blocks;
+      // we just wrap the MBB's symbol as an MCExpr.
+      MCOp = MCOperand::createExpr(MCSymbolRefExpr::create(
+          MO.getMBB()->getSymbol(), OutContext));
+      break;
+    case MachineOperand::MO_GlobalAddress:
+      // Stage 5a doesn't emit any calls yet, but adding the case now
+      // keeps lower() honest for stage 6: `call <global>` is the next
+      // thing that lands here.
+      MCOp = MCOperand::createExpr(MCSymbolRefExpr::create(
+          getSymbol(MO.getGlobal()), OutContext));
+      break;
+    case MachineOperand::MO_ExternalSymbol:
+      MCOp = MCOperand::createExpr(MCSymbolRefExpr::create(
+          GetExternalSymbolSymbol(MO.getSymbolName()), OutContext));
+      break;
     default:
       llvm_unreachable("unexpected MachineOperand kind in Mov asm printer");
     }

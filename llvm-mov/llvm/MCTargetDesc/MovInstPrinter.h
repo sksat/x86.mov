@@ -25,6 +25,15 @@ public:
   void printRegName(raw_ostream &O, MCRegister Reg) override;
   void printOperand(const MCInst *MI, unsigned OpNo, raw_ostream &O);
 
+  // 4-arg overload for PC-relative operands (branch targets in JMP / Jcc).
+  // The generated AsmWriter passes the instruction address; we don't use
+  // it for Intel asm (the symbol expression is self-describing), but the
+  // signature must match what TableGen emits.
+  void printOperand(const MCInst *MI, uint64_t /*Address*/, unsigned OpNo,
+                    raw_ostream &O) {
+    printOperand(MI, OpNo, O);
+  }
+
   // Two-operand printer for MovMemOperand: emits `[base + disp]` in Intel
   // syntax. Called from the TableGen-generated printInstruction whenever
   // it encounters an operand whose `let PrintMethod = "printMemOperand"`.

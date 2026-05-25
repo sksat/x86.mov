@@ -24,6 +24,14 @@ def MovRet         : SDNode<"MovISD::RET", SDT_MovRet,
 
 def i32imm_op : Operand<i32>;
 
+// Branch-target operand for JMP / Jcc. OtherVT is the LLVM convention for
+// "this is a code-pointer-shaped operand; print whatever the printer
+// decides to call it"; AsmPrinter::lower turns the MO_MachineBasicBlock
+// into an MCSymbolRef so `as` resolves the label.
+def brtarget : Operand<OtherVT> {
+  let OperandType = "OPERAND_PCREL";
+}
+
 // Minimum addressing mode for stage 2: base register + 32-bit displacement.
 // Stack-slot reads (`[esp + 4]`) need exactly this; base+index*scale shapes
 // come later and will fold in as additional ComplexPattern matchers.
@@ -164,6 +172,57 @@ def PUSH32r : MovInst<(outs), (ins GPR32:$src),
 let Defs = [ESP], Uses = [ESP], mayLoad = 1 in
 def POP32r  : MovInst<(outs GPR32:$dst), (ins),
                       "pop\t$dst", []>;
+
+//===----------------------------------------------------------------------===//
+// CMP — sets EFLAGS for the following Jcc. Patternless: selection (stage
+// 5b) pairs them with a glued Jcc rather than relying on TableGen
+// SDNode-pattern matching for the CMP→Jcc dependence.
+//===----------------------------------------------------------------------===//
+
+let Defs = [EFLAGS], hasSideEffects = 0 in {
+def CMP32rr : MovInst<(outs), (ins GPR32:$src1, GPR32:$src2),
+                      "cmp\t$src1, $src2", []>;
+def CMP32ri : MovInst<(outs), (ins GPR32:$src1, i32imm_op:$src2),
+                      "cmp\t$src1, $src2", []>;
+}
+
+//===----------------------------------------------------------------------===//
+// JMP / Jcc — unconditional and conditional branches. Operand is a
+// MachineBasicBlock; AsmPrinter::lower routes MO_MachineBasicBlock to an
+// MCSymbolRef expression so `as` resolves the label.
+//
+// Mapping LLVM ICmp predicate → x86 mnemonic (used in MovISelDAGToDAG):
+//   EQ  → je       NE  → jne
+//   SLT → jl       SGT → jg       SLE → jle       SGE → jge
+//   ULT → jb       UGT → ja       ULE → jbe       UGE → jae
+//
+// One opcode per predicate (no abstract Jcc<predicate> pseudo) — keeps
+// the printer trivial and the MIR readable. Stage-7 mov-only
+// legalization replaces all of these with mov-driven branchless idioms.
+//===----------------------------------------------------------------------===//
+
+let isBranch = 1, isTerminator = 1, isBarrier = 1 in
+def JMP : MovInst<(outs), (ins brtarget:$dst),
+                  "jmp\t$dst", [(br bb:$dst)]>;
+
+class JccInst<string OpStr>
+  : MovInst<(outs), (ins brtarget:$dst),
+            !strconcat(OpStr, "\t$dst"), []> {
+  let isBranch     = 1;
+  let isTerminator = 1;
+  let Uses         = [EFLAGS];
+}
+
+def JE  : JccInst<"je">;
+def JNE : JccInst<"jne">;
+def JL  : JccInst<"jl">;
+def JG  : JccInst<"jg">;
+def JLE : JccInst<"jle">;
+def JGE : JccInst<"jge">;
+def JB  : JccInst<"jb">;
+def JA  : JccInst<"ja">;
+def JBE : JccInst<"jbe">;
+def JAE : JccInst<"jae">;
 
 //===----------------------------------------------------------------------===//
 // RET

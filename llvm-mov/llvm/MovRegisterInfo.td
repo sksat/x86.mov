@@ -37,3 +37,13 @@ def GPR32_NOSP : RegisterClass<"Mov", [i32], 32,
 // `cl` in the asm. Selection in MovISelDAGToDAG.cpp does an explicit
 // CopyToReg ECX before emitting the shift.
 def CCR : RegisterClass<"Mov", [i32], 32, (add ECX)>;
+
+// EFLAGS — x86's status register. CMP writes the result of a compare
+// here; Jcc reads it. We model it as a physical register so RA sees the
+// Def/Use dependence, but we don't put it in any allocatable class — no
+// virtual register ever lives here, and the CMP→Jcc dependence is
+// additionally glued (in the SelectionDAG) so the scheduler can't slip
+// a flag-clobbering instruction between them.
+def EFLAGS : Register<"eflags"> {
+  let Namespace = "Mov";
+}
