@@ -49,18 +49,29 @@ In scope: the instructions movfuscator + the planned mov-only LLVM backend actua
 
 Not in scope (yet): the rest of the crt0 surface that gets linked into a *real* movfuscator-produced ELF — `call sigaction`, segment-register mov (`mov cs, eax`), indirect `jmp DWORD PTR ds:0x0`, FPU. End-to-end testing currently uses hand-crafted ELFs that skip crt0; running a real movfuscator-built binary is the explicit follow-up goal. The default link path in `movfuscator-wasm` is *dynamic* (`-dynamic-linker /lib/ld-linux.so.2 -lc -lm -lgcc`), so we also need a `PT_INTERP`/`PT_DYNAMIC`-supporting loader path before that goal is in reach — the current loader rejects them up front (`ElfError::DynamicLinkingUnsupported`).
 
-## Next: bringing up a real movfuscator binary (follow-up PR)
+## Real movfuscator binary: where we got (and where the follow-up picks up)
 
 Empirical scope check via `nm -u movfuscator-wasm/tests/goldens-o/return42.o` (the .o file is committed; no build required):
 
 - 40 undefined symbols, **all of them movfuscator runtime**: `alu_eq`, `alu_x`, `alu_y`, `and`, `b0..b3`, `branch_temp`, `D0..D2`, `data_p`, `F0..F2`, `fp`, `jmp_d0..d2`, `jmp_f0..f2`, `jmp_r0..r3`, `on`, `pop`, `push`, `R0..R3`, `sel_data`, `sel_on`, `sel_target`, `sp`, `stack_temp`, `target`.
 - **Zero libc references.** `hello.o` adds exactly `printf` and nothing else — i.e. libc only enters the picture for programs that actually call into it.
 
-What this means for the follow-up:
+### What landed in this PR
 
-- The blocker is **not** libc / dynamic linking. It's reproducing the movfuscator runtime data tables and the `push` / `pop` helpers that `crt0.o` + `crtd.o` define (gitignored under `vendor/movfuscator/build/` — need `cd movfuscator-wasm && make setup && make build-native`, ~5-15 min).
-- The cheapest path to a runnable real-movfuscator ELF: static-link `return42.o` against just `crt0.o`/`crtd.o`/`softfloat32.o` (no libc, no ld-linux), then load it through `movie86`. The ELF should have no `PT_INTERP`/`PT_DYNAMIC` so the existing loader accepts it.
-- Likely instruction-set gaps to fill before the link succeeds at runtime: the indirect `jmp DWORD PTR ds:0x0` and `mov cs, eax` in `crtf.o` (only needed if the runtime actually uses them on the simple `return42` path — to be verified).
+- **Decoder is real-movfuscator-output complete** for everything that appears in the goldens. The `decoder_covers_return42_o_text` integration test in `cli/tests/e2e.rs` walks every byte of the committed `return42.o`'s `.text` through `decode()` and asserts no `UnknownOpcode`. Adding new instructions until this passed surfaced `moffs` MOV forms (`A0`/`A1`/`A2`/`A3` + their 66-prefixed siblings), `mov sreg, r/m16` (`8E /r`), and the indirect-memory `jmp r/m32` (`FF /4`).
+- **Loader produces a Linux-style startup image.** `flatten_with_stack` writes `argc=0, argv=NULL, envp=NULL, auxv=NULL` at the top of the stack region and points `%esp` at `argc`. Without this, the first thing real crt0 does (`mov esp, [esp+0]`) faulted at the top-of-region boundary.
+- **`mov cs, ax` is modelled as the SIGSEGV-trampoline dispatch trick** (`Insn::MovfuscatorDispatchJump`): we treat it as "jump to the full 32-bit value of the source register's parent". On real x86 this would `#GP`-fault and a signal handler would do the same recovery; we just jump directly.
+
+### Where the follow-up picks up
+
+A static link of `return42.o` + `crt0_cf.o` + `crtf_cf.o` + `crtd_cf.o` + `softfloat32.o` + a tiny `stubs.s` (`sigaction` returns 0, `exit` issues `int 0x80` syscall 1) produces a runnable ELF that movie86 now loads, executes hundreds of instructions in, simulates the SIGSEGV dispatch, and then jumps to address `0` — because movfuscator's runtime data tables (`sel_data`, the jump-register slots, etc.) aren't initialized to anything meaningful at process start.
+
+So the follow-up needs to either:
+
+1. Understand and replay movfuscator's data-table init enough that the dispatch tables converge on `main` being called, OR
+2. Find a smaller mov-only test case that doesn't need the dispatch trick at all (e.g. a hand-written assembly fixture using only what `return42.o`'s body actually does, without the full crt0 wrapper).
+
+Tooling needed for path (1) is `cd movfuscator-wasm && make setup && make build-native` to materialize the runtime objects (gitignored under `vendor/movfuscator/build/`).
 
 ## CI
 

@@ -202,4 +202,19 @@ pub enum Insn {
     /// handle `ret imm16` (opcode `C2 iw`), which movfuscator output
     /// doesn't emit (cdecl callers pop their own args).
     Ret,
+    /// `mov cs, r16` (opcode `8E /r` with `reg=001`) — modelled as an
+    /// indirect jump to the **full 32-bit** value of the source's parent
+    /// register. movfuscator uses this as its main control-flow trick:
+    /// writing to CS raises #GP on real x86, a SIGSEGV handler decodes
+    /// the trap and transfers to EAX. For us, the trap is irrelevant —
+    /// we just do the jump directly.
+    MovfuscatorDispatchJump(Reg32),
+    /// `mov sreg, r/m16` (opcode `8E /r`) with `reg != 001`. We don't
+    /// model segment registers in flat 32-bit mode, so this is a no-op.
+    MovToOtherSegReg,
+    /// `jmp r/m32` indirect through memory (opcode `FF /4`, mod≠11).
+    /// Only the memory form is observed in movfuscator output (crtf's
+    /// `.plt` dispatch). Register-indirect `jmp r32` (FF /4, mod=11)
+    /// can be added if it ever appears.
+    JmpIndirectMem32(EffectiveAddress),
 }

@@ -137,6 +137,19 @@ impl Cpu {
                 self.set_reg(Reg32::Esp, esp.wrapping_add(4));
                 Ok(target)
             }
+            Insn::MovfuscatorDispatchJump(src) => {
+                // The full 32-bit value of the source register is the
+                // jump target — see Insn::MovfuscatorDispatchJump docs.
+                Ok(self.reg(src))
+            }
+            Insn::MovToOtherSegReg => {
+                // No-op in flat 32-bit mode.
+                Ok(next_eip_default)
+            }
+            Insn::JmpIndirectMem32(ea) => {
+                let target = mem.read_u32(self.compute_ea(ea))?;
+                Ok(target)
+            }
         }
     }
 
@@ -632,6 +645,39 @@ mod tests {
         mem.write_u32(pushed_addr, 0xcafe_d00d).unwrap();
         cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.reg(Reg32::Esp), 0xcafe_d00d);
+    }
+
+    // --- movfuscator dispatch trick + indirect jmp ---
+
+    #[test]
+    fn movfuscator_dispatch_jump_jumps_to_full_eax() {
+        // 8e c8 → mov cs, ax  (modelled as: jmp eax, full 32 bits)
+        let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[0x8e, 0xc8], 64);
+        cpu.set_reg(Reg32::Eax, 0xdead_beef);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0xdead_beef);
+    }
+
+    #[test]
+    fn mov_to_other_seg_reg_is_noop_and_advances_eip() {
+        // 8e d8 → mov ds, ax  (no-op in flat 32-bit mode)
+        let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[0x8e, 0xd8], 64);
+        cpu.set_reg(Reg32::Eax, 0x1234);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0x1002, "should advance past the 2-byte insn");
+        assert_eq!(cpu.reg(Reg32::Eax), 0x1234, "eax unchanged");
+    }
+
+    #[test]
+    fn jmp_indirect_mem32_reads_target_from_memory() {
+        // ff 25 00 20 00 00 → jmp DWORD PTR ds:0x2000
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x2000);
+        mem.write_bytes(0x1000, &[0xff, 0x25, 0x00, 0x20, 0x00, 0x00])
+            .unwrap();
+        mem.write_u32(0x2000, 0xcafe_d00d).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0xcafe_d00d);
     }
 
     // --- call + ret ---

@@ -75,9 +75,60 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
         }
         // ret near — opcode C3
         (false, 0xC3) => (Insn::Ret, 1),
+        // mov sreg, r/m16 — opcode 8E /r. movfuscator only uses this
+        // with mod=11 and the dispatch trick (`mov cs, ax`).
+        (false, 0x8E) => decode_mov_to_sreg(rest)?,
+        // jmp r/m32 indirect — opcode FF /4
+        (false, 0xFF) => decode_ff_group(rest)?,
         _ => return Err(Fault::UnknownOpcode(opcode)),
     };
     Ok((insn, body_len + prefix_len))
+}
+
+/// Decode `mov sreg, r/m16` (opcode 8E /r). ModR/M `reg` field selects
+/// the segment register: 1 = CS (movfuscator's dispatch trick), other
+/// values are real segment regs we treat as no-op writes.
+fn decode_mov_to_sreg(rest: &[u8]) -> Result<(Insn, u8), Fault> {
+    let modrm_byte = *rest.get(1).ok_or(Fault::DecodeTruncated)?;
+    let m = parse_modrm(modrm_byte);
+    if m.mod_ != 0b11 {
+        // We've only seen mod=11 in movfuscator output. Memory-source
+        // form (`mov cs, [m16]`) is technically valid but we have no
+        // need yet — surface as UnknownOpcode so the unhandled case
+        // is loud.
+        return Err(Fault::UnknownOpcode(0x8E));
+    }
+    let src = Reg32::from_index(m.rm); // parent reg of the r/m16 sub-reg
+    let insn = if m.reg == 1 {
+        Insn::MovfuscatorDispatchJump(src)
+    } else {
+        Insn::MovToOtherSegReg
+    };
+    Ok((insn, 2))
+}
+
+/// Decode the FF opcode family. `reg` field of the ModR/M byte selects:
+///   /0  inc r/m32       — not yet supported
+///   /1  dec r/m32       — not yet supported
+///   /2  call r/m32      — not yet supported (movfuscator goes through E8)
+///   /3  call FAR        — not yet supported
+///   /4  jmp r/m32       — the indirect jmp movfuscator's crtf uses
+///   /5  jmp FAR         — not yet supported
+///   /6  push r/m32      — not yet supported (50+rd covers reg-only)
+fn decode_ff_group(rest: &[u8]) -> Result<(Insn, u8), Fault> {
+    let modrm_byte = *rest.get(1).ok_or(Fault::DecodeTruncated)?;
+    let m = parse_modrm(modrm_byte);
+    if m.reg != 4 {
+        return Err(Fault::UnknownOpcode(0xFF));
+    }
+    // jmp r/m32. We've only seen the memory-indirect form
+    // (mod ≠ 11) in movfuscator's crtf.plt; reg-indirect would land
+    // here too and is straightforward to add when needed.
+    if m.mod_ == 0b11 {
+        return Err(Fault::UnknownOpcode(0xFF));
+    }
+    let (ea, ea_extra) = parse_effective_address_32(m.mod_, m.rm, &rest[2..])?;
+    Ok((Insn::JmpIndirectMem32(ea), 2 + ea_extra))
 }
 
 /// Decode one of the moffs MOV forms — the short (no-ModR/M) encodings

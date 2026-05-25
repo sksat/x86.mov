@@ -144,17 +144,26 @@ pub fn flatten_into_region(elf: &LoadedElf<'_>) -> Result<FlatMemory, ElfError> 
 }
 
 /// Like [`flatten_into_region`] but also reserves `stack_size` bytes
-/// immediately above the highest segment for the guest's stack. Returns
-/// the materialized memory plus the initial `%esp` value (the top of
-/// the stack region — the stack grows down).
+/// immediately above the highest segment for the guest's stack, and
+/// writes a minimal Linux-style startup image at the top:
+/// `[argc=0, argv=NULL, envp=NULL, auxv=NULL]` (4 dwords, 16 bytes).
+/// The returned `esp_initial` points at the `argc` slot, matching what
+/// the kernel hands `_start` on a freshly-`execve`d process.
 ///
-/// A `stack_size` of 0 is equivalent to [`flatten_into_region`] and the
-/// returned `esp_initial` is meaningless (set to the top of the segment
-/// region for consistency).
+/// A `stack_size` of 0 still reserves the 16-byte argc image so a
+/// program that immediately dereferences `[esp]` sees zero (no faulting
+/// read at the very top of the region). The returned esp is the top of
+/// that image.
 pub fn flatten_with_stack(
     elf: &LoadedElf<'_>,
     stack_size: u32,
 ) -> Result<(FlatMemory, u32), ElfError> {
+    /// argc + argv-NULL + envp-NULL + auxv-NULL — the bare minimum Linux
+    /// SysV-ABI startup image. 4 dwords. Real Linux also includes a
+    /// random bytes auxv entry; movfuscator's crt0 doesn't look at any of
+    /// this beyond `[esp]`, so zeros are fine.
+    const STARTUP_IMAGE: u32 = 16;
+
     let Some(first) = elf.segments.first() else {
         return Err(ElfError::NonsenseSegmentSizes); // reused: "nothing to load"
     };
@@ -166,18 +175,21 @@ pub fn flatten_with_stack(
         lo = lo.min(seg_lo);
         hi = hi.max(seg_hi);
     }
-    // Extend the region upward to host the stack. esp starts at the
-    // very top because the stack grows toward lower addresses.
-    let stack_top_u64 = hi + u64::from(stack_size);
+    // Reserve: stack_size guest-usable bytes + STARTUP_IMAGE.
+    let total_extra = u64::from(stack_size) + u64::from(STARTUP_IMAGE);
+    let top_u64 = hi + total_extra;
     let base = u32::try_from(lo).map_err(|_| ElfError::Truncated)?;
-    let size = usize::try_from(stack_top_u64 - lo).map_err(|_| ElfError::Truncated)?;
-    let esp_initial = u32::try_from(stack_top_u64).map_err(|_| ElfError::Truncated)?;
+    let size = usize::try_from(top_u64 - lo).map_err(|_| ElfError::Truncated)?;
     let mut mem = FlatMemory::new_zeroed(base, size);
     for seg in &elf.segments {
-        // Memory is already zeroed, so we only have to copy filesz bytes.
         mem.write_bytes(seg.vaddr, seg.data)
             .map_err(|_| ElfError::Truncated)?;
     }
+    // ESP points at the argc slot — top of the STARTUP_IMAGE region.
+    // The image is the last 16 bytes of the region; the region is
+    // already zeroed, so argc / argv / envp / auxv are already 0.
+    let esp_initial =
+        u32::try_from(top_u64 - u64::from(STARTUP_IMAGE)).map_err(|_| ElfError::Truncated)?;
     Ok((mem, esp_initial))
 }
 
