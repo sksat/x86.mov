@@ -49,6 +49,19 @@ In scope: the instructions movfuscator + the planned mov-only LLVM backend actua
 
 Not in scope (yet): the rest of the crt0 surface that gets linked into a *real* movfuscator-produced ELF — `call sigaction`, segment-register mov (`mov cs, eax`), indirect `jmp DWORD PTR ds:0x0`, FPU. End-to-end testing currently uses hand-crafted ELFs that skip crt0; running a real movfuscator-built binary is the explicit follow-up goal. The default link path in `movfuscator-wasm` is *dynamic* (`-dynamic-linker /lib/ld-linux.so.2 -lc -lm -lgcc`), so we also need a `PT_INTERP`/`PT_DYNAMIC`-supporting loader path before that goal is in reach — the current loader rejects them up front (`ElfError::DynamicLinkingUnsupported`).
 
+## Next: bringing up a real movfuscator binary (follow-up PR)
+
+Empirical scope check via `nm -u movfuscator-wasm/tests/goldens-o/return42.o` (the .o file is committed; no build required):
+
+- 40 undefined symbols, **all of them movfuscator runtime**: `alu_eq`, `alu_x`, `alu_y`, `and`, `b0..b3`, `branch_temp`, `D0..D2`, `data_p`, `F0..F2`, `fp`, `jmp_d0..d2`, `jmp_f0..f2`, `jmp_r0..r3`, `on`, `pop`, `push`, `R0..R3`, `sel_data`, `sel_on`, `sel_target`, `sp`, `stack_temp`, `target`.
+- **Zero libc references.** `hello.o` adds exactly `printf` and nothing else — i.e. libc only enters the picture for programs that actually call into it.
+
+What this means for the follow-up:
+
+- The blocker is **not** libc / dynamic linking. It's reproducing the movfuscator runtime data tables and the `push` / `pop` helpers that `crt0.o` + `crtd.o` define (gitignored under `vendor/movfuscator/build/` — need `cd movfuscator-wasm && make setup && make build-native`, ~5-15 min).
+- The cheapest path to a runnable real-movfuscator ELF: static-link `return42.o` against just `crt0.o`/`crtd.o`/`softfloat32.o` (no libc, no ld-linux), then load it through `movie86`. The ELF should have no `PT_INTERP`/`PT_DYNAMIC` so the existing loader accepts it.
+- Likely instruction-set gaps to fill before the link succeeds at runtime: the indirect `jmp DWORD PTR ds:0x0` and `mov cs, eax` in `crtf.o` (only needed if the runtime actually uses them on the simple `return42` path — to be verified).
+
 ## CI
 
 `.github/workflows/movie86.yaml` at the repo root. Runs on push/PR to `mov`: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test --workspace --all-targets`, and a `wasm32-unknown-unknown` build of `movie86-core`. Actions pinned to `vMAJOR.MINOR.PATCH` per project convention.
