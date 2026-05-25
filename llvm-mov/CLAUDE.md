@@ -97,6 +97,17 @@ test/
   arithmetic to `EAX/ECX/EDX` (plenty for the current fixtures) and
   makes the callee-save contract truthful. Drop the reservation in the
   same commit that lands the prologue/epilogue at stage 4.
+- **LLVM Stack Slot Coloring will merge alloca slots with cdecl arg
+  slots** whenever the alloca is the only user of the i32 value the
+  caller pushed. cdecl allows callee to scribble its arg slots, so SSC
+  rewrites the alloca's FrameIndex to `%fixed-stack.0` and the asm ends
+  up writing to `[ebp + 8]` instead of `[ebp - 4]`. This is a legal
+  optimisation, but it means the obvious `define i32 @rmw(i32 %x) {
+  alloca; store %x; ...; load; ret }` shape does *not* cover the
+  local-slot codepath. To exercise it, use a no-arg fixture (or a
+  fixture whose alloca lifetime provably overlaps with the arg slot's).
+  `test/Execution/rmw.ll` is the no-arg version that does land at
+  `[ebp - 4]`; `spill_chain.ll` exercises PEI-allocated spill slots.
 - **All stage 3 binops are 2-address** (`Constraints = "$src1 = $dst"`
   in `MovInstrInfo.td`). x86 `add reg, src` is `dst = dst + src`, not
   `dst = src1 + src2`; without the tie, RA freely picks distinct
