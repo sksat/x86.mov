@@ -29,7 +29,7 @@ Bootstrap. Goals listed in roughly increasing difficulty:
 | 4      | `alloca/load/store` on a local stack frame + EBP frame + real spill | exec: `rmw` (no-arg alloca → `[ebp-4]`) + `spill_chain` (PEI spill) | ✅ |
 | 5      | `icmp + br` (CMP + Jcc 10 predicates, EBP frame interop) | execution: is_42 (eq) + is_not_42 + min (slt) + abs + is_lt_unsigned (ult) | ✅ |
 | 6a     | direct cdecl `call` between user-defined functions | exec: call_identity, call_add2, call_live_across (regmask) | ✅ |
-| 6.5    | `examples/rust` (rustc IR → llvm-mov-llc → ELF)    | end-to-end Rust no_std example                            |       |
+| 6.5    | `examples/rust` (rustc IR → llvm-mov-llc → ELF)    | `make test-rust-example` — `rust_main() -> i32 { 42 }`   | ✅    |
 | 6c     | indirect `call` via function pointer (CALL32r)     | execution tests                                          |       |
 | 7      | mov-only legalization pass (compare/branch/arith)  | objdump gate: no non-`mov` opcodes in `.text`            |       |
 | 8      | bigger fixtures (movfuscator's `upstream-*` set)   | side-by-side bench vs movfuscator                        |       |

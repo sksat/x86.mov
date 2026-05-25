@@ -11,18 +11,21 @@ BUILD_TYPE   ?= Release
 # LLVM and printing a less useful error 200 lines down.
 LLVM_CMAKE_DIR := $(shell $(LLVM_CONFIG) --cmakedir 2>/dev/null)
 
-.PHONY: all build configure test test-exec test-codegen clean distclean help
+.PHONY: all build configure test test-exec test-codegen test-rust-example \
+        clean distclean help
 
 all: build
 
 help:
 	@echo "Targets:"
-	@echo "  build         — configure + build the backend and llvm-mov-llc"
-	@echo "  test          — execution tests + codegen lit tests"
-	@echo "  test-exec     — execution tests only  (test/Execution)"
-	@echo "  test-codegen  — lit + FileCheck only  (test/CodeGen)"
-	@echo "  clean         — remove build artefacts"
-	@echo "  distclean     — also remove the build directory entirely"
+	@echo "  build              — configure + build the backend and llvm-mov-llc"
+	@echo "  test               — execution tests + codegen lit tests"
+	@echo "  test-exec          — execution tests only  (test/Execution)"
+	@echo "  test-codegen       — lit + FileCheck only  (test/CodeGen)"
+	@echo "  test-rust-example  — rustc → llvm-mov-llc → ELF round-trip (stage 6.5;"
+	@echo "                       needs 'rustup target add i686-unknown-linux-gnu')"
+	@echo "  clean              — remove build artefacts"
+	@echo "  distclean          — also remove the build directory entirely"
 	@echo ""
 	@echo "Variables:"
 	@echo "  LLVM_VERSION  (default $(LLVM_VERSION))"
@@ -57,6 +60,13 @@ test-codegen: build
 	else \
 		echo "test-codegen: lit not installed or no CodeGen suite yet — skipping"; \
 	fi
+
+# Stage-6.5 demo: rustc → llvm-mov-llc → as → ld → run. Opt-in — not
+# in the default `test` target because it pulls in a Rust toolchain
+# dependency. The script itself surfaces a clear message if the i686
+# rust-std rlibs aren't installed.
+test-rust-example: build
+	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --run
 
 clean:
 	@[ -d $(BUILD_DIR) ] && ninja -C $(BUILD_DIR) clean || true
