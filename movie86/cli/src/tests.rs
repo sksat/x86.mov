@@ -33,6 +33,26 @@ fn write_with_unknown_fd_returns_negative_ebadf() {
 }
 
 #[test]
+fn write_with_bad_fd_does_not_dereference_guest_buffer() {
+    // The buffer pointer is *unmapped*. Linux returns -EBADF for a bad
+    // fd without ever touching the user buffer, so we must do the same
+    // — touching it would surface as Fault::Unmapped instead of EBADF.
+    let mut mem = FlatMemory::new_zeroed(0x1000, 16);
+    let args = SyscallArgs {
+        eax: 4,
+        ebx: 99,          // bogus fd
+        ecx: 0xdead_0000, // unmapped buf pointer
+        edx: 64,
+        esi: 0,
+        edi: 0,
+        ebp: 0,
+    };
+    let r = write_syscall(&args, &mut mem).expect("should not Fault on unmapped buf");
+    let SyscallResult::Return(v) = r;
+    assert_eq!(v, errno_to_eax(9));
+}
+
+#[test]
 fn write_with_huge_count_does_not_pre_allocate_4gb() {
     // The guest claims to want to write 4 GiB, but the buffer is
     // unmapped past the first page. We should not allocate 4 GiB to

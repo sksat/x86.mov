@@ -50,8 +50,21 @@ impl Cpu {
         H: SysHost,
     {
         let mut buf = [0u8; MAX_INSN_LEN];
-        let n = fetch(mem, self.eip, &mut buf)?;
-        let (insn, len) = decode(&buf[..n])?;
+        let (n, partial_fault) = fetch(mem, self.eip, &mut buf)?;
+        let (insn, len) = match decode(&buf[..n]) {
+            Ok(p) => p,
+            Err(Fault::DecodeTruncated) => {
+                // If the decoder ran out of bytes and we know fetch
+                // was also halted by an unmapped byte, surface that as
+                // the real cause — instruction-spans-unmapped is a
+                // memory fault, not a malformed instruction stream.
+                if let Some(fault) = partial_fault {
+                    return Err(fault);
+                }
+                return Err(Fault::DecodeTruncated);
+            }
+            Err(e) => return Err(e),
+        };
         let next_eip_default = self.eip.wrapping_add(u32::from(len));
         self.eip = self.execute(insn, mem, host, next_eip_default)?;
         Ok(())
@@ -280,20 +293,25 @@ impl Cpu {
 /// at the first byte that faults. Used so an instruction near the end of a
 /// mapped region still decodes if enough bytes are available.
 ///
-/// Returns the original fault if even the **first** byte is unmapped —
-/// otherwise an unmapped `eip` would degenerate into `DecodeTruncated`
-/// and hide a bad-PC bug.
-fn fetch<M: Memory>(mem: &M, addr: u32, buf: &mut [u8]) -> Result<usize, Fault> {
+/// Returns:
+/// - `Err(fault)` if even the **first** byte is unmapped (so a bad PC
+///   surfaces as `Unmapped(eip)` instead of degenerating into
+///   `DecodeTruncated`).
+/// - `Ok((n, Some(fault)))` if we got `n` bytes (`1..MAX_INSN_LEN`) but
+///   then hit an unmapped byte — caller can promote the fault if the
+///   short prefix doesn't decode to a valid instruction.
+/// - `Ok((n, None))` if the full `buf.len()` bytes were readable.
+fn fetch<M: Memory>(mem: &M, addr: u32, buf: &mut [u8]) -> Result<(usize, Option<Fault>), Fault> {
     for (i, slot) in buf.iter_mut().enumerate() {
         // MAX_INSN_LEN is 15 so `i` always fits in u32.
         let off = u32::try_from(i).unwrap_or(u32::MAX);
         match mem.read_u8(addr.wrapping_add(off)) {
             Ok(b) => *slot = b,
             Err(e) if i == 0 => return Err(e),
-            Err(_) => return Ok(i),
+            Err(e) => return Ok((i, Some(e))),
         }
     }
-    Ok(buf.len())
+    Ok((buf.len(), None))
 }
 
 #[cfg(test)]
@@ -531,6 +549,22 @@ mod tests {
         assert_eq!(
             cpu.step(&mut mem, &mut PanicHost).unwrap_err(),
             Fault::Unmapped(0x2000)
+        );
+    }
+
+    #[test]
+    fn step_with_partial_fetch_reports_unmapped_at_missing_byte() {
+        // Allocate exactly 2 bytes — enough for fetch to read 2 bytes
+        // of a `mov eax, imm32` (5 bytes), but not the immediate. Plain
+        // decode would say DecodeTruncated; we want the underlying
+        // Unmapped at the missing byte's address surfaced instead.
+        let mut mem = FlatMemory::new_zeroed(0x1000, 2);
+        mem.write_bytes(0x1000, &[0xb8, 0x42]).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        assert_eq!(
+            cpu.step(&mut mem, &mut PanicHost).unwrap_err(),
+            Fault::Unmapped(0x1002),
+            "missing instruction byte should surface as Unmapped, not DecodeTruncated"
         );
     }
 

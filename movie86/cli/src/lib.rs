@@ -75,6 +75,13 @@ impl SysHost for StdHost {
 fn write_syscall(args: &SyscallArgs, mem: &mut dyn Memory) -> Result<SyscallResult, Fault> {
     const CHUNK: usize = 4096;
     let fd = args.ebx;
+    // Bad-fd is reported by Linux without ever dereferencing the user
+    // buffer. Mirror that here so a guest that probes invalid FDs
+    // (write(99, NULL, len)) sees -EBADF instead of an unmapped-memory
+    // fault from our pre-read.
+    if fd != 1 && fd != 2 {
+        return Ok(SyscallResult::Return(errno_to_eax(9)));
+    }
     let mut addr = args.ecx;
     let mut remaining = args.edx as usize;
     let mut written: u32 = 0;
@@ -87,15 +94,7 @@ fn write_syscall(args: &SyscallArgs, mem: &mut dyn Memory) -> Result<SyscallResu
         let n_res = match fd {
             1 => io::stdout().write(slice),
             2 => io::stderr().write(slice),
-            _ => {
-                // Bad-fd in Linux is EBADF (9). Return -EBADF if no
-                // bytes have been written yet; otherwise return the
-                // partial count (matches glibc behaviour).
-                if written == 0 {
-                    return Ok(SyscallResult::Return(errno_to_eax(9)));
-                }
-                return Ok(SyscallResult::Return(written));
-            }
+            _ => unreachable!("fd checked at top of write_syscall"),
         };
         match n_res {
             Ok(0) => break, // EOF / nothing more to write
