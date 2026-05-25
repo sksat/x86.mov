@@ -11,8 +11,8 @@ BUILD_TYPE   ?= Release
 # LLVM and printing a less useful error 200 lines down.
 LLVM_CMAKE_DIR := $(shell $(LLVM_CONFIG) --cmakedir 2>/dev/null)
 
-.PHONY: all build configure test test-exec test-codegen test-rust-example \
-        clean distclean help
+.PHONY: all build configure test test-exec test-codegen test-mov-only \
+        test-rust-example clean distclean help
 
 all: build
 
@@ -22,6 +22,8 @@ help:
 	@echo "  test               — execution tests + codegen lit tests"
 	@echo "  test-exec          — execution tests only  (test/Execution)"
 	@echo "  test-codegen       — lit + FileCheck only  (test/CodeGen)"
+	@echo "  test-mov-only      — objdump gate: every fixture under test/MovOnly/"
+	@echo "                       must disassemble to mov-only opcodes (stage 7+)"
 	@echo "  test-rust-example  — rustc → llvm-mov-llc → ELF round-trip (stage 6.5;"
 	@echo "                       needs 'rustup target add i686-unknown-linux-gnu')"
 	@echo "  clean              — remove build artefacts"
@@ -67,6 +69,14 @@ test-codegen: build
 # rust-std rlibs aren't installed.
 test-rust-example: build
 	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --run
+
+# Stage-7+ gate. `test/MovOnly/run.sh` builds every fixture under
+# test/MovOnly/ and asserts the disassembly contains only mov-family
+# mnemonics. At stage 7a0 there are no fixtures yet, so this is a clean
+# exit; each subsequent 7-stage (7a1 ADD, 7b AND/OR/XOR, 7c CMP/Jcc/JMP,
+# 7d CALL/RET) lights up the next group.
+test-mov-only: build
+	@./test/MovOnly/run.sh $(BUILD_DIR)
 
 clean:
 	@[ -d $(BUILD_DIR) ] && ninja -C $(BUILD_DIR) clean || true

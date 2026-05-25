@@ -31,4 +31,10 @@ private:
 
 // Declared here so MovISelDAGToDAG.cpp and MovTargetMachine.cpp share a name.
 FunctionPass *createMovISelDag(MovTargetMachine &TM, CodeGenOptLevel OptLevel);
+
+// Stage 7+: MachineFunctionPass that rewrites mov-heavy MIR into
+// mov-only sequences via lookup tables and (later) branchless dispatch.
+// At stage 7a0 the pass is wired but does nothing; the entry point is
+// stable so subsequent stages just grow the per-opcode body.
+FunctionPass *createMovOnlyLegalizePass();
 } // namespace llvm

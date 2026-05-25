@@ -21,6 +21,7 @@ add_llvm_component_library(LLVMMovCodeGen
   MovISelDAGToDAG.cpp
   MovISelLowering.cpp
   MovInstrInfo.cpp
+  MovOnlyLegalize.cpp
   MovRegisterInfo.cpp
   MovSubtarget.cpp
   MovTargetMachine.cpp

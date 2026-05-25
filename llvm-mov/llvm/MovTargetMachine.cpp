@@ -50,6 +50,15 @@ public:
     addPass(createMovISelDag(getMovTargetMachine(), getOptLevel()));
     return false;
   }
+
+  // Stage 7+: MovOnlyLegalize runs as a pre-emit pass, after RegAlloc /
+  // PEI / BranchFolder have settled the MIR into its final shape but
+  // before AsmPrinter walks it. Per codex's stage-7 design pass this is
+  // the only safe place — we need finalized physical registers and a
+  // stable CFG for the rewriting to make sense.
+  void addPreEmitPass() override {
+    addPass(createMovOnlyLegalizePass());
+  }
 };
 } // namespace
 

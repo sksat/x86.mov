@@ -120,6 +120,26 @@ test/
   `jmp/call/ret/cmp`. The dedicated `MovOnlyLegalize` MachineFunctionPass at stage 7 is
   what eliminates them. Don't preemptively encode mov-only patterns into TableGen — it'll
   slow every other stage.
+- **`MovOnlyLegalize` is its own staging story** (per codex's stage-7 design pass):
+  - **7a/7b are local rewrites**: per-MI, deterministic, no CFG/ABI changes.
+    `7a0` ships the empty pass + `addPreEmitPass` wiring + `make test-mov-only`
+    gate. `7a1` is the first real legalization (`ADD32r{r,i}` via i32-cell
+    lookup tables — deliberately *not* introducing `MOV8/MOV16rm` here so
+    the table machinery stays scoped to the existing addressing modes).
+    `7b1 = AND/OR/XOR`, `7b2 = SHL/SHR/SAR` (separate from logic because
+    shift carry/bit-extraction is a different table shape).
+  - **7c and 7d swap the execution substrate**: control flow and ABI move
+    to dispatcher / lookup-driven mechanisms. These are *much* harder than
+    7a/7b and should not be opened until 7a/7b are stable. Codex's
+    flagged stage-7 trap: do **NOT** start with movfuscator's
+    segment-register-self-modification trick — Linux ELF section
+    permissions (W^X), late-MI CFG invariants, and the `Jcc`/`CALL`/`RET`
+    terminator-class machinery all collide there. The initial 7c uses a
+    branchless dispatcher; segment-reg tricks can come later if at all.
+  - **`test/MovOnly/run.sh`** is the objdump gate. Whitelist: `mov`,
+    `movabs`, `movzx`, `movsx`. Anything else in a fixture's `.text` is
+    a FAIL. Fixtures land per stage (none at 7a0, then add at 7a1, etc.).
+    `_start.s` is never disassembled (it owns the only `int 0x80`).
 
 ## Things sksat has explicitly asked for and is expecting
 

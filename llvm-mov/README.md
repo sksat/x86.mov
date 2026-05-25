@@ -31,7 +31,12 @@ Bootstrap. Goals listed in roughly increasing difficulty:
 | 6a     | direct cdecl `call` between user-defined functions | exec: call_identity, call_add2, call_live_across (regmask) | ✅ |
 | 6.5    | `examples/rust` (rustc IR → llvm-mov-llc → ELF)    | `make test-rust-example` — `rust_main() -> i32 { 42 }`   | ✅    |
 | 6c     | indirect `call` via function pointer (CALL32r)     | execution tests                                          |       |
-| 7      | mov-only legalization pass (compare/branch/arith)  | objdump gate: no non-`mov` opcodes in `.text`            |       |
+| 7a0    | `MovOnlyLegalize` pass wired into `addPreEmitPass` + objdump gate harness | `make test-mov-only` runs (no fixtures yet) | ✅ |
+| 7a1    | ADD32r{r,i} mov-only via i32-cell lookup table     | 1 add fixture passes objdump gate                        |       |
+| 7b1    | AND / OR / XOR mov-only                            | objdump gate widens                                      |       |
+| 7b2    | SHL / SHR / SAR mov-only                           | objdump gate widens                                      |       |
+| 7c     | CMP + Jcc + JMP mov-only (control-flow substrate)  | objdump gate covers branching                            |       |
+| 7d     | CALL + RET mov-only                                | objdump gate covers calls                                |       |
 | 8      | bigger fixtures (movfuscator's `upstream-*` set)   | side-by-side bench vs movfuscator                        |       |
 
 At stage 0–6 the emitter is "mov-heavy" — `jmp/call/ret/cmp` are still allowed.

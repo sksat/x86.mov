@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Stage-7+ mov-only gate. For every fixture under test/MovOnly/, build it
+# through the full pipeline and assert the disassembly of the linked ELF's
+# .text contains only mov-family opcodes (plus the runtime-provided
+# `int 0x80` in `_start.s`).
+#
+# At stage 7a0 the MovOnlyLegalize pass is still a no-op, so no fixture
+# can pass this gate yet — the harness exits 0 with "no fixtures" instead
+# of failing, and each subsequent 7-stage (7a1 ADD, 7b AND/OR/XOR, 7c
+# CMP/Jcc/JMP, 7d CALL/RET) lights up the next group.
+#
+# The gate looks at `objdump -d -Mintel` output: any line whose mnemonic
+# isn't in the whitelist counts as a violation. The whitelist:
+#   - mov family: mov, movs[bw]l-style — only `mov` actually emitted today
+#   - nothing else
+# `_start.s`'s int 0x80 lives in a different ELF that the runner links
+# alongside the fixture, but objdump-ing only the fixture object skips
+# the runtime — see how we invoke objdump below.
+
+set -euo pipefail
+
+BUILD_DIR="${1:-build}"
+DRIVER="${BUILD_DIR}/bin/llvm-mov-llc"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+if ! [ -x "$DRIVER" ]; then
+    echo "error: $DRIVER not found — run 'make build' first." 1>&2
+    exit 2
+fi
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Allowed mnemonics. Stage 7's whole point is to drive this list down to
+# `mov` (plus its widening cousins) and the `int 0x80` runtime escape.
+ALLOWED='^(mov|movabs|movzx|movsx)$'
+
+pass=0
+fail=0
+skipped=0
+fail_names=()
+
+shopt -s nullglob
+fixtures=("${HERE}"/*.ll)
+if [ "${#fixtures[@]}" -eq 0 ]; then
+    echo "(no MovOnly fixtures yet — stage 7a0 ships the gate without"
+    echo " any fixtures so the harness exits clean. fixtures land at"
+    echo " stage 7a1 onwards.)"
+    exit 0
+fi
+
+for ll in "${fixtures[@]}"; do
+    name="$(basename "${ll}" .ll)"
+    s="${WORK}/${name}.s"
+    o="${WORK}/${name}.o"
+
+    if ! "${DRIVER}" "${ll}" -o "${s}" 2>"${WORK}/${name}.driver.log"; then
+        echo "SKIP  ${name}: llvm-mov-llc failed:"
+        sed 's/^/  /' "${WORK}/${name}.driver.log"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    if ! as --32 -o "${o}" "${s}" 2>"${WORK}/${name}.as.log"; then
+        echo "SKIP  ${name}: as failed:"
+        sed 's/^/  /' "${WORK}/${name}.as.log"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    # objdump the .text and look for non-mov mnemonics. The awk pull
+    # picks just the mnemonic column (after `addr: bytes`).
+    violations="$(
+        objdump -d -Mintel --no-show-raw-insn "${o}" \
+            | awk '/^[[:space:]]*[0-9a-f]+:/ {
+                       # line shape: "  <addr>: <mnemonic> ..."
+                       mnemonic = $2;
+                       print mnemonic;
+                   }' \
+            | grep -Ev "${ALLOWED}" \
+            | sort -u || true
+    )"
+
+    if [ -z "$violations" ]; then
+        echo "PASS  ${name}  (mov-only)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  ${name}  non-mov opcodes:"
+        echo "$violations" | sed 's/^/    /'
+        fail=$((fail + 1))
+        fail_names+=("${name}")
+    fi
+done
+
+echo
+echo "----- ${pass} mov-only, ${fail} non-mov-violating, ${skipped} skipped -----"
+if [ "${fail}" -gt 0 ]; then
+    printf 'failed: %s\n' "${fail_names[@]}"
+    exit 1
+fi
