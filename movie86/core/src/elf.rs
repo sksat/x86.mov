@@ -59,6 +59,22 @@ pub struct LoadSegment<'a> {
 pub struct LoadedElf<'a> {
     pub entry: u32,
     pub segments: Vec<LoadSegment<'a>>,
+    /// `(name, value)` for each symbol that has both a name and a
+    /// non-zero `st_value`. Used by the CLI to look up `dispatch`,
+    /// `master_loop`, etc. — the addresses movfuscator's runtime
+    /// registers via sigaction. Empty for stripped binaries.
+    pub symbols: Vec<(&'a str, u32)>,
+}
+
+impl LoadedElf<'_> {
+    /// Find a symbol by exact name. Returns its `st_value` (typically
+    /// a virtual address) if present.
+    #[must_use]
+    pub fn find_symbol(&self, name: &str) -> Option<u32> {
+        self.symbols
+            .iter()
+            .find_map(|&(n, v)| (n == name).then_some(v))
+    }
 }
 
 /// Parse `bytes` as an ELF32 little-endian i386 executable.
@@ -126,10 +142,82 @@ pub fn parse(bytes: &[u8]) -> Result<LoadedElf<'_>, ElfError> {
         });
     }
 
+    let symbols = parse_symbols(bytes).unwrap_or_default();
+
     Ok(LoadedElf {
         entry: e_entry,
         segments,
+        symbols,
     })
+}
+
+/// Parse the optional `.symtab` / `.strtab` sections out of the ELF.
+/// Returns the set of `(name, st_value)` pairs for every symbol with
+/// a non-empty name and non-zero value. Returns `None` if there's no
+/// symbol table or the section table is malformed — callers should
+/// treat absence as "stripped, no symbols".
+fn parse_symbols(bytes: &[u8]) -> Option<Vec<(&str, u32)>> {
+    // e_shoff, e_shentsize, e_shnum, e_shstrndx live at known offsets
+    // in the Ehdr; if any read fails we just bail out.
+    let e_shoff = read_u32(bytes, 32).ok()? as usize;
+    let e_shentsize = usize::from(read_u16(bytes, 46).ok()?);
+    let e_shnum = usize::from(read_u16(bytes, 48).ok()?);
+    if e_shoff == 0 || e_shentsize == 0 || e_shnum == 0 {
+        return None;
+    }
+
+    // Section header fields we care about: sh_type (offset 4),
+    // sh_offset (16), sh_size (20), sh_link (24), sh_entsize (36).
+    // SHT_SYMTAB = 2, SHT_STRTAB = 3.
+    let shdr = |i: usize| -> Option<&[u8]> {
+        let off = e_shoff + i * e_shentsize;
+        bytes.get(off..off + e_shentsize)
+    };
+    let mut symtab_off = 0usize;
+    let mut symtab_size = 0usize;
+    let mut symtab_entsize = 0usize;
+    let mut strtab_idx = 0usize;
+    for i in 0..e_shnum {
+        let h = shdr(i)?;
+        let sh_type = read_u32(h, 4).ok()?;
+        if sh_type == 2 {
+            symtab_off = read_u32(h, 16).ok()? as usize;
+            symtab_size = read_u32(h, 20).ok()? as usize;
+            strtab_idx = read_u32(h, 24).ok()? as usize;
+            symtab_entsize = read_u32(h, 36).ok()? as usize;
+            break;
+        }
+    }
+    if symtab_size == 0 || symtab_entsize == 0 {
+        return None;
+    }
+
+    let strtab_h = shdr(strtab_idx)?;
+    let strtab_off = read_u32(strtab_h, 16).ok()? as usize;
+    let strtab_size = read_u32(strtab_h, 20).ok()? as usize;
+    let strtab = bytes.get(strtab_off..strtab_off + strtab_size)?;
+
+    // Symbol entry (Elf32_Sym): st_name (u32, off 0), st_value
+    // (u32, off 4), st_size (u32, off 8), st_info (u8, off 12),
+    // st_other (u8, off 13), st_shndx (u16, off 14). 16 bytes.
+    let mut out = Vec::new();
+    let mut off = symtab_off;
+    while off + symtab_entsize <= symtab_off + symtab_size {
+        let entry = bytes.get(off..off + symtab_entsize)?;
+        let st_name = read_u32(entry, 0).ok()? as usize;
+        let st_value = read_u32(entry, 4).ok()?;
+        off += symtab_entsize;
+        if st_value == 0 || st_name == 0 {
+            continue;
+        }
+        let name_bytes = strtab.get(st_name..)?;
+        let nul = name_bytes.iter().position(|&b| b == 0)?;
+        let name = core::str::from_utf8(&name_bytes[..nul]).ok()?;
+        if !name.is_empty() {
+            out.push((name, st_value));
+        }
+    }
+    Some(out)
 }
 
 /// Build a [`FlatMemory`] covering the smallest contiguous range that

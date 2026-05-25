@@ -14,12 +14,29 @@ use crate::{Fault, Memory};
 /// bytes per step.
 const MAX_INSN_LEN: usize = 15;
 
+/// Linux signal numbers that the emulator can model. Real Linux has
+/// many more; we only model the ones movfuscator actually installs
+/// handlers for via `sigaction` (SIGSEGV for the dispatch trick,
+/// SIGILL for the alternate dispatch via `master_loop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Segv = 11,
+    Ill = 4,
+}
+
 /// Architectural state of the guest CPU.
 #[derive(Debug, Clone)]
 pub struct Cpu {
     /// General-purpose registers, indexed by [`Reg32`] as `usize`.
     pub regs: [u32; 8],
     pub eip: u32,
+    /// Handler address for SIGSEGV (`mov cs, ax` dispatch trick).
+    /// `None` means no handler registered — the trick traps with
+    /// [`Fault::SignalHandlerUnregistered`].
+    sigsegv_handler: Option<u32>,
+    /// Handler address for SIGILL — the alternate dispatch movfuscator
+    /// registers (`master_loop`).
+    sigill_handler: Option<u32>,
 }
 
 impl Cpu {
@@ -29,6 +46,8 @@ impl Cpu {
         Self {
             regs: [0; 8],
             eip: entry,
+            sigsegv_handler: None,
+            sigill_handler: None,
         }
     }
 
@@ -39,6 +58,24 @@ impl Cpu {
 
     pub fn set_reg(&mut self, r: Reg32, v: u32) {
         self.regs[r as usize] = v;
+    }
+
+    /// Register a guest function to invoke when `sig` fires. Called by
+    /// the loader once it knows where movfuscator's `dispatch` /
+    /// `master_loop` symbols landed.
+    pub fn set_signal_handler(&mut self, sig: Signal, handler: u32) {
+        match sig {
+            Signal::Segv => self.sigsegv_handler = Some(handler),
+            Signal::Ill => self.sigill_handler = Some(handler),
+        }
+    }
+
+    #[must_use]
+    pub fn signal_handler(&self, sig: Signal) -> Option<u32> {
+        match sig {
+            Signal::Segv => self.sigsegv_handler,
+            Signal::Ill => self.sigill_handler,
+        }
     }
 
     /// Fetch one instruction at `eip`, decode and execute it, and update
@@ -137,10 +174,16 @@ impl Cpu {
                 self.set_reg(Reg32::Esp, esp.wrapping_add(4));
                 Ok(target)
             }
-            Insn::MovfuscatorDispatchJump(src) => {
-                // The full 32-bit value of the source register is the
-                // jump target — see Insn::MovfuscatorDispatchJump docs.
-                Ok(self.reg(src))
+            Insn::MovfuscatorDispatchJump(_src) => {
+                // `mov cs, ax` on real x86 raises #GP / SIGSEGV.
+                // movfuscator's runtime registers a SIGSEGV handler via
+                // sigaction; the kernel invokes that handler instead of
+                // killing the process. We model the same: jump to the
+                // registered handler. With no handler registered, trap
+                // — the placeholder "jump to eax" semantic was wrong
+                // (eax often holds a data pointer, not a code address).
+                self.signal_handler(Signal::Segv)
+                    .ok_or(Fault::SignalHandlerUnregistered(Signal::Segv as u32))
             }
             Insn::MovToOtherSegReg => {
                 // No-op in flat 32-bit mode.
@@ -650,12 +693,25 @@ mod tests {
     // --- movfuscator dispatch trick + indirect jmp ---
 
     #[test]
-    fn movfuscator_dispatch_jump_jumps_to_full_eax() {
-        // 8e c8 → mov cs, ax  (modelled as: jmp eax, full 32 bits)
+    fn movfuscator_dispatch_jump_invokes_registered_sigsegv_handler() {
+        // 8e c8 → mov cs, ax. With a SIGSEGV handler registered, the
+        // dispatch jumps there (matching what the kernel does on real
+        // Linux when movfuscator's runtime calls sigaction).
         let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[0x8e, 0xc8], 64);
-        cpu.set_reg(Reg32::Eax, 0xdead_beef);
+        cpu.set_signal_handler(Signal::Segv, 0xdead_beef);
+        cpu.set_reg(Reg32::Eax, 0x4242); // intentionally NOT the target
         cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.eip, 0xdead_beef);
+    }
+
+    #[test]
+    fn movfuscator_dispatch_jump_with_no_handler_traps() {
+        let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[0x8e, 0xc8], 64);
+        cpu.set_reg(Reg32::Eax, 0x4242);
+        assert_eq!(
+            cpu.step(&mut mem, &mut PanicHost).unwrap_err(),
+            Fault::SignalHandlerUnregistered(Signal::Segv as u32),
+        );
     }
 
     #[test]

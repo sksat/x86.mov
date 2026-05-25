@@ -75,13 +75,20 @@ The root cause is in `movfuscator.c:877-887` and `:2810-2840`:
 
 So "what `mov cs, ax` does" depends on which handler was registered via `sigaction`. With our no-op stub, no handler was registered, so the placeholder "jump to EAX" semantic is a wrong guess.
 
-The follow-up needs:
+**What landed in this PR for the dispatch path:**
 
-1. **Real `sigaction` in `StdHost`** (or equivalent in the core). The stub has to read the `struct sigaction` from guest memory, parse out the handler pointer, and record `(signum → handler)` somewhere accessible to the CPU.
-2. **`mov cs, ax` → invoke the registered SIGSEGV handler** (or the SIGILL handler — movfuscator uses both). The handler runs in guest context like any other code; the dispatch happens through the normal fetch / decode / step loop after `eip` is set to the handler's address.
-3. **Self-modifying-code observability** — `external`'s value is written by runtime mov instructions and read back as the dispatch target. Our current memory model already supports this (just plain reads/writes), but it's worth pinning explicitly with a test.
+- **ELF symbol-table parsing** (`elf::parse_symbols`) — exposes `(name, st_value)` pairs from `.symtab`/`.strtab` via `LoadedElf::find_symbol`.
+- **Signal-handler tracking on `Cpu`** — `Cpu::set_signal_handler(Signal, addr)`; with no handler registered the dispatch traps with `Fault::SignalHandlerUnregistered`.
+- **CLI wires it up automatically** — `run_elf_with_host` looks up `dispatch` (→ SIGSEGV) and `master_loop` (→ SIGILL) at load time and registers them. `mov cs, ax` now correctly jumps into `dispatch`.
 
-Tooling needed for any of this: `cd movfuscator-wasm && make setup && make build-native` to materialize the runtime objects (gitignored under `vendor/movfuscator/build/`).
+`dispatch` itself is `mov esp, [sp]; jmp [external]`. It runs end-to-end in movie86 but jumps to `mem[external]` which is `0` at process start — the runtime is supposed to self-modify `external` to the resume-target before each dispatch, and that's the part the follow-up needs.
+
+**Open question for the next PR:** what's the exact mechanism by which `external` gets the right value? Two leading hypotheses:
+
+1. Runtime writes the desired resume-target to `external` via a regular `mov` *before* the `mov cs, ax`. We'd see this in the trace if it's the case — look for `mov [external_addr], imm32` or similar shortly before each dispatch.
+2. movfuscator's SIGSEGV handler is *not* the bare `dispatch` we see in `.plt`. It might be a richer C function (in something I haven't located) that reads `ucontext` to recover the faulting `eax` and writes it to `external`. That would mean the `sa_dispatch.long dispatch` we see in `movfuscator.c` is just the dispatch *body*, not the full handler.
+
+Tooling needed to dig in: `cd movfuscator-wasm && make setup && make build-native` to materialize the runtime objects (gitignored under `vendor/movfuscator/build/`).
 
 ## CI
 

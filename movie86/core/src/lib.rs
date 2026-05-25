@@ -9,7 +9,7 @@ pub mod insn;
 pub mod mem;
 pub mod syscall;
 
-pub use cpu::Cpu;
+pub use cpu::{Cpu, Signal};
 pub use decode::decode;
 pub use elf::{ElfError, LoadSegment, LoadedElf};
 pub use insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
@@ -41,4 +41,8 @@ pub enum Fault {
     UnsupportedInterrupt(u8),
     /// `int 0x80` with a syscall number the host doesn't implement.
     UnknownSyscall(u32),
+    /// A signal fired (e.g. SIGSEGV from `mov cs, ax`) but no handler
+    /// was registered for it. The numeric signal number is the value
+    /// of [`crate::cpu::Signal`] cast to `u32`.
+    SignalHandlerUnregistered(u32),
 }

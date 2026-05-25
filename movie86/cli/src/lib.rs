@@ -6,7 +6,7 @@ use std::io::{self, Write};
 
 use movie86_core::elf::{flatten_with_stack, parse, ElfError};
 use movie86_core::syscall::{SysHost, SyscallArgs, SyscallResult};
-use movie86_core::{Cpu, Fault, Memory, Reg32};
+use movie86_core::{Cpu, Fault, Memory, Reg32, Signal};
 
 /// Stack size reserved by the CLI for every program. 64 KiB is enough
 /// for any hand-assembled fixture we run today and well within the
@@ -152,6 +152,16 @@ pub fn run_elf_with_host<H: SysHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
     };
     let mut cpu = Cpu::new(elf.entry);
     cpu.set_reg(Reg32::Esp, esp_initial);
+    // movfuscator's runtime installs `dispatch` (SIGSEGV) and
+    // `master_loop` (SIGILL) handlers via sigaction. We don't run a
+    // real sigaction stub, so we wire the handlers up directly from
+    // the ELF's symbol table — same end effect for a static link.
+    if let Some(addr) = elf.find_symbol("dispatch") {
+        cpu.set_signal_handler(Signal::Segv, addr);
+    }
+    if let Some(addr) = elf.find_symbol("master_loop") {
+        cpu.set_signal_handler(Signal::Ill, addr);
+    }
     // Per-instruction tracing is gated on an env var so the hot path
     // costs at most an integer load in the common case. Set
     // `MOVIE86_TRACE=1` to dump `eip eax ebx ecx edx esp` before each
