@@ -57,3 +57,13 @@ jobs:
 
       - name: test (execution)
         run: make test-exec
+
+      # Stage 6.5 — rustc → llvm-mov-llc → ELF end-to-end. The ubuntu-24.04
+      # runner already ships with a recent rustup-managed rustc, but the
+      # i686 std rlibs are not preinstalled. Adding the target is ~10 MB
+      # and cached implicitly by the rustup install.
+      - name: install i686 rust-std (for examples/rust)
+        run: rustup target add i686-unknown-linux-gnu
+
+      - name: test-rust-example (stage 6.5)
+        run: make test-rust-example
