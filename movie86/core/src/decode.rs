@@ -42,6 +42,11 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
         (false, 0x8A) => decode_mov_rm_r_8(rest, /* dir_to_reg */ true)?,
         (false, 0x8B) => decode_mov_rm_r_32(rest, /* dir_to_reg */ true)?,
         (false, 0xC7) => decode_mov_rm32_imm32(rest)?,
+        // moffs MOV forms (A0/A1/A2/A3, 5 bytes) — short encodings of
+        // mov al/ax/eax to/from an absolute address. See decode_moffs.
+        (false, 0xA0..=0xA3) | (true, 0xA1 | 0xA3) => {
+            decode_moffs(opcode, operand_size_16, rest)?
+        }
         // 16-bit variants: 66 89 /r and 66 8B /r
         (true, 0x89) => decode_mov_rm_r_16(rest, /* dir_to_reg */ false)?,
         (true, 0x8B) => decode_mov_rm_r_16(rest, /* dir_to_reg */ true)?,
@@ -75,6 +80,44 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
         _ => return Err(Fault::UnknownOpcode(opcode)),
     };
     Ok((insn, body_len + prefix_len))
+}
+
+/// Decode one of the moffs MOV forms — the short (no-ModR/M) encodings
+/// that move AL/AX/EAX to or from a 32-bit absolute address.
+///
+/// - `A0` / `A2`: AL ↔ [disp32]   (8-bit, ignores any 0x66 prefix)
+/// - `A1` / `A3`: EAX ↔ [disp32]  (32-bit by default, 16-bit with `66`)
+fn decode_moffs(opcode: u8, operand_size_16: bool, rest: &[u8]) -> Result<(Insn, u8), Fault> {
+    let disp = read_i32_le(rest, 1)?;
+    let mem = no_base_disp(disp);
+    let insn = match (opcode, operand_size_16) {
+        (0xA0, _) => Insn::Mov {
+            dst: Operand::Reg8(Reg8::Al),
+            src: Operand::Mem8(mem),
+        },
+        (0xA2, _) => Insn::Mov {
+            dst: Operand::Mem8(mem),
+            src: Operand::Reg8(Reg8::Al),
+        },
+        (0xA1, false) => Insn::Mov {
+            dst: Operand::Reg32(Reg32::Eax),
+            src: Operand::Mem32(mem),
+        },
+        (0xA3, false) => Insn::Mov {
+            dst: Operand::Mem32(mem),
+            src: Operand::Reg32(Reg32::Eax),
+        },
+        (0xA1, true) => Insn::Mov {
+            dst: Operand::Reg16(Reg16::Ax),
+            src: Operand::Mem16(mem),
+        },
+        (0xA3, true) => Insn::Mov {
+            dst: Operand::Mem16(mem),
+            src: Operand::Reg16(Reg16::Ax),
+        },
+        _ => return Err(Fault::UnknownOpcode(opcode)),
+    };
+    Ok((insn, 5))
 }
 
 /// 16-bit twin of [`decode_mov_rm_r_32`]: handles `66 89 /r` and `66 8B /r`.
@@ -562,6 +605,102 @@ mod tests {
             Insn::Mov {
                 dst: Operand::Reg32(Reg32::Eax),
                 src: mem32_sib(Some(Reg32::Esp), None, 1, 4),
+            }
+        );
+    }
+
+    // --- moffs forms (A0/A1/A2/A3) ---
+
+    #[test]
+    fn moffs_mov_eax_from_abs() {
+        // a1 78 56 34 12 → mov eax, ds:0x12345678
+        // 1-byte shorter than the equivalent 8b 05 ... encoding.
+        let (insn, len) = decode(&[0xa1, 0x78, 0x56, 0x34, 0x12]).unwrap();
+        assert_eq!(len, 5);
+        assert_eq!(
+            insn,
+            Insn::Mov {
+                dst: Operand::Reg32(Reg32::Eax),
+                src: mem32(0x1234_5678_i32),
+            }
+        );
+    }
+
+    #[test]
+    fn moffs_mov_abs_from_eax() {
+        // a3 78 56 34 12 → mov ds:0x12345678, eax
+        let (insn, len) = decode(&[0xa3, 0x78, 0x56, 0x34, 0x12]).unwrap();
+        assert_eq!(len, 5);
+        assert_eq!(
+            insn,
+            Insn::Mov {
+                dst: mem32(0x1234_5678_i32),
+                src: Operand::Reg32(Reg32::Eax),
+            }
+        );
+    }
+
+    #[test]
+    fn moffs_mov_al_byte_forms() {
+        // a0 .. → mov al, byte ds:disp32
+        let (insn, _) = decode(&[0xa0, 0x00, 0x20, 0x00, 0x00]).unwrap();
+        assert_eq!(
+            insn,
+            Insn::Mov {
+                dst: Operand::Reg8(Reg8::Al),
+                src: Operand::Mem8(EffectiveAddress {
+                    base: None,
+                    index: None,
+                    scale: 1,
+                    disp: 0x2000,
+                }),
+            }
+        );
+        // a2 .. → mov byte ds:disp32, al
+        let (insn, _) = decode(&[0xa2, 0x00, 0x20, 0x00, 0x00]).unwrap();
+        assert_eq!(
+            insn,
+            Insn::Mov {
+                dst: Operand::Mem8(EffectiveAddress {
+                    base: None,
+                    index: None,
+                    scale: 1,
+                    disp: 0x2000,
+                }),
+                src: Operand::Reg8(Reg8::Al),
+            }
+        );
+    }
+
+    #[test]
+    fn moffs_mov_with_66_prefix_is_16bit() {
+        // 66 a1 .. → mov ax, word ds:disp32
+        let (insn, len) = decode(&[0x66, 0xa1, 0x00, 0x20, 0x00, 0x00]).unwrap();
+        assert_eq!(len, 6);
+        assert_eq!(
+            insn,
+            Insn::Mov {
+                dst: Operand::Reg16(Reg16::Ax),
+                src: Operand::Mem16(EffectiveAddress {
+                    base: None,
+                    index: None,
+                    scale: 1,
+                    disp: 0x2000,
+                }),
+            }
+        );
+        // 66 a3 .. → mov word ds:disp32, ax
+        let (insn, _) = decode(&[0x66, 0xa3, 0x00, 0x20, 0x00, 0x00]).unwrap();
+        assert_eq!(
+            insn,
+            Insn::Mov {
+                dst: Operand::Mem16(EffectiveAddress {
+                    base: None,
+                    index: None,
+                    scale: 1,
+                    disp: 0x2000,
+                }),
+                src: Operand::Reg16(Reg16::Ax),
             }
         );
     }
