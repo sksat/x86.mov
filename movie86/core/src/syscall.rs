@@ -53,9 +53,6 @@ pub enum SyscallResult {
 /// `mem` is the guest address space so the host can read input buffers
 /// (e.g. the `buf` of a `write(2)`) and write output buffers.
 pub trait SysHost {
-    fn syscall(
-        &mut self,
-        args: &SyscallArgs,
-        mem: &mut dyn Memory,
-    ) -> Result<SyscallResult, Fault>;
+    fn syscall(&mut self, args: &SyscallArgs, mem: &mut dyn Memory)
+        -> Result<SyscallResult, Fault>;
 }

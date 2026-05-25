@@ -14,7 +14,7 @@ pub use decode::decode;
 pub use elf::{ElfError, LoadSegment, LoadedElf};
 pub use insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
 pub use mem::{FlatMemory, Memory};
-pub use syscall::{SyscallArgs, SyscallResult, SysHost};
+pub use syscall::{SysHost, SyscallArgs, SyscallResult};
 
 /// Reasons emulation can stop in a way the caller needs to handle.
 ///

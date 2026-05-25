@@ -7,7 +7,7 @@
 
 use crate::decode::decode;
 use crate::insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
-use crate::syscall::{SyscallArgs, SyscallResult, SysHost};
+use crate::syscall::{SysHost, SyscallArgs, SyscallResult};
 use crate::{Fault, Memory};
 
 /// Maximum length of any x86 instruction. Fetches read up to this many
@@ -334,7 +334,10 @@ mod tests {
         let mut mem = FlatMemory::new_zeroed(0x1000, 16);
         mem.write_u8(0x1000, 0x00).unwrap(); // unknown opcode
         let mut cpu = Cpu::new(0x1000);
-        assert_eq!(cpu.step(&mut mem, &mut PanicHost).unwrap_err(), Fault::UnknownOpcode(0x00));
+        assert_eq!(
+            cpu.step(&mut mem, &mut PanicHost).unwrap_err(),
+            Fault::UnknownOpcode(0x00)
+        );
     }
 
     #[test]
@@ -461,7 +464,11 @@ mod tests {
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Eax, 0x1234_5677);
         cpu.step(&mut mem, &mut PanicHost).unwrap();
-        assert_eq!(cpu.reg(Reg32::Eax), 0x1234_bb77, "AH should touch bits 15:8 only");
+        assert_eq!(
+            cpu.reg(Reg32::Eax),
+            0x1234_bb77,
+            "AH should touch bits 15:8 only"
+        );
     }
 
     #[test]
@@ -486,7 +493,10 @@ mod tests {
         // read byte 0. We must see Unmapped(0x2000), not DecodeTruncated.
         let mut mem = FlatMemory::new_zeroed(0x1000, 16);
         let mut cpu = Cpu::new(0x2000);
-        assert_eq!(cpu.step(&mut mem, &mut PanicHost).unwrap_err(), Fault::Unmapped(0x2000));
+        assert_eq!(
+            cpu.step(&mut mem, &mut PanicHost).unwrap_err(),
+            Fault::Unmapped(0x2000)
+        );
     }
 
     #[test]
@@ -497,7 +507,10 @@ mod tests {
             .unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.set_reg(Reg32::Eax, 42);
-        assert_eq!(cpu.step(&mut mem, &mut PanicHost).unwrap_err(), Fault::Unmapped(0x9000));
+        assert_eq!(
+            cpu.step(&mut mem, &mut PanicHost).unwrap_err(),
+            Fault::Unmapped(0x9000)
+        );
     }
 
     // --- jmp + int ---
@@ -507,7 +520,8 @@ mod tests {
         // 1000: e9 0a 00 00 00   → jmp +10
         // Next-insn address is 0x1005; target is 0x1005 + 10 = 0x100f.
         let mut mem = FlatMemory::new_zeroed(0x1000, 0x100);
-        mem.write_bytes(0x1000, &[0xe9, 0x0a, 0x00, 0x00, 0x00]).unwrap();
+        mem.write_bytes(0x1000, &[0xe9, 0x0a, 0x00, 0x00, 0x00])
+            .unwrap();
         let mut cpu = Cpu::new(0x1000);
         cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.eip, 0x100f);
@@ -517,7 +531,8 @@ mod tests {
     fn step_jmp_rel32_negative_loops_back() {
         // 1005: e9 f6 ff ff ff  → jmp -10  (next-insn is 0x100a; target 0x1000)
         let mut mem = FlatMemory::new_zeroed(0x1000, 0x100);
-        mem.write_bytes(0x1005, &[0xe9, 0xf6, 0xff, 0xff, 0xff]).unwrap();
+        mem.write_bytes(0x1005, &[0xe9, 0xf6, 0xff, 0xff, 0xff])
+            .unwrap();
         let mut cpu = Cpu::new(0x1005);
         cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.eip, 0x1000);
@@ -540,7 +555,11 @@ mod tests {
         assert_eq!(args.ebx, 1);
         assert_eq!(args.ecx, 0x2000);
         assert_eq!(args.edx, 5);
-        assert_eq!(cpu.reg(Reg32::Eax), 5, "host return value should land in EAX");
+        assert_eq!(
+            cpu.reg(Reg32::Eax),
+            5,
+            "host return value should land in EAX"
+        );
         assert_eq!(cpu.eip, 0x1002);
     }
 

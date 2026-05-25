@@ -104,7 +104,9 @@ pub fn parse(bytes: &[u8]) -> Result<LoadedElf<'_>, ElfError> {
         let end = (p_offset as usize)
             .checked_add(p_filesz as usize)
             .ok_or(ElfError::Truncated)?;
-        let data = bytes.get(p_offset as usize..end).ok_or(ElfError::Truncated)?;
+        let data = bytes
+            .get(p_offset as usize..end)
+            .ok_or(ElfError::Truncated)?;
         segments.push(LoadSegment {
             vaddr: p_vaddr,
             memsz: p_memsz,
@@ -141,7 +143,8 @@ pub fn flatten_into_region(elf: &LoadedElf<'_>) -> Result<FlatMemory, ElfError> 
     let mut mem = FlatMemory::new_zeroed(base, size);
     for seg in &elf.segments {
         // Memory is already zeroed, so we only have to copy filesz bytes.
-        mem.write_bytes(seg.vaddr, seg.data).map_err(|_| ElfError::Truncated)?;
+        mem.write_bytes(seg.vaddr, seg.data)
+            .map_err(|_| ElfError::Truncated)?;
     }
     Ok(mem)
 }
@@ -210,7 +213,8 @@ mod tests {
                 .copy_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes()); // p_filesz
             bytes[off + 20..off + 24].copy_from_slice(&memsz.to_le_bytes());
             bytes[off + 24..off + 28].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
-            bytes[off + 28..off + 32].copy_from_slice(&0x1000u32.to_le_bytes()); // p_align
+            bytes[off + 28..off + 32].copy_from_slice(&0x1000u32.to_le_bytes());
+            // p_align
         }
         bytes
     }
@@ -286,13 +290,7 @@ mod tests {
     fn flattened_region_covers_multiple_segments() {
         let text = b"\x90";
         let data = b"\xaa\xbb";
-        let elf = build_elf(
-            0x1000,
-            &[
-                (0x1000, 1, text),
-                (0x2000, 2, data),
-            ],
-        );
+        let elf = build_elf(0x1000, &[(0x1000, 1, text), (0x2000, 2, data)]);
         let loaded = parse(&elf).unwrap();
         let mem = flatten_into_region(&loaded).unwrap();
         assert_eq!(mem.read_u8(0x1000).unwrap(), 0x90);

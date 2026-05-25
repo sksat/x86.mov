@@ -252,11 +252,7 @@ fn parse_sib_address(mod_: u8, sib: u8, rest: &[u8]) -> Result<(EffectiveAddress
     let (base, disp, disp_bytes) = match (mod_, base_field) {
         (0b00, 0b101) => (None, read_i32_le(rest, 0)?, 4),
         (0b00, b) => (Some(Reg32::from_index(b)), 0, 0),
-        (0b01, b) => (
-            Some(Reg32::from_index(b)),
-            i32::from(read_i8(rest, 0)?),
-            1,
-        ),
+        (0b01, b) => (Some(Reg32::from_index(b)), i32::from(read_i8(rest, 0)?), 1),
         (0b10, b) => (Some(Reg32::from_index(b)), read_i32_le(rest, 0)?, 4),
         _ => unreachable!("mod=11 has no SIB byte"),
     };
@@ -484,12 +480,7 @@ mod tests {
 
     // --- SIB ---
 
-    fn mem32_sib(
-        base: Option<Reg32>,
-        index: Option<Reg32>,
-        scale: u8,
-        disp: i32,
-    ) -> Operand {
+    fn mem32_sib(base: Option<Reg32>, index: Option<Reg32>, scale: u8, disp: i32) -> Operand {
         Operand::Mem32(EffectiveAddress {
             base,
             index,
@@ -564,10 +555,8 @@ mod tests {
     fn mov_mem_disp32_imm32_via_c7() {
         // c7 05 78 56 34 12 ef be ad de
         //   →  mov dword [0x12345678], 0xdeadbeef
-        let (insn, len) = decode(&[
-            0xc7, 0x05, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad, 0xde,
-        ])
-        .unwrap();
+        let (insn, len) =
+            decode(&[0xc7, 0x05, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad, 0xde]).unwrap();
         assert_eq!(len, 10);
         assert_eq!(
             insn,

@@ -25,7 +25,7 @@ fn build_elf(entry: u32, program: &[u8]) -> Vec<u8> {
     bytes[40..42].copy_from_slice(&(EHDR_SIZE as u16).to_le_bytes()); // e_ehsize
     bytes[42..44].copy_from_slice(&(PHDR_SIZE as u16).to_le_bytes()); // e_phentsize
     bytes[44..46].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
-    // Phdr (single PT_LOAD)
+                                                        // Phdr (single PT_LOAD)
     let p = EHDR_SIZE;
     let seg_offset = bytes.len() as u32; // program data appended at the end
     bytes[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD

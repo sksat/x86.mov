@@ -5,7 +5,7 @@
 use std::io::{self, Write};
 
 use movie86_core::elf::{flatten_into_region, parse, ElfError};
-use movie86_core::syscall::{SyscallArgs, SyscallResult, SysHost};
+use movie86_core::syscall::{SysHost, SyscallArgs, SyscallResult};
 use movie86_core::{Cpu, Fault, Memory};
 
 #[cfg(test)]
@@ -66,10 +66,7 @@ impl SysHost for StdHost {
 /// OOM the host. Host I/O failures return a Linux-style negative errno
 /// in EAX (not [`Fault::UnknownSyscall`]) so pipelines like
 /// `movie86 prog | head` behave the way the guest expects.
-fn write_syscall(
-    args: &SyscallArgs,
-    mem: &mut dyn Memory,
-) -> Result<SyscallResult, Fault> {
+fn write_syscall(args: &SyscallArgs, mem: &mut dyn Memory) -> Result<SyscallResult, Fault> {
     const CHUNK: usize = 4096;
     let fd = args.ebx;
     let mut addr = args.ecx;

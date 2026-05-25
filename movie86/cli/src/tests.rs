@@ -25,7 +25,11 @@ fn write_with_unknown_fd_returns_negative_ebadf() {
     };
     let r = write_syscall(&args, &mut mem).unwrap();
     let SyscallResult::Return(v) = r;
-    assert_eq!(v, errno_to_eax(9), "should be -EBADF before any bytes written");
+    assert_eq!(
+        v,
+        errno_to_eax(9),
+        "should be -EBADF before any bytes written"
+    );
 }
 
 #[test]
