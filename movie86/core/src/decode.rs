@@ -44,9 +44,7 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
         (false, 0xC7) => decode_mov_rm32_imm32(rest)?,
         // moffs MOV forms (A0/A1/A2/A3, 5 bytes) — short encodings of
         // mov al/ax/eax to/from an absolute address. See decode_moffs.
-        (false, 0xA0..=0xA3) | (true, 0xA1 | 0xA3) => {
-            decode_moffs(opcode, operand_size_16, rest)?
-        }
+        (false, 0xA0..=0xA3) | (true, 0xA1 | 0xA3) => decode_moffs(opcode, operand_size_16, rest)?,
         // 16-bit variants: 66 89 /r and 66 8B /r
         (true, 0x89) => decode_mov_rm_r_16(rest, /* dir_to_reg */ false)?,
         (true, 0x8B) => decode_mov_rm_r_16(rest, /* dir_to_reg */ true)?,

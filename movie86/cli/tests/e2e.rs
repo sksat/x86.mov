@@ -4,7 +4,7 @@
 
 use movie86_cli::{run_elf, run_elf_with_host, RunOutcome};
 use movie86_core::syscall::{SysHost, SyscallArgs, SyscallResult};
-use movie86_core::{Fault, Memory};
+use movie86_core::{decode, Fault, Memory};
 
 /// Build a minimal ELF32-LE-i386 `ET_EXEC` whose entry runs `program`.
 /// One `PT_LOAD` segment covering exactly the program bytes.
@@ -176,6 +176,43 @@ fn call_function_that_writes_and_rets_then_exits() {
         other => panic!("expected Exit(0), got {other:?}"),
     }
     assert_eq!(host.stdout, b"Hi\n");
+}
+
+/// Decoder-coverage test: walk every byte of the `.text` section in
+/// the committed `return42.o` (real movfuscator output) through
+/// `decode()` and assert it all decodes cleanly. Catches a class of
+/// regressions the hand-crafted tests can't: a real movfuscator
+/// binary's instruction mix.
+///
+/// The .text offset/size are taken from a one-time `objdump -h` of
+/// the file (`52..52+0x0adc`). If the golden is regenerated and that
+/// changes, update the constants; the test will fail loud either way.
+#[test]
+fn decoder_covers_return42_o_text() {
+    const RETURN42_O: &[u8] =
+        include_bytes!("../../../movfuscator-wasm/tests/goldens-o/return42.o");
+    const TEXT_OFFSET: usize = 0x34;
+    const TEXT_LEN: usize = 0x0adc;
+
+    let text = &RETURN42_O[TEXT_OFFSET..TEXT_OFFSET + TEXT_LEN];
+    let mut pos = 0;
+    let mut insns = 0;
+    while pos < text.len() {
+        match decode(&text[pos..]) {
+            Ok((_, len)) => {
+                assert!(len > 0, "decode returned 0-length insn at {pos:#x}");
+                pos += usize::from(len);
+                insns += 1;
+            }
+            Err(e) => panic!("decode failed at .text offset {pos:#x} ({insns} insns in): {e:?}"),
+        }
+    }
+    assert_eq!(pos, text.len(), "decoder consumed exactly the .text bytes");
+    // Lower bound — return42.o is ~2.7 KB of mov-heavy code, so we
+    // expect many hundreds of decoded instructions. Pinning a precise
+    // count would couple the test to the golden, but the floor catches
+    // a degenerate "every byte was a 0xb8 imm32 swallowing 5" pattern.
+    assert!(insns > 100, "expected >100 instructions, got {insns}");
 }
 
 #[test]
