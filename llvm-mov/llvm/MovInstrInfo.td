@@ -124,6 +124,24 @@ def SHL32ri : ShiftRI<"shl", shl>;
 def SHR32ri : ShiftRI<"shr", srl>;
 def SAR32ri : ShiftRI<"sar", sra>;
 
+// Variable-amount shifts. x86 constrains the count to CL; we expose the
+// constraint via `Uses = [ECX]` (the register-allocator-visible side) and
+// hardcode `cl` in the AsmString (the printer side). Patternless on
+// purpose: MovDAGToDAGISel::Select inserts the `mov ecx, <amt>` CopyToReg
+// + glue ahead of these — TableGen patterns can't express "copy this
+// operand into a specific physreg first".
+class ShiftRCL<string OpStr>
+  : MovInst<(outs GPR32:$dst), (ins GPR32:$src1),
+            !strconcat(OpStr, "\t$dst, cl"),
+            []> {
+  let Constraints = "$src1 = $dst";
+  let Uses = [ECX];
+}
+
+def SHL32rCL : ShiftRCL<"shl">;
+def SHR32rCL : ShiftRCL<"shr">;
+def SAR32rCL : ShiftRCL<"sar">;
+
 //===----------------------------------------------------------------------===//
 // RET
 //===----------------------------------------------------------------------===//

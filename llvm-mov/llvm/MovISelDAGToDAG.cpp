@@ -55,8 +55,40 @@ public:
 char MovDAGToDAGISelLegacy::ID = 0;
 
 void MovDAGToDAGISel::Select(SDNode *Node) {
-  // If pre-selection custom matching is ever needed (e.g. fancier ADDR modes),
-  // do it here. For stage 0–2 the TableGen-generated patterns cover everything.
+  // Variable-amount shifts: x86 requires the count in CL, so before falling
+  // back to TableGen patterns (which only know `shift reg, imm`) we
+  // intercept (shl/srl/sra GPR32, GPR32) and emit
+  //
+  //     %ecx = COPY <amt>
+  //     %dst = SHL32rCL %src1           ; Uses=[ECX]
+  //
+  // The CopyToReg's glue is hung off the shift instruction so the register
+  // scheduler keeps them adjacent. We only intercept the reg-amount form;
+  // imm-amount keeps using SHL32ri via the TableGen pattern.
+  unsigned ShiftOp = 0;
+  switch (Node->getOpcode()) {
+  case ISD::SHL: ShiftOp = Mov::SHL32rCL; break;
+  case ISD::SRL: ShiftOp = Mov::SHR32rCL; break;
+  case ISD::SRA: ShiftOp = Mov::SAR32rCL; break;
+  default:       break;
+  }
+  if (ShiftOp && Node->getValueType(0) == MVT::i32 &&
+      !isa<ConstantSDNode>(Node->getOperand(1))) {
+    SDLoc DL(Node);
+    SDValue Src = Node->getOperand(0);
+    SDValue Amt = Node->getOperand(1);
+
+    SDValue Chain = CurDAG->getEntryNode();
+    SDValue Copy  = CurDAG->getCopyToReg(Chain, DL, Mov::ECX, Amt, SDValue());
+    SDValue Glue  = Copy.getValue(1);
+
+    SDValue Ops[] = { Src, Glue };
+    SDNode *Shift = CurDAG->getMachineNode(
+        ShiftOp, DL, CurDAG->getVTList(MVT::i32, MVT::Glue), Ops);
+    ReplaceNode(Node, Shift);
+    return;
+  }
+
   SelectCode(Node);
 }
 

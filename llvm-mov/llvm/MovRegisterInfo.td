@@ -30,3 +30,10 @@ def GPR32 : RegisterClass<"Mov", [i32], 32,
 // be the stack or (later) frame pointer.
 def GPR32_NOSP : RegisterClass<"Mov", [i32], 32,
   (add EAX, ECX, EDX, EBX, ESI, EDI)>;
+
+// Singleton class for the shift-amount slot. x86's variable-amount shifts
+// must take their count in CL — we don't model 8-bit subregisters yet,
+// so the constraint is expressed at the i32 level and the printer hardcodes
+// `cl` in the asm. Selection in MovISelDAGToDAG.cpp does an explicit
+// CopyToReg ECX before emitting the shift.
+def CCR : RegisterClass<"Mov", [i32], 32, (add ECX)>;
