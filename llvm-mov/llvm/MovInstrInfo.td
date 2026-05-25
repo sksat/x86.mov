@@ -44,6 +44,9 @@ def MovCallSeqEnd   : SDNode<"ISD::CALLSEQ_END",   SDT_MovCallSeqEnd,
 
 def i32imm_op : Operand<i32>;
 
+// 8-bit immediate operand for stage 7-prep's MOV8ri.
+def i8imm_op : Operand<i8>;
+
 // Branch-target operand for JMP / Jcc. OtherVT is the LLVM convention for
 // "this is a code-pointer-shaped operand; print whatever the printer
 // decides to call it"; AsmPrinter::lower turns the MO_MachineBasicBlock
@@ -121,6 +124,32 @@ let mayStore = 1 in
 def MOV32mr : MovInst<(outs), (ins MovMemOperand:$dst, GPR32:$src),
                       "mov\tdword ptr $dst, $src",
                       [(store GPR32:$src, addr:$dst)]>;
+
+// 8-bit MOV family — stage 7-prep. No DAG patterns: these instructions
+// are reserved for MovOnlyLegalize (post-RA) to build mov-only
+// table-lookup chains. The MOV{8rm,8mr,8rr,8ri} forms mirror the
+// existing 32-bit set so the legalize pass can emit them via BuildMI.
+//
+// Note: the GR8 register class (AL/CL/DL/BL) is a sub_8bit of the
+// GPR32 set, so RA correctly understands that using CL overlaps with
+// ECX. Stage 7a1 will exploit this to spill the parent reg before
+// using its low byte for table-lookup scratch.
+
+let mayLoad = 1 in
+def MOV8rm : MovInst<(outs GR8:$dst), (ins MovMemOperand:$src),
+                     "mov\t$dst, byte ptr $src", []>;
+
+let mayStore = 1 in
+def MOV8mr : MovInst<(outs), (ins MovMemOperand:$dst, GR8:$src),
+                     "mov\tbyte ptr $dst, $src", []>;
+
+let isMoveReg = 1 in
+def MOV8rr : MovInst<(outs GR8:$dst), (ins GR8:$src),
+                     "mov\t$dst, $src", []>;
+
+let isReMaterializable = 1, isAsCheapAsAMove = 1 in
+def MOV8ri : MovInst<(outs GR8:$dst), (ins i8imm_op:$src),
+                     "mov\t$dst, $src", []>;
 
 //===----------------------------------------------------------------------===//
 // Integer arithmetic + bitwise — stage 3 (mov-heavy bootstrap).
