@@ -40,9 +40,14 @@ Run the bin with `cargo run -p movie86-cli -- path/to/file.elf`; exit status is 
 
 ## Scope (and what's NOT in scope)
 
-In scope: the instructions movfuscator + the planned mov-only LLVM backend actually emit. That's mov-heavy (all `mov` widths, ModR/M, SIB, the 0x66 operand-size prefix), plus `jmp rel32` (E9) and `int 0x80` (CD 80) for the syscall path. Linux i386 syscalls: at minimum `exit(1)` and `write(4)`.
+In scope: the instructions movfuscator + the planned mov-only LLVM backend actually emit. That's mov-heavy (all `mov` widths, ModR/M, SIB, the 0x66 operand-size prefix), plus `jmp rel32` (E9), `int 0x80` (CD 80), `push`/`pop` (50+rd / 58+rd), and `call rel32` / `ret near` (E8 / C3). Linux i386 syscalls: at minimum `exit(1)` and `write(4)`.
 
-Not in scope (yet): the rest of the crt0 surface that gets linked into a *real* movfuscator-produced ELF — `call sigaction`, segment-register mov (`mov cs, eax`), indirect `jmp DWORD PTR ds:0x0`, FPU. End-to-end testing currently uses hand-crafted ELFs that skip crt0; running a real movfuscator-built binary is the explicit follow-up goal.
+**Deliberately not implemented even though they're valid x86:**
+
+- `mov r8, imm8` (B0+rb), `mov r/m8, imm8` (C6 /0), `mov r16, imm16` (66 B8+rw), `mov r/m16, imm16` (66 C7 /0 iw). The movfuscator goldens contain **zero** `movb $imm, ...` and zero `movw $imm, ...` instructions — movfuscator clears registers with `mov r32, imm32` and then byte-loads from memory, so it never materializes a sub-32-bit immediate. Adding these encodings before the LLVM backend exists would be pure speculation. If `Fault::UnknownOpcode(0xB0..=0xB7 | 0xC6)` ever fires in practice, fill the gap then with a test pinned to the input that exposed it.
+- `ret imm16` (C2 iw) — the stdcall caller-pop variant. movfuscator is cdecl; callers pop their own args.
+
+Not in scope (yet): the rest of the crt0 surface that gets linked into a *real* movfuscator-produced ELF — `call sigaction`, segment-register mov (`mov cs, eax`), indirect `jmp DWORD PTR ds:0x0`, FPU. End-to-end testing currently uses hand-crafted ELFs that skip crt0; running a real movfuscator-built binary is the explicit follow-up goal. The default link path in `movfuscator-wasm` is *dynamic* (`-dynamic-linker /lib/ld-linux.so.2 -lc -lm -lgcc`), so we also need a `PT_INTERP`/`PT_DYNAMIC`-supporting loader path before that goal is in reach — the current loader rejects them up front (`ElfError::DynamicLinkingUnsupported`).
 
 ## CI
 
