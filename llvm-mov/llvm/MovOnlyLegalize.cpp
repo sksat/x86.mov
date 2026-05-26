@@ -40,8 +40,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "MCTargetDesc/MovMCTargetDesc.h"
 #include "MovInstrInfo.h"
 #include "MovTargetMachine.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -64,17 +66,57 @@ public:
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override {
-    // Stage 7a0: structural pass — walks the function but rewrites
-    // nothing. Later stages (7a1+) will replace this loop with a real
-    // per-opcode dispatch table that emits mov-only sequences.
     bool Changed = false;
-    for (const MachineBasicBlock &MBB : MF) {
-      for (const MachineInstr &MI : MBB) {
-        (void)MI;
-        // Per-opcode rewriting lands at stage 7a1 (ADD32) onwards.
+    for (MachineBasicBlock &MBB : MF) {
+      for (MachineInstr &MI :
+           llvm::make_early_inc_range(MBB)) {
+        switch (MI.getOpcode()) {
+        case Mov::ADD32rr:
+        case Mov::ADD32ri:
+          Changed |= legalizeADD32(MI);
+          break;
+        // The remaining opcodes (SUB/AND/OR/XOR rr+ri, SHL/SHR/SAR
+        // ri/rCL, CMP+Jcc family, CALL32d + CALLSEQ, RET) light up
+        // in stages 7b → 7d. Each will have its own legalizeXxx
+        // helper here.
+        default:
+          break;
+        }
       }
     }
     return Changed;
+  }
+
+private:
+  // Stage-7a1 placeholder — see the file-level comment for the design.
+  //
+  // The full implementation needs the following infrastructure we
+  // haven't built yet (call this list "stage 7-prep-2"):
+  //
+  //   1. `.rodata` table emission: a 256x256 byte-add table indexed by
+  //      (a, b, carry-in) returning (sum, carry-out). Either emitted
+  //      as a `Module`-level GlobalVariable via a separate ModulePass,
+  //      or as raw `.byte` directives in MovAsmPrinter::emitEndOfAsmFile.
+  //
+  //   2. SIB-style `[base + index]` addressing for MOV8rm. Our current
+  //      MovMemOperand is `(base_reg, disp_imm)` only; to use a byte
+  //      held in CL/AL/etc. as a table index we need the index-register
+  //      form. This is a new Operand kind in MovInstrInfo.td and a
+  //      new path in SelectAddr.
+  //
+  //   3. Per-function scratch slots for spilling parent regs (EAX/etc.)
+  //      around byte-reg usage. MovOnlyLegalize must allocate these
+  //      via MFI.CreateStackObject, since RA has already finished.
+  //
+  // Until those are in place, this returns false so the pass stays a
+  // no-op for ADD32 — gated by the test/MovOnly/ harness which has no
+  // ADD-focused fixtures yet. Returning false here keeps the existing
+  // 39 execution tests + Rust example green; the mov-only gate stays
+  // empty.
+  bool legalizeADD32(MachineInstr & /*MI*/) const {
+    // TODO(stage 7a1, post 7-prep-2): byte-split + carry-chain table
+    // lookups. See file-level comment.
+    return false;
   }
 };
 } // namespace
