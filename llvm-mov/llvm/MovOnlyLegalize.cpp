@@ -454,6 +454,31 @@ private:
           FStore->eraseFromParent();
         Jcc->eraseFromParent();
 
+        // CFG fixup: the Jcc used to give MBB a direct edge to TTarget.
+        // After the rewrite, MBB falls through to the trailing `jmp
+        // dispatcher` and reaches TTarget through the dispatcher. So
+        // (1) remove the stale MBB → TTarget edge, and (2) ensure the
+        // dispatcher MBB has TTarget in its successor list. Without
+        // both, `-verify-machineinstrs` complains "MBB has unexpected
+        // successors" on functions like `is_42`.
+        if (MBB.isSuccessor(TTarget))
+          MBB.removeSuccessor(TTarget);
+        // Find the dispatcher MBB (the only one containing JMP32m, set
+        // up by legalizeCFG above) and route TTarget through it.
+        MachineBasicBlock *Dispatcher = nullptr;
+        for (MachineBasicBlock &D : MF) {
+          for (const MachineInstr &DMI : D) {
+            if (DMI.getOpcode() == Mov::JMP32m) {
+              Dispatcher = &D;
+              break;
+            }
+          }
+          if (Dispatcher)
+            break;
+        }
+        if (Dispatcher && !Dispatcher->isSuccessor(TTarget))
+          Dispatcher->addSuccessor(TTarget);
+
         // Resume scanning past the Jcc we just erased.
         It = NextOuter;
         Changed = true;
