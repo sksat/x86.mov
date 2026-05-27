@@ -38,18 +38,26 @@ type Action int
 
 const (
 	// ActionResume: write Result.Return into the child's eax (skipping
-	// the real syscall) and let it run again.
+	// the real syscall) and let it run again. The "emulate" path.
 	ActionResume Action = iota
 	// ActionExit: the guest called exit(); end the session.
 	ActionExit
 	// ActionFault: a non-recoverable condition (unknown syscall, bad
 	// argument, memory access failure); emit the Fault event and stop.
 	ActionFault
+	// ActionPassthrough: let the kernel actually run this syscall.
+	// Used for signal-disposition syscalls (rt_sigaction et al.) where
+	// the runner deliberately wants the kernel's native semantics —
+	// installing a real handler so SIGSEGV / SIGILL from the guest get
+	// dispatched by the kernel into the guest's own code. Result.Event
+	// is nil for passthrough; the runner skips emitting an event.
+	ActionPassthrough
 )
 
 // Result is what HandleSyscall returns to the runner.
 type Result struct {
-	// Event is the Outbound message to send the frontend. Always non-nil.
+	// Event is the Outbound message to send the frontend. Nil for
+	// ActionPassthrough; non-nil otherwise.
 	Event proto.Outbound
 	// Return is the value to write to the child's eax. Only meaningful
 	// when Action == ActionResume.
@@ -62,6 +70,21 @@ type Result struct {
 // is a bug or DoS attempt; the runner shouldn't allocate gigabytes on
 // behalf of a misbehaving guest. Linux itself caps at 0x7FFFF000.
 const maxWriteBytes = 64 * 1024 * 1024
+
+// Signal-disposition syscalls — let these run on the kernel so the
+// guest's own handlers get installed in the child's signal table and
+// dispatched natively when SIGILL / SIGSEGV / ... fires.
+//
+//	rt_sigaction    (174): install / inspect handler for a signal
+//	rt_sigreturn    (173): return from a signal handler (sigframe-driven;
+//	                       MUST passthrough — the kernel restores EIP and
+//	                       all GP regs from the sigframe)
+//	rt_sigprocmask  (175): adjust the blocked-signal mask
+const (
+	sysRtSigreturn   = 173
+	sysRtSigaction   = 174
+	sysRtSigprocmask = 175
+)
 
 // HandleSyscall translates one guest syscall into a Result.
 //
@@ -78,6 +101,8 @@ func HandleSyscall(args SyscallArgs, mem GuestMemory) (Result, error) {
 		}, nil
 	case 4: // write
 		return handleWrite(args, mem)
+	case sysRtSigaction, sysRtSigreturn, sysRtSigprocmask:
+		return Result{Action: ActionPassthrough}, nil
 	default:
 		return Result{
 			Event:  proto.Fault{Reason: fmt.Sprintf("unsupported syscall eax=%d", args.Eax)},

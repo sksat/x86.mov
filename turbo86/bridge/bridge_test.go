@@ -154,3 +154,18 @@ func TestHandleSyscall_Unknown(t *testing.T) {
 		t.Errorf("fault reason should mention syscall 999: %q", fault.Reason)
 	}
 }
+
+func TestHandleSyscall_PassthroughSignalSyscalls(t *testing.T) {
+	for _, sysno := range []uint32{173, 174, 175} { // rt_sigreturn / rt_sigaction / rt_sigprocmask
+		res, err := HandleSyscall(SyscallArgs{Eax: sysno}, nil)
+		if err != nil {
+			t.Errorf("syscall %d: unexpected error: %v", sysno, err)
+		}
+		if res.Action != ActionPassthrough {
+			t.Errorf("syscall %d: Action got %v want ActionPassthrough", sysno, res.Action)
+		}
+		if res.Event != nil {
+			t.Errorf("syscall %d: Event got %#v want nil", sysno, res.Event)
+		}
+	}
+}

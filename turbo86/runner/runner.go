@@ -508,14 +508,21 @@ func (r *Runner) emitFault(reason string) {
 	r.eventsCh <- proto.Fault{Reason: reason}
 }
 
-// pendingEmulation holds state between the entry and exit syscall stops
-// of an emulated syscall. The entry stop suppresses the kernel syscall
-// (orig_eax = -1) and remembers the synthetic return value the bridge
-// computed; the next stop is the matching exit, at which we overwrite
-// eax with that value.
-type pendingEmulation struct {
-	active      bool
-	returnValue uint32
+// syscallPending holds the runner's state between a syscall-entry stop
+// and the matching exit stop. Two flavors:
+//
+//   - Emulated: the entry suppressed the kernel call (orig_eax = -1)
+//     and remembers the synthetic return value the bridge computed.
+//     At exit we overwrite eax with that value.
+//   - Passthrough: the kernel actually runs the syscall. The exit stop
+//     still fires, but there's nothing for us to do — we just continue.
+//
+// `expectingExit` distinguishes "next syscall stop is the exit of an
+// in-flight syscall" from "next syscall stop is a fresh entry".
+type syscallPending struct {
+	expectingExit bool
+	overwriteEax  bool   // true for emulated, false for passthrough
+	returnValue   uint32 // only meaningful when overwriteEax is true
 }
 
 // syscallLoop drives the child through PTRACE_SYSCALL entry/exit pairs:
@@ -530,7 +537,7 @@ type pendingEmulation struct {
 // state machine.
 func (r *Runner) syscallLoop(regs *regs32) {
 	var ws syscall.WaitStatus
-	var pending pendingEmulation
+	var pending syscallPending
 
 	for {
 		if err := syscall.PtraceSyscall(r.pid, 0); err != nil {
@@ -570,20 +577,22 @@ func (r *Runner) syscallLoop(regs *regs32) {
 			return
 		}
 
-		// Syscall-trap stop. Distinguish entry from exit via our pending
-		// state: an active pending means the last stop was an entry that
-		// suppressed a syscall and now needs its eax overwritten.
-		if pending.active {
-			if err := ptraceGetRegs32(r.pid, regs); err != nil {
-				r.emitFault(fmt.Sprintf("get i386 regs (exit stop): %v", err))
-				return
+		// Syscall-trap stop. Distinguish entry from exit via pending.
+		if pending.expectingExit {
+			if pending.overwriteEax {
+				if err := ptraceGetRegs32(r.pid, regs); err != nil {
+					r.emitFault(fmt.Sprintf("get i386 regs (exit stop): %v", err))
+					return
+				}
+				regs.Eax = pending.returnValue
+				if err := ptraceSetRegs32(r.pid, regs); err != nil {
+					r.emitFault(fmt.Sprintf("set i386 regs (exit stop): %v", err))
+					return
+				}
 			}
-			regs.Eax = pending.returnValue
-			if err := ptraceSetRegs32(r.pid, regs); err != nil {
-				r.emitFault(fmt.Sprintf("set i386 regs (exit stop): %v", err))
-				return
-			}
-			pending = pendingEmulation{}
+			// Passthrough: nothing to write back — the kernel already
+			// set eax to whatever the real syscall returned.
+			pending = syscallPending{}
 			continue
 		}
 
@@ -602,7 +611,9 @@ func (r *Runner) syscallLoop(regs *regs32) {
 			Ebp: regs.Ebp,
 		}
 		result, brErr := bridge.HandleSyscall(args, r.mem)
-		r.eventsCh <- result.Event
+		if result.Event != nil {
+			r.eventsCh <- result.Event
+		}
 		if brErr != nil {
 			return
 		}
@@ -618,7 +629,11 @@ func (r *Runner) syscallLoop(regs *regs32) {
 				r.emitFault(fmt.Sprintf("set i386 regs (suppress syscall): %v", err))
 				return
 			}
-			pending = pendingEmulation{active: true, returnValue: result.Return}
+			pending = syscallPending{expectingExit: true, overwriteEax: true, returnValue: result.Return}
+		case bridge.ActionPassthrough:
+			// Let the kernel run the real syscall. orig_eax is unchanged
+			// (the original number); no eax overwrite at exit.
+			pending = syscallPending{expectingExit: true}
 		}
 	}
 }
