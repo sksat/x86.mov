@@ -57,6 +57,24 @@ public:
     SavedParentSlots[ParentReg] = FI;
   }
 
+  // Stage 7a1: per-function buffer the ADD32 byte-chain rewrite uses to
+  // spill its operand register, run byte-wise table updates against it,
+  // and load the final 32-bit result back. ADD32 is 2-address-tied
+  // (dst == src1), so one 4-byte slot per function is enough. Reserved
+  // pre-PEI in processFunctionBeforeFrameFinalized; `-1` means "not
+  // reserved for this function" (i.e. the function had no ADD32 the
+  // pre-PEI scan caught, so the legalize pass should skip).
+  int getAddRewriteSrcDstFI() const { return AddRewriteSrcDstFI; }
+  void setAddRewriteSrcDstFI(int FI) { AddRewriteSrcDstFI = FI; }
+
+  // Stage 7a1: per-function slot used by the rewrite to pack the
+  // (cin, a, b) index triple into 3 bytes before doing a single
+  // `mov ecx, dword ptr [idx]` to load it. Builds 17-bit indices into
+  // a 32-bit reg via memory because GR8 only models AL/CL/DL/BL — we
+  // can't write the CH byte directly.
+  int getAddRewriteIdxFI() const { return AddRewriteIdxFI; }
+  void setAddRewriteIdxFI(int FI) { AddRewriteIdxFI = FI; }
+
 private:
   // Keyed on the *parent* (full-width) physreg, e.g. Mov::ECX for the
   // slot that backs CL-uses. We don't key by the byte subreg because
@@ -64,6 +82,9 @@ private:
   // from, and one parent reg only ever needs one save slot per
   // function (sequential CL uses can reload between them).
   DenseMap<Register, int> SavedParentSlots;
+
+  int AddRewriteSrcDstFI = -1;
+  int AddRewriteIdxFI = -1;
 };
 
 } // namespace llvm

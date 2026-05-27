@@ -33,7 +33,28 @@ trap 'rm -rf "$WORK"' EXIT
 
 # Allowed mnemonics. Stage 7's whole point is to drive this list down to
 # `mov` (plus its widening cousins) and the `int 0x80` runtime escape.
-ALLOWED='^(mov|movabs|movzx|movsx)$'
+#
+# A fixture may opt in to additional opcodes via a per-fixture `.expect`
+# side file (one mnemonic per non-empty, non-comment line). This is the
+# explicit acknowledgement that "stage 7a1's legalize doesn't cover X
+# yet — and that's expected". Each later 7-stage shrinks the .expect
+# files of fixtures it touches; stage 7d's job is to drive them empty.
+ALLOWED='mov|movabs|movzx|movsx'
+
+# Read a per-fixture .expect file (if any) and merge its mnemonics into
+# ALLOWED. Returns a regex anchored as ^(...)$ on stdout.
+read_allowed_regex() {
+    local expect_file="$1"
+    if [ -f "${expect_file}" ]; then
+        local extras
+        extras="$(grep -vE '^\s*(#|$)' "${expect_file}" | awk 'NF>0{print $1}' | tr '\n' '|' | sed 's/|$//')"
+        if [ -n "${extras}" ]; then
+            printf '^(%s|%s)$\n' "${ALLOWED}" "${extras}"
+            return
+        fi
+    fi
+    printf '^(%s)$\n' "${ALLOWED}"
+}
 
 pass=0
 fail=0
@@ -74,6 +95,7 @@ for ll in "${fixtures[@]}"; do
 
     # objdump the .text and look for non-mov mnemonics. The awk pull
     # picks just the mnemonic column (after `addr: bytes`).
+    fixture_allowed="$(read_allowed_regex "${HERE}/${name}.expect")"
     violations="$(
         objdump -d -Mintel --no-show-raw-insn "${o}" \
             | awk '/^[[:space:]]*[0-9a-f]+:/ {
@@ -81,7 +103,7 @@ for ll in "${fixtures[@]}"; do
                        mnemonic = $2;
                        print mnemonic;
                    }' \
-            | grep -Ev "${ALLOWED}" \
+            | grep -Ev "${fixture_allowed}" \
             | sort -u || true
     )"
 

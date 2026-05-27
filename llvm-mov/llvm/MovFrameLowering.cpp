@@ -114,9 +114,31 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
 
   auto *MovMFI = MF.getInfo<MovMachineFunctionInfo>();
   MachineFrameInfo &MFI = MF.getFrameInfo();
-  const int FI = MFI.CreateStackObject(/*Size=*/4, Align(4),
-                                       /*isSpillSlot=*/false,
-                                       /*Alloca=*/nullptr,
-                                       /*ID=*/0);
-  MovMFI->setSavedParentSlotFI(Mov::ECX, FI);
+  const auto Make = [&]() {
+    return MFI.CreateStackObject(/*Size=*/4, Align(4),
+                                 /*isSpillSlot=*/false, /*Alloca=*/nullptr,
+                                 /*ID=*/0);
+  };
+  // Four slots are needed by the stage-7a1 ADD32ri byte-chain rewrite:
+  //
+  //   - save_ecx, save_edx: spill/restore for the two parent registers
+  //     the rewrite borrows (ECX as the table-index register, EDX/DL
+  //     as the temp byte register that shuffles bytes between memory
+  //     and the index slot).
+  //   - srcdst:  result buffer. The 32-bit operand register is spilled
+  //              here at the start; per-byte sums are written back into
+  //              it in place; the final result is reloaded into the dst
+  //              register at the end. ADD32 is 2-address-tied so one
+  //              slot doubles as both source spill and result buffer.
+  //   - idx:    where the (cin, a, b) index triple is packed before
+  //             `mov ecx, dword ptr [idx]` loads it into the index reg.
+  //             Needed because GR8 only models AL/CL/DL/BL, so we
+  //             can't write the CH byte of ECX directly.
+  //
+  // Total of 16 bytes added to the local frame of every ADD-having
+  // function. Stage 7b/c/d will extend this when more opcodes legalize.
+  MovMFI->setSavedParentSlotFI(Mov::ECX, Make());
+  MovMFI->setSavedParentSlotFI(Mov::EDX, Make());
+  MovMFI->setAddRewriteSrcDstFI(Make());
+  MovMFI->setAddRewriteIdxFI(Make());
 }
