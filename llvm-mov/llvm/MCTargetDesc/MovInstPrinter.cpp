@@ -56,3 +56,18 @@ void MovInstPrinter::printMemOperand(const MCInst *MI, unsigned OpNo,
   }
   O << ']';
 }
+
+void MovInstPrinter::printIdxMemOperand(const MCInst *MI, unsigned OpNo,
+                                        raw_ostream &O) {
+  const MCOperand &Base = MI->getOperand(OpNo);
+  const MCOperand &Index = MI->getOperand(OpNo + 1);
+  if (!Base.isExpr())
+    llvm_unreachable("MovIdxMemOperand base must be an MCExpr (table symbol)");
+  if (!Index.isReg() || Index.getReg() == 0)
+    llvm_unreachable("MovIdxMemOperand index must be a non-zero register");
+  O << '[';
+  MAI.printExpr(O, *Base.getExpr());
+  O << " + ";
+  printRegName(O, Index.getReg());
+  O << ']';
+}

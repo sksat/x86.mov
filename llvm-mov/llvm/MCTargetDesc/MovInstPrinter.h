@@ -38,5 +38,11 @@ public:
   // syntax. Called from the TableGen-generated printInstruction whenever
   // it encounters an operand whose `let PrintMethod = "printMemOperand"`.
   void printMemOperand(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+
+  // Two-operand printer for MovIdxMemOperand (stage 7-prep-2b): emits
+  // `[<symbol-expr> + <index_reg>]` in Intel syntax. The base slot must
+  // be an MCExpr (table symbol); the index slot must be a non-zero
+  // register. Strictly (expr, reg) — generic shapes are not accepted.
+  void printIdxMemOperand(const MCInst *MI, unsigned OpNo, raw_ostream &O);
 };
 } // namespace llvm

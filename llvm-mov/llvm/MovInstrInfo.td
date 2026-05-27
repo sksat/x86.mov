@@ -70,6 +70,27 @@ def MovMemOperand : Operand<i32> {
   let PrintMethod   = "printMemOperand";
 }
 
+// Stage 7-prep-2b: symbol-typed operand for the base of a byte-table
+// lookup. Distinct from `calltarget` (which is OPERAND_PCREL for `call
+// <sym>`) — table lookups use absolute (R_386_32) relocations and the
+// printer emits the symbol inside `[<sym> + <reg>]`, not as a branch
+// target. The MO is always MO_ExternalSymbol or MO_GlobalAddress lowered
+// to an MCExpr by MovAsmPrinter::lower; printIdxMemOperand asserts that.
+def tablesym : Operand<iPTR>;
+
+// Stage 7-prep-2b: `[<table-symbol> + <index_reg>]` addressing mode used
+// by MovOnlyLegalize for byte-add table lookups. Held separately from
+// MovMemOperand so the existing 32-bit memory ops are unaffected. No
+// ISel ComplexPattern — MOV8rm_idx is built directly by the legalize
+// pass via BuildMI; SelectAddr is never invoked for it. The index is
+// constrained to GPR32_NOSP so the legalize pass can't accidentally use
+// ESP/EBP as an index (the byte we feed in is conceptually CL/AL/etc.
+// but is named as its parent ECX/EAX register in the printed asm).
+def MovIdxMemOperand : Operand<i32> {
+  let MIOperandInfo = (ops tablesym:$base, GPR32_NOSP:$index);
+  let PrintMethod   = "printIdxMemOperand";
+}
+
 // Address selector for memory ops. Stage 6a generalises beyond
 // frame-index-only addresses: outgoing-arg stores arrive as
 // `(add (CopyFromReg ESP), imm)`, which is a register-base + displacement.
@@ -150,6 +171,18 @@ def MOV8rr : MovInst<(outs GR8:$dst), (ins GR8:$src),
 let isReMaterializable = 1, isAsCheapAsAMove = 1 in
 def MOV8ri : MovInst<(outs GR8:$dst), (ins i8imm_op:$src),
                      "mov\t$dst, $src", []>;
+
+// Stage 7-prep-2b: indexed byte load — `mov <dst-byte>, byte ptr
+// [<table-symbol> + <index_reg>]`. Legalize-only, no DAG pattern; the
+// MovOnlyLegalize pass builds these directly via BuildMI with
+// `.addExternalSymbol("__mov_add8_sum_table")` + `.addReg(IdxReg)`. The
+// index register is named as its full 32-bit parent in the printed asm
+// (the table is indexed by `cin*65536 + a*256 + b`, where `a` is held
+// in CL but written as ECX in the asm), so the index slot is
+// GPR32_NOSP, not GR8.
+let mayLoad = 1, isCodeGenOnly = 1 in
+def MOV8rm_idx : MovInst<(outs GR8:$dst), (ins MovIdxMemOperand:$src),
+                         "mov\t$dst, byte ptr $src", []>;
 
 //===----------------------------------------------------------------------===//
 // Integer arithmetic + bitwise — stage 3 (mov-heavy bootstrap).

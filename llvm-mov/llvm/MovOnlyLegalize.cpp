@@ -95,29 +95,30 @@ public:
 private:
   // Stage-7a1 placeholder — see the file-level comment for the design.
   //
-  // The full implementation needs the following infrastructure we
-  // haven't built yet (call this list "stage 7-prep-2"):
+  // Stage 7-prep-2 builds the three infrastructure pieces this rewrite
+  // depends on, in separate commits:
   //
-  //   1. `.rodata` table emission: a 256x256 byte-add table indexed by
-  //      (a, b, carry-in) returning (sum, carry-out). Either emitted
-  //      as a `Module`-level GlobalVariable via a separate ModulePass,
-  //      or as raw `.byte` directives in MovAsmPrinter::emitEndOfAsmFile.
+  //   2a. `.rodata.__mov_add8_tables` emission for the byte-add lookup
+  //       tables. Done in MovAsmPrinter::emitEndOfAsmFile — landed.
   //
-  //   2. SIB-style `[base + index]` addressing for MOV8rm. Our current
-  //      MovMemOperand is `(base_reg, disp_imm)` only; to use a byte
-  //      held in CL/AL/etc. as a table index we need the index-register
-  //      form. This is a new Operand kind in MovInstrInfo.td and a
-  //      new path in SelectAddr.
+  //   2b. `[<symbol> + <index_reg>]` addressing for byte loads. Done as
+  //       a new MI-only operand `MovIdxMemOperand` + the codegen-only
+  //       instruction `MOV8rm_idx` + printer routine
+  //       `printIdxMemOperand` — landed. No SelectAddr / ComplexPattern
+  //       changes (MOV8rm_idx has no DAG pattern; legalize uses BuildMI
+  //       directly with `.addExternalSymbol("__mov_add8_sum_table")` +
+  //       `.addReg(IdxReg)`).
   //
-  //   3. Per-function scratch slots for spilling parent regs (EAX/etc.)
-  //      around byte-reg usage. MovOnlyLegalize must allocate these
-  //      via MFI.CreateStackObject, since RA has already finished.
+  //   2c. Per-function scratch slots for spilling parent regs (EAX/etc.)
+  //       around byte-reg usage. MovOnlyLegalize must allocate these
+  //       via MFI.CreateStackObject, since RA has already finished —
+  //       not yet implemented.
   //
-  // Until those are in place, this returns false so the pass stays a
-  // no-op for ADD32 — gated by the test/MovOnly/ harness which has no
-  // ADD-focused fixtures yet. Returning false here keeps the existing
-  // 39 execution tests + Rust example green; the mov-only gate stays
-  // empty.
+  // Until 2c lands (and this routine starts using all three), this
+  // returns false so the pass stays a no-op for ADD32. Gated by the
+  // test/MovOnly/ harness which has no ADD-focused fixtures yet.
+  // Returning false here keeps the existing 39 execution tests + Rust
+  // example green; the mov-only gate stays empty.
   bool legalizeADD32(MachineInstr & /*MI*/) const {
     // TODO(stage 7a1, post 7-prep-2): byte-split + carry-chain table
     // lookups. See file-level comment.
