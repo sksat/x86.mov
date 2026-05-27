@@ -13,6 +13,7 @@
 #include "TargetInfo/MovTargetInfo.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineOperand.h"
@@ -20,7 +21,7 @@
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
-#include "llvm/MC/MCObjectFileInfo.h"
+#include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/TargetRegistry.h"
@@ -136,10 +137,17 @@ void MovAsmPrinter::emitInstruction(const MachineInstr *MI) {
 //
 // Emission policy: unconditional, once per translation unit, after all
 // functions. The symbols are not declared `.globl`, so each .o keeps
-// them as local symbols — multi-object links don't conflict, and
-// `ld --gc-sections` is free to drop them when MovOnlyLegalize hasn't
-// produced any references. PoC overhead is ~256 KiB / object; for the
-// current 39 execution fixtures this is academic.
+// them as local symbols — multi-object links don't conflict.
+//
+// The tables live in their *own* ELF section `.rodata.__mov_add8_tables`,
+// not the generic `.rodata`. ld's `--gc-sections` operates per-section,
+// so emitting into the shared `.rodata` would keep the tables alive
+// whenever any other constant in the TU is live (string literals, FP
+// constants, jump tables, etc.). A dedicated section is independently
+// GC-eligible, so until MovOnlyLegalize starts producing references at
+// stage 7a1, every link drops the 256 KiB at no asm-side cost. Both
+// tables share one section because stage 7a1 always references them
+// together — splitting them gains nothing.
 void MovAsmPrinter::emitAdd8Tables() {
   static constexpr unsigned kSize = 2u * 256u * 256u;
   SmallVector<uint8_t, kSize> Sum;
@@ -156,8 +164,9 @@ void MovAsmPrinter::emitAdd8Tables() {
     }
   }
 
-  MCSection *RoSec = OutContext.getObjectFileInfo()->getReadOnlySection();
-  OutStreamer->switchSection(RoSec);
+  MCSection *TableSec = OutContext.getELFSection(
+      ".rodata.__mov_add8_tables", ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
+  OutStreamer->switchSection(TableSec);
 
   const auto emitTable = [&](StringRef Name, ArrayRef<uint8_t> Data) {
     MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
