@@ -91,9 +91,20 @@ public:
   // the start of the rewrite). Each per-byte stage that walks "off
   // the high end" of the original 32-bit value substitutes this byte
   // in place of the orig byte that would otherwise be 0. Reserved
-  // only when at least one SAR32ri is in the function.
+  // only when at least one SAR32ri *or* SAR32rCL is in the function.
   int getShiftSignBufFI() const { return ShiftSignBufFI; }
   void setShiftSignBufFI(int FI) { ShiftSignBufFI = FI; }
+
+  // Stage 7b3: variable-shift (rCL) scratch — `amount_buf` holds the
+  // initial CL value (the runtime shift count) spilled at the top of
+  // the rewrite, and `shifted_buf` is the alternative 32-bit value
+  // computed in each of the 5 power-of-2 stages before being merged
+  // into srcdst via the mask-based select. Reserved together, only
+  // when at least one SHL/SHR/SAR32rCL is in the function.
+  int getShiftAmountBufFI() const { return ShiftAmountBufFI; }
+  void setShiftAmountBufFI(int FI) { ShiftAmountBufFI = FI; }
+  int getShiftShiftedBufFI() const { return ShiftShiftedBufFI; }
+  void setShiftShiftedBufFI(int FI) { ShiftShiftedBufFI = FI; }
 
 private:
   // Keyed on the *parent* (full-width) physreg, e.g. Mov::ECX for the
@@ -107,6 +118,8 @@ private:
   int AddRewriteIdxFI = -1;
   int AddRewriteRhsFI = -1;
   int ShiftSignBufFI = -1;
+  int ShiftAmountBufFI = -1;
+  int ShiftShiftedBufFI = -1;
 };
 
 } // namespace llvm

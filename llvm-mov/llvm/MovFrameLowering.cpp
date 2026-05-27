@@ -110,6 +110,7 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
   bool NeedsByteOpScratch = false;
   bool NeedsRhsScratch = false;
   bool NeedsShiftSignScratch = false;
+  bool NeedsShiftVarScratch = false;
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
       switch (MI.getOpcode()) {
@@ -131,6 +132,16 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
       case Mov::SAR32ri:
         NeedsByteOpScratch = true;
         NeedsShiftSignScratch = true;
+        break;
+      case Mov::SHL32rCL:
+      case Mov::SHR32rCL:
+        NeedsByteOpScratch = true;
+        NeedsShiftVarScratch = true;
+        break;
+      case Mov::SAR32rCL:
+        NeedsByteOpScratch = true;
+        NeedsShiftSignScratch = true;
+        NeedsShiftVarScratch = true;
         break;
       default:
         break;
@@ -163,10 +174,19 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
     MovMFI->setAddRewriteRhsFI(Make());
 
   // 6th slot — SAR sign byte buffer. Only allocated when at least one
-  // SAR32ri is in the function. The byte that ends up here is the
-  // sign-extended byte (0x00 or 0xFF) used to substitute the
+  // SAR (ri or rCL) is in the function. The byte that ends up here is
+  // the sign-extended byte (0x00 or 0xFF) used to substitute the
   // out-of-range source bytes that an arithmetic shift right pulls in
   // from "above" the 32-bit value.
   if (NeedsShiftSignScratch)
     MovMFI->setShiftSignBufFI(Make());
+
+  // 7th/8th slots — variable-shift (rCL) buffers. amount_buf parks
+  // the runtime shift count (CL) before any ECX clobber; shifted_buf
+  // holds the alternative 32-bit value for each of the 5 power-of-2
+  // stages.
+  if (NeedsShiftVarScratch) {
+    MovMFI->setShiftAmountBufFI(Make());
+    MovMFI->setShiftShiftedBufFI(Make());
+  }
 }

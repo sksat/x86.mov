@@ -122,9 +122,18 @@ public:
         case Mov::SAR32ri:
           Changed |= legalizeShift32ri(MI, MBB, TII, ShiftDir::SAR);
           break;
-        // SUB rr/ri, SHL/SHR/SAR rCL, CMP+Jcc, CALL32d + CALLSEQ,
-        // RET, and the prologue/epilogue PUSH/POP/SUB/MOV sequence
-        // light up across stages 7b3 → 7d.
+        case Mov::SHL32rCL:
+          Changed |= legalizeShift32rCL(MI, MBB, TII, ShiftDir::SHL);
+          break;
+        case Mov::SHR32rCL:
+          Changed |= legalizeShift32rCL(MI, MBB, TII, ShiftDir::SHR);
+          break;
+        case Mov::SAR32rCL:
+          Changed |= legalizeShift32rCL(MI, MBB, TII, ShiftDir::SAR);
+          break;
+        // SUB rr/ri, CMP+Jcc, CALL32d + CALLSEQ, RET, and the
+        // prologue/epilogue PUSH/POP/SUB/MOV sequence light up
+        // across stages 7c → 7d.
         default:
           break;
         }
@@ -146,6 +155,8 @@ private:
     int64_t IdxDisp;
     std::optional<int64_t> RhsDisp;
     std::optional<int64_t> SignBufDisp;
+    std::optional<int64_t> AmountBufDisp;
+    std::optional<int64_t> ShiftedBufDisp;
   };
 
   // Stage-7a1 placeholder — see the file-level comment for the design.
@@ -199,15 +210,26 @@ private:
     if (FI_Ecx == -1 || FI_Edx == -1 || FI_Sd == -1 || FI_Ix == -1)
       return std::nullopt;
     const auto &MFI = MF.getFrameInfo();
-    EbpAddr A{MFI.getObjectOffset(FI_Ecx), MFI.getObjectOffset(FI_Edx),
-              MFI.getObjectOffset(FI_Sd), MFI.getObjectOffset(FI_Ix),
-              std::nullopt, std::nullopt};
+    EbpAddr A{MFI.getObjectOffset(FI_Ecx),
+              MFI.getObjectOffset(FI_Edx),
+              MFI.getObjectOffset(FI_Sd),
+              MFI.getObjectOffset(FI_Ix),
+              std::nullopt,
+              std::nullopt,
+              std::nullopt,
+              std::nullopt};
     const int FI_Rhs = MovMFI->getAddRewriteRhsFI();
     if (FI_Rhs != -1)
       A.RhsDisp = MFI.getObjectOffset(FI_Rhs);
     const int FI_Sign = MovMFI->getShiftSignBufFI();
     if (FI_Sign != -1)
       A.SignBufDisp = MFI.getObjectOffset(FI_Sign);
+    const int FI_Amt = MovMFI->getShiftAmountBufFI();
+    if (FI_Amt != -1)
+      A.AmountBufDisp = MFI.getObjectOffset(FI_Amt);
+    const int FI_Shifted = MovMFI->getShiftShiftedBufFI();
+    if (FI_Shifted != -1)
+      A.ShiftedBufDisp = MFI.getObjectOffset(FI_Shifted);
     return A;
   }
 
@@ -628,18 +650,23 @@ private:
   //   - load from srcdst[Idx]   (when Idx is in [0, 3])
   //   - load from sign_buf       (used for SAR's high-side OOR substitution)
   // Returns nothing; the target reg has the byte after the call.
-  enum class ByteSrc { FromSrcDst, FromSignBuf, ConstZero };
+  enum class ByteSrc { FromBuf, FromSignBuf, ConstZero };
+  // Generalised byte-source loader. `BufBaseDisp` is the EBP-relative
+  // displacement of the buffer to read from (e.g. `A.SrcDstDisp` for
+  // the ri in-place flow, `A.ShiftedBufDisp` for rCL's per-stage
+  // shifted-value buffer). `Idx` is the byte offset within that buf.
   static void emitLoadByteSrc(MachineBasicBlock &MBB,
                               MachineBasicBlock::iterator I,
                               const DebugLoc &DL, const TargetInstrInfo &TII,
-                              const EbpAddr &A, ByteSrc Src, int Idx,
+                              const EbpAddr &A, ByteSrc Src,
+                              int64_t BufBaseDisp, int Idx,
                               Register TargetByteReg) {
     switch (Src) {
-    case ByteSrc::FromSrcDst:
-      // mov <reg>, byte ptr [srcdst + Idx]
+    case ByteSrc::FromBuf:
+      // mov <reg>, byte ptr [<buf_base> + Idx]
       BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), TargetByteReg)
           .addReg(Mov::EBP)
-          .addImm(A.SrcDstDisp + static_cast<int64_t>(Idx));
+          .addImm(BufBaseDisp + static_cast<int64_t>(Idx));
       break;
     case ByteSrc::FromSignBuf:
       assert(A.SignBufDisp && "FromSignBuf requires a reserved sign-buf slot");
@@ -702,11 +729,12 @@ private:
                                  MachineBasicBlock::iterator I,
                                  const DebugLoc &DL,
                                  const TargetInstrInfo &TII,
-                                 const EbpAddr &A, unsigned ByteIdx) {
-    // mov cl, byte ptr [srcdst + i]   ; recover low_contrib into CL
+                                 const EbpAddr &A, int64_t DstBufDisp,
+                                 unsigned ByteIdx) {
+    // mov cl, byte ptr [<dst_buf> + i]   ; recover low_contrib into CL
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::CL)
         .addReg(Mov::EBP)
-        .addImm(A.SrcDstDisp + static_cast<int64_t>(ByteIdx));
+        .addImm(DstBufDisp + static_cast<int64_t>(ByteIdx));
     // mov byte ptr [idx + 0], dl       ; idx[0] = high_contrib
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
         .addReg(Mov::EBP).addImm(A.IdxDisp).addReg(Mov::DL);
@@ -722,24 +750,25 @@ private:
     // mov dl, byte ptr [__mov_or8_table + ecx]
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
         .addExternalSymbol("__mov_or8_table").addReg(Mov::ECX);
-    // mov byte ptr [srcdst + i], dl
+    // mov byte ptr [<dst_buf> + i], dl
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
         .addReg(Mov::EBP)
-        .addImm(A.SrcDstDisp + static_cast<int64_t>(ByteIdx))
+        .addImm(DstBufDisp + static_cast<int64_t>(ByteIdx))
         .addReg(Mov::DL);
   }
 
-  // Helper: emit `mov byte ptr [srcdst + ByteIdx], dl` — the
+  // Helper: emit `mov byte ptr [<dst_buf> + ByteIdx], dl` — the
   // single-byte stash used by emitShiftByteStage to park the low
   // contribution before computing the high contribution.
   static void emitStashLowContrib(MachineBasicBlock &MBB,
                                   MachineBasicBlock::iterator I,
                                   const DebugLoc &DL,
                                   const TargetInstrInfo &TII,
-                                  const EbpAddr &A, unsigned ByteIdx) {
+                                  const EbpAddr & /*A*/, int64_t DstBufDisp,
+                                  unsigned ByteIdx) {
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
         .addReg(Mov::EBP)
-        .addImm(A.SrcDstDisp + static_cast<int64_t>(ByteIdx))
+        .addImm(DstBufDisp + static_cast<int64_t>(ByteIdx))
         .addReg(Mov::DL);
   }
 
@@ -760,42 +789,47 @@ private:
                                  MachineBasicBlock::iterator I,
                                  const DebugLoc &DL,
                                  const TargetInstrInfo &TII,
-                                 const EbpAddr &A, unsigned ResultIdx,
+                                 const EbpAddr &A, int64_t SrcBufDisp,
+                                 int64_t DstBufDisp, unsigned ResultIdx,
                                  int LowSrcIdx, int HighSrcIdx,
                                  const char *LowTableSym,
                                  const char *HighTableSym, bool OorIsSign) {
     auto srcForIdx = [&](int Idx) -> ByteSrc {
       if (Idx >= 0 && Idx <= 3)
-        return ByteSrc::FromSrcDst;
+        return ByteSrc::FromBuf;
       return OorIsSign ? ByteSrc::FromSignBuf : ByteSrc::ConstZero;
     };
 
     // (1) low_contrib: load low source byte into DL, optionally
-    // shift via LowTableSym, then stash to srcdst[ResultIdx].
+    // shift via LowTableSym, then stash to dst[ResultIdx].
     const ByteSrc LowSrc = srcForIdx(LowSrcIdx);
     if (LowTableSym) {
-      emitLoadByteSrc(MBB, I, DL, TII, A, LowSrc, LowSrcIdx, Mov::DL);
+      emitLoadByteSrc(MBB, I, DL, TII, A, LowSrc, SrcBufDisp, LowSrcIdx,
+                      Mov::DL);
       emitUnaryByteLookup(MBB, I, DL, TII, A, Mov::DL, LowTableSym, Mov::DL);
     } else {
       // No shift needed (bit_shift effectively 0 for this contribution —
       // shouldn't happen in this helper; included for completeness).
-      emitLoadByteSrc(MBB, I, DL, TII, A, LowSrc, LowSrcIdx, Mov::DL);
+      emitLoadByteSrc(MBB, I, DL, TII, A, LowSrc, SrcBufDisp, LowSrcIdx,
+                      Mov::DL);
     }
-    emitStashLowContrib(MBB, I, DL, TII, A, ResultIdx);
+    emitStashLowContrib(MBB, I, DL, TII, A, DstBufDisp, ResultIdx);
 
     // (2) high_contrib: load high source byte into DL, optionally
     // shift via HighTableSym. Result stays in DL.
     const ByteSrc HighSrc = srcForIdx(HighSrcIdx);
     if (HighTableSym) {
-      emitLoadByteSrc(MBB, I, DL, TII, A, HighSrc, HighSrcIdx, Mov::DL);
+      emitLoadByteSrc(MBB, I, DL, TII, A, HighSrc, SrcBufDisp, HighSrcIdx,
+                      Mov::DL);
       emitUnaryByteLookup(MBB, I, DL, TII, A, Mov::DL, HighTableSym, Mov::DL);
     } else {
-      emitLoadByteSrc(MBB, I, DL, TII, A, HighSrc, HighSrcIdx, Mov::DL);
+      emitLoadByteSrc(MBB, I, DL, TII, A, HighSrc, SrcBufDisp, HighSrcIdx,
+                      Mov::DL);
     }
 
-    // (3) OR low_contrib (stashed at srcdst[ResultIdx]) and
-    // high_contrib (in DL), store final byte to srcdst[ResultIdx].
-    emitOrByteAndStore(MBB, I, DL, TII, A, ResultIdx);
+    // (3) OR low_contrib (stashed at dst[ResultIdx]) and
+    // high_contrib (in DL), store final byte to dst[ResultIdx].
+    emitOrByteAndStore(MBB, I, DL, TII, A, DstBufDisp, ResultIdx);
   }
 
   // Stage 7b2 — `<shift> DST32, DST32, IMM5` mov-only legalisation.
@@ -897,10 +931,11 @@ private:
         // No table lookup; just one MOV8mr from srcdst[LowSrcIdx] to
         // srcdst[i] via DL, or substitute 0 / sign_byte for OOR.
         ByteSrc Src = (LowSrcIdx >= 0 && LowSrcIdx <= 3)
-                          ? ByteSrc::FromSrcDst
+                          ? ByteSrc::FromBuf
                           : (IsSAR ? ByteSrc::FromSignBuf
                                    : ByteSrc::ConstZero);
-        emitLoadByteSrc(MBB, Insert, DL, TII, *Addr, Src, LowSrcIdx, Mov::DL);
+        emitLoadByteSrc(MBB, Insert, DL, TII, *Addr, Src, Addr->SrcDstDisp,
+                        LowSrcIdx, Mov::DL);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
             .addReg(Mov::EBP)
             .addImm(Addr->SrcDstDisp + static_cast<int64_t>(i))
@@ -909,13 +944,15 @@ private:
       }
 
       // bit_shift > 0: 2 unary lookups + OR. Pick the table direction
-      // based on which side this contribution comes from.
+      // based on which side this contribution comes from. ri legalize
+      // is in-place: src and dst bufs are both srcdst.
       const char *LowTab = IsSHL ? ShlTables[BitShift]
                                  : ShrTables[BitShift];
       const char *HighTab = IsSHL ? ShrTables[8 - BitShift]
                                   : ShlTables[8 - BitShift];
-      emitShiftByteStage(MBB, Insert, DL, TII, *Addr, i, LowSrcIdx,
-                         HighSrcIdx, LowTab, HighTab, IsSAR);
+      emitShiftByteStage(MBB, Insert, DL, TII, *Addr, Addr->SrcDstDisp,
+                         Addr->SrcDstDisp, i, LowSrcIdx, HighSrcIdx, LowTab,
+                         HighTab, IsSAR);
     };
 
     if (IsSHL) {
@@ -931,6 +968,238 @@ private:
     }
 
     // EPILOGUE — restore ECX/EDX, load DST32 from srcdst.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
+
+    MI.eraseFromParent();
+    return true;
+  }
+
+  // Stage 7b3 — `<shift> DST32, DST32, CL` mov-only legalisation.
+  // The shift amount is a runtime value in CL (via the SHL/SHR/SAR
+  // 32rCL opcode's `Uses=[ECX]` constraint). We can't dispatch off
+  // it at codegen time, so we unroll a 5-stage power-of-2 chain:
+  //
+  //   for k in 0..4:
+  //     shifted_buf = srcdst <shift by 2^k>     ; always compute
+  //     mask = (amount & (1<<k)) ? 0xFF : 0x00 ; runtime
+  //     srcdst = (mask & shifted_buf) | (~mask & srcdst)
+  //
+  // After 5 stages, srcdst holds `dst << (amount & 31)` (or the
+  // shr/sar variant). The mask-based select is the only mov-only way
+  // to express conditional update — branches don't exist at this
+  // point. Per-byte select: 2 AND lookups + 1 OR via the existing
+  // bitwise tables (added at stage 7b1), plus 1 XOR for ~mask.
+  //
+  // CL holds the amount on entry from the SelectionDAGISel-inserted
+  // `CopyToReg ECX`. It MUST be spilled to amount_buf before the
+  // first ECX clobber, or the runtime count is lost.
+  bool legalizeShift32rCL(MachineInstr &MI, MachineBasicBlock &MBB,
+                          const TargetInstrInfo &TII, ShiftDir Dir) const {
+    const MachineFunction &MF = *MBB.getParent();
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr || !Addr->AmountBufDisp || !Addr->ShiftedBufDisp)
+      return false;
+    if (Dir == ShiftDir::SAR && !Addr->SignBufDisp)
+      return false;
+
+    assert(MI.getOperand(0).isReg() && "shift32rCL op 0 must be reg");
+    const Register Dst = MI.getOperand(0).getReg();
+
+    auto Insert = MachineBasicBlock::iterator(&MI);
+    const DebugLoc DL = MI.getDebugLoc();
+    const bool IsSHL = (Dir == ShiftDir::SHL);
+    const bool IsSAR = (Dir == ShiftDir::SAR);
+
+    // PROLOGUE — order matters:
+    //   1. Save CL to amount_buf[0] FIRST, before touching ECX.
+    //   2. Spill ECX, EDX.
+    //   3. Spill Dst to srcdst.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+        .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp).addReg(Mov::CL);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Dst);
+
+    // SAR sign byte — computed once from the *original* top byte
+    // (before any stage updates srcdst).
+    if (IsSAR) {
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + 3);
+      emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
+                          "__mov_sar_sign_byte", Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(*Addr->SignBufDisp).addReg(Mov::DL);
+    }
+
+    // Shift table maps (same as ri legalize).
+    const char *ShlTables[8] = {
+        nullptr, "__mov_shl_byte_1", "__mov_shl_byte_2", "__mov_shl_byte_3",
+        "__mov_shl_byte_4", "__mov_shl_byte_5", "__mov_shl_byte_6",
+        "__mov_shl_byte_7",
+    };
+    const char *ShrTables[8] = {
+        nullptr, "__mov_shr_byte_1", "__mov_shr_byte_2", "__mov_shr_byte_3",
+        "__mov_shr_byte_4", "__mov_shr_byte_5", "__mov_shr_byte_6",
+        "__mov_shr_byte_7",
+    };
+
+    // ===== 5-stage unroll =====
+    for (unsigned k = 0; k < 5; ++k) {
+      const unsigned ShiftAmount = 1u << k; // 1, 2, 4, 8, 16
+
+      // ----- (A) Compute shifted_buf = (srcdst shifted by ShiftAmount) -----
+      if (ShiftAmount < 8) {
+        // Sub-byte shift: bit_shift = ShiftAmount, byte_shift = 0.
+        const unsigned BitShift = ShiftAmount;
+        const char *LowTab = IsSHL ? ShlTables[BitShift] : ShrTables[BitShift];
+        const char *HighTab =
+            IsSHL ? ShrTables[8 - BitShift] : ShlTables[8 - BitShift];
+
+        auto processOneByte = [&](unsigned i) {
+          const int LowSrcIdx = static_cast<int>(i);
+          const int HighSrcIdx = IsSHL ? (LowSrcIdx - 1) : (LowSrcIdx + 1);
+          emitShiftByteStage(MBB, Insert, DL, TII, *Addr, Addr->SrcDstDisp,
+                             *Addr->ShiftedBufDisp, i, LowSrcIdx, HighSrcIdx,
+                             LowTab, HighTab, IsSAR);
+        };
+        // src and dst bufs are different here, so processing order
+        // doesn't matter — pick the ri-style order for consistency.
+        if (IsSHL) {
+          processOneByte(3); processOneByte(2);
+          processOneByte(1); processOneByte(0);
+        } else {
+          processOneByte(0); processOneByte(1);
+          processOneByte(2); processOneByte(3);
+        }
+      } else {
+        // Whole-byte shift: byte_shift = ShiftAmount / 8 (1 or 2),
+        // bit_shift = 0. No table lookups needed.
+        const int ByteShift = static_cast<int>(ShiftAmount / 8);
+        for (unsigned i = 0; i < 4; ++i) {
+          const int SrcIdx = IsSHL ? (static_cast<int>(i) - ByteShift)
+                                   : (static_cast<int>(i) + ByteShift);
+          // Load source byte into DL (or OOR substitute).
+          if (SrcIdx >= 0 && SrcIdx <= 3) {
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+                .addReg(Mov::EBP)
+                .addImm(Addr->SrcDstDisp + static_cast<int64_t>(SrcIdx));
+          } else if (IsSAR) {
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+                .addReg(Mov::EBP).addImm(*Addr->SignBufDisp);
+          } else {
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0);
+          }
+          // Store to shifted_buf[i].
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP)
+              .addImm(*Addr->ShiftedBufDisp + static_cast<int64_t>(i))
+              .addReg(Mov::DL);
+        }
+      }
+
+      // ----- (B) Compute mask = (amount & (1<<k)) ? 0xFF : 0x00 -----
+      // 1. amount_byte → DL
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp);
+      // 2. Pack (amount, 1<<k) into idx[1..0] and look up __mov_and8_table.
+      emitIdxZero(MBB, Insert, DL, TII, *Addr);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
+          .addImm(static_cast<int64_t>(1u << k));
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+      // 3. select_mask_table[DL] → DL (non-zero → 0xFF, zero → 0x00).
+      emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
+                          "__mov_select_mask_table", Mov::DL);
+      // 4. Stash mask at amount_buf[1] for stable per-byte access.
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP)
+          .addImm(*Addr->AmountBufDisp + 1)
+          .addReg(Mov::DL);
+      // 5. Compute inv_mask = mask XOR 0xFF (using __mov_xor8_table)
+      //    and stash at amount_buf[2].
+      emitIdxZero(MBB, Insert, DL, TII, *Addr);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP)
+          .addImm(*Addr->AmountBufDisp + 2)
+          .addReg(Mov::DL);
+
+      // ----- (C) Per-byte select:
+      //         srcdst[i] = (mask & shifted_buf[i]) | (~mask & srcdst[i])
+      // For each byte, we compute the inv_mask AND-merge first
+      // (consuming srcdst[i] before we overwrite it), then the mask
+      // AND-merge, then OR them via the existing emitOrByteAndStore
+      // (which expects low_contrib parked at dst[i] and high_contrib
+      // in DL).
+      for (unsigned i = 0; i < 4; ++i) {
+        // (C1) Compute (~mask & srcdst[i]) → DL, stash to srcdst[i].
+        emitIdxZero(MBB, Insert, DL, TII, *Addr);
+        // idx[1] = inv_mask
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+            .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp + 2);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+        // idx[0] = srcdst[i]
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+            .addReg(Mov::EBP)
+            .addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+            .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+        // Stash to srcdst[i].
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP)
+            .addImm(Addr->SrcDstDisp + static_cast<int64_t>(i))
+            .addReg(Mov::DL);
+
+        // (C2) Compute (mask & shifted_buf[i]) → DL.
+        emitIdxZero(MBB, Insert, DL, TII, *Addr);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+            .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp + 1);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+            .addReg(Mov::EBP)
+            .addImm(*Addr->ShiftedBufDisp + static_cast<int64_t>(i));
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+            .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+
+        // (C3) OR the stashed inv_mask & srcdst (at srcdst[i]) with the
+        // mask & shifted_buf (in DL), write final to srcdst[i].
+        emitOrByteAndStore(MBB, Insert, DL, TII, *Addr, Addr->SrcDstDisp, i);
+      }
+    }
+
+    // EPILOGUE — restore ECX/EDX, load Dst from srcdst.
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
         .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)

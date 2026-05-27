@@ -308,6 +308,16 @@ void MovAsmPrinter::emitShift8Tables() {
       [](uint8_t a) -> uint8_t {
         return (a & 0x80) ? static_cast<uint8_t>(0xFFu) : static_cast<uint8_t>(0);
       });
+
+  // Stage 7b3 — `__mov_select_mask_table[a] = a ? 0xFF : 0x00`. Used
+  // by the variable-shift (rCL) legalize to turn the per-bit
+  // `amount & (1 << k)` flag into a full-byte mask suitable for an
+  // AND/OR-based 32-bit conditional select.
+  emitUnaryByteTable(
+      "__mov_select_mask_table",
+      [](uint8_t a) -> uint8_t {
+        return a ? static_cast<uint8_t>(0xFFu) : static_cast<uint8_t>(0);
+      });
 }
 
 extern "C" void LLVMInitializeMovAsmPrinter() {
