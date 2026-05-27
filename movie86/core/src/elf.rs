@@ -266,6 +266,14 @@ pub fn flatten_with_stack(
     // Reserve: stack_size guest-usable bytes + STARTUP_IMAGE.
     let total_extra = u64::from(stack_size) + u64::from(STARTUP_IMAGE);
     let top_u64 = hi + total_extra;
+    // A top-packed ELF whose highest segment ends near `0xffff_ffff`
+    // would push `top_u64` past the 32-bit address space once we add
+    // the stack reservation. Catch that here — `FlatMemory::new_zeroed`
+    // would otherwise hit its internal `assert!` and abort the process
+    // instead of returning a clean LoadError.
+    if top_u64 > u64::from(u32::MAX) + 1 {
+        return Err(ElfError::Truncated);
+    }
     let base = u32::try_from(lo).map_err(|_| ElfError::Truncated)?;
     let size = usize::try_from(top_u64 - lo).map_err(|_| ElfError::Truncated)?;
     let mut mem = FlatMemory::new_zeroed(base, size);
@@ -501,5 +509,25 @@ mod tests {
         assert_eq!(mem.read_u8(0x2001).unwrap(), 0xbb);
         // Gap between segments is zero.
         assert_eq!(mem.read_u8(0x1500).unwrap(), 0);
+    }
+
+    #[test]
+    fn flatten_with_stack_rejects_top_packed_elf_overflowing_4gib() {
+        // ELF whose highest segment ends near 0xffff_ffff. Adding a
+        // typical stack reservation would push the region past the
+        // 32-bit address space. Without the explicit bounds check
+        // FlatMemory::new_zeroed's assert would abort the process —
+        // we want a clean ElfError instead so the caller can
+        // surface a LoadError to the user.
+        //
+        // The segment is at 0xffff_e000 with memsz 0x1000 → segment
+        // end = 0xffff_f000. Stack of 0x10000 + 16-byte startup
+        // image puts top_u64 at 0xffff_f000 + 0x10010 = 0x1_0000_f010,
+        // which exceeds u32::MAX + 1.
+        let elf = build_elf(0xffff_e000, &[(0xffff_e000, 0x1000, &[0u8])]);
+        let loaded = parse(&elf).unwrap();
+        let err = flatten_with_stack(&loaded, 0x10000)
+            .expect_err("top-packed ELF should be rejected, not asserted");
+        assert!(matches!(err, ElfError::Truncated));
     }
 }

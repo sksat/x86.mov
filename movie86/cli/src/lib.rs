@@ -175,7 +175,7 @@ fn libc_printf(call: &mut LibcCall<'_>) -> Result<LibcResult, Fault> {
         if scanned >= PRINTF_MAX_LEN {
             // Fmt string too long / not terminated. Flush what we have
             // and return -1 (printf's I/O-error convention).
-            flush(&buf);
+            let _ = flush(&buf);
             return Ok(LibcResult::Return(u32::MAX));
         }
         let byte = call.mem.read_u8(p)?;
@@ -216,13 +216,13 @@ fn libc_printf(call: &mut LibcCall<'_>) -> Result<LibcResult, Fault> {
                 // written — a classic format-string vulnerability and
                 // explicitly out of scope per smart-friend's review.
                 b'n' => {
-                    flush(&buf);
+                    let _ = flush(&buf);
                     return Ok(LibcResult::Return(u32::MAX));
                 }
                 _ => {
                     // Unknown / unsupported conversion. Flush what we
                     // have and bail with -1.
-                    flush(&buf);
+                    let _ = flush(&buf);
                     return Ok(LibcResult::Return(u32::MAX));
                 }
             }
@@ -233,7 +233,13 @@ fn libc_printf(call: &mut LibcCall<'_>) -> Result<LibcResult, Fault> {
         p = p.wrapping_add(1);
         scanned = scanned.wrapping_add(1);
     }
-    flush(&buf);
+    // Mirror `write_syscall`'s error propagation: if stdout is closed
+    // (broken pipe) or otherwise refuses the write, surface -1 in EAX
+    // — the C printf I/O-error convention. Without this, a wrapped
+    // printf piped into `head` would lie about how many bytes landed.
+    if !flush(&buf) {
+        return Ok(LibcResult::Return(u32::MAX));
+    }
     Ok(LibcResult::Return(written))
 }
 
@@ -254,13 +260,14 @@ fn append_cstr_from_guest(buf: &mut Vec<u8>, mem: &mut dyn Memory, ptr: u32) -> 
     }
 }
 
-/// Flush a `printf` accumulator to stdout.
-///
-/// Best-effort: matches `write_syscall`'s policy of treating a broken
-/// pipe / EIO as a recoverable short-write at the libc layer. The
-/// wrapper's u32 return value already encodes that.
-fn flush(buf: &[u8]) {
-    let _ = io::stdout().write_all(buf);
+/// Flush a `printf` accumulator to stdout. `true` on success, `false`
+/// on a broken pipe / EIO so the caller can return -1 in EAX (the C
+/// printf I/O-error convention). Mirrors how `write_syscall` reports
+/// -EPIPE for closed stdout — without it, a wrapped printf piped into
+/// `head` would lie about how many bytes landed.
+#[must_use]
+fn flush(buf: &[u8]) -> bool {
+    io::stdout().write_all(buf).is_ok()
 }
 
 impl SysHost for StdHost {
