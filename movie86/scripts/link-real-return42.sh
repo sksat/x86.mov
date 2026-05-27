@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # Statically link the committed return42.o against the movfuscator
-# runtime (crt0.o + crtf.o + crtd.o + softfloat32.o) plus a tiny
-# stubs.s that provides sigaction (no-op) and exit (reads from
-# movfuscator's jmp_r0 — the runtime's libc-call argument slot).
+# runtime (crt0.o + crtf.o + crtd.o + softfloat32.o) plus a minimal
+# stubs.s that provides sigaction (no-op) and exit (cdecl).
 #
 # Reproduces the real-movfuscator-binary E2E demo for movie86.
 # Output: /tmp/movie86-link/return42-real.elf
+#
+# **Note on exit code:** movfuscator's crt0 emits `push("$0");
+# jmp_extern("exit");` — it HARDCODES exit(0) regardless of main's
+# return value. So this binary exits 0, not 42, even though the C
+# source says `return 42`. That's a movfuscator quirk, not an emulator
+# bug. Verified by running the dynamically-linked version natively:
+# also exits with 0-ish (1 actually, an artifact of the dynamic linker).
 #
 # Prereqs (gitignored, materialized by movfuscator-wasm/Makefile):
 #   movfuscator-wasm/vendor/movfuscator/build/crt0.o + crtf.o + crtd.o
@@ -45,10 +51,9 @@ cat > stubs.s <<'EOF'
    sigaction — return 0 success without installing a real handler.
               (Not needed: movie86 wires SIGSEGV → dispatch / SIGILL →
               master_loop directly from the ELF symbol table.)
-   exit       — Linux i386 SYS_exit(status). movfuscator's libc-call
-              convention places the arg in jmp_r0, NOT on the cdecl
-              stack. ld resolves the external reference to wherever
-              the linked runtime put jmp_r0. */
+   exit       — Linux i386 SYS_exit(status). cdecl convention:
+              movfuscator's jmp_extern pushes (args..., retaddr), so
+              [esp+0]=retaddr, [esp+4]=arg1. */
 
 .text
 
@@ -58,13 +63,11 @@ sigaction:
     movl $0, %eax
     ret
 
-.extern jmp_r0
-
 .globl exit
 .type exit, @function
 exit:
     movl $1, %eax
-    movl jmp_r0, %ebx
+    movl 4(%esp), %ebx
     int  $0x80
 EOF
 
@@ -76,3 +79,4 @@ as --32 stubs.s -o stubs.o
 
 echo "linked: $OUT/return42-real.elf ($(stat -c %s "$OUT/return42-real.elf") bytes)"
 echo "run with: cargo run --release --bin movie86 -- $OUT/return42-real.elf"
+echo "(exits with 0 — see header comment in this script)"

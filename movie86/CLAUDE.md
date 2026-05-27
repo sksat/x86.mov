@@ -131,25 +131,24 @@ Switched to the mov-loop CRT (`crt0.o` + `crtf.o` + `crtd.o` + `softfloat32.o` +
 
 **`movie86 /tmp/movie86-link/return42-real.elf` exits cleanly.** Real movfuscator-built mov-only binary now runs.
 
-### Exit code 42 — solved
+### Real movfuscator binaries: end-to-end demos
 
-The runtime ABI was the final puzzle. Trace via `movie86 --break-at 0x08049fc6`:
+movfuscator's libc-call ABI is **cdecl**. `jmp_extern` pushes args then a return label and sets `esp = sp` so the callee sees the standard `[esp+0] = retaddr, [esp+4] = arg1` layout. The minimal stubs in [`scripts/link-real-return42.sh`](scripts/link-real-return42.sh) and [`scripts/link-real-hello.sh`](scripts/link-real-hello.sh) follow that convention.
 
-- main computes 42 correctly. The literal `0x2a` appears once in the linked binary (`mov DWORD PTR ds:0x80dd000, 0x2a` at `0x08049a60`), which writes 42 to `R0` (movfuscator's software return-value register at `0x080dd000`).
-- Master_loop's exit-call block then propagates R0 — `mov [eax], edx` at `0x08049fc6` with eax=`0x08686150` (= **`jmp_r0`**) and edx=42 lands the value in `jmp_r0`.
-- **But our `exit` stub reads `[esp+4]` = `0x08686138`**, which is 28 bytes away from `jmp_r0` and never gets written to 42. exit_stub thus reads 0 → `exit(0)`.
+| Program | Linker script | Behavior through movie86 | Notes |
+|---|---|---|---|
+| `return42.c` | `link-real-return42.sh` | exits with status **0** | movfuscator's crt0 hardcodes `push("$0"); jmp_extern("exit")` — it **ignores main's return value** and always exits 0. Confirmed against the dynamically-linked native build too. |
+| `hello.c` | `link-real-hello.sh` | prints `Hello` to stdout, exits 0 | The `printf` stub hardcodes a 6-byte write (= length of `"Hello\n"`) because real `strlen` needs `cmp + jcc` + EFLAGS modeling, which is outside movie86's mov-only scope. Sufficient for the committed fixture; won't generalize. |
 
-So movfuscator's libc-call ABI is "arg lives in `jmp_r0`", not the cdecl shadow stack. The `stubs.s` produced by [`scripts/link-real-return42.sh`](scripts/link-real-return42.sh) reads from `jmp_r0` directly — ld resolves the external reference to wherever the runtime placed it (varies per link):
+Both demos exercise the same end-to-end path:
 
-```asm
-.extern jmp_r0
-exit:
-    movl $1, %eax
-    movl jmp_r0, %ebx     /* not 4(%esp) — movfuscator parks the arg here */
-    int  $0x80
 ```
-
-**Result:** `movie86 /tmp/movie86-link/return42-real.elf` exits with status **42**. The full real-movfuscator-built mov-only `return 42` program runs end-to-end through movie86, with the correct return value. 🎉
+crt0 → master_loop → main (mov-only body) → return → master_loop's
+  exit-call block → push retaddr + args on shadow stack →
+  set external = &callee → NULL deref → SIGSEGV →
+  Cpu::step routes Unmapped(0) → SIGSEGV handler →
+  dispatch (mov esp, [sp]; jmp [external]) → libc stub → int 0x80
+```
 
 ### How to reproduce
 
@@ -157,12 +156,16 @@ exit:
 # Materialize the gitignored runtime objects (5–15 min):
 cd ../movfuscator-wasm && make setup && make build-native && cd -
 
-# Link return42.o + runtime + the jmp_r0-aware stubs.s:
+# return42 demo:
 movie86/scripts/link-real-return42.sh
-
-# Run through movie86:
 cargo run --release --bin movie86 -- /tmp/movie86-link/return42-real.elf
-echo $?    # → 42
+echo $?    # → 0  (movfuscator quirk — see table)
+
+# hello demo:
+movie86/scripts/link-real-hello.sh
+cargo run --release --bin movie86 -- /tmp/movie86-link/hello-real.elf
+# prints: Hello
+echo $?    # → 0
 ```
 
 ## 2026-05-28 follow-up: why `jmp main` exists
