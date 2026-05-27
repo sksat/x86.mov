@@ -11,6 +11,8 @@
 #include "MCTargetDesc/MovMCTargetDesc.h"
 #include "MovTargetMachine.h"
 #include "TargetInfo/MovTargetInfo.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineOperand.h"
@@ -18,6 +20,7 @@
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
+#include "llvm/MC/MCObjectFileInfo.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/TargetRegistry.h"
@@ -42,8 +45,14 @@ public:
     OutStreamer->emitRawText(StringRef(".intel_syntax noprefix"));
   }
 
+  // Stage 7-prep-2a: emit byte-add lookup tables that the MovOnlyLegalize
+  // pass will index from stage 7a1 onward. Emitted unconditionally — see
+  // the comment in emitAdd8Tables() for the rationale.
+  void emitEndOfAsmFile(Module & /*M*/) override { emitAdd8Tables(); }
+
 private:
   void lower(const MachineInstr *MI, MCInst &OutMI) const;
+  void emitAdd8Tables();
 };
 } // namespace
 
@@ -109,6 +118,55 @@ void MovAsmPrinter::emitInstruction(const MachineInstr *MI) {
   MCInst TmpInst;
   lower(MI, TmpInst);
   EmitToStreamer(*OutStreamer, TmpInst);
+}
+
+// Stage 7-prep-2a:
+//   __mov_add8_sum_table[cin][a][b]   = (cin + a + b) & 0xFF
+//   __mov_add8_carry_table[cin][a][b] = (cin + a + b) >> 8   (∈ {0,1})
+//
+// Each table is 2 * 256 * 256 = 131072 bytes, laid out in
+// (cin, a, b)-major order so a byte add at carry-chain step `i` reads
+//     sum_byte_i   = __mov_add8_sum_table  [cin*65536 + a_i*256 + b_i]
+//     carry_out_i  = __mov_add8_carry_table[cin*65536 + a_i*256 + b_i]
+//
+// The MovOnlyLegalize pass at stage 7a1 will lower ADD32rr/ri to four
+// such per-byte lookups chained by carry. This printer-side hook owns
+// the data emission so MovOnlyLegalize can stay focused on MI rewriting
+// and never touch Module-level IR (no ModulePass / no GlobalVariable).
+//
+// Emission policy: unconditional, once per translation unit, after all
+// functions. The symbols are not declared `.globl`, so each .o keeps
+// them as local symbols — multi-object links don't conflict, and
+// `ld --gc-sections` is free to drop them when MovOnlyLegalize hasn't
+// produced any references. PoC overhead is ~256 KiB / object; for the
+// current 39 execution fixtures this is academic.
+void MovAsmPrinter::emitAdd8Tables() {
+  static constexpr unsigned kSize = 2u * 256u * 256u;
+  SmallVector<uint8_t, kSize> Sum;
+  SmallVector<uint8_t, kSize> Carry;
+  Sum.reserve(kSize);
+  Carry.reserve(kSize);
+  for (unsigned cin = 0; cin < 2; ++cin) {
+    for (unsigned a = 0; a < 256; ++a) {
+      for (unsigned b = 0; b < 256; ++b) {
+        const unsigned s = a + b + cin;
+        Sum.push_back(static_cast<uint8_t>(s & 0xFF));
+        Carry.push_back(static_cast<uint8_t>(s >> 8));
+      }
+    }
+  }
+
+  MCSection *RoSec = OutContext.getObjectFileInfo()->getReadOnlySection();
+  OutStreamer->switchSection(RoSec);
+
+  const auto emitTable = [&](StringRef Name, ArrayRef<uint8_t> Data) {
+    MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
+    OutStreamer->emitLabel(Sym);
+    OutStreamer->emitBytes(StringRef(
+        reinterpret_cast<const char *>(Data.data()), Data.size()));
+  };
+  emitTable("__mov_add8_sum_table", Sum);
+  emitTable("__mov_add8_carry_table", Carry);
 }
 
 extern "C" void LLVMInitializeMovAsmPrinter() {
