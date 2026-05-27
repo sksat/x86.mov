@@ -36,7 +36,6 @@ Companion to [`movie86`](../movie86/): movie86 is the in-browser interpreter ("w
 - amd64 Linux host only.
 
 **Not in scope (yet):**
-- Streaming additional `Code` while the guest is executing. v1 is buffer-then-run; a streaming Runner is the planned follow-up.
 - Library-call bridging (canvas, arbitrary RPC). Needs a separate trap mechanism (replace call target with `int3`, or use a sentinel address-range trap).
 - `stdin` / `read(3)`. Needs a half-duplex bridge (host pauses guest, awaits `Stdin` from frontend, resumes).
 - Windows host. Would need a different execution path (Wine? QEMU-user? in-process JIT?). movie86 (the interpreter) remains the always-portable path.
@@ -54,8 +53,8 @@ Matches the repo convention:
 
 - [`proto/`](proto/) — wire-protocol types + JSON marshal/unmarshal. Platform-agnostic. **Inbound**: `Code`, `Start`, `LoadContext`. **Outbound**: `Stdout`, `Stderr`, `Exit`, `Fault`, `Paused`. Migration schema: `Context{Regs, Regions[]}`, `Regs{Eax..Edi, Esp, Eip, Eflags}`, `MemRegion{Addr, Bytes}`.
 - [`bridge/`](bridge/) — pure-function `HandleSyscall(SyscallArgs, GuestMemory) → Result{Event, Return, Action}`. Analogue of movie86's `SysHost` trait. Decides per syscall what Outbound event to emit and whether the runner should Resume / Exit / Fault.
-- [`runner/`](runner/) — ptrace driver. `//go:build linux`. `RunOnce` (fresh) and `RunWithContext` (resume from `proto.Context`) share `runWithStub`: spawn stub, drive to SIGSTOP, inject code, set regs, run the syscall-bridge loop. `snapshotMemory` produces the sparse `MemRegion[]` carried by Paused.
-- [`server/`](server/) — WebSocket handler (`Handler() http.Handler`). One connection = one session, buffer-then-run.
+- [`runner/`](runner/) — ptrace driver. `//go:build linux`. Long-lived `Runner` with `New` / `WriteCode` / `Run` / `RunWithContext` / `Close` lifecycle. An internal tracer goroutine pins itself to one OS thread (does all ptrace ops); `WriteCode` writes via `/proc/PID/mem` and is safe from any goroutine, before OR after `Run` — the streaming primitive. `RunOnce` and `RunWithContext` (top-level) are convenience wrappers for the no-streaming case. `snapshotMemory` produces the sparse `MemRegion[]` carried by Paused.
+- [`server/`](server/) — WebSocket handler (`Handler() http.Handler`). Two-phase: pre-run reads inbound for Code + Start/LoadContext, post-run spawns a reader goroutine for streaming Code while forwarding events on the main goroutine.
 - [`stub/`](stub/) — `_stub.s` (i386 GAS source, leading `_` so Go ignores it) + `Makefile` + the built `stub` binary. `stub.go` exposes the embedded bytes via `//go:embed`.
 - [`cmd/turbo86/`](cmd/turbo86/) — main entry. `--addr` flag, `http.ListenAndServe`.
 
@@ -71,7 +70,9 @@ Matches the repo convention:
 
 - **The guest stack mmap MUST NOT collide with the stub's own kernel-allocated stack.** Linux puts the stub's stack near `~0xBFFFFFF0`. The stub maps the guest stack at `0x70000000..0x70200000`, well below. If you ever want the guest stack at a higher address, check `/proc/PID/maps` of the running stub first.
 
-- **`Code` after `Start` is allowed but not synchronized.** v1 doesn't pause execution to apply post-Start writes — the frontend is responsible for sending all needed code before `Start` unless it understands what races it's accepting.
+- **`Code` after `Start` is allowed but not synchronized with guest execution.** Post-Start writes go through `runner.WriteCode` (a plain `/proc/PID/mem` write), not through ptrace. The frontend is responsible for arranging that streamed code lands at addresses the guest hasn't reached yet.
+
+- **The runner's `eventsCh` is unbuffered.** This keeps the tracer goroutine in lockstep with the consumer: the tracer can't run ahead, finish the session, and tear down `/proc/PID/mem` before the consumer has read the events it sent. If you change this to buffered, the streaming test starts flaking because mid-session `WriteCode` hits a closed fd.
 
 - **Paused vs Fault** are semantically distinct. Paused = "recoverable boundary, peer engine may resume via LoadContext" (signals, future "unsupported feature" stops). Fault = "non-recoverable, give up" (unsupported syscall numbers, host-side ptrace errors). Don't merge them.
 
