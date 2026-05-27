@@ -97,14 +97,19 @@ So "what `mov cs, ax` does" depends on which handler was registered via `sigacti
 
 ### Next puzzle (where the bring-up is currently stuck)
 
-The emulator is stuck in a **deterministic infinite loop** inside `master_loop` (605 unique EIPs visited per iteration; ~600 instructions per iteration). The `target` data symbol (`0x08486128` in our build) — movfuscator's per-iteration "next basic block selector" — never updates from 0. Without `target` progressing, master_loop keeps doing the same dispatch every iteration.
+The emulator is stuck in a **deterministic infinite loop** inside `master_loop` (605 unique EIPs visited per iteration; ~600 instructions per iteration). Diagnosed via `--watch`:
 
-`target` is never written via a direct `mov [target], ...`; the only references in the binary are reads (`mov eax, ds:0x8486128`). Writes must come through indirect stores (`mov [data_p], val` where `data_p` happens to point at `target`). `data_p` is observed to take many values during the loop, but apparently none of them target the right slot — or our --watch (value-change-only) is missing same-value writes.
+- `toggle_execution` (`0x848611c`) starts at 1, is set to 0 in iteration 1 at `0x0804909f` (`mov [0x848611c], 0x0`), and **never returns to 1**.
+- master_loop's prologue uses `toggle_execution` as the index into `sel_on[]`. With `toggle_execution = 1`, `sel_on[1] = &on`, so writes to that slot land on `on`. With `toggle_execution = 0`, `sel_on[0]` points at a *discard area* in BSS (`0x086866d0`), so the writes have no effect — every iteration after the first is a no-op.
 
-Next-step ideas for whoever picks this up:
-- Add a "memory write log" mode (every store, not just value changes) — would surface stores even when the new value equals the old.
-- Cross-check master_loop's logic against the movfuscator-wasm dynamically-linked `return42` binary running natively to see what `target` *should* become at each iteration.
-- Audit our decoder for any rare-but-existent encoding that movfuscator's master_loop body uses (`movie86`'s `decoder_covers_return42_o_text` test proves we accept every byte of `return42.o`, but master_loop / crt0 came from `crt0_cf.o` / `crtd_cf.o` whose coverage we haven't pinned).
+So the missing piece is whatever's supposed to flip `toggle_execution` back to 1 between iterations. We checked the binary; the **only** write to `toggle_execution` is the `→ 0` at `0x0804909f`. There is no `→ 1` write. The flip must happen via an indirect store, and we haven't found which `mov [reg], val` site has `reg == &toggle_execution`.
+
+Three candidate explanations:
+1. **Some `mov [data_p], val` site stores to `&toggle_execution`** via data_p taking that value at some point. Our `--watch` (value-change-only) would miss it if it writes the same value. The next debugger feature should be a "raw write log" — every memory store, regardless of value-change.
+2. **The signal-handler-return mechanism is supposed to flip it.** On real Linux the kernel restores saved register state when the SIGILL handler returns; that restore-through-saved-context might land on a memory location, possibly `toggle_execution`. We don't simulate signal-frame restoration.
+3. **Our decoder has a wrong semantic for some rare encoding in master_loop / crt0_cf.** Our `decoder_covers_return42_o_text` test only pins `return42.o`'s `.text`; the runtime objects (`crt0_cf.o`, `crtd_cf.o`, `crtf_cf.o`) have not been coverage-tested.
+
+Pick one of these for the next investigation pass. (3) is the easiest to rule in/out — just add a coverage test for the runtime `.o` files.
 
 Tooling needed to dig in: `cd movfuscator-wasm && make setup && make build-native` to materialize the runtime objects (gitignored under `vendor/movfuscator/build/`).
 
