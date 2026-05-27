@@ -147,13 +147,19 @@ func ptraceSysEmuStep(pid int) error {
 	return nil
 }
 
-// RunOnce executes a single guest session.
+// setupFunc runs once the child stub has reached its self-SIGSTOP and
+// /proc/PID/mem is open. It writes any initial guest memory and mutates
+// regs in place; the runner then writes regs back and enters the
+// syscall loop. Used to vary "what to load before running" between the
+// fresh-start path (RunOnce) and the engine-migration path
+// (RunWithContext).
+type setupFunc func(mem *procMem, regs *regs32) error
+
+// RunOnce executes a single guest session starting fresh.
 //
 // `code` maps guest virtual addresses → bytes to write into the guest's
 // RWX region before execution begins. `entry` is the initial EIP;
-// `stackTop` is the initial ESP. Returns the ordered sequence of events
-// produced by the bridge, ending with the Exit / Fault that closed the
-// session.
+// `stackTop` is the initial ESP.
 //
 // The caller's goroutine must be LockOSThread'd; all ptrace requests
 // target the OS thread that became the tracer at exec.Cmd.Start().
@@ -163,6 +169,50 @@ func RunOnce(
 	entry uint32,
 	stackTop uint32,
 ) ([]proto.Outbound, error) {
+	return runWithStub(stubBytes, func(mem *procMem, regs *regs32) error {
+		for addr, data := range code {
+			if err := mem.WriteAt(addr, data); err != nil {
+				return fmt.Errorf("write %d bytes at 0x%x: %w", len(data), addr, err)
+			}
+		}
+		regs.Eip = entry
+		regs.Esp = stackTop
+		return nil
+	})
+}
+
+// RunWithContext resumes a guest session from a Context handed off by
+// another engine (e.g., movie86). Writes ctx.Regions into guest memory
+// and sets the full register file from ctx.Regs (Eax..Edi, Esp, Eip,
+// Eflags), then executes through the same syscall-bridge loop.
+//
+// Same LockOSThread requirement as RunOnce.
+func RunWithContext(stubBytes []byte, ctx proto.Context) ([]proto.Outbound, error) {
+	return runWithStub(stubBytes, func(mem *procMem, regs *regs32) error {
+		for _, r := range ctx.Regions {
+			if err := mem.WriteAt(r.Addr, r.Bytes); err != nil {
+				return fmt.Errorf("write region %d bytes at 0x%x: %w", len(r.Bytes), r.Addr, err)
+			}
+		}
+		regs.Eax = ctx.Regs.Eax
+		regs.Ebx = ctx.Regs.Ebx
+		regs.Ecx = ctx.Regs.Ecx
+		regs.Edx = ctx.Regs.Edx
+		regs.Esi = ctx.Regs.Esi
+		regs.Edi = ctx.Regs.Edi
+		regs.Ebp = ctx.Regs.Ebp
+		regs.Esp = ctx.Regs.Esp
+		regs.Eip = ctx.Regs.Eip
+		regs.Eflags = ctx.Regs.Eflags
+		return nil
+	})
+}
+
+// runWithStub holds the boilerplate shared between RunOnce and
+// RunWithContext: spawn the stub, drive it to its self-SIGSTOP, open
+// /proc/PID/mem, invoke setup, then run the syscall-bridge loop until
+// Exit or Fault.
+func runWithStub(stubBytes []byte, setup setupFunc) ([]proto.Outbound, error) {
 	// Stage the stub in a memfd and execve it via /proc/self/fd/N.
 	const mfdCloexec = 1
 	fd, err := memfdCreate("turbo86-stub", mfdCloexec)
@@ -222,20 +272,15 @@ func RunOnce(
 	defer memFile.Close()
 	mem := &procMem{f: memFile}
 
-	// Inject guest code at the requested addresses.
-	for addr, data := range code {
-		if err := mem.WriteAt(addr, data); err != nil {
-			return nil, fmt.Errorf("write %d bytes at 0x%x: %w", len(data), addr, err)
-		}
-	}
-
-	// Point EIP / ESP at the guest entry.
+	// Snapshot current regs (so setup can preserve fields it doesn't
+	// touch — e.g., CS/SS that the stub already established).
 	var regs regs32
 	if err := ptraceGetRegs32(pid, &regs); err != nil {
 		return nil, fmt.Errorf("get i386 regs (init): %w", err)
 	}
-	regs.Eip = entry
-	regs.Esp = stackTop
+	if err := setup(mem, &regs); err != nil {
+		return nil, fmt.Errorf("setup: %w", err)
+	}
 	if err := ptraceSetRegs32(pid, &regs); err != nil {
 		return nil, fmt.Errorf("set i386 regs (init): %w", err)
 	}
