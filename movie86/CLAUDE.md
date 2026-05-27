@@ -86,16 +86,25 @@ So "what `mov cs, ax` does" depends on which handler was registered via `sigacti
 
 **Open question for the next PR:** what's the exact mechanism by which `external` gets the right value?
 
-**Confirmed by the new debug tooling (`movie86 --watch <addr>`):** `external` (`0x08686194` in our test build) is **never written** during the entire run. Hypothesis 1 ("runtime self-modifies `external` before each dispatch") is dead.
+**Solved via smart-friend + movfuscator.c source reading:**
 
-Also confirmed by `--break-at`:
-- main starts running at step 102 (entry → crt0 → main).
-- `mov cs, ax` at `0x08049d6e` fires at step 625. That address sits **inside main's body** (it ends at `0x08049d68` per objdump; the dispatch is 6 bytes past the end). So this dispatch is main's exit / return mechanism, not a libc-call trampoline.
+- `mov cs, ax` (opcode `8e c8`) is movfuscator's deliberate **SIGILL** trigger — emitted by `progend()` (movfuscator.c:3091) under the `mov_loop` branch. It is *not* a SIGSEGV trigger.
+- The runtime registers `SIGILL → master_loop` via `sigaction` (movfuscator.c:2832). So `mov cs, ax` re-enters `master_loop` for the next iteration.
+- The other dispatch — `SIGSEGV → dispatch` — is for **external libc calls**. movfuscator emits `movl $callee, (external)` followed by a deliberate NULL deref at each external call site (`jmp_extern()` in movfuscator.c:2397). The NULL deref faults; the handler `dispatch` does `mov esp, [sp]; jmp [external]` to call the libc function.
+- `return42` makes no external calls, so `external` is correctly never written. It additionally has a **direct `jmp exit` at `0x08049287`** (inside master_loop's body) — that's the intended termination path, not the dispatch trick.
 
-That makes hypothesis 2 (a richer C SIGSEGV handler that reads `ucontext` to recover EAX and stuff it into `external`) the leading remaining candidate — but movfuscator's `sigaction` call uses `SA_NODEFER` and a `void(int)` handler signature, so the bare `dispatch` we see can't access `ucontext`. There's something else going on, possibly:
-- A different signal handler than the one we identified (maybe a wrapping libc function).
-- A layout trick where `external` is the same address as some other heavily-written symbol — though `nm` says no.
-- The whole site is a deliberate "kill the process" pattern that real Linux turns into program termination, expecting the kernel's default SIGSEGV behavior to fire.
+`Insn::MovfuscatorDispatchJump` is now wired to the SIGILL handler instead of SIGSEGV. With that fix the emulator runs the binary for 50M+ steps without crashing — but it never reaches `jmp exit`.
+
+### Next puzzle (where the bring-up is currently stuck)
+
+The emulator is stuck in a **deterministic infinite loop** inside `master_loop` (605 unique EIPs visited per iteration; ~600 instructions per iteration). The `target` data symbol (`0x08486128` in our build) — movfuscator's per-iteration "next basic block selector" — never updates from 0. Without `target` progressing, master_loop keeps doing the same dispatch every iteration.
+
+`target` is never written via a direct `mov [target], ...`; the only references in the binary are reads (`mov eax, ds:0x8486128`). Writes must come through indirect stores (`mov [data_p], val` where `data_p` happens to point at `target`). `data_p` is observed to take many values during the loop, but apparently none of them target the right slot — or our --watch (value-change-only) is missing same-value writes.
+
+Next-step ideas for whoever picks this up:
+- Add a "memory write log" mode (every store, not just value changes) — would surface stores even when the new value equals the old.
+- Cross-check master_loop's logic against the movfuscator-wasm dynamically-linked `return42` binary running natively to see what `target` *should* become at each iteration.
+- Audit our decoder for any rare-but-existent encoding that movfuscator's master_loop body uses (`movie86`'s `decoder_covers_return42_o_text` test proves we accept every byte of `return42.o`, but master_loop / crt0 came from `crt0_cf.o` / `crtd_cf.o` whose coverage we haven't pinned).
 
 Tooling needed to dig in: `cd movfuscator-wasm && make setup && make build-native` to materialize the runtime objects (gitignored under `vendor/movfuscator/build/`).
 

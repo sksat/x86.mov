@@ -175,15 +175,17 @@ impl Cpu {
                 Ok(target)
             }
             Insn::MovfuscatorDispatchJump(_src) => {
-                // `mov cs, ax` on real x86 raises #GP / SIGSEGV.
-                // movfuscator's runtime registers a SIGSEGV handler via
-                // sigaction; the kernel invokes that handler instead of
-                // killing the process. We model the same: jump to the
-                // registered handler. With no handler registered, trap
-                // — the placeholder "jump to eax" semantic was wrong
-                // (eax often holds a data pointer, not a code address).
-                self.signal_handler(Signal::Segv)
-                    .ok_or(Fault::SignalHandlerUnregistered(Signal::Segv as u32))
+                // `mov cs, ax` (8e c8) is movfuscator's deliberate **SIGILL**
+                // trigger — emitted by `progend()` (movfuscator.c:3091)
+                // with `mov_loop`. The runtime registers SIGILL → master_loop
+                // via sigaction (movfuscator.c:2832), so the kernel invokes
+                // master_loop here on real Linux.
+                //
+                // The other dispatch (NULL deref → SIGSEGV → dispatch) is
+                // for external libc calls — a separate trigger we handle
+                // in the unmapped-read path, not here.
+                self.signal_handler(Signal::Ill)
+                    .ok_or(Fault::SignalHandlerUnregistered(Signal::Ill as u32))
             }
             Insn::MovToOtherSegReg => {
                 // No-op in flat 32-bit mode.
@@ -693,12 +695,13 @@ mod tests {
     // --- movfuscator dispatch trick + indirect jmp ---
 
     #[test]
-    fn movfuscator_dispatch_jump_invokes_registered_sigsegv_handler() {
-        // 8e c8 → mov cs, ax. With a SIGSEGV handler registered, the
-        // dispatch jumps there (matching what the kernel does on real
-        // Linux when movfuscator's runtime calls sigaction).
+    fn movfuscator_dispatch_jump_invokes_registered_sigill_handler() {
+        // 8e c8 → mov cs, ax. movfuscator emits this as a deliberate
+        // SIGILL trigger (movfuscator.c:3091, inside the `mov_loop`
+        // branch of progend). With a SIGILL handler registered the
+        // dispatch jumps there (matching kernel signal delivery).
         let (mut cpu, mut mem) = cpu_with_stack(0x1000, &[0x8e, 0xc8], 64);
-        cpu.set_signal_handler(Signal::Segv, 0xdead_beef);
+        cpu.set_signal_handler(Signal::Ill, 0xdead_beef);
         cpu.set_reg(Reg32::Eax, 0x4242); // intentionally NOT the target
         cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.eip, 0xdead_beef);
@@ -710,7 +713,7 @@ mod tests {
         cpu.set_reg(Reg32::Eax, 0x4242);
         assert_eq!(
             cpu.step(&mut mem, &mut PanicHost).unwrap_err(),
-            Fault::SignalHandlerUnregistered(Signal::Segv as u32),
+            Fault::SignalHandlerUnregistered(Signal::Ill as u32),
         );
     }
 
