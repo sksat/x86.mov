@@ -43,9 +43,24 @@ FRESH="$TMP/results.md"
 # Regenerate into a temp file (no committed-file mutation).
 RESULTS_OUT="$FRESH" "$HERE/run.sh" "$@" >/dev/null
 
-# Strip the intentionally-volatile lines from both before comparing.
+# Strip the intentionally-volatile pieces from both before comparing:
+#
+#   - The "Generated ..." preamble (timestamp).
+#   - The "wall-clock runtime (hyperfine mean)" row (host-dependent).
+#   - The movfuscator column on every data row. This is external
+#     reference data — the precise number depends on the host's gas/ld
+#     minor version (e.g. Debian 13 vs ubuntu-24.04 ld give 10221108
+#     vs 10221148 for the same return42 fixture, a 40-byte difference
+#     that isn't anything llvm-mov did). We DO care about the
+#     llvm-mov column, which our backend fully controls.
+#
+# The sed picks out 4-piped table rows (`| col1 | col2 | col3 |`) and
+# replaces col3 (the movfuscator value) with `<movfuscator>`. Header
+# and separator rows get the same treatment, so before/after still
+# match exactly when only movfuscator drifts.
 strip_volatile() {
-    grep -vE '^Generated [0-9]|^\| wall-clock runtime' "$1"
+    grep -vE '^Generated [0-9]|^\| wall-clock runtime' "$1" \
+        | sed -E 's/^(\|[^|]*\|[^|]*\|)[^|]*\|$/\1 <movfuscator> |/'
 }
 
 diff_out="$(diff -u \

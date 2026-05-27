@@ -253,12 +253,15 @@ for name in "${FIXTURE_NAMES[@]}"; do
             printf '| total ELF (bytes) | %s | %s |\n' \
                 "$(printf '%d' "$lm_total")" "$(printf '%d' "$mf_total")"
 
-            lm_text=$(section_size "$lm_elf" "\\.text")
-            mf_text=$(section_size "$mf_elf" "\\.text")
+            # Patterns use `[.]` for the leading literal dot rather than
+            # `\.` to keep mawk/gawk quiet (gawk warns "escape sequence
+            # \. treated as plain ." for the latter shape).
+            lm_text=$(section_size "$lm_elf" "[.]text")
+            mf_text=$(section_size "$mf_elf" "[.]text")
             printf '| .text size | %s | %s |\n' "${lm_text:-0}" "${mf_text:-0}"
 
-            lm_rodata=$(section_size "$lm_elf" "\\.rodata")
-            mf_rodata=$(section_size "$mf_elf" "\\.rodata")
+            lm_rodata=$(section_size "$lm_elf" "[.]rodata")
+            mf_rodata=$(section_size "$mf_elf" "[.]rodata")
             printf '| .rodata size | %s | %s |\n' "${lm_rodata:-0}" "${mf_rodata:-0}"
 
             read -r lm_movs lm_tot lm_ratio <<<"$(count_mov_ratio "$lm_elf")"
