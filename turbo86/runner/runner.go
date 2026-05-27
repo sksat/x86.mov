@@ -143,7 +143,6 @@ func memfdCreate(name string, flags uint) (int, error) {
 	return int(r0), nil
 }
 
-
 // protoRegs copies the GP + control fields from the kernel reg layout
 // to the wire-protocol Regs (the canonical migration schema).
 func protoRegs(r *regs32) proto.Regs {
