@@ -62,6 +62,7 @@ Empirical scope check via `nm -u movfuscator-wasm/tests/goldens-o/return42.o` (t
 - **Loader produces a Linux-style startup image.** `flatten_with_stack` writes `argc=0, argv=NULL, envp=NULL, auxv=NULL` at the top of the stack region and points `%esp` at `argc`. Without this, the first thing real crt0 does (`mov esp, [esp+0]`) faulted at the top-of-region boundary.
 - **`mov cs, ax` is modelled as a stand-in for the SIGSEGV-trampoline dispatch trick** (`Insn::MovfuscatorDispatchJump`): the placeholder semantic is "jump to the full 32-bit value of the source register's parent". This is **wrong in the general case** — see the next-PR section.
 - **Env-var-gated instruction trace.** Set `MOVIE86_TRACE=1` to dump `eip eax ebx ecx edx esp` before each `step`. Cheap (only branch in the loop), invaluable for debugging where a real binary diverges.
+- **Debugger CLI flags.** `movie86 --trace --break-at HEX --max-steps N --watch HEX <elf>` gives focused debug tooling for the bring-up work: trace, address breakpoint, instruction-count limit, and memory watchpoints (sampled per step, so any write — `mov`, syscall, self-modifying-code — is reported). The exposed `run_elf_with_debug(bytes, host, DebugConfig)` lets tests use the same machinery.
 
 ### Where the follow-up picks up
 
@@ -83,10 +84,18 @@ So "what `mov cs, ax` does" depends on which handler was registered via `sigacti
 
 `dispatch` itself is `mov esp, [sp]; jmp [external]`. It runs end-to-end in movie86 but jumps to `mem[external]` which is `0` at process start — the runtime is supposed to self-modify `external` to the resume-target before each dispatch, and that's the part the follow-up needs.
 
-**Open question for the next PR:** what's the exact mechanism by which `external` gets the right value? Two leading hypotheses:
+**Open question for the next PR:** what's the exact mechanism by which `external` gets the right value?
 
-1. Runtime writes the desired resume-target to `external` via a regular `mov` *before* the `mov cs, ax`. We'd see this in the trace if it's the case — look for `mov [external_addr], imm32` or similar shortly before each dispatch.
-2. movfuscator's SIGSEGV handler is *not* the bare `dispatch` we see in `.plt`. It might be a richer C function (in something I haven't located) that reads `ucontext` to recover the faulting `eax` and writes it to `external`. That would mean the `sa_dispatch.long dispatch` we see in `movfuscator.c` is just the dispatch *body*, not the full handler.
+**Confirmed by the new debug tooling (`movie86 --watch <addr>`):** `external` (`0x08686194` in our test build) is **never written** during the entire run. Hypothesis 1 ("runtime self-modifies `external` before each dispatch") is dead.
+
+Also confirmed by `--break-at`:
+- main starts running at step 102 (entry → crt0 → main).
+- `mov cs, ax` at `0x08049d6e` fires at step 625. That address sits **inside main's body** (it ends at `0x08049d68` per objdump; the dispatch is 6 bytes past the end). So this dispatch is main's exit / return mechanism, not a libc-call trampoline.
+
+That makes hypothesis 2 (a richer C SIGSEGV handler that reads `ucontext` to recover EAX and stuff it into `external`) the leading remaining candidate — but movfuscator's `sigaction` call uses `SA_NODEFER` and a `void(int)` handler signature, so the bare `dispatch` we see can't access `ucontext`. There's something else going on, possibly:
+- A different signal handler than the one we identified (maybe a wrapping libc function).
+- A layout trick where `external` is the same address as some other heavily-written symbol — though `nm` says no.
+- The whole site is a deliberate "kill the process" pattern that real Linux turns into program termination, expecting the kernel's default SIGSEGV behavior to fire.
 
 Tooling needed to dig in: `cd movfuscator-wasm && make setup && make build-native` to materialize the runtime objects (gitignored under `vendor/movfuscator/build/`).
 

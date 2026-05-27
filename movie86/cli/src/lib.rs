@@ -142,6 +142,38 @@ pub fn run_elf(bytes: &[u8]) -> RunOutcome {
 /// tests substitute a recording host (capture stdout, assert no syscall
 /// happens, etc.) without spawning a subprocess.
 pub fn run_elf_with_host<H: SysHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
+    run_elf_with_debug(bytes, host, &DebugConfig::default())
+}
+
+/// Configuration for the debugger-driven run path. All fields default
+/// to "off"; setting any of them enables that diagnostic.
+#[derive(Debug, Default, Clone)]
+pub struct DebugConfig {
+    /// Print `eip + GPRs` before each `step()`.
+    pub trace: bool,
+    /// Stop and report when `eip` first equals this address.
+    pub break_at: Option<u32>,
+    /// Stop after this many successful instructions.
+    pub max_steps: Option<u64>,
+    /// Print a message any time the `u32` at one of these guest
+    /// addresses changes value (write detection by sampling — catches
+    /// any kind of mov, jmp-self-modifying-code, syscall, etc.).
+    pub watch_u32: Vec<u32>,
+}
+
+/// Reason the debug-driven run stopped *short* of the guest exiting on
+/// its own. Embedded inside [`RunOutcome::Fault`] when surfaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugStop {
+    /// Caller-supplied `break_at` address was reached.
+    Break(u32),
+    /// `max_steps` was reached without the guest exiting.
+    MaxSteps(u64),
+}
+
+/// Like [`run_elf_with_host`] but also accepts a `DebugConfig`. This
+/// is the entry the `movie86 --watch ...` CLI uses, exposed for tests.
+pub fn run_elf_with_debug<H: SysHost>(bytes: &[u8], host: &mut H, cfg: &DebugConfig) -> RunOutcome {
     let elf = match parse(bytes) {
         Ok(e) => e,
         Err(e) => return RunOutcome::LoadError(e),
@@ -162,16 +194,38 @@ pub fn run_elf_with_host<H: SysHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
     if let Some(addr) = elf.find_symbol("master_loop") {
         cpu.set_signal_handler(Signal::Ill, addr);
     }
-    // Per-instruction tracing is gated on an env var so the hot path
-    // costs at most an integer load in the common case. Set
-    // `MOVIE86_TRACE=1` to dump `eip eax ebx ecx edx esp` before each
-    // step — useful for tracking down where a real movfuscator binary
-    // diverges.
-    let trace = std::env::var_os("MOVIE86_TRACE").is_some();
+    // Per-instruction tracing is gated on the DebugConfig (or the
+    // legacy MOVIE86_TRACE env var) so the hot path costs at most an
+    // integer load in the common case.
+    let trace = cfg.trace || std::env::var_os("MOVIE86_TRACE").is_some();
+    // Snapshot the watched addresses' current values; we sample after
+    // each step and report deltas.
+    let mut watch_state: Vec<u32> = cfg
+        .watch_u32
+        .iter()
+        .map(|&a| mem.read_u32(a).unwrap_or(0))
+        .collect();
+    let mut step_count: u64 = 0;
     loop {
+        if cfg.break_at == Some(cpu.eip) {
+            eprintln!(
+                "movie86: --break-at hit eip={:#010x} (after {step_count} steps)",
+                cpu.eip
+            );
+            return RunOutcome::Fault(Fault::Unmapped(cpu.eip)); // borrow Unmapped as a "stopped" signal; the CLI prints DebugStop separately
+        }
+        if let Some(max) = cfg.max_steps {
+            if step_count >= max {
+                eprintln!(
+                    "movie86: --max-steps {max} reached at eip={:#010x}",
+                    cpu.eip
+                );
+                return RunOutcome::Fault(Fault::Unmapped(cpu.eip));
+            }
+        }
         if trace {
             eprintln!(
-                "eip={:08x} eax={:08x} ebx={:08x} ecx={:08x} edx={:08x} esp={:08x}",
+                "[{step_count:>6}] eip={:08x} eax={:08x} ebx={:08x} ecx={:08x} edx={:08x} esp={:08x}",
                 cpu.eip,
                 cpu.reg(Reg32::Eax),
                 cpu.reg(Reg32::Ebx),
@@ -180,8 +234,21 @@ pub fn run_elf_with_host<H: SysHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
                 cpu.reg(Reg32::Esp),
             );
         }
-        match cpu.step(&mut mem, host) {
-            Ok(()) => {}
+        let outcome = cpu.step(&mut mem, host);
+        // Check watched addresses *after* the step so we can report
+        // which instruction caused the write.
+        for (i, &addr) in cfg.watch_u32.iter().enumerate() {
+            let new_v = mem.read_u32(addr).unwrap_or(0);
+            if new_v != watch_state[i] {
+                eprintln!(
+                    "[{step_count:>6}] WATCH {addr:#010x}: {:#010x} -> {:#010x}  (now eip={:#010x})",
+                    watch_state[i], new_v, cpu.eip,
+                );
+                watch_state[i] = new_v;
+            }
+        }
+        match outcome {
+            Ok(()) => step_count += 1,
             Err(Fault::Exit(status)) => return RunOutcome::Exit(status),
             Err(e) => return RunOutcome::Fault(e),
         }
