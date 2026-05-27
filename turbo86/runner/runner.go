@@ -15,6 +15,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -147,14 +149,6 @@ func ptraceSysEmuStep(pid int) error {
 	return nil
 }
 
-// setupFunc runs once the child stub has reached its self-SIGSTOP and
-// /proc/PID/mem is open. It writes any initial guest memory and mutates
-// regs in place; the runner then writes regs back and enters the
-// syscall loop. Used to vary "what to load before running" between the
-// fresh-start path (RunOnce) and the engine-migration path
-// (RunWithContext).
-type setupFunc func(mem *procMem, regs *regs32) error
-
 // protoRegs copies the GP + control fields from the kernel reg layout
 // to the wire-protocol Regs (the canonical migration schema).
 func protoRegs(r *regs32) proto.Regs {
@@ -234,6 +228,11 @@ func allZero(b []byte) bool {
 
 // RunOnce executes a single guest session starting fresh.
 //
+// Convenience wrapper around the long-lived Runner for the common case:
+// no streaming, all code known up front. New code arriving while the
+// guest is executing — the streaming use case — needs the Runner API
+// directly (see New/WriteCode/Run).
+//
 // `code` maps guest virtual addresses → bytes to write into the guest's
 // RWX region before execution begins. `entry` is the initial EIP;
 // `stackTop` is the initial ESP.
@@ -246,169 +245,313 @@ func RunOnce(
 	entry uint32,
 	stackTop uint32,
 ) ([]proto.Outbound, error) {
-	return runWithStub(stubBytes, func(mem *procMem, regs *regs32) error {
-		for addr, data := range code {
-			if err := mem.WriteAt(addr, data); err != nil {
-				return fmt.Errorf("write %d bytes at 0x%x: %w", len(data), addr, err)
-			}
+	r, err := New(stubBytes)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	for addr, data := range code {
+		if err := r.WriteCode(addr, data); err != nil {
+			return nil, err
 		}
-		regs.Eip = entry
-		regs.Esp = stackTop
-		return nil
-	})
+	}
+	return collectEvents(r.Run(entry, stackTop))
 }
 
 // RunWithContext resumes a guest session from a Context handed off by
-// another engine (e.g., movie86). Writes ctx.Regions into guest memory
-// and sets the full register file from ctx.Regs (Eax..Edi, Esp, Eip,
-// Eflags), then executes through the same syscall-bridge loop.
+// another engine (e.g., movie86). Convenience wrapper for the no-
+// streaming case; see RunWithContextStreaming on Runner for the
+// post-Resume Code-streaming variant.
 //
 // Same LockOSThread requirement as RunOnce.
 func RunWithContext(stubBytes []byte, ctx proto.Context) ([]proto.Outbound, error) {
-	return runWithStub(stubBytes, func(mem *procMem, regs *regs32) error {
-		for _, r := range ctx.Regions {
-			if err := mem.WriteAt(r.Addr, r.Bytes); err != nil {
-				return fmt.Errorf("write region %d bytes at 0x%x: %w", len(r.Bytes), r.Addr, err)
-			}
-		}
-		regs.Eax = ctx.Regs.Eax
-		regs.Ebx = ctx.Regs.Ebx
-		regs.Ecx = ctx.Regs.Ecx
-		regs.Edx = ctx.Regs.Edx
-		regs.Esi = ctx.Regs.Esi
-		regs.Edi = ctx.Regs.Edi
-		regs.Ebp = ctx.Regs.Ebp
-		regs.Esp = ctx.Regs.Esp
-		regs.Eip = ctx.Regs.Eip
-		regs.Eflags = ctx.Regs.Eflags
-		return nil
-	})
+	r, err := New(stubBytes)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return collectEvents(r.RunWithContext(ctx))
 }
 
-// runWithStub holds the boilerplate shared between RunOnce and
-// RunWithContext: spawn the stub, drive it to its self-SIGSTOP, open
-// /proc/PID/mem, invoke setup, then run the syscall-bridge loop until
-// Exit or Fault.
-func runWithStub(stubBytes []byte, setup setupFunc) ([]proto.Outbound, error) {
+// Runner is a long-lived guest session, driven by an internal "tracer"
+// goroutine pinned to one OS thread. The lifecycle is:
+//
+//  1. New(stubBytes) spawns the stub, attaches via ptrace, drives it to
+//     its self-SIGSTOP, opens /proc/PID/mem. After this the child is
+//     stopped, regs / memory writable, ready for setup.
+//  2. WriteCode(offset, bytes) writes guest memory directly via the
+//     /proc fd — does NOT involve ptrace, so it's safe to call from
+//     any goroutine, before OR after Run. Streaming use case: the
+//     frontend keeps sending Code messages after Run kicks off; each
+//     one just writes into the (still-mapped) RWX region.
+//  3. Run(entry, stackTop) / RunWithContext(ctx) sets EIP/ESP and
+//     enters the syscall-bridge loop. Returns a channel that streams
+//     Outbound events; the channel is closed when the session ends.
+//     Calling Run/RunWithContext is one-shot per Runner.
+//  4. Close() kills the child and reaps it.
+//
+// Concurrency: WriteCode is goroutine-safe. Run/RunWithContext and
+// Close are intended to be called from the orchestrating goroutine
+// (typically the WS handler); calling Run twice or after Close is
+// a programmer error.
+type Runner struct {
+	cmd *exec.Cmd
+	pid int
+	mem *procMem
+
+	startCh   chan startMsg
+	eventsCh  chan proto.Outbound
+	closeCh   chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+type startMsg struct {
+	withCtx  bool
+	entry    uint32
+	stackTop uint32
+	ctx      proto.Context
+}
+
+// New spawns the stub and drives it to its self-SIGSTOP. The internal
+// tracer goroutine is OS-thread-locked for the lifetime of the Runner.
+// Returns once the child is paused and /proc/PID/mem is open; callers
+// may then WriteCode at will and eventually call Run / RunWithContext.
+func New(stubBytes []byte) (*Runner, error) {
+	r := &Runner{
+		startCh:  make(chan startMsg, 1),
+		eventsCh: make(chan proto.Outbound, 16),
+		closeCh:  make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+
+	bootErr := make(chan error, 1)
+	go r.tracerLoop(stubBytes, bootErr)
+	if err := <-bootErr; err != nil {
+		<-r.done // ensure tracer goroutine cleanup ran
+		return nil, err
+	}
+	return r, nil
+}
+
+// WriteCode writes `data` at guest virtual address `offset`. Safe from
+// any goroutine. After Run begins, writes are *not* synchronized with
+// guest execution — callers must arrange that they only write to
+// pages the guest isn't currently executing / reading.
+func (r *Runner) WriteCode(offset uint32, data []byte) error {
+	return r.mem.WriteAt(offset, data)
+}
+
+// Run sets EIP=entry / ESP=stackTop and enters the syscall-bridge loop.
+// Returns a channel that streams Outbound events in order; the channel
+// closes when the session ends (Exit / Paused / Fault).
+//
+// One-shot per Runner: do not call Run or RunWithContext more than once.
+func (r *Runner) Run(entry, stackTop uint32) <-chan proto.Outbound {
+	r.startCh <- startMsg{entry: entry, stackTop: stackTop}
+	return r.eventsCh
+}
+
+// RunWithContext writes ctx.Regions into guest memory, sets the full
+// reg file from ctx.Regs, then enters the syscall-bridge loop. Same
+// channel semantics as Run.
+func (r *Runner) RunWithContext(ctx proto.Context) <-chan proto.Outbound {
+	r.startCh <- startMsg{withCtx: true, ctx: ctx}
+	return r.eventsCh
+}
+
+// Close signals shutdown and waits for the tracer goroutine to finish.
+// Idempotent. Safe to call from any goroutine.
+//
+// All cleanup (kill child, reap, close mem fd, close events channel)
+// happens inside the tracer goroutine's defer; Close just signals it
+// and blocks on r.done.
+func (r *Runner) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.closeCh)
+		// Kicking the child wakes the tracer's wait4 so it can clean up.
+		if r.cmd != nil && r.cmd.Process != nil {
+			_ = r.cmd.Process.Kill()
+		}
+	})
+	<-r.done
+	return nil
+}
+
+// tracerLoop owns the OS thread that did exec.Cmd.Start. All ptrace
+// ops live here. The lifecycle is: bootstrap → wait for start command
+// → apply setup → run syscall loop → close events channel.
+func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
+	runtime.LockOSThread()
+	// Intentionally not unlocked: the thread is destroyed when the
+	// goroutine returns, which is exactly the cleanup we want.
+
+	// Single defer covers all exit paths (bootstrap failure, pre-Run
+	// close, post-Run close, natural session end).
+	defer func() {
+		if r.cmd != nil && r.cmd.Process != nil {
+			_ = r.cmd.Process.Kill() // no-op if already dead
+			var ws syscall.WaitStatus
+			_, _ = syscall.Wait4(r.pid, &ws, 0, nil) // reap
+		}
+		if r.mem != nil {
+			_ = r.mem.f.Close()
+		}
+		close(r.eventsCh)
+		close(r.done)
+	}()
+
+	if err := r.bootstrap(stubBytes); err != nil {
+		bootErr <- err
+		return
+	}
+	bootErr <- nil
+
+	// Wait for the run command, or for Close to cancel us.
+	var msg startMsg
+	select {
+	case msg = <-r.startCh:
+	case <-r.closeCh:
+		return
+	}
+
+	// Apply setup (memory + regs) from the start command.
+	var regs regs32
+	if err := ptraceGetRegs32(r.pid, &regs); err != nil {
+		r.emitFault(fmt.Sprintf("get i386 regs (init): %v", err))
+		return
+	}
+	if msg.withCtx {
+		for _, region := range msg.ctx.Regions {
+			if err := r.mem.WriteAt(region.Addr, region.Bytes); err != nil {
+				r.emitFault(fmt.Sprintf("write context region 0x%x: %v", region.Addr, err))
+				return
+			}
+		}
+		regs.Eax = msg.ctx.Regs.Eax
+		regs.Ebx = msg.ctx.Regs.Ebx
+		regs.Ecx = msg.ctx.Regs.Ecx
+		regs.Edx = msg.ctx.Regs.Edx
+		regs.Esi = msg.ctx.Regs.Esi
+		regs.Edi = msg.ctx.Regs.Edi
+		regs.Ebp = msg.ctx.Regs.Ebp
+		regs.Esp = msg.ctx.Regs.Esp
+		regs.Eip = msg.ctx.Regs.Eip
+		regs.Eflags = msg.ctx.Regs.Eflags
+	} else {
+		regs.Eip = msg.entry
+		regs.Esp = msg.stackTop
+	}
+	if err := ptraceSetRegs32(r.pid, &regs); err != nil {
+		r.emitFault(fmt.Sprintf("set i386 regs (init): %v", err))
+		return
+	}
+
+	r.syscallLoop(&regs)
+}
+
+func (r *Runner) bootstrap(stubBytes []byte) error {
 	// Stage the stub in a memfd and execve it via /proc/self/fd/N.
 	const mfdCloexec = 1
 	fd, err := memfdCreate("turbo86-stub", mfdCloexec)
 	if err != nil {
-		return nil, fmt.Errorf("memfd_create: %w", err)
+		return fmt.Errorf("memfd_create: %w", err)
 	}
 	if _, err := syscall.Write(fd, stubBytes); err != nil {
 		_ = syscall.Close(fd)
-		return nil, fmt.Errorf("write stub to memfd: %w", err)
+		return fmt.Errorf("write stub to memfd: %w", err)
 	}
 
 	cmd := exec.Command(fmt.Sprintf("/proc/self/fd/%d", fd))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
 	if err := cmd.Start(); err != nil {
 		_ = syscall.Close(fd)
-		return nil, fmt.Errorf("exec stub: %w", err)
+		return fmt.Errorf("exec stub: %w", err)
 	}
 	_ = syscall.Close(fd)
-	pid := cmd.Process.Pid
+	r.cmd = cmd
+	r.pid = cmd.Process.Pid
 
-	// Best-effort cleanup. Kill on an already-dead process is harmless.
-	defer func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	}()
-
-	// Initial stop: Go's Ptrace=true makes the child PTRACE_TRACEME then
-	// execve, and the kernel stops it at execve.
+	// Initial stop: Go's Ptrace=true makes the child PTRACE_TRACEME
+	// then execve, and the kernel stops it at execve.
 	var ws syscall.WaitStatus
-	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
-		return nil, fmt.Errorf("wait initial execve stop: %w", err)
+	if _, err := syscall.Wait4(r.pid, &ws, 0, nil); err != nil {
+		return fmt.Errorf("wait initial execve stop: %w", err)
 	}
 	if !ws.Stopped() {
-		return nil, fmt.Errorf("expected initial execve stop, got status %v", ws)
+		return fmt.Errorf("expected initial execve stop, got status %v", ws)
 	}
-	if err := syscall.PtraceSetOptions(pid, syscall.PTRACE_O_TRACESYSGOOD); err != nil {
-		return nil, fmt.Errorf("set TRACESYSGOOD: %w", err)
+	if err := syscall.PtraceSetOptions(r.pid, syscall.PTRACE_O_TRACESYSGOOD); err != nil {
+		return fmt.Errorf("set TRACESYSGOOD: %w", err)
 	}
 
 	// Let the stub run its setup (mmap RWX region + stack, then
 	// kill(self, SIGSTOP)). Wait for the SIGSTOP.
-	if err := syscall.PtraceCont(pid, 0); err != nil {
-		return nil, fmt.Errorf("cont (stub setup): %w", err)
+	if err := syscall.PtraceCont(r.pid, 0); err != nil {
+		return fmt.Errorf("cont (stub setup): %w", err)
 	}
-	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
-		return nil, fmt.Errorf("wait stub SIGSTOP: %w", err)
+	if _, err := syscall.Wait4(r.pid, &ws, 0, nil); err != nil {
+		return fmt.Errorf("wait stub SIGSTOP: %w", err)
 	}
 	if !ws.Stopped() || ws.StopSignal() != syscall.SIGSTOP {
-		return nil, fmt.Errorf("expected stub SIGSTOP, got status %v", ws)
+		return fmt.Errorf("expected stub SIGSTOP, got status %v", ws)
 	}
 
-	// Open /proc/PID/mem for fast bulk memory I/O.
-	memFile, err := os.OpenFile(fmt.Sprintf("/proc/%d/mem", pid), os.O_RDWR, 0)
+	memFile, err := os.OpenFile(fmt.Sprintf("/proc/%d/mem", r.pid), os.O_RDWR, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open /proc/%d/mem: %w", pid, err)
+		return fmt.Errorf("open /proc/%d/mem: %w", r.pid, err)
 	}
-	defer memFile.Close()
-	mem := &procMem{f: memFile}
+	r.mem = &procMem{f: memFile}
+	return nil
+}
 
-	// Snapshot current regs (so setup can preserve fields it doesn't
-	// touch — e.g., CS/SS that the stub already established).
-	var regs regs32
-	if err := ptraceGetRegs32(pid, &regs); err != nil {
-		return nil, fmt.Errorf("get i386 regs (init): %w", err)
-	}
-	if err := setup(mem, &regs); err != nil {
-		return nil, fmt.Errorf("setup: %w", err)
-	}
-	if err := ptraceSetRegs32(pid, &regs); err != nil {
-		return nil, fmt.Errorf("set i386 regs (init): %w", err)
-	}
+func (r *Runner) emitFault(reason string) {
+	r.eventsCh <- proto.Fault{Reason: reason}
+}
 
-	// Syscall loop: PTRACE_SYSEMU stops the child *before* each syscall.
-	// We translate via bridge.HandleSyscall, set rax to the synthetic
-	// return value, and resume.
-	var events []proto.Outbound
+func (r *Runner) syscallLoop(regs *regs32) {
+	var ws syscall.WaitStatus
 	for {
-		if err := ptraceSysEmuStep(pid); err != nil {
-			return events, fmt.Errorf("PTRACE_SYSEMU: %w", err)
+		if err := ptraceSysEmuStep(r.pid); err != nil {
+			r.emitFault(fmt.Sprintf("PTRACE_SYSEMU: %v", err))
+			return
 		}
-		if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
-			return events, fmt.Errorf("wait syscall stop: %w", err)
+		if _, err := syscall.Wait4(r.pid, &ws, 0, nil); err != nil {
+			r.emitFault(fmt.Sprintf("wait syscall stop: %v", err))
+			return
 		}
 		if ws.Exited() {
-			events = append(events, proto.Fault{
-				Reason: fmt.Sprintf("child exited unexpectedly (status %d)", ws.ExitStatus()),
-			})
-			return events, nil
+			r.emitFault(fmt.Sprintf("child exited unexpectedly (status %d)", ws.ExitStatus()))
+			return
 		}
 		if !ws.Stopped() {
-			events = append(events, proto.Fault{
-				Reason: fmt.Sprintf("unexpected wait status %v", ws),
-			})
-			return events, nil
+			r.emitFault(fmt.Sprintf("unexpected wait status %v", ws))
+			return
 		}
 		if sig := ws.StopSignal(); sig != syscallTrap {
 			// SIGSEGV / SIGILL / ... — a recoverable stop boundary the
-			// runner doesn't model natively. Surface as Paused with the
-			// current regs + a sparse memory snapshot so a peer engine
-			// (movie86, with its modeled signal-handler dispatch) can
-			// pick the session up via LoadContext.
-			if err := ptraceGetRegs32(pid, &regs); err != nil {
-				return events, fmt.Errorf("get i386 regs (signal stop): %w", err)
+			// runner doesn't model natively. Surface as Paused.
+			if err := ptraceGetRegs32(r.pid, regs); err != nil {
+				r.emitFault(fmt.Sprintf("get i386 regs (signal stop): %v", err))
+				return
 			}
-			regions, err := snapshotMemory(mem)
+			regions, err := snapshotMemory(r.mem)
 			if err != nil {
-				return events, fmt.Errorf("memory snapshot at pause: %w", err)
+				r.emitFault(fmt.Sprintf("memory snapshot at pause: %v", err))
+				return
 			}
-			events = append(events, proto.Paused{
-				Regs:    protoRegs(&regs),
+			r.eventsCh <- proto.Paused{
+				Regs:    protoRegs(regs),
 				Regions: regions,
 				Signal:  uint8(sig),
 				Reason:  fmt.Sprintf("guest received signal %d", sig),
-			})
-			return events, nil
+			}
+			return
 		}
 
-		if err := ptraceGetRegs32(pid, &regs); err != nil {
-			return events, fmt.Errorf("get i386 regs (syscall stop): %w", err)
+		if err := ptraceGetRegs32(r.pid, regs); err != nil {
+			r.emitFault(fmt.Sprintf("get i386 regs (syscall stop): %v", err))
+			return
 		}
 		args := bridge.SyscallArgs{
 			Eax: regs.OrigEax,
@@ -419,19 +562,31 @@ func runWithStub(stubBytes []byte, setup setupFunc) ([]proto.Outbound, error) {
 			Edi: regs.Edi,
 			Ebp: regs.Ebp,
 		}
-		result, brErr := bridge.HandleSyscall(args, mem)
-		events = append(events, result.Event)
+		result, brErr := bridge.HandleSyscall(args, r.mem)
+		r.eventsCh <- result.Event
 		if brErr != nil {
-			return events, brErr
+			return
 		}
 		switch result.Action {
 		case bridge.ActionExit, bridge.ActionFault:
-			return events, nil
+			return
 		case bridge.ActionResume:
 			regs.Eax = result.Return
-			if err := ptraceSetRegs32(pid, &regs); err != nil {
-				return events, fmt.Errorf("set i386 regs (return value): %w", err)
+			if err := ptraceSetRegs32(r.pid, regs); err != nil {
+				r.emitFault(fmt.Sprintf("set i386 regs (return value): %v", err))
+				return
 			}
 		}
 	}
+}
+
+// collectEvents drains an events channel into an ordered slice. The
+// channel must be closed for this to return. Used by the convenience
+// wrappers RunOnce and RunWithContext.
+func collectEvents(events <-chan proto.Outbound) ([]proto.Outbound, error) {
+	var out []proto.Outbound
+	for ev := range events {
+		out = append(out, ev)
+	}
+	return out, nil
 }
