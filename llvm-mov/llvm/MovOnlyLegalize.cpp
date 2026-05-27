@@ -105,24 +105,70 @@ public:
       for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
         switch (MI.getOpcode()) {
         case Mov::ADD32ri:
+          // opt 3 — `add reg, 0` is a no-op; erase the MI to avoid
+          // paying ~51 movs for nothing. LLVM IR optimisations usually
+          // fold this away, but defensive code can leave it.
+          if (MI.getOperand(2).getImm() == 0) {
+            MI.eraseFromParent();
+            Changed = true;
+            break;
+          }
           Changed |= legalizeADD32ri(MI, MBB, TII);
           break;
         case Mov::ADD32rr:
           Changed |= legalizeADD32rr(MI, MBB, TII);
           break;
         case Mov::AND32ri:
+          // opt 3 — `and reg, 0` zeroes Dst; `and reg, ~0` is a no-op.
+          if (MI.getOperand(2).getImm() == 0) {
+            BuildMI(MBB, MachineBasicBlock::iterator(&MI),
+                    MI.getDebugLoc(), TII.get(Mov::MOV32ri),
+                    MI.getOperand(0).getReg())
+                .addImm(0);
+            MI.eraseFromParent();
+            Changed = true;
+            break;
+          }
+          if (static_cast<uint32_t>(MI.getOperand(2).getImm()) == 0xFFFFFFFFu) {
+            MI.eraseFromParent();
+            Changed = true;
+            break;
+          }
           Changed |= legalizeBitwise32ri(MI, MBB, TII, "__mov_and8_table");
           break;
         case Mov::AND32rr:
           Changed |= legalizeBitwise32rr(MI, MBB, TII, "__mov_and8_table");
           break;
         case Mov::OR32ri:
+          // opt 3 — `or reg, 0` is a no-op; `or reg, ~0` sets Dst to ~0.
+          if (MI.getOperand(2).getImm() == 0) {
+            MI.eraseFromParent();
+            Changed = true;
+            break;
+          }
+          if (static_cast<uint32_t>(MI.getOperand(2).getImm()) == 0xFFFFFFFFu) {
+            BuildMI(MBB, MachineBasicBlock::iterator(&MI),
+                    MI.getDebugLoc(), TII.get(Mov::MOV32ri),
+                    MI.getOperand(0).getReg())
+                .addImm(-1);
+            MI.eraseFromParent();
+            Changed = true;
+            break;
+          }
           Changed |= legalizeBitwise32ri(MI, MBB, TII, "__mov_or8_table");
           break;
         case Mov::OR32rr:
           Changed |= legalizeBitwise32rr(MI, MBB, TII, "__mov_or8_table");
           break;
         case Mov::XOR32ri:
+          // opt 3 — `xor reg, 0` is a no-op. (`xor reg, ~0` is a
+          // bitwise NOT and would need a separate mov-only sequence;
+          // not folded here.)
+          if (MI.getOperand(2).getImm() == 0) {
+            MI.eraseFromParent();
+            Changed = true;
+            break;
+          }
           Changed |= legalizeBitwise32ri(MI, MBB, TII, "__mov_xor8_table");
           break;
         case Mov::XOR32rr:

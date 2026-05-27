@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-27T23:15:03Z on x86_64 (Linux).
+Generated 2026-05-27T23:16:51Z on x86_64 (Linux).
 
 ## return0
 
@@ -20,7 +20,7 @@ int main(void) { return 0; }
 | .rodata size | 0 | 0 |
 | mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.122 ms | 0.556 ms |
+| wall-clock runtime (hyperfine mean) | 0.144 ms | 0.567 ms |
 
 ## return42
 
@@ -35,7 +35,7 @@ int main(void) { return 42; }
 | .rodata size | 0 | 0 |
 | mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.137 ms | 0.576 ms |
+| wall-clock runtime (hyperfine mean) | 0.139 ms | 0.515 ms |
 
 ## sum10
 
@@ -55,5 +55,5 @@ int main(void) {
 | .rodata size | 262144 | 0 |
 | mov count / total | 103 / 116 (88.8%) | 1225 / 1227 (99.8%) |
 | non-mov mnemonics | `call cmp int jg jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.142 ms | 0.554 ms |
+| wall-clock runtime (hyperfine mean) | 0.175 ms | 0.580 ms |
 
