@@ -50,12 +50,15 @@
 #include "MovMachineFunctionInfo.h"
 #include "MovTargetMachine.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
+#include <optional>
+#include <utility>
 
 using namespace llvm;
 
@@ -122,10 +125,24 @@ private:
   // 39 execution fixtures + Rust example stay green and the
   // test/MovOnly gate stays empty.
 
-  static int getSavedParentSlot(const MachineFunction &MF,
-                                Register ParentReg) {
-    return MF.getInfo<MovMachineFunctionInfo>()->getSavedParentSlot(
-        ParentReg);
+  // Resolve the prep-2c scratch slot reserved for `ParentReg` to its
+  // final EBP-relative (base, disp) form. By the time this pass runs,
+  // PEI has finalised the frame and eliminateFrameIndex has rewritten
+  // every existing FI; the legalize pass cannot use raw FrameIndex
+  // operands (a second eliminateFrameIndex pass doesn't run). Instead,
+  // we read MFI.getObjectOffset on the FI that MovFrameLowering
+  // reserved pre-PEI — for a local (non-fixed) object that is exactly
+  // the EBP-relative offset the eliminateFrameIndex path would have
+  // produced. `std::nullopt` means no slot was reserved for this
+  // ParentReg (legalize must skip the rewrite).
+  static std::optional<std::pair<Register, int64_t>>
+  getSavedParentEbpAddr(const MachineFunction &MF, Register ParentReg) {
+    const auto *MovMFI = MF.getInfo<MovMachineFunctionInfo>();
+    const int FI = MovMFI->getSavedParentSlotFI(ParentReg);
+    if (FI == -1)
+      return std::nullopt;
+    const int64_t Disp = MF.getFrameInfo().getObjectOffset(FI);
+    return std::make_pair(Register(Mov::EBP), Disp);
   }
   bool legalizeADD32(MachineInstr & /*MI*/) const {
     // TODO(stage 7a1, post 7-prep-2): byte-split + carry-chain table

@@ -36,20 +36,24 @@ public:
       const override;
 
   // Stage 7-prep-2c: per-function scratch-slot bookkeeping for
-  // MovOnlyLegalize. `getSavedParentSlot(ParentReg)` returns the
-  // FrameIndex reserved to hold `ParentReg`'s value while the legalize
-  // pass borrows the low byte (e.g. spill ECX, then use CL as a table
-  // index, then reload ECX from the slot). `-1` means "no slot has
-  // been reserved" — the legalize pass is required to either reserve
-  // one (via the FrameLowering hook) or skip the rewrite. Storing the
-  // slot here, rather than recomputing it from MachineFrameInfo on
-  // every query, keeps the rewrite paths short and avoids any
-  // dependence on FI ordering.
-  int getSavedParentSlot(Register ParentReg) const {
+  // MovOnlyLegalize. The producer (MovFrameLowering's
+  // processFunctionBeforeFrameFinalized) reserves a FrameIndex pre-PEI
+  // and stashes it here via `setSavedParentSlotFI`. The consumer
+  // (MovOnlyLegalize at addPreEmitPass) cannot use that raw FI in
+  // MachineInstrs it builds — `eliminateFrameIndex` has already run by
+  // then, so an FI operand would never be resolved and would reach the
+  // AsmPrinter unresolved. The consumer therefore calls
+  // `getSavedParentEbpDisp` (below), which combines the FI lookup with
+  // `MachineFrameInfo::getObjectOffset` to return the final
+  // EBP-relative displacement directly.
+  //
+  // Returns `-1` if no slot was reserved (legalize must skip the
+  // rewrite in that case).
+  int getSavedParentSlotFI(Register ParentReg) const {
     auto It = SavedParentSlots.find(ParentReg);
     return It == SavedParentSlots.end() ? -1 : It->second;
   }
-  void setSavedParentSlot(Register ParentReg, int FI) {
+  void setSavedParentSlotFI(Register ParentReg, int FI) {
     SavedParentSlots[ParentReg] = FI;
   }
 

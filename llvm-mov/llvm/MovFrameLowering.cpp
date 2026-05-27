@@ -118,5 +118,5 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
                                        /*isSpillSlot=*/false,
                                        /*Alloca=*/nullptr,
                                        /*ID=*/0);
-  MovMFI->setSavedParentSlot(Mov::ECX, FI);
+  MovMFI->setSavedParentSlotFI(Mov::ECX, FI);
 }
