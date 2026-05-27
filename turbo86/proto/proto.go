@@ -27,11 +27,31 @@ type Code struct {
 
 func (Code) inboundKind() string { return "code" }
 
+// Mode picks between the two execution policies turbo86 supports.
+//
+//   - "host":  rt_sigaction/rt_sigreturn/rt_sigprocmask pass through to
+//     the kernel; signal stops are forwarded so the guest's kernel-
+//     registered handler runs. Simple, native semantics.
+//   - "trap":  turbo86 owns signal dispatch. rt_sigaction is emulated
+//     (handler address recorded in-runner); signal stops change EIP to
+//     the recorded handler directly; rt_sigreturn restores from the
+//     in-runner saved-regs stack. Migration-parity with movie86.
+//
+// The empty string defaults to "host" — existing protocol callers stay
+// on the original behavior without changes.
+type Mode string
+
+const (
+	ModeHost Mode = "host"
+	ModeTrap Mode = "trap"
+)
+
 // Start sets the guest's initial EIP and ESP and begins execution.
 // Sent after the Code messages that supply the entry-point's code.
 type Start struct {
 	Entry    uint32 `json:"entry"`
 	StackTop uint32 `json:"stack_top"`
+	Mode     Mode   `json:"mode,omitempty"`
 }
 
 func (Start) inboundKind() string { return "start" }
@@ -79,9 +99,11 @@ type Context struct {
 // LoadContext hands a Context to the runner: write each MemRegion into
 // guest memory, set Regs, and continue. Used for engine migration —
 // e.g., the frontend takes a Context out of movie86 and hands it to
-// turbo86 for the hot path.
+// turbo86 for the hot path. Mode picks the execution policy; empty
+// defaults to "host".
 type LoadContext struct {
 	Context Context `json:"context"`
+	Mode    Mode    `json:"mode,omitempty"`
 }
 
 func (LoadContext) inboundKind() string { return "load_context" }

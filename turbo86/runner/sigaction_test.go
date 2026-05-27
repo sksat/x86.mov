@@ -17,8 +17,12 @@ func binaryLittleEndianPut(b []byte, v uint32) {
 }
 
 // TestRunner_SigactionForwardsSIGILLToGuestHandler exercises the full
-// signal-passthrough path:
+// signal-dispatch path. Run twice — once in host mode and once in trap
+// mode — and both must produce the same Exit{99}. This is the migration-
+// parity doctrine: a guest program that triggers a registered signal
+// handler should behave identically under either policy.
 //
+// Host mode:
 //  1. rt_sigaction(SIGILL, &kact, NULL, 8) installs the guest's SIGILL
 //     handler natively in the child via the syscall passthrough path.
 //  2. ud2 raises SIGILL.
@@ -29,9 +33,24 @@ func binaryLittleEndianPut(b []byte, v uint32) {
 //  5. The handler runs `mov eax,1; mov ebx,99; int 0x80` → bridge
 //     emits Exit{99} and the session ends.
 //
-// This proves the movfuscator dispatch pattern (sigaction-registered
-// trap handler invoked by the kernel) actually works on turbo86.
+// Trap mode:
+//  1. rt_sigaction is intercepted by the runner; the handler address
+//     is read out of the userspace struct and recorded in r.handlers.
+//     The actual rt_sigaction syscall is suppressed.
+//  2. ud2 raises SIGILL.
+//  3. The runner looks up handler in r.handlers, saves the pre-signal
+//     regs on r.signalRegs, sets EIP=handler, resumes without
+//     delivering the signal to the kernel.
+//  4. Same handler bytes run, same Exit{99}.
 func TestRunner_SigactionForwardsSIGILLToGuestHandler(t *testing.T) {
+	for _, mode := range []proto.Mode{proto.ModeHost, proto.ModeTrap} {
+		t.Run(string(mode), func(t *testing.T) {
+			runSigactionTest(t, mode)
+		})
+	}
+}
+
+func runSigactionTest(t *testing.T, mode proto.Mode) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -114,10 +133,10 @@ func TestRunner_SigactionForwardsSIGILLToGuestHandler(t *testing.T) {
 		}
 	}
 
-	events := r.Run(entry, 0x701FFFF0)
+	events := r.RunWithMode(entry, 0x701FFFF0, mode)
 	got, _ := collectEvents(events)
 	want := []proto.Outbound{proto.Exit{Code: 99}}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("events:\n  got:  %#v\n  want: %#v", got, want)
+		t.Errorf("events (%s mode):\n  got:  %#v\n  want: %#v", mode, got, want)
 	}
 }

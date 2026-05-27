@@ -298,6 +298,11 @@ type Runner struct {
 	closeCh   chan struct{}
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// Mode-dependent state, populated when the syscall loop starts.
+	mode       proto.Mode        // host (default) or trap
+	handlers   map[uint8]uint32  // signum → handler addr (trap mode only)
+	signalRegs []regs32          // saved regs stack for rt_sigreturn (trap mode only)
 }
 
 type startMsg struct {
@@ -305,6 +310,7 @@ type startMsg struct {
 	entry    uint32
 	stackTop uint32
 	ctx      proto.Context
+	mode     proto.Mode
 }
 
 // New spawns the stub and drives it to its self-SIGSTOP. The internal
@@ -340,21 +346,33 @@ func (r *Runner) WriteCode(offset uint32, data []byte) error {
 	return r.mem.WriteAt(offset, data)
 }
 
-// Run sets EIP=entry / ESP=stackTop and enters the syscall-bridge loop.
-// Returns a channel that streams Outbound events in order; the channel
-// closes when the session ends (Exit / Paused / Fault).
+// Run sets EIP=entry / ESP=stackTop and enters the syscall-bridge loop
+// in the default host mode (kernel handles signal dispatch). Returns a
+// channel that streams Outbound events in order; the channel closes
+// when the session ends (Exit / Paused / Fault).
 //
-// One-shot per Runner: do not call Run or RunWithContext more than once.
+// One-shot per Runner: do not call Run / RunWithContext / *Mode more
+// than once.
 func (r *Runner) Run(entry, stackTop uint32) <-chan proto.Outbound {
-	r.startCh <- startMsg{entry: entry, stackTop: stackTop}
+	return r.RunWithMode(entry, stackTop, proto.ModeHost)
+}
+
+// RunWithMode is Run with explicit mode selection (host / trap).
+func (r *Runner) RunWithMode(entry, stackTop uint32, mode proto.Mode) <-chan proto.Outbound {
+	r.startCh <- startMsg{entry: entry, stackTop: stackTop, mode: mode}
 	return r.eventsCh
 }
 
 // RunWithContext writes ctx.Regions into guest memory, sets the full
-// reg file from ctx.Regs, then enters the syscall-bridge loop. Same
-// channel semantics as Run.
+// reg file from ctx.Regs, then enters the syscall-bridge loop in the
+// default host mode. Same channel semantics as Run.
 func (r *Runner) RunWithContext(ctx proto.Context) <-chan proto.Outbound {
-	r.startCh <- startMsg{withCtx: true, ctx: ctx}
+	return r.RunWithContextAndMode(ctx, proto.ModeHost)
+}
+
+// RunWithContextAndMode is RunWithContext with explicit mode selection.
+func (r *Runner) RunWithContextAndMode(ctx proto.Context, mode proto.Mode) <-chan proto.Outbound {
+	r.startCh <- startMsg{withCtx: true, ctx: ctx, mode: mode}
 	return r.eventsCh
 }
 
@@ -411,6 +429,14 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 	case msg = <-r.startCh:
 	case <-r.closeCh:
 		return
+	}
+
+	r.mode = msg.mode
+	if r.mode == "" {
+		r.mode = proto.ModeHost
+	}
+	if r.mode == proto.ModeTrap {
+		r.handlers = make(map[uint8]uint32)
 	}
 
 	// Apply setup (memory + regs) from the start command.
@@ -625,8 +651,42 @@ func (r *Runner) syscallLoop(regs *regs32) {
 				return
 			}
 			if isForwardableSignal(sig) {
-				// Snapshot the fault state in case the child dies from
-				// this signal (no handler), then forward.
+				// In trap mode the runner owns signal dispatch: look up
+				// the guest-registered handler in r.handlers, save the
+				// pre-signal regs on r.signalRegs for a future
+				// rt_sigreturn, and redirect EIP into the handler. The
+				// signal is NOT delivered to the kernel (nextSignal=0)
+				// — turbo86 just edits the child's state directly.
+				if r.mode == proto.ModeTrap {
+					if handlerAddr, ok := r.handlers[uint8(sig)]; ok {
+						if err := ptraceGetRegs32(r.pid, regs); err != nil {
+							r.emitFault(fmt.Sprintf("get regs (trap signal): %v", err))
+							return
+						}
+						r.signalRegs = append(r.signalRegs, *regs)
+						regs.Eip = handlerAddr
+						if err := ptraceSetRegs32(r.pid, regs); err != nil {
+							r.emitFault(fmt.Sprintf("set regs (trap signal): %v", err))
+							return
+						}
+						continue
+					}
+					// No registered handler in trap mode → fall through
+					// to Paused with the snapshot.
+					snap, err := r.capturePausedSnapshot(sig)
+					if err != nil {
+						r.emitFault(fmt.Sprintf("snapshot at unhandled trap-mode signal: %v", err))
+						return
+					}
+					r.eventsCh <- proto.Paused{
+						Regs:    snap.regs,
+						Regions: snap.regions,
+						Signal:  snap.signal,
+						Reason:  fmt.Sprintf("trap-mode: no handler for signal %d", sig),
+					}
+					return
+				}
+				// Host mode: snapshot then forward to kernel.
 				snap, err := r.capturePausedSnapshot(sig)
 				if err != nil {
 					r.emitFault(fmt.Sprintf("snapshot at signal forward: %v", err))
@@ -675,6 +735,28 @@ func (r *Runner) syscallLoop(regs *regs32) {
 			r.emitFault(fmt.Sprintf("get i386 regs (entry stop): %v", err))
 			return
 		}
+
+		// In trap mode, the runner intercepts the signal-disposition
+		// syscalls itself (instead of letting the bridge passthrough
+		// to the kernel) so guest signal handling stays entirely
+		// inside turbo86 — matching movie86's software-modeled signal
+		// semantics for migration parity.
+		if r.mode == proto.ModeTrap {
+			if handled, retVal, err := r.handleTrapModeSyscall(regs); handled {
+				if err != nil {
+					r.emitFault(fmt.Sprintf("trap-mode syscall %d: %v", regs.OrigEax, err))
+					return
+				}
+				regs.OrigEax = suppressedSyscall
+				if err := ptraceSetRegs32(r.pid, regs); err != nil {
+					r.emitFault(fmt.Sprintf("set regs (trap-mode suppress): %v", err))
+					return
+				}
+				pending = syscallPending{expectingExit: true, overwriteEax: true, returnValue: retVal}
+				continue
+			}
+		}
+
 		args := bridge.SyscallArgs{
 			Eax: regs.OrigEax,
 			Ebx: regs.Ebx,
@@ -710,6 +792,67 @@ func (r *Runner) syscallLoop(regs *regs32) {
 			pending = syscallPending{expectingExit: true}
 		}
 	}
+}
+
+// Syscall numbers the trap-mode path intercepts (kept in sync with
+// bridge/bridge.go's passthrough allowlist).
+const (
+	sysRtSigreturn   = 173
+	sysRtSigaction   = 174
+	sysRtSigprocmask = 175
+)
+
+// handleTrapModeSyscall intercepts the signal-disposition syscalls in
+// trap mode so the runner — not the kernel — owns guest signal state.
+// Returns (handled, returnValue, err). When handled is true, the
+// caller suppresses the kernel syscall and sets up the exit stop to
+// overwrite eax with returnValue.
+func (r *Runner) handleTrapModeSyscall(regs *regs32) (bool, uint32, error) {
+	switch regs.OrigEax {
+	case sysRtSigaction:
+		// rt_sigaction(signum, &act, &oldact, sigsetsize)
+		// ebx = signum, ecx = &act
+		if regs.Ecx == 0 {
+			// Querying (act==NULL); nothing to record. Return 0.
+			return true, 0, nil
+		}
+		// Userspace struct sigaction has sa_handler at offset 0.
+		var buf [4]byte
+		if err := r.mem.ReadAt(regs.Ecx, buf[:]); err != nil {
+			return true, 0, fmt.Errorf("read sa_handler at 0x%x: %w", regs.Ecx, err)
+		}
+		handler := uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24
+		r.handlers[uint8(regs.Ebx)] = handler
+		return true, 0, nil
+
+	case sysRtSigreturn:
+		// Restore the regs we saved at the matching signal stop. The
+		// syscall's "return value" is what we wrote at exit, but
+		// rt_sigreturn replaces *all* regs from the sigframe — so we
+		// overwrite the regs entirely here, and the exit-stop logic's
+		// eax write is harmless (eax also comes from saved regs).
+		if len(r.signalRegs) == 0 {
+			return true, 0, fmt.Errorf("rt_sigreturn with empty signal stack")
+		}
+		top := len(r.signalRegs) - 1
+		saved := r.signalRegs[top]
+		r.signalRegs = r.signalRegs[:top]
+		// Preserve OrigEax = suppressedSyscall (caller will set it
+		// right after we return), then write the saved register state
+		// out. The exit-stop code will load regs again before its eax
+		// overwrite, but we got there first — set everything now.
+		*regs = saved
+		regs.OrigEax = suppressedSyscall
+		// returnValue is the saved eax (already in regs.Eax via *regs = saved)
+		return true, saved.Eax, nil
+
+	case sysRtSigprocmask:
+		// No-op: turbo86 sees every signal stop regardless of the
+		// guest's nominal mask, so changing the mask doesn't affect
+		// what gets dispatched.
+		return true, 0, nil
+	}
+	return false, 0, nil
 }
 
 // collectEvents drains an events channel into an ordered slice. The
