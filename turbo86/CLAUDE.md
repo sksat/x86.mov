@@ -22,9 +22,13 @@ Companion to [`movie86`](../movie86/): movie86 is the in-browser interpreter ("w
 - **Memory transfer**: `/proc/PID/mem` (faster than `PTRACE_POKEDATA` for bulk writes).
 - **Syscall interception**: `PTRACE_SYSCALL` with entry+exit stop pairs. The bridge classifies each syscall as:
   - **Emulate** (`write`, `exit`): suppress the kernel call (set `orig_eax = -1` at entry), emit the Outbound event, overwrite `eax` with the synthetic return value at exit. Kernel never executes the original syscall.
-  - **Passthrough** (`rt_sigaction`, `rt_sigreturn`, `rt_sigprocmask`): let the kernel run the syscall natively. The runner shepherds the entry/exit stops past; no event is emitted. Used for signal-disposition syscalls so the guest's own handlers get installed in the kernel and dispatched by it.
+  - **Passthrough** (`rt_sigaction`, `rt_sigreturn`, `rt_sigprocmask`): let the kernel run the syscall natively (host mode). The runner shepherds the entry/exit stops past; no event is emitted. In **trap mode** the runner intercepts these syscalls before the bridge and emulates them in-process (handler addr stored in `r.handlers`, signal-stack popped on rt_sigreturn).
   - **Fault** / **Exit**: terminal — emit the corresponding event and end the session.
-- **Signal stops**: split three ways. Forwardable signals (SIGILL, SIGSEGV, SIGBUS, SIGFPE, SIGPIPE, SIGUSR1, SIGUSR2) are delivered to the guest via the next `PTRACE_SYSCALL` so its registered handler runs (movfuscator's `mov cs, ax` → SIGILL → installed handler pattern). Plain SIGTRAP is reserved for tracer-owned int3 traps (future library-call bridging) and Faults if it ever fires unexpectedly. Other signals (job-control, …) surface as `Paused`. Before forwarding, the runner snapshots regs + sparse memory; if the kernel kills the child (no handler), that snapshot rides along on the `Paused` so debugging visibility is preserved.
+- **Signal stops**: split three ways.
+  - Plain SIGTRAP is reserved for tracer-owned int3 traps (future library-call bridging); unexpected → Fault.
+  - Forwardable signals (SIGILL, SIGSEGV, SIGBUS, SIGFPE, SIGPIPE, SIGUSR1, SIGUSR2): in **host mode** delivered to the guest via the next `PTRACE_SYSCALL` so the kernel-registered handler runs (movfuscator's `mov cs, ax` → SIGILL → installed handler pattern). In **trap mode** the runner looks up the handler in `r.handlers`, saves the pre-signal regs on `r.signalRegs`, sets `EIP = handler addr` directly, and resumes without delivering the signal to the kernel.
+  - Other signals (job-control, …) surface as `Paused`. Before forwarding/redirect, the runner snapshots regs + sparse memory; if the kernel kills the child (no handler) in host mode, that snapshot rides along on the `Paused`.
+- **Execution mode**: per-session policy chosen via `proto.Start.Mode` / `proto.LoadContext.Mode` — `"host"` (default; kernel handles signals) or `"trap"` (turbo86 handles signals). The same guest program should produce the same Outbound event stream under either mode — that's the migration-parity doctrine the [signal-dispatch parity test](runner/sigaction_test.go) enforces.
 
 ## Scope
 
@@ -43,7 +47,6 @@ Companion to [`movie86`](../movie86/): movie86 is the in-browser interpreter ("w
 - `stdin` / `read(3)`. Needs a half-duplex bridge (host pauses guest, awaits `Stdin` from frontend, resumes).
 - Windows host. Would need a different execution path (Wine? QEMU-user? in-process JIT?). movie86 (the interpreter) remains the always-portable path.
 - Loading full linked ELFs server-side. The frontend's job: parse the ELF, stream `Code` messages for each segment, then issue `Start{entry}`.
-- "Trap mode" — turbo86 fully owns signal dispatch (constructs sigframe, invokes handler, emulates rt_sigreturn). Today's behavior is the "host mode" planned in the design: kernel does the dispatch via passthrough. Trap mode is a follow-up axis for migration-parity with movie86.
 - Real movfuscator binary completion. Investigated empirically with the runtime built (`make setup && make build-native` in `movfuscator-wasm/`) and a real-sigaction stubs.s linked in: the binary loads, runs, and locks into the upstream master_loop dispatch trick. The SIGILL handler is `master_loop = _start0` which re-runs `main` from the top on each `mov cs, ax`; without a termination signal we know how to provide from our stubs, it loops indefinitely (movie86 hits the same wall from the other side). Env-gated investigation test at [`runner/movfuscator_elf_test.go`](runner/movfuscator_elf_test.go) documents the observation. Fully completing a real movfuscator binary is a movfuscator-runtime-side problem — turbo86's wiring (rt_sigaction passthrough + SIGILL forward) is working.
 
 ## TDD style
