@@ -95,9 +95,27 @@ public:
         case Mov::ADD32rr:
           Changed |= legalizeADD32rr(MI, MBB, TII);
           break;
-        // SUB/AND/OR/XOR rr+ri, SHL/SHR/SAR ri/rCL, CMP+Jcc, CALL32d
-        // + CALLSEQ, RET, and the prologue/epilogue PUSH/POP/SUB/MOV
-        // sequence light up across stages 7b → 7d.
+        case Mov::AND32ri:
+          Changed |= legalizeBitwise32ri(MI, MBB, TII, "__mov_and8_table");
+          break;
+        case Mov::AND32rr:
+          Changed |= legalizeBitwise32rr(MI, MBB, TII, "__mov_and8_table");
+          break;
+        case Mov::OR32ri:
+          Changed |= legalizeBitwise32ri(MI, MBB, TII, "__mov_or8_table");
+          break;
+        case Mov::OR32rr:
+          Changed |= legalizeBitwise32rr(MI, MBB, TII, "__mov_or8_table");
+          break;
+        case Mov::XOR32ri:
+          Changed |= legalizeBitwise32ri(MI, MBB, TII, "__mov_xor8_table");
+          break;
+        case Mov::XOR32rr:
+          Changed |= legalizeBitwise32rr(MI, MBB, TII, "__mov_xor8_table");
+          break;
+        // SUB rr/ri, SHL/SHR/SAR ri/rCL, CMP+Jcc, CALL32d + CALLSEQ,
+        // RET, and the prologue/epilogue PUSH/POP/SUB/MOV sequence
+        // light up across stages 7b2 → 7d.
         default:
           break;
         }
@@ -203,93 +221,133 @@ private:
     }
   };
 
-  // Emit one per-byte stage of the carry chain. `ByteIdx` controls two
-  // boundary conditions:
-  //   - On byte 0 we don't load a carry-in from CL (there was no
-  //     previous byte), so we skip both the `mov dl, cl` save and the
-  //     `mov [idx + 2], dl` write. `mov [idx], ecx` (with ECX = 0)
-  //     leaves idx[2] = 0 = correct cin for byte 0.
-  //   - On byte 3 we don't need the carry-out for a following stage,
-  //     so we skip the trailing `mov cl, [carry_table + ecx]` read.
-  // `BSrc` selects how the b_byte (RHS i-th byte) is loaded into DL —
-  // either a compile-time immediate slice (ADD32ri) or a load from
-  // the per-function RHS spill buffer (ADD32rr).
-  static void emitByteStage(MachineBasicBlock &MBB,
+  // Helper: zero ECX, then zero the idx slot. After this returns,
+  // ECX = 0 and idx[0..3] = 0. DL is untouched (callers that need to
+  // preserve CL into DL before zeroing must do so themselves).
+  static void emitIdxZero(MachineBasicBlock &MBB,
+                          MachineBasicBlock::iterator I, const DebugLoc &DL,
+                          const TargetInstrInfo &TII, const EbpAddr &A) {
+    // mov ecx, 0
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
+    // mov dword ptr [idx], ecx
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP)
+        .addImm(A.IdxDisp)
+        .addReg(Mov::ECX);
+  }
+
+  // Helper: pack the a-byte (read from srcdst[ByteIdx]) and the
+  // b-byte (from BSrc — either an immediate slice or a memory spill)
+  // into idx[1] and idx[0] respectively. Trashes DL. Leaves idx[2..3]
+  // as the caller set them — ADD writes carry into idx[2] BEFORE this
+  // helper runs (so the a-byte read doesn't clobber the carry write).
+  static void emitIdxPackAB(MachineBasicBlock &MBB,
                             MachineBasicBlock::iterator I, const DebugLoc &DL,
                             const TargetInstrInfo &TII, const EbpAddr &A,
                             unsigned ByteIdx, ByteSource BSrc) {
     const int64_t SrcByteDisp = A.SrcDstDisp + static_cast<int64_t>(ByteIdx);
-    const int64_t IdxBaseDisp = A.IdxDisp;
 
-    if (ByteIdx > 0) {
-      // mov dl, cl              ; preserve carry across the upcoming ECX zero
-      BuildMI(MBB, I, DL, TII.get(Mov::MOV8rr), Mov::DL).addReg(Mov::CL);
-    }
-
-    // mov ecx, 0               ; zero ECX so we can zero idx and rebuild it
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
-
-    // mov dword ptr [idx], ecx ; zero all four bytes of the idx slot
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP)
-        .addImm(IdxBaseDisp)
-        .addReg(Mov::ECX);
-
-    if (ByteIdx > 0) {
-      // mov byte ptr [idx + 2], dl   ; carry-in byte (byte 0 of high word)
-      BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP)
-          .addImm(IdxBaseDisp + 2)
-          .addReg(Mov::DL);
-    }
-
-    // mov dl, byte ptr [srcdst + i]
+    // mov dl, byte ptr [srcdst + i]   ; a_byte
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::DL)
         .addReg(Mov::EBP)
         .addImm(SrcByteDisp);
-    // mov byte ptr [idx + 1], dl     ; a_byte
+    // mov byte ptr [idx + 1], dl
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
         .addReg(Mov::EBP)
-        .addImm(IdxBaseDisp + 1)
+        .addImm(A.IdxDisp + 1)
         .addReg(Mov::DL);
 
-    // Load b_byte. Two shapes:
+    // Load b_byte:
     if (BSrc.K == ByteSource::Kind::Imm) {
-      // mov dl, IMM8                 ; b_byte = compile-time immediate slice
+      // mov dl, IMM8                  ; compile-time immediate slice
       BuildMI(MBB, I, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(BSrc.Imm);
     } else {
-      // mov dl, byte ptr [rhs_buf + i]  ; b_byte = ADD32rr RHS spill byte
+      // mov dl, byte ptr [rhs_buf + i] ; rr-form RHS spill byte
       BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::DL)
           .addReg(Mov::EBP)
           .addImm(BSrc.MemDisp + static_cast<int64_t>(ByteIdx));
     }
-    // mov byte ptr [idx + 0], dl     ; b_byte
+    // mov byte ptr [idx + 0], dl
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
         .addReg(Mov::EBP)
-        .addImm(IdxBaseDisp)
+        .addImm(A.IdxDisp)
         .addReg(Mov::DL);
+  }
 
-    // mov ecx, dword ptr [idx]       ; load the packed index into ECX
+  // Helper: load the packed index from idx into ECX, look up the
+  // result byte from `[<TableSym> + ECX]` into DL, and write DL back
+  // to srcdst[ByteIdx]. This is the common "read table, write byte"
+  // sequence used by every byte-table legalizer.
+  static void emitTableLookupAndStore(MachineBasicBlock &MBB,
+                                      MachineBasicBlock::iterator I,
+                                      const DebugLoc &DL,
+                                      const TargetInstrInfo &TII,
+                                      const EbpAddr &A, unsigned ByteIdx,
+                                      const char *TableSym) {
+    // mov ecx, dword ptr [idx]
     BuildMI(MBB, I, DL, TII.get(Mov::MOV32rm), Mov::ECX)
         .addReg(Mov::EBP)
-        .addImm(IdxBaseDisp);
-
-    // mov dl, byte ptr [sum_table + ecx]   ; lookup the sum byte
+        .addImm(A.IdxDisp);
+    // mov dl, byte ptr [TableSym + ecx]
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-        .addExternalSymbol("__mov_add8_sum_table")
+        .addExternalSymbol(TableSym)
         .addReg(Mov::ECX);
-    // mov byte ptr [srcdst + i], dl  ; write sum back in place
+    // mov byte ptr [srcdst + i], dl
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
         .addReg(Mov::EBP)
-        .addImm(SrcByteDisp)
+        .addImm(A.SrcDstDisp + static_cast<int64_t>(ByteIdx))
         .addReg(Mov::DL);
+  }
 
+  // ADD per-byte stage: builds the index from (carry-in, a, b),
+  // looks up the sum, writes it to srcdst[i], and loads the carry-out
+  // into CL for the next stage. The boundary cases:
+  //   - byte 0 has no carry-in — skip the `mov dl, cl` preserve and
+  //     the `mov [idx+2], dl` write. emitIdxZero zeros idx[2] anyway.
+  //   - byte 3 doesn't need carry-out — skip the trailing load.
+  static void emitByteStageAdd(MachineBasicBlock &MBB,
+                               MachineBasicBlock::iterator I,
+                               const DebugLoc &DL,
+                               const TargetInstrInfo &TII, const EbpAddr &A,
+                               unsigned ByteIdx, ByteSource BSrc) {
+    if (ByteIdx > 0) {
+      // mov dl, cl              ; preserve carry across the next ECX zero
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8rr), Mov::DL).addReg(Mov::CL);
+    }
+    emitIdxZero(MBB, I, DL, TII, A);
+    if (ByteIdx > 0) {
+      // mov byte ptr [idx + 2], dl   ; carry-in byte
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP)
+          .addImm(A.IdxDisp + 2)
+          .addReg(Mov::DL);
+    }
+    emitIdxPackAB(MBB, I, DL, TII, A, ByteIdx, BSrc);
+    emitTableLookupAndStore(MBB, I, DL, TII, A, ByteIdx,
+                            "__mov_add8_sum_table");
     if (ByteIdx < 3) {
       // mov cl, byte ptr [carry_table + ecx]  ; carry-out for next stage
       BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
           .addExternalSymbol("__mov_add8_carry_table")
           .addReg(Mov::ECX);
     }
+  }
+
+  // Bitwise per-byte stage: AND/OR/XOR are per-bit, so each byte is
+  // independent (no carry chain). Single table lookup, single store.
+  // The (cin, a, b) index used by ADD becomes just (a, b) here —
+  // idx[2..3] stay 0 from emitIdxZero, which is fine because the
+  // bitwise tables are indexed by `a*256 + b` (only 16 bits of idx
+  // matter, the rest is read as 0 by `mov ecx, [idx]`).
+  static void emitByteStageBitwise(MachineBasicBlock &MBB,
+                                   MachineBasicBlock::iterator I,
+                                   const DebugLoc &DL,
+                                   const TargetInstrInfo &TII,
+                                   const EbpAddr &A, unsigned ByteIdx,
+                                   ByteSource BSrc, const char *TableSym) {
+    emitIdxZero(MBB, I, DL, TII, A);
+    emitIdxPackAB(MBB, I, DL, TII, A, ByteIdx, BSrc);
+    emitTableLookupAndStore(MBB, I, DL, TII, A, ByteIdx, TableSym);
   }
 
   // Stage 7a1 — lower a single `ADD32ri DST32, DST32, IMM32` into a
@@ -355,7 +413,7 @@ private:
     // its original value at positions ≥ ByteIdx) and writes the sum
     // back in place; the carry-out is left in CL for the next stage.
     for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
-      emitByteStage(MBB, Insert, DL, TII, *Addr, ByteIdx,
+      emitByteStageAdd(MBB, Insert, DL, TII, *Addr, ByteIdx,
                     ByteSource::fromImm(ImmBytes[ByteIdx]));
 
     // EPILOGUE — restore the parent regs, then reload DST32 from the
@@ -429,7 +487,7 @@ private:
 
     // CHAIN — four byte stages, RHS bytes read from rhs_buf.
     for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
-      emitByteStage(MBB, Insert, DL, TII, *Addr, ByteIdx,
+      emitByteStageAdd(MBB, Insert, DL, TII, *Addr, ByteIdx,
                     ByteSource::fromMem(RhsDisp));
 
     // EPILOGUE — restore ECX/EDX, then load DST32 from srcdst (same
@@ -443,6 +501,105 @@ private:
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
         .addReg(Mov::EBP)
         .addImm(Addr->SrcDstDisp);
+
+    MI.eraseFromParent();
+    return true;
+  }
+
+  // Stage 7b1 — `<bitwise32> DST32, DST32, IMM32` (AND/OR/XOR ri).
+  // Same shape as legalizeADD32ri, but each byte stage is the simpler
+  // single-lookup form (no carry chain), and the table symbol comes
+  // from the dispatcher rather than being baked in. `TableSym` is one
+  // of `__mov_and8_table`, `__mov_or8_table`, `__mov_xor8_table`.
+  bool legalizeBitwise32ri(MachineInstr &MI, MachineBasicBlock &MBB,
+                           const TargetInstrInfo &TII,
+                           const char *TableSym) const {
+    const MachineFunction &MF = *MBB.getParent();
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr)
+      return false;
+
+    assert(MI.getOperand(0).isReg() && "bitwise32ri op 0 must be reg");
+    assert(MI.getOperand(2).isImm() && "bitwise32ri op 2 must be imm");
+    const Register Dst = MI.getOperand(0).getReg();
+    const uint32_t Imm = static_cast<uint32_t>(MI.getOperand(2).getImm());
+    const std::array<uint8_t, 4> ImmBytes = {
+        static_cast<uint8_t>(Imm & 0xFFu),
+        static_cast<uint8_t>((Imm >> 8) & 0xFFu),
+        static_cast<uint8_t>((Imm >> 16) & 0xFFu),
+        static_cast<uint8_t>((Imm >> 24) & 0xFFu),
+    };
+
+    auto Insert = MachineBasicBlock::iterator(&MI);
+    const DebugLoc DL = MI.getDebugLoc();
+
+    // PROLOGUE — same as ADD32ri: save ECX, EDX, spill DST32.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Dst);
+
+    // CHAIN — four independent byte stages, each a single table lookup.
+    for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
+      emitByteStageBitwise(MBB, Insert, DL, TII, *Addr, ByteIdx,
+                           ByteSource::fromImm(ImmBytes[ByteIdx]), TableSym);
+
+    // EPILOGUE — same restore order as ADD32ri.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
+
+    MI.eraseFromParent();
+    return true;
+  }
+
+  // Stage 7b1 — `<bitwise32> DST32, DST32, RHS32` (AND/OR/XOR rr).
+  // Same shape as legalizeADD32rr (rhs_buf spill + per-byte memory
+  // read), but byte-stage form is the bitwise single-lookup.
+  bool legalizeBitwise32rr(MachineInstr &MI, MachineBasicBlock &MBB,
+                           const TargetInstrInfo &TII,
+                           const char *TableSym) const {
+    const MachineFunction &MF = *MBB.getParent();
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr || !Addr->RhsDisp)
+      return false;
+
+    assert(MI.getOperand(0).isReg() && "bitwise32rr op 0 must be reg");
+    assert(MI.getOperand(2).isReg() && "bitwise32rr op 2 must be reg");
+    const Register Dst = MI.getOperand(0).getReg();
+    const Register Rhs = MI.getOperand(2).getReg();
+
+    auto Insert = MachineBasicBlock::iterator(&MI);
+    const DebugLoc DL = MI.getDebugLoc();
+    const int64_t RhsDisp = *Addr->RhsDisp;
+
+    // PROLOGUE — save ECX, EDX, spill both operands. Same ordering
+    // rationale as ADD32rr (Dst == Rhs is fine — both spills capture
+    // the current value before any byte register is borrowed).
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Dst);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(RhsDisp).addReg(Rhs);
+
+    for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
+      emitByteStageBitwise(MBB, Insert, DL, TII, *Addr, ByteIdx,
+                           ByteSource::fromMem(RhsDisp), TableSym);
+
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
 
     MI.eraseFromParent();
     return true;

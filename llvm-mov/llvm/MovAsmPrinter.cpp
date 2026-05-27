@@ -46,14 +46,21 @@ public:
     OutStreamer->emitRawText(StringRef(".intel_syntax noprefix"));
   }
 
-  // Stage 7-prep-2a: emit byte-add lookup tables that the MovOnlyLegalize
-  // pass will index from stage 7a1 onward. Emitted unconditionally — see
-  // the comment in emitAdd8Tables() for the rationale.
-  void emitEndOfAsmFile(Module & /*M*/) override { emitAdd8Tables(); }
+  // Stage 7-prep-2a / 7b1: emit byte-table data the MovOnlyLegalize
+  // pass indexes. Emitted unconditionally — see the comment in
+  // emitAdd8Tables() for the rationale; the bitwise tables follow
+  // the same policy in their own sections so --gc-sections can drop
+  // them independently when stage 7b1 hasn't produced references.
+  void emitEndOfAsmFile(Module & /*M*/) override {
+    emitAdd8Tables();
+    emitBitwise8Tables();
+  }
 
 private:
   void lower(const MachineInstr *MI, MCInst &OutMI) const;
   void emitAdd8Tables();
+  void emitBitwise8Tables();
+  void emitBitwise8Table(StringRef Name, uint8_t (*Op)(uint8_t, uint8_t));
 };
 } // namespace
 
@@ -176,6 +183,50 @@ void MovAsmPrinter::emitAdd8Tables() {
   };
   emitTable("__mov_add8_sum_table", Sum);
   emitTable("__mov_add8_carry_table", Carry);
+}
+
+// Stage 7b1 — bitwise byte tables: __mov_and8_table, __mov_or8_table,
+// __mov_xor8_table. Each is 256x256 = 64 KiB indexed by (a*256 + b).
+// No carry-out, so each op needs only a single table (vs ADD's pair).
+//
+// Each table lives in its own ELF section `.rodata.__mov_<op>8_table`,
+// not the shared .rodata. Bitwise ops are referenced independently —
+// a TU might exercise XOR without AND, so per-table sections let
+// `ld --gc-sections` drop the unused ones. (ADD's two tables share
+// one section because the legalize pass always references them as a
+// pair, so there is no GC win from splitting.)
+void MovAsmPrinter::emitBitwise8Table(StringRef Name,
+                                      uint8_t (*Op)(uint8_t, uint8_t)) {
+  static constexpr unsigned kSize = 256u * 256u;
+  SmallVector<uint8_t, kSize> Data;
+  Data.reserve(kSize);
+  for (unsigned a = 0; a < 256; ++a) {
+    for (unsigned b = 0; b < 256; ++b) {
+      Data.push_back(Op(static_cast<uint8_t>(a), static_cast<uint8_t>(b)));
+    }
+  }
+
+  std::string SecName = (".rodata." + Name).str();
+  MCSection *Sec = OutContext.getELFSection(SecName, ELF::SHT_PROGBITS,
+                                            ELF::SHF_ALLOC);
+  OutStreamer->switchSection(Sec);
+
+  MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
+  OutStreamer->emitLabel(Sym);
+  OutStreamer->emitBytes(StringRef(
+      reinterpret_cast<const char *>(Data.data()), Data.size()));
+}
+
+void MovAsmPrinter::emitBitwise8Tables() {
+  emitBitwise8Table(
+      "__mov_and8_table",
+      [](uint8_t a, uint8_t b) -> uint8_t { return a & b; });
+  emitBitwise8Table(
+      "__mov_or8_table",
+      [](uint8_t a, uint8_t b) -> uint8_t { return a | b; });
+  emitBitwise8Table(
+      "__mov_xor8_table",
+      [](uint8_t a, uint8_t b) -> uint8_t { return a ^ b; });
 }
 
 extern "C" void LLVMInitializeMovAsmPrinter() {

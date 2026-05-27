@@ -92,34 +92,49 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
   // scratch slots the post-PEI MovOnlyLegalize rewrite will need.
   // Two independent questions:
   //
-  //   NeedsAddScratch     — does any ADD32 (rr or ri) appear? If so
-  //                         reserve the 4 base slots (save_ecx,
-  //                         save_edx, srcdst, idx).
-  //   NeedsAddRhsScratch  — does any ADD32rr specifically appear? If
-  //                         so reserve a 5th slot for the RHS register
-  //                         spill. ADD32ri's RHS is a compile-time
-  //                         immediate that doesn't need memory.
+  //   NeedsByteOpScratch     — does any byte-chain legalize-target
+  //                            opcode appear (ADD32rr/ri at stage 7a,
+  //                            AND/OR/XOR 32rr/ri at stage 7b1)? If
+  //                            so reserve the 4 base slots (save_ecx,
+  //                            save_edx, srcdst, idx) — they are
+  //                            shared across all the byte-table
+  //                            legalizers.
+  //   NeedsRhsScratch        — does any rr-form specifically appear?
+  //                            If so reserve a 5th slot (rhs_buf) for
+  //                            the RHS register spill. ri-form's RHS
+  //                            is a compile-time immediate that needs
+  //                            no memory.
   //
-  // So an ADD32ri-only function reserves 16 bytes; an ADD-rr-having
-  // function reserves 20 bytes; an ADD-less function reserves none.
-  bool NeedsAddScratch = false;
-  bool NeedsAddRhsScratch = false;
+  // ri-only functions reserve 16 bytes; rr-having functions reserve
+  // 20 bytes; functions with no legalize target reserve none.
+  bool NeedsByteOpScratch = false;
+  bool NeedsRhsScratch = false;
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
-      const unsigned Op = MI.getOpcode();
-      if (Op == Mov::ADD32rr) {
-        NeedsAddScratch = true;
-        NeedsAddRhsScratch = true;
-      } else if (Op == Mov::ADD32ri) {
-        NeedsAddScratch = true;
+      switch (MI.getOpcode()) {
+      case Mov::ADD32rr:
+      case Mov::AND32rr:
+      case Mov::OR32rr:
+      case Mov::XOR32rr:
+        NeedsByteOpScratch = true;
+        NeedsRhsScratch = true;
+        break;
+      case Mov::ADD32ri:
+      case Mov::AND32ri:
+      case Mov::OR32ri:
+      case Mov::XOR32ri:
+        NeedsByteOpScratch = true;
+        break;
+      default:
+        break;
       }
-      if (NeedsAddScratch && NeedsAddRhsScratch)
+      if (NeedsByteOpScratch && NeedsRhsScratch)
         break;
     }
-    if (NeedsAddScratch && NeedsAddRhsScratch)
+    if (NeedsByteOpScratch && NeedsRhsScratch)
       break;
   }
-  if (!NeedsAddScratch)
+  if (!NeedsByteOpScratch)
     return;
 
   auto *MovMFI = MF.getInfo<MovMachineFunctionInfo>();
@@ -138,9 +153,9 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
   MovMFI->setAddRewriteSrcDstFI(Make());
   MovMFI->setAddRewriteIdxFI(Make());
 
-  // 5th slot — RHS spill — only when ADD32rr is present. Without this
-  // conditional, ADD32ri-only functions would grow by 4 bytes of dead
-  // frame space.
-  if (NeedsAddRhsScratch)
+  // 5th slot — RHS spill — only when an rr-form byte-op is present.
+  // Without this conditional, ri-only functions would grow by 4 bytes
+  // of dead frame space.
+  if (NeedsRhsScratch)
     MovMFI->setAddRewriteRhsFI(Make());
 }
