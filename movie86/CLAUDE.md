@@ -131,9 +131,20 @@ Switched to the mov-loop CRT (`crt0.o` + `crtf.o` + `crtd.o` + `softfloat32.o` +
 
 **`movie86 /tmp/movie86-link/return42-real.elf` exits cleanly.** Real movfuscator-built mov-only binary now runs.
 
-### Remaining gap (follow-up)
+### Remaining gap: exit-code propagation (follow-up)
 
-Exit status is `0` instead of `42`. movfuscator's main-return-value-to-exit-arg propagation puts `0` in the exit syscall's `ebx` slot. Suspect an emulation gap somewhere in main's return-value path (or main's pushed-arg state). Concretely: at the moment of NULL-deref (eip `0x08049588`), `[esp+4]` is `0` instead of `42`. Investigation needed — but no longer blocking end-to-end execution.
+Exit status is `0` instead of `42`. Deeper investigation via the debugger:
+
+- main computes 42 correctly. The literal `0x2a` appears once in the linked binary (`mov DWORD PTR ds:0x80dd000, 0x2a` at `0x08049a60`), which writes 42 to `R0` (movfuscator's software return-value register at `0x080dd000`).
+- Master_loop's exit-call block then propagates R0 — `mov [eax], edx` at `0x08049fc6` with eax=`0x08686150` (= **`jmp_r0`**) and edx=42 lands the value in `jmp_r0`.
+- **But our `exit` stub reads `[esp+4]` = `0x08686138`**, which is 28 bytes away from `jmp_r0` and never gets written to 42. exit_stub thus reads 0 → `exit(0)`.
+
+So movfuscator parks the libc-call arg in `jmp_r0`, not on the cdecl stack at `[esp+4]`. The dynamic-link path probably has libc's `exit()` plumbed through the dispatch trampoline so that `jmp_r0` *becomes* `[esp+4]` by the time control reaches the libc function — or the convention is different in some way we haven't reverse-engineered.
+
+Concrete next moves for the follow-up:
+1. Run the dynamically-linked `return42` under qemu-user-static or in a chroot with i386 libc, set a breakpoint on libc's `exit`, see what's at `[esp+4]` there. That tells us what convention the real link expects.
+2. If the convention is "arg lives in `jmp_r0`", change `stubs.s`'s `exit` to read from `mem[jmp_r0]` (`mov ebx, ds:0x08686150` in our binary's layout — but movfuscator's `jmp_r0` address varies per link, so probably reads from the symbol).
+3. If the convention is cdecl-on-the-shadow-stack, find why the propagation jmp_r0 → shadow stack isn't happening in our run (or in this build).
 
 Tooling needed to dig in: `cd movfuscator-wasm && make setup && make build-native` to materialize the runtime objects (gitignored under `vendor/movfuscator/build/`).
 
