@@ -319,8 +319,12 @@ type startMsg struct {
 // may then WriteCode at will and eventually call Run / RunWithContext.
 func New(stubBytes []byte) (*Runner, error) {
 	r := &Runner{
-		startCh:  make(chan startMsg, 1),
-		eventsCh: make(chan proto.Outbound, 16),
+		startCh: make(chan startMsg, 1),
+		// Unbuffered: each event the tracer emits blocks until the
+		// consumer reads, so the tracer can't outrun the consumer and
+		// tear down resources (mem fd, child) before mid-session
+		// streaming writes have a chance to land.
+		eventsCh: make(chan proto.Outbound),
 		closeCh:  make(chan struct{}),
 		done:     make(chan struct{}),
 	}

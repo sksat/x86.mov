@@ -1,13 +1,10 @@
 //go:build linux
 
 // Package server exposes turbo86 over a WebSocket. One connection = one
-// guest session. v1 buffer-then-run: the client sends Code messages
-// (optionally) and either Start (fresh) or LoadContext (resume from
-// another engine), the server invokes the runner, then streams the
-// resulting events back as JSON text frames and closes.
-//
-// Streaming-while-running (Code arriving mid-execution, multi-session
-// per connection) is deferred to the streaming-Runner refactor.
+// guest session. Code messages can stream in before AND after Start /
+// LoadContext — pre-run writes set up initial code, post-run writes
+// populate code the running guest will reach later (the streaming use
+// case modelling "send context, load it, then keep streaming bytes").
 package server
 
 import (
@@ -15,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"runtime"
 
 	"github.com/coder/websocket"
 
@@ -40,68 +36,74 @@ func serve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.CloseNow()
 
-	// All ptrace operations the runner issues target the OS thread that
-	// did the exec.Cmd.Start(). Pin a dedicated goroutine to a thread
-	// and never unlock — the thread is torn down when the goroutine
-	// exits, which is exactly the lifetime we want.
-	done := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-		done <- handleSession(r.Context(), ws)
-	}()
-
-	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+	if err := handleSession(r.Context(), ws); err != nil && !errors.Is(err, context.Canceled) {
 		ws.Close(websocket.StatusInternalError, truncate(err.Error(), 120))
 		return
 	}
 	ws.Close(websocket.StatusNormalClosure, "")
 }
 
-// handleSession reads Inbound messages until the run kicks off, drives
-// the runner to completion, and writes the Outbound events out. Each
-// connection is single-use: after the run ends, this returns and the
-// connection closes.
+// handleSession drives one guest session end-to-end:
+//  1. New Runner.
+//  2. Read inbound. Code → WriteCode. Start / LoadContext → kick off
+//     the syscall loop and obtain the events channel.
+//  3. While events flow, spawn a side goroutine that continues reading
+//     inbound and applies post-run Code messages via WriteCode (the
+//     streaming case).
+//  4. When the events channel closes (Exit / Paused / Fault), tear down.
 func handleSession(ctx context.Context, ws *websocket.Conn) error {
-	code := make(map[uint32][]byte)
+	r, err := runner.New(stub.Bytes)
+	if err != nil {
+		return fmt.Errorf("create runner: %w", err)
+	}
+	defer r.Close()
 
-	for {
-		_, data, err := ws.Read(ctx)
+	// Phase 1: pre-run setup — Code messages then Start/LoadContext.
+	var events <-chan proto.Outbound
+	for events == nil {
+		msg, err := readInbound(ctx, ws)
 		if err != nil {
-			return fmt.Errorf("read inbound: %w", err)
+			return err
 		}
-		msg, err := proto.UnmarshalInbound(data)
-		if err != nil {
-			return fmt.Errorf("parse inbound: %w", err)
-		}
-
 		switch m := msg.(type) {
 		case proto.Code:
-			// Later Code messages at the same offset replace earlier
-			// ones — fine for v1's buffer-then-run semantics.
-			code[m.Offset] = m.Bytes
-
+			if err := r.WriteCode(m.Offset, m.Bytes); err != nil {
+				return fmt.Errorf("write code: %w", err)
+			}
 		case proto.Start:
-			events, err := runner.RunOnce(stub.Bytes, code, m.Entry, m.StackTop)
-			if err != nil {
-				return fmt.Errorf("RunOnce: %w", err)
-			}
-			return writeEvents(ctx, ws, events)
-
+			events = r.Run(m.Entry, m.StackTop)
 		case proto.LoadContext:
-			events, err := runner.RunWithContext(stub.Bytes, m.Context)
-			if err != nil {
-				return fmt.Errorf("RunWithContext: %w", err)
-			}
-			return writeEvents(ctx, ws, events)
-
+			events = r.RunWithContext(m.Context)
 		default:
-			return fmt.Errorf("unexpected inbound message %T before Start/LoadContext", msg)
+			return fmt.Errorf("unexpected inbound %T before Start/LoadContext", msg)
 		}
 	}
-}
 
-func writeEvents(ctx context.Context, ws *websocket.Conn, events []proto.Outbound) error {
-	for _, ev := range events {
+	// Phase 2: post-run. A side goroutine accepts streaming Code; the
+	// main goroutine forwards events. Either side ending tears the
+	// session down (defer r.Close() + deferred ws.CloseNow()).
+	readDone := make(chan error, 1)
+	go func() {
+		for {
+			msg, err := readInbound(ctx, ws)
+			if err != nil {
+				readDone <- err
+				return
+			}
+			switch m := msg.(type) {
+			case proto.Code:
+				if err := r.WriteCode(m.Offset, m.Bytes); err != nil {
+					readDone <- fmt.Errorf("write code (post-start): %w", err)
+					return
+				}
+			default:
+				readDone <- fmt.Errorf("unexpected inbound %T after Start/LoadContext", msg)
+				return
+			}
+		}
+	}()
+
+	for ev := range events {
 		data, err := proto.MarshalOutbound(ev)
 		if err != nil {
 			return fmt.Errorf("marshal outbound: %w", err)
@@ -110,7 +112,22 @@ func writeEvents(ctx context.Context, ws *websocket.Conn, events []proto.Outboun
 			return fmt.Errorf("write outbound: %w", err)
 		}
 	}
+	// Session ended naturally. The reader goroutine is still blocked
+	// in ws.Read; ws.CloseNow (deferred in serve) will unblock it, and
+	// its readDone send is dropped (the channel is buffered).
 	return nil
+}
+
+func readInbound(ctx context.Context, ws *websocket.Conn) (proto.Inbound, error) {
+	_, data, err := ws.Read(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read inbound: %w", err)
+	}
+	msg, err := proto.UnmarshalInbound(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse inbound: %w", err)
+	}
+	return msg, nil
 }
 
 func truncate(s string, n int) string {

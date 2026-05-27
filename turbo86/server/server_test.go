@@ -91,6 +91,82 @@ func TestE2E_LoadContext_OverWebSocket(t *testing.T) {
 	}
 }
 
+// TestE2E_PostStartCodeStreaming exercises the streaming case: after
+// Start, the client keeps sending Code messages while the guest is
+// running. The server must apply them via runner.WriteCode without
+// disrupting the in-flight syscall loop. Demonstrates the underlying
+// streaming primitive end-to-end over the wire.
+//
+// Guest: write(1, "A", 1); exit(42)  (two syscalls).
+// Sequence: Code + Code(data) + Start → recv Stdout("A") → Code(post-
+// Start, unused address) → recv Exit{42}.
+func TestE2E_PostStartCodeStreaming(t *testing.T) {
+	srv := httptest.NewServer(server.Handler())
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer ws.CloseNow()
+
+	const entry uint32 = 0x08048000
+	const aAddr uint32 = 0x08048100
+	const lateAddr uint32 = 0x08049000
+
+	program := []byte{
+		0xB8, 0x04, 0x00, 0x00, 0x00, // mov eax, 4    (SYS_write)
+		0xBB, 0x01, 0x00, 0x00, 0x00, // mov ebx, 1    (stdout)
+		0xB9, 0x00, 0x81, 0x04, 0x08, // mov ecx, aAddr
+		0xBA, 0x01, 0x00, 0x00, 0x00, // mov edx, 1    (len)
+		0xCD, 0x80, // int 0x80
+		0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1    (SYS_exit)
+		0xBB, 0x2A, 0x00, 0x00, 0x00, // mov ebx, 42
+		0xCD, 0x80, // int 0x80
+	}
+
+	sendInbound(t, ctx, ws, proto.Code{Offset: entry, Bytes: program})
+	sendInbound(t, ctx, ws, proto.Code{Offset: aAddr, Bytes: []byte("A")})
+	sendInbound(t, ctx, ws, proto.Start{Entry: entry, StackTop: 0x701FFFF0})
+
+	// First event: Stdout("A"). Reaching this means the server has
+	// processed the write syscall stop and is between syscalls.
+	first := readNextEvent(t, ctx, ws)
+	if want := (proto.Stdout{Bytes: []byte("A")}); !reflect.DeepEqual(first, want) {
+		t.Fatalf("first event: got %#v want %#v", first, want)
+	}
+
+	// Mid-session streaming Code. Bytes content irrelevant — the test
+	// is "does the server accept Code after Start without disrupting
+	// the in-flight session".
+	sendInbound(t, ctx, ws, proto.Code{Offset: lateAddr, Bytes: []byte{0x90, 0x90}})
+
+	// Drain remaining events; expect Exit{42}.
+	rest := readAllEvents(t, ctx, ws)
+	wantRest := []proto.Outbound{proto.Exit{Code: 42}}
+	if !reflect.DeepEqual(rest, wantRest) {
+		t.Errorf("remaining events: got %#v want %#v", rest, wantRest)
+	}
+}
+
+// readNextEvent reads exactly one outbound frame.
+func readNextEvent(t *testing.T, ctx context.Context, ws *websocket.Conn) proto.Outbound {
+	t.Helper()
+	_, data, err := ws.Read(ctx)
+	if err != nil {
+		t.Fatalf("read frame: %v", err)
+	}
+	msg, err := proto.UnmarshalOutbound(data)
+	if err != nil {
+		t.Fatalf("parse frame %q: %v", data, err)
+	}
+	return msg
+}
+
 func sendInbound(t *testing.T, ctx context.Context, ws *websocket.Conn, msg proto.Inbound) {
 	t.Helper()
 	data, err := proto.MarshalInbound(msg)
