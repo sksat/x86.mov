@@ -77,7 +77,7 @@ func TestOutboundRoundTrip(t *testing.T) {
 		{"Exit nonzero", Exit{Code: 42}},
 		{"Fault message", Fault{Reason: "unknown syscall 99"}},
 		{
-			"Paused signal",
+			"Paused signal (no regions)",
 			Paused{
 				Regs: Regs{
 					Eax: 0xDEADBEEF, Ebx: 0, Esp: 0x701FFFF0,
@@ -85,6 +85,17 @@ func TestOutboundRoundTrip(t *testing.T) {
 				},
 				Signal: 11,
 				Reason: "guest received SIGSEGV",
+			},
+		},
+		{
+			"Paused signal with sparse regions",
+			Paused{
+				Regs:   Regs{Eip: 0x08048005, Esp: 0x701FFFF0},
+				Signal: 11,
+				Reason: "guest received SIGSEGV",
+				Regions: []MemRegion{
+					{Addr: 0x08048000, Bytes: []byte{0xB8, 0x01, 0x00, 0x00, 0x00}},
+				},
 			},
 		},
 	}

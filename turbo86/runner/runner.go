@@ -172,6 +172,66 @@ func protoRegs(r *regs32) proto.Regs {
 	}
 }
 
+// guestRegions are the address ranges the i386 stub maps for the guest.
+// Kept in sync with stub/_stub.s — the only authority for these values
+// is the stub assembly's mmap2 calls.
+var guestRegions = []struct{ addr, size uint32 }{
+	{0x08048000, 0x01000000}, // code/data: 16 MiB at the conventional ELF base
+	{0x70000000, 0x00200000}, // stack:      2 MiB well clear of the stub's own stack
+}
+
+// pageSize is the smallest snapshot granule. Anonymous mmap mappings
+// are demand-zero — pages that the guest never touched read as zeros
+// via /proc/PID/mem and are skipped here.
+const pageSize = 4096
+
+// snapshotMemory reads each known guest region and returns the non-zero
+// 4 KiB pages as MemRegion entries. Adjacent non-zero pages are merged
+// into a single MemRegion run. For a freshly-faulted guest this drops
+// the encoded payload from ~18 MiB to a few KiB.
+//
+// The child MUST be stopped before this is called (otherwise pages can
+// race under your read); the runner only invokes it at ptrace stops.
+func snapshotMemory(mem *procMem) ([]proto.MemRegion, error) {
+	var out []proto.MemRegion
+
+	for _, gr := range guestRegions {
+		buf := make([]byte, gr.size)
+		if err := mem.ReadAt(gr.addr, buf); err != nil {
+			return nil, fmt.Errorf("snapshot region 0x%x..0x%x: %w", gr.addr, gr.addr+gr.size, err)
+		}
+		var i uint32
+		for i < gr.size {
+			// Skip zero pages.
+			for i < gr.size && allZero(buf[i:i+pageSize]) {
+				i += pageSize
+			}
+			if i >= gr.size {
+				break
+			}
+			// Walk the run of non-zero pages.
+			runStart := i
+			for i < gr.size && !allZero(buf[i:i+pageSize]) {
+				i += pageSize
+			}
+			out = append(out, proto.MemRegion{
+				Addr:  gr.addr + runStart,
+				Bytes: append([]byte(nil), buf[runStart:i]...),
+			})
+		}
+	}
+	return out, nil
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // RunOnce executes a single guest session starting fresh.
 //
 // `code` maps guest virtual addresses → bytes to write into the guest's
@@ -328,17 +388,21 @@ func runWithStub(stubBytes []byte, setup setupFunc) ([]proto.Outbound, error) {
 		if sig := ws.StopSignal(); sig != syscallTrap {
 			// SIGSEGV / SIGILL / ... — a recoverable stop boundary the
 			// runner doesn't model natively. Surface as Paused with the
-			// current regs so a peer engine (movie86, with its modeled
-			// signal-handler dispatch) can pick the session up via
-			// LoadContext + accompanying memory snapshot (snapshot
-			// delivery lands in a later slice).
+			// current regs + a sparse memory snapshot so a peer engine
+			// (movie86, with its modeled signal-handler dispatch) can
+			// pick the session up via LoadContext.
 			if err := ptraceGetRegs32(pid, &regs); err != nil {
 				return events, fmt.Errorf("get i386 regs (signal stop): %w", err)
 			}
+			regions, err := snapshotMemory(mem)
+			if err != nil {
+				return events, fmt.Errorf("memory snapshot at pause: %w", err)
+			}
 			events = append(events, proto.Paused{
-				Regs:   protoRegs(&regs),
-				Signal: uint8(sig),
-				Reason: fmt.Sprintf("guest received signal %d", sig),
+				Regs:    protoRegs(&regs),
+				Regions: regions,
+				Signal:  uint8(sig),
+				Reason:  fmt.Sprintf("guest received signal %d", sig),
 			})
 			return events, nil
 		}

@@ -183,14 +183,18 @@ func (Fault) outboundKind() string { return "fault" }
 // Paused reports that the guest stopped at a recoverable boundary the
 // current engine doesn't handle natively — typically a synchronous
 // signal (SIGSEGV from the movfuscator dispatch trick, SIGILL from the
-// alt master_loop trick, …). The Regs snapshot is enough for another
-// engine to pick the session up via LoadContext IF it also has the
-// guest memory (delivered separately by a future Snapshot event; v1
-// ships regs-only so the protocol shape lands first).
+// alt master_loop trick, …). Regs + Regions together are enough for a
+// peer engine to pick the session up via LoadContext.
+//
+// Regions is sparse: the runner walks the guest's mmap'd ranges page
+// by page and emits only the non-zero pages (merged into runs of
+// adjacent non-zero pages). For a freshly-faulted guest this is
+// typically a few KiB, vs. the ~18 MiB the dense range would carry.
 type Paused struct {
-	Regs   Regs   `json:"regs"`
-	Signal uint8  `json:"signal"`
-	Reason string `json:"reason"`
+	Regs    Regs        `json:"regs"`
+	Regions []MemRegion `json:"regions,omitempty"`
+	Signal  uint8       `json:"signal"`
+	Reason  string      `json:"reason"`
 }
 
 func (Paused) outboundKind() string { return "paused" }

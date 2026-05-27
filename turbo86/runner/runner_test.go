@@ -3,6 +3,7 @@
 package runner
 
 import (
+	"bytes"
 	"reflect"
 	"runtime"
 	"testing"
@@ -133,5 +134,22 @@ func TestRunOnce_NullDerefBecomesPaused(t *testing.T) {
 	// the operation the original engine couldn't perform.
 	if want := entry + 5; paused.Regs.Eip != want {
 		t.Errorf("Regs.Eip: got 0x%x, want 0x%x (faulting mov [0], eax)", paused.Regs.Eip, want)
+	}
+
+	// The sparse snapshot should carry exactly one run — the 4 KiB
+	// page that holds our 11 bytes of guest code. Everything else in
+	// the 16 MiB code region and the 2 MiB stack region is demand-zero.
+	if len(paused.Regions) != 1 {
+		t.Fatalf("Regions: got %d entries, want 1: %#v", len(paused.Regions), paused.Regions)
+	}
+	r := paused.Regions[0]
+	if r.Addr != entry {
+		t.Errorf("Regions[0].Addr: got 0x%x, want 0x%x", r.Addr, entry)
+	}
+	if len(r.Bytes) != 4096 {
+		t.Errorf("Regions[0].Bytes len: got %d, want 4096 (one page)", len(r.Bytes))
+	}
+	if !bytes.Equal(r.Bytes[:len(code)], code) {
+		t.Errorf("Regions[0].Bytes[:len(code)]:\n  got:  % x\n  want: % x", r.Bytes[:len(code)], code)
 	}
 }
