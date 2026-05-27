@@ -86,6 +86,7 @@ DEFAULT_FIXTURES=(
     return0
     return42
     eq42
+    lt_unsigned
     bitops
     sum10
     fib10

@@ -295,7 +295,8 @@ private:
             }
             break;
           }
-          if (POp == Mov::JE || POp == Mov::JNE) {
+          if (POp == Mov::JE || POp == Mov::JNE || POp == Mov::JB ||
+              POp == Mov::JAE || POp == Mov::JBE || POp == Mov::JA) {
             Jcc = &*Probe;
             break;
           }
@@ -329,7 +330,14 @@ private:
           ++It;
           continue;
         }
-        const bool IsEQ = (Jcc->getOpcode() == Mov::JE);
+        const unsigned JccOp = Jcc->getOpcode();
+        const bool IsEQ = (JccOp == Mov::JE);
+        const bool IsEqOrNe = (JccOp == Mov::JE || JccOp == Mov::JNE);
+        const bool IsB = (JccOp == Mov::JB);
+        const bool IsAE = (JccOp == Mov::JAE);
+        const bool IsBE = (JccOp == Mov::JBE);
+        const bool IsA = (JccOp == Mov::JA);
+        (void)IsB; (void)IsAE; (void)IsBE; (void)IsA; // used inside if/else
 
         // Save the iterator past the Jcc — we'll resume scanning there
         // after the rewrite, since the dispatcher JMP that follows is
@@ -350,7 +358,8 @@ private:
               .addReg(Mov::EBP).addImm(*Addr->RhsDisp).addReg(RhsReg);
         }
 
-        // === PHASE 1: in-place XOR of srcdst[i] with rhs[i] ===
+        if (IsEqOrNe) {
+        // === PHASE 1 (EQ/NE): in-place XOR of srcdst[i] with rhs[i] ===
         // For each byte i, srcdst[i] = srcdst[i] XOR rhs[i]. After this
         // loop srcdst is the byte-wise XOR result (all-zero iff lhs == rhs).
         for (unsigned i = 0; i < 4; ++i) {
@@ -384,8 +393,6 @@ private:
         }
 
         // === PHASE 2: OR-reduce srcdst[0..3] into DL ===
-        // DL accumulates the OR: DL := srcdst[0]; then for i in 1..3,
-        // DL := DL OR srcdst[i] via the OR8 table.
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
             .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
         for (unsigned i = 1; i < 4; ++i) {
@@ -403,9 +410,7 @@ private:
         }
         // DL = or_byte (0 iff lhs == rhs).
 
-        // === PHASE 3: compute predicate mask + invert for EQ + stash ===
-        // mask := select_mask_table[or_byte]  → 0xFF if !=, 0x00 if ==.
-        // For JE we invert with XOR 0xFF so mask matches "take T".
+        // === PHASE 3: compute predicate mask + invert for EQ ===
         emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
                             "__mov_select_mask_table", Mov::DL);
         if (IsEQ) {
@@ -419,6 +424,153 @@ private:
               .addReg(Mov::EBP).addImm(Addr->IdxDisp);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
               .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+        }
+        } else {
+        // === PHASE 1' (B/AE/BE/A): byte SUB chain ===
+        // srcdst[i] = lhs[i] - rhs[i] - borrow_in (CL holds borrow,
+        // 0 on entry to byte 0). After the loop CL holds the final
+        // borrow_out = CF.
+        for (unsigned i = 0; i < 4; ++i) {
+          const int64_t LhsByteDisp =
+              Addr->SrcDstDisp + static_cast<int64_t>(i);
+          emitIdxZero(MBB, Insert, DL, TII, *Addr);
+          if (i > 0) {
+            // mov [idx + 2], cl  ; borrow_in from previous stage
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+                .addReg(Mov::EBP).addImm(Addr->IdxDisp + 2).addReg(Mov::CL);
+          }
+          // mov dl, [srcdst + i]  ; a_byte
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(LhsByteDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+          // b_byte
+          if (IsImmRhs) {
+            const uint8_t RhsByte =
+                static_cast<uint8_t>((Imm >> (8u * i)) & 0xFFu);
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
+                .addImm(RhsByte);
+          } else {
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+                .addReg(Mov::EBP).addImm(*Addr->RhsDisp + static_cast<int64_t>(i));
+          }
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+          // Lookup diff and borrow.
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+              .addExternalSymbol("__mov_sub8_diff_table").addReg(Mov::ECX);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(LhsByteDisp).addReg(Mov::DL);
+          // CL = borrow_out. Loaded on every iteration (incl. byte 3 —
+          // that's the CF byte that drives the predicate mask).
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
+              .addExternalSymbol("__mov_sub8_borrow_table").addReg(Mov::ECX);
+        }
+        // CL = CF_byte (0 or 1). Stash to cmp_mask_buf[0] so it
+        // survives the OR-reduce below (which clobbers ECX/CL).
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp).addReg(Mov::CL);
+
+        // === PHASE 2': OR-reduce diff bytes into DL ===
+        // Reuses the EQ/NE Phase 2 verbatim — srcdst now contains the
+        // diff bytes; DL := diff_or_byte after the loop.
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+            .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
+        for (unsigned i = 1; i < 4; ++i) {
+          emitIdxZero(MBB, Insert, DL, TII, *Addr);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+              .addExternalSymbol("__mov_or8_table").addReg(Mov::ECX);
+        }
+        // DL = diff_or_byte (0 iff lhs == rhs).
+
+        // === PHASE 3' (B/AE/BE/A): predicate-specific mask compute ===
+        // Need both CF_mask and ZF_mask as 0x00/0xFF byte values.
+        //   CF_mask = (CF byte != 0) ? 0xFF : 0x00 = select_mask_table[CF]
+        //   ZF_mask = (diff_or == 0) ? 0xFF : 0x00 = NOT select_mask_table[diff_or]
+        //
+        // Predicates:
+        //   B  : mask = CF_mask
+        //   AE : mask = NOT CF_mask
+        //   BE : mask = CF_mask OR ZF_mask
+        //   A  : mask = NOT (CF_mask OR ZF_mask)
+
+        // Compute ZF_mask from diff_or_byte (in DL): select_mask then XOR 0xFF.
+        emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
+                            "__mov_select_mask_table", Mov::DL);
+        // Invert: DL = DL XOR 0xFF
+        emitIdxZero(MBB, Insert, DL, TII, *Addr);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+            .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+        // Stash ZF_mask to cmp_mask_buf[1] (free until final stash phase).
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 1).addReg(Mov::DL);
+
+        // Load CF byte from cmp_mask_buf[0], convert to CF_mask via
+        // select_mask_table. CF byte is 0 or 1 from the sub borrow lookup.
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+            .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp);
+        emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
+                            "__mov_select_mask_table", Mov::DL);
+        // DL = CF_mask. cmp_mask_buf[1] = ZF_mask.
+
+        // Predicate-specific combine.
+        if (IsAE) {
+          // mask = NOT CF_mask : XOR with 0xFF.
+          emitIdxZero(MBB, Insert, DL, TII, *Addr);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+              .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+        } else if (IsBE || IsA) {
+          // mask = CF_mask OR ZF_mask  (BE), then XOR 0xFF for A.
+          emitIdxZero(MBB, Insert, DL, TII, *Addr);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 1);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+              .addExternalSymbol("__mov_or8_table").addReg(Mov::ECX);
+          if (IsA) {
+            // Invert the OR result via XOR 0xFF.
+            emitIdxZero(MBB, Insert, DL, TII, *Addr);
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+                .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+                .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+                .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+          }
+        }
+        // IsB: DL already holds CF_mask — that's the final mask.
         }
         // Stash mask at cmp_mask_buf[0]
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))

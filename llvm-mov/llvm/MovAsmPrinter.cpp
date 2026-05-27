@@ -55,6 +55,7 @@ public:
     emitAdd8Tables();
     emitBitwise8Tables();
     emitShift8Tables();
+    emitSub8Tables();
   }
 
 private:
@@ -64,6 +65,7 @@ private:
   void emitBitwise8Table(StringRef Name, uint8_t (*Op)(uint8_t, uint8_t));
   void emitShift8Tables();
   void emitUnaryByteTable(StringRef Name, uint8_t (*Op)(uint8_t));
+  void emitSub8Tables();
 };
 } // namespace
 
@@ -318,6 +320,53 @@ void MovAsmPrinter::emitShift8Tables() {
       [](uint8_t a) -> uint8_t {
         return a ? static_cast<uint8_t>(0xFFu) : static_cast<uint8_t>(0);
       });
+}
+
+// Stage 7c3 — byte-subtract lookup tables used by the CMP+Jcc rewrite
+// when the predicate is an unsigned comparison (B/AE/BE/A) and, from
+// stage 7c4, signed comparisons (L/GE/LE/G). The pair is shaped like
+// the add8 tables but encodes `(a - b - cin)` instead of `(a + b + cin)`:
+//
+//   __mov_sub8_diff_table  [cin][a][b] = (a - b - cin) & 0xFF
+//   __mov_sub8_borrow_table[cin][a][b] = ((a - b - cin) >> 31) & 1
+//                                        — 1 iff the subtract underflowed
+//
+// Layout matches the add8 pair (cin-major, then a, then b) so the same
+// idx-pack mechanism works for both. Both tables share a single
+// `.rodata.__mov_sub8_tables` section — they're always referenced as a
+// pair by the legalize pass, so independent GC buys nothing. Total
+// 256 KiB; linked only when a function references the symbols
+// (i.e. when stage 7c3+ has rewritten a CMP+Jcc on an unsigned/signed
+// predicate).
+void MovAsmPrinter::emitSub8Tables() {
+  static constexpr unsigned kSize = 2u * 256u * 256u;
+  SmallVector<uint8_t, kSize> Diff;
+  SmallVector<uint8_t, kSize> Borrow;
+  Diff.reserve(kSize);
+  Borrow.reserve(kSize);
+  for (unsigned cin = 0; cin < 2; ++cin) {
+    for (unsigned a = 0; a < 256; ++a) {
+      for (unsigned b = 0; b < 256; ++b) {
+        const int d = static_cast<int>(a) - static_cast<int>(b) -
+                      static_cast<int>(cin);
+        Diff.push_back(static_cast<uint8_t>(d & 0xFF));
+        Borrow.push_back(static_cast<uint8_t>(d < 0 ? 1 : 0));
+      }
+    }
+  }
+
+  MCSection *TableSec = OutContext.getELFSection(
+      ".rodata.__mov_sub8_tables", ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
+  OutStreamer->switchSection(TableSec);
+
+  const auto emitTable = [&](StringRef Name, ArrayRef<uint8_t> Data) {
+    MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
+    OutStreamer->emitLabel(Sym);
+    OutStreamer->emitBytes(StringRef(
+        reinterpret_cast<const char *>(Data.data()), Data.size()));
+  };
+  emitTable("__mov_sub8_diff_table", Diff);
+  emitTable("__mov_sub8_borrow_table", Borrow);
 }
 
 extern "C" void LLVMInitializeMovAsmPrinter() {

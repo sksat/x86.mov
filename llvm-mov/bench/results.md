@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-27T23:22:54Z on x86_64 (Linux).
+Generated 2026-05-27T23:42:17Z on x86_64 (Linux).
 
 ## return0
 
@@ -20,7 +20,7 @@ int main(void) { return 0; }
 | .rodata size | 0 | 0 |
 | mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.136 ms | 0.523 ms |
+| wall-clock runtime (hyperfine mean) | 0.135 ms | 0.527 ms |
 
 ## return42
 
@@ -35,7 +35,7 @@ int main(void) { return 42; }
 | .rodata size | 0 | 0 |
 | mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.130 ms | 0.527 ms |
+| wall-clock runtime (hyperfine mean) | 0.139 ms | 0.527 ms |
 
 ## eq42
 
@@ -59,7 +59,52 @@ int main(void) {
 | .rodata size | 196864 | 0 |
 | mov count / total | 170 / 180 (94.4%) | 1050 / 1052 (99.8%) |
 | non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.156 ms | 0.544 ms |
+| wall-clock runtime (hyperfine mean) | 0.146 ms | 0.536 ms |
+
+## lt_unsigned
+
+```c
+/* Stage 7c3 visibility — unsigned `<` comparison.
+ *
+ * Uses `argc` (a non-constant function argument) to prevent LLVM from
+ * constant-folding the comparison at IR time. With both operands of
+ * the compare being a constant we'd lose the predicate entirely —
+ * `x < UINT_MAX` in particular folds to `x != UINT_MAX` and lowers
+ * to CMP + JNE, falling into the stage 7c2 EQ/NE pipeline. With a
+ * runtime LHS the IR keeps `icmp ult` and SelectionDAG lowers it to
+ * CMP32ri + JB, which is what 7c3 targets.
+ *
+ * Stage 7c3 (this commit) rewrites the CMP+JB pair into a mov-only
+ * sequence:
+ *
+ *   - byte SUB chain via __mov_sub8_{diff,borrow}_table — the
+ *     final borrow_out (CF) lands in CL after byte 3.
+ *   - select_mask_table[CF] turns the {0,1} CF byte into a
+ *     {0x00, 0xFF} mask.
+ *   - per-byte mask-select writes the chosen target into next_pc.
+ *
+ * After 7c3 the `.text` shows no `cmp` / `jb` — only the
+ * dispatcher's `jmp`.
+ *
+ * The runner doesn't pass real argc/argv to main (no CRT), so the
+ * computed exit code is non-deterministic. The bench measures static
+ * code shape + average runtime, neither of which depends on the
+ * exact result. */
+int main(int argc, char **argv) {
+    (void)argv;
+    if ((unsigned)argc < 10u) return 1;
+    return 0;
+}
+```
+
+| metric | llvm-mov | movfuscator |
+|---|---:|---:|
+| total ELF (bytes) | 467992 | 10221108 |
+| .text size | 813 | 5692 |
+| .rodata size | 459008 | 0 |
+| mov count / total | 202 / 212 (95.3%) | 1045 / 1047 (99.8%) |
+| non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.148 ms | 0.520 ms |
 
 ## bitops
 
@@ -89,7 +134,7 @@ int main(void) {
 | .rodata size | 65536 | 0 |
 | mov count / total | 51 / 57 (89.5%) | 922 / 924 (99.8%) |
 | non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.138 ms | 0.557 ms |
+| wall-clock runtime (hyperfine mean) | 0.153 ms | 0.528 ms |
 
 ## sum10
 
@@ -109,7 +154,7 @@ int main(void) {
 | .rodata size | 262144 | 0 |
 | mov count / total | 103 / 116 (88.8%) | 1225 / 1227 (99.8%) |
 | non-mov mnemonics | `call cmp int jg jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.144 ms | 0.562 ms |
+| wall-clock runtime (hyperfine mean) | 0.139 ms | 0.615 ms |
 
 ## fib10
 
@@ -147,5 +192,5 @@ int main(void) {
 | .rodata size | 262144 | 0 |
 | mov count / total | 108 / 121 (89.3%) | 1267 / 1269 (99.8%) |
 | non-mov mnemonics | `call cmp int jg jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.162 ms | 0.582 ms |
+| wall-clock runtime (hyperfine mean) | 0.136 ms | 0.546 ms |
 
