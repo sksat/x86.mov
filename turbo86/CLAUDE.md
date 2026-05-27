@@ -44,6 +44,7 @@ Companion to [`movie86`](../movie86/): movie86 is the in-browser interpreter ("w
 - Windows host. Would need a different execution path (Wine? QEMU-user? in-process JIT?). movie86 (the interpreter) remains the always-portable path.
 - Loading full linked ELFs server-side. The frontend's job: parse the ELF, stream `Code` messages for each segment, then issue `Start{entry}`.
 - "Trap mode" — turbo86 fully owns signal dispatch (constructs sigframe, invokes handler, emulates rt_sigreturn). Today's behavior is the "host mode" planned in the design: kernel does the dispatch via passthrough. Trap mode is a follow-up axis for migration-parity with movie86.
+- Real movfuscator binary completion. Investigated empirically with the runtime built (`make setup && make build-native` in `movfuscator-wasm/`) and a real-sigaction stubs.s linked in: the binary loads, runs, and locks into the upstream master_loop dispatch trick. The SIGILL handler is `master_loop = _start0` which re-runs `main` from the top on each `mov cs, ax`; without a termination signal we know how to provide from our stubs, it loops indefinitely (movie86 hits the same wall from the other side). Env-gated investigation test at [`runner/movfuscator_elf_test.go`](runner/movfuscator_elf_test.go) documents the observation. Fully completing a real movfuscator binary is a movfuscator-runtime-side problem — turbo86's wiring (rt_sigaction passthrough + SIGILL forward) is working.
 
 ## TDD style
 
