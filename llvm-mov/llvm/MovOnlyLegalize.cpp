@@ -776,6 +776,13 @@ private:
   // into idx[1] and idx[0] respectively. Trashes DL. Leaves idx[2..3]
   // as the caller set them — ADD writes carry into idx[2] BEFORE this
   // helper runs (so the a-byte read doesn't clobber the carry write).
+  //
+  // ri zero-byte fast path: when BSrc is a compile-time immediate of
+  // value 0, both the `mov dl, 0` and the `mov [idx + 0], dl` are
+  // redundant — emitIdxZero already cleared idx[0] to 0, so the
+  // store would only re-write the same value. Skipping the pair
+  // saves 2 movs per zero-byte stage; for the common `add reg, 1`
+  // shape (byte 0 = 1, bytes 1/2/3 = 0) that's 6 movs / ADD32ri site.
   static void emitIdxPackAB(MachineBasicBlock &MBB,
                             MachineBasicBlock::iterator I, const DebugLoc &DL,
                             const TargetInstrInfo &TII, const EbpAddr &A,
@@ -791,6 +798,11 @@ private:
         .addReg(Mov::EBP)
         .addImm(A.IdxDisp + 1)
         .addReg(Mov::DL);
+
+    // Zero-byte fast path for ri-form: idx[0] is already 0 from
+    // emitIdxZero, so no write needed.
+    if (BSrc.K == ByteSource::Kind::Imm && BSrc.Imm == 0)
+      return;
 
     // Load b_byte:
     if (BSrc.K == ByteSource::Kind::Imm) {
