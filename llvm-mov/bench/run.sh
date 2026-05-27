@@ -111,6 +111,45 @@ non_mov_mnemonics() {
         | paste -sd' ' -
 }
 
+# measure_runtime <ELF> → mean wall-clock time in milliseconds, or
+# "n/a" if hyperfine isn't available. We use `--shell=none` to avoid
+# shell-init overhead, and `--warmup 2 --runs 20` for tight short-
+# program timing (the fixtures here are mostly sub-millisecond).
+#
+# Caveat for movfuscator-compiled binaries on this host: their exit
+# code is always 1 (not main's return value) due to an upstream
+# crt/exit-path quirk, but the computation itself runs to completion
+# — stdout is correct, runtime is meaningful, only the post-main
+# exit-code linkage is broken. hyperfine's `-i` ignores the
+# non-zero exit so we still get a runtime number.
+measure_runtime() {
+    local elf="$1"
+    if ! command -v hyperfine >/dev/null 2>&1; then
+        printf 'n/a\n'
+        return
+    fi
+    # Hyperfine writes both human-readable benchmark text and the JSON
+    # export to stdout, so we point the export at a temp file and
+    # silence the textual output.
+    local hf_json="$WORK/hf-$$-$RANDOM.json"
+    if ! hyperfine --shell=none --warmup 2 --runs 20 -i \
+            --export-json "$hf_json" -- "$elf" >/dev/null 2>&1; then
+        printf 'n/a\n'
+        return
+    fi
+    local mean
+    mean="$(grep -oE '"mean":[[:space:]]*[0-9.eE+-]+' "$hf_json" \
+        | head -1 \
+        | grep -oE '[0-9.eE+-]+$')"
+    rm -f "$hf_json"
+    if [ -z "$mean" ]; then
+        printf 'n/a\n'
+    else
+        # hyperfine reports seconds; convert to ms with 3 decimals.
+        awk -v s="$mean" 'BEGIN { printf "%.3f ms\n", s*1000 }'
+    fi
+}
+
 section_size() {
     local elf="$1" pattern="$2"
     # `objdump -h` layout:
@@ -232,6 +271,11 @@ for name in "${FIXTURE_NAMES[@]}"; do
             mf_other=$(non_mov_mnemonics "$mf_elf")
             printf '| non-mov mnemonics | `%s` | `%s` |\n' \
                 "${lm_other:-(none)}" "${mf_other:-(none)}"
+
+            lm_time=$(measure_runtime "$lm_elf")
+            mf_time=$(measure_runtime "$mf_elf")
+            printf '| wall-clock runtime (hyperfine mean) | %s | %s |\n' \
+                "$lm_time" "$mf_time"
         else
             [ "$lm_ok" -eq 0 ] && printf '| (llvm-mov build failed; see log) |||\n'
             [ "$mf_ok" -eq 0 ] && printf '| (movfuscator build failed; see log) |||\n'
