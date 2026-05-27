@@ -20,8 +20,11 @@ Companion to [`movie86`](../movie86/): movie86 is the in-browser interpreter ("w
 - **Host**: amd64 Linux, single Go binary (`GOOS=linux GOARCH=amd64`).
 - **Stub**: tiny i386 ELF (hand-assembled, no libc / no Go runtime). Embedded into the host binary via `//go:embed`. Spawned per session via `memfd_create` + `execve`. Sets up an RWX mmap region for guest code + a stack region, then stops itself with `PTRACE_TRACEME` + `raise(SIGSTOP)`, waiting for the host to inject code and set EIP.
 - **Memory transfer**: `/proc/PID/mem` (faster than `PTRACE_POKEDATA` for bulk writes).
-- **Syscall interception**: `PTRACE_SYSEMU` stops the child *before* each syscall executes. The host reads child registers, translates the call into an Outbound event (`write(1)` → `Stdout`, etc.), sets the synthetic return value into `eax`, and resumes. The kernel does NOT execute the original syscall.
-- **Signal stops** (SIGSEGV / SIGILL / …): surface as a `Paused` Outbound event carrying the regs + a sparse memory snapshot, then the session ends. movie86 can pick the session up via `LoadContext` (e.g., to handle the movfuscator SIGSEGV-dispatch trick in software).
+- **Syscall interception**: `PTRACE_SYSCALL` with entry+exit stop pairs. The bridge classifies each syscall as:
+  - **Emulate** (`write`, `exit`): suppress the kernel call (set `orig_eax = -1` at entry), emit the Outbound event, overwrite `eax` with the synthetic return value at exit. Kernel never executes the original syscall.
+  - **Passthrough** (`rt_sigaction`, `rt_sigreturn`, `rt_sigprocmask`): let the kernel run the syscall natively. The runner shepherds the entry/exit stops past; no event is emitted. Used for signal-disposition syscalls so the guest's own handlers get installed in the kernel and dispatched by it.
+  - **Fault** / **Exit**: terminal — emit the corresponding event and end the session.
+- **Signal stops**: split three ways. Forwardable signals (SIGILL, SIGSEGV, SIGBUS, SIGFPE, SIGPIPE, SIGUSR1, SIGUSR2) are delivered to the guest via the next `PTRACE_SYSCALL` so its registered handler runs (movfuscator's `mov cs, ax` → SIGILL → installed handler pattern). Plain SIGTRAP is reserved for tracer-owned int3 traps (future library-call bridging) and Faults if it ever fires unexpectedly. Other signals (job-control, …) surface as `Paused`. Before forwarding, the runner snapshots regs + sparse memory; if the kernel kills the child (no handler), that snapshot rides along on the `Paused` so debugging visibility is preserved.
 
 ## Scope
 
@@ -36,11 +39,11 @@ Companion to [`movie86`](../movie86/): movie86 is the in-browser interpreter ("w
 - amd64 Linux host only.
 
 **Not in scope (yet):**
-- Library-call bridging (canvas, arbitrary RPC). Needs a separate trap mechanism (replace call target with `int3`, or use a sentinel address-range trap).
+- Library-call bridging (canvas, arbitrary RPC). Needs a separate trap mechanism (replace call target with `int3`, or use a sentinel address-range trap). The plain-SIGTRAP path in the runner is already reserved for this.
 - `stdin` / `read(3)`. Needs a half-duplex bridge (host pauses guest, awaits `Stdin` from frontend, resumes).
 - Windows host. Would need a different execution path (Wine? QEMU-user? in-process JIT?). movie86 (the interpreter) remains the always-portable path.
 - Loading full linked ELFs server-side. The frontend's job: parse the ELF, stream `Code` messages for each segment, then issue `Start{entry}`.
-- Syscall passthrough for `sigaction`. Required to fully run an unmodified movfuscator binary (the `mov cs, ax` SIGILL dispatch trick depends on the guest's own signal handler being installed). Currently blocks the real-movfuscator E2E from completing; the test [`runner/movfuscator_test.go`](runner/movfuscator_test.go) only validates "stream + early Paused, no host crash".
+- "Trap mode" — turbo86 fully owns signal dispatch (constructs sigframe, invokes handler, emulates rt_sigreturn). Today's behavior is the "host mode" planned in the design: kernel does the dispatch via passthrough. Trap mode is a follow-up axis for migration-parity with movie86.
 
 ## TDD style
 
@@ -52,7 +55,7 @@ Matches the repo convention:
 ## Layout
 
 - [`proto/`](proto/) — wire-protocol types + JSON marshal/unmarshal. Platform-agnostic. **Inbound**: `Code`, `Start`, `LoadContext`. **Outbound**: `Stdout`, `Stderr`, `Exit`, `Fault`, `Paused`. Migration schema: `Context{Regs, Regions[]}`, `Regs{Eax..Edi, Esp, Eip, Eflags}`, `MemRegion{Addr, Bytes}`.
-- [`bridge/`](bridge/) — pure-function `HandleSyscall(SyscallArgs, GuestMemory) → Result{Event, Return, Action}`. Analogue of movie86's `SysHost` trait. Decides per syscall what Outbound event to emit and whether the runner should Resume / Exit / Fault.
+- [`bridge/`](bridge/) — pure-function `HandleSyscall(SyscallArgs, GuestMemory) → Result{Event, Return, Action}`. Analogue of movie86's `SysHost` trait. Decides per syscall what Outbound event to emit and whether the runner should Resume / Exit / Fault / Passthrough. Passthrough syscalls return `Event: nil` and let the kernel actually execute the call.
 - [`runner/`](runner/) — ptrace driver. `//go:build linux`. Long-lived `Runner` with `New` / `WriteCode` / `Run` / `RunWithContext` / `Close` lifecycle. An internal tracer goroutine pins itself to one OS thread (does all ptrace ops); `WriteCode` writes via `/proc/PID/mem` and is safe from any goroutine, before OR after `Run` — the streaming primitive. `RunOnce` and `RunWithContext` (top-level) are convenience wrappers for the no-streaming case. `snapshotMemory` produces the sparse `MemRegion[]` carried by Paused.
 - [`server/`](server/) — WebSocket handler (`Handler() http.Handler`). Two-phase: pre-run reads inbound for Code + Start/LoadContext, post-run spawns a reader goroutine for streaming Code while forwarding events on the main goroutine.
 - [`stub/`](stub/) — `_stub.s` (i386 GAS source, leading `_` so Go ignores it) + `Makefile` + the built `stub` binary. `stub.go` exposes the embedded bytes via `//go:embed`.
@@ -64,7 +67,11 @@ Matches the repo convention:
 
 - **`/proc/PID/mem` reads/writes need the child stopped.** ptrace stops imply that, but a freshly attached child that hasn't yet received a stop signal can race. Always `waitpid` for the stop before writing.
 
-- **`PTRACE_SYSEMU` (request 31) skips the kernel syscall entirely** — the tracer is fully responsible for setting `eax` to the synthetic return value. Cleaner than `PTRACE_SYSCALL` for our bridging use case (one stop per syscall, no need to suppress with `orig_eax = -1`).
+- **`PTRACE_SYSCALL` with entry/exit stop pairs is the mode**, not `PTRACE_SYSEMU`. SYSEMU is cheaper (one stop per syscall) but only supports skip-the-kernel-syscall semantics — it can't pass calls through to the kernel, which is needed for `rt_sigaction`/`rt_sigreturn`. The runner's `syscallPending` flag distinguishes entry from exit; emulate sets `orig_eax = -1` at entry and overwrites `eax` at exit, passthrough leaves both alone.
+
+- **i386 sigaction needs a valid restorer.** `NR_rt_sigaction` (174) does NOT have a kernel-default sa_restorer on i386 — without `SA_RESTORER + sa_restorer = &trampoline`, the handler's return address is whatever was in the sigframe (usually zero), and the handler crashes on return. Our [sigaction E2E test](runner/sigaction_test.go) builds a tiny `mov eax, 173; int 0x80` restorer at a known address; movfuscator's libc-style crt0 emits its own via glibc.
+
+- **Plain SIGTRAP is reserved.** The runner Faults on it. The future int3-breakpoint mechanism for library-call bridging will own SIGTRAP exclusively; do not start forwarding SIGTRAP to the guest as part of any signal-passthrough work.
 
 - **The stub MUST NOT be linked at `0x08048000`.** The conventional i386 ELF base is also where the guest code region lives. `mmap MAP_FIXED` at that address from inside the stub overwrites the stub's own code → next instruction segfaults. The Makefile uses `-Ttext-segment=0x40000000` to keep them apart.
 
