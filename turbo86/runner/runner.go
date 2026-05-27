@@ -300,9 +300,9 @@ type Runner struct {
 	closeOnce sync.Once
 
 	// Mode-dependent state, populated when the syscall loop starts.
-	mode       proto.Mode        // host (default) or trap
-	handlers   map[uint8]uint32  // signum → handler addr (trap mode only)
-	signalRegs []regs32          // saved regs stack for rt_sigreturn (trap mode only)
+	mode       proto.Mode       // host (default) or trap
+	handlers   map[uint8]uint32 // signum → handler addr (trap mode only)
+	signalRegs []regs32         // saved regs stack for rt_sigreturn (trap mode only)
 }
 
 type startMsg struct {
