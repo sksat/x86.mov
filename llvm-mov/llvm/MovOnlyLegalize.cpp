@@ -93,12 +93,7 @@ public:
           Changed |= legalizeADD32ri(MI, MBB, TII);
           break;
         case Mov::ADD32rr:
-          // Stage 7a1 only lands ADD32ri. ADD32rr needs an extra
-          // 4-byte spill slot for the RHS register and a second
-          // byte-extract path, both small but big enough to keep out
-          // of the first commit. Falls through to no-op for now —
-          // the existing 39 execution fixtures that use ADD32rr keep
-          // hitting the original `add reg, reg` instruction.
+          Changed |= legalizeADD32rr(MI, MBB, TII);
           break;
         // SUB/AND/OR/XOR rr+ri, SHL/SHR/SAR ri/rCL, CMP+Jcc, CALL32d
         // + CALLSEQ, RET, and the prologue/epilogue PUSH/POP/SUB/MOV
@@ -113,12 +108,15 @@ public:
 
 private:
   // Address triple for `[EBP + Disp]`. Built once per legalize site
-  // and reused for every BuildMI in the byte chain.
+  // and reused for every BuildMI in the byte chain. The RhsDisp slot
+  // is only populated when the function has at least one ADD32rr —
+  // ADD32ri-only functions leave it nullopt.
   struct EbpAddr {
     int64_t SaveEcxDisp;
     int64_t SaveEdxDisp;
     int64_t SrcDstDisp;
     int64_t IdxDisp;
+    std::optional<int64_t> RhsDisp;
   };
 
   // Stage-7a1 placeholder — see the file-level comment for the design.
@@ -149,13 +147,15 @@ private:
   // 39 execution fixtures + Rust example stay green and the
   // test/MovOnly gate stays empty.
 
-  // Look up the EBP-relative displacement for the four pre-PEI-reserved
+  // Look up the EBP-relative displacement for the pre-PEI-reserved
   // scratch slots a stage-7a1 rewrite needs. Returns `std::nullopt` if
-  // any slot is missing (i.e. the FrameLowering scan didn't see an
-  // ADD32 in this function and skipped reservation — legalize must
-  // bail in that case).
+  // any base slot is missing (i.e. the FrameLowering scan didn't see
+  // an ADD32 in this function and skipped reservation — legalize must
+  // bail in that case). `RhsDisp` is populated only when the function
+  // has at least one ADD32**rr**; ADD32ri-only callers leave it
+  // nullopt and ignore it.
   //
-  // The four slots are independent FIs, and MFI.getObjectOffset
+  // All FIs are independent local objects, and MFI.getObjectOffset
   // returns each one's final layout offset directly (LocalAreaOffset
   // is 0 for our frame, so the offset *is* the EBP-relative disp).
   // Using these resolved displacements means BuildMI never touches a
@@ -170,9 +170,38 @@ private:
     if (FI_Ecx == -1 || FI_Edx == -1 || FI_Sd == -1 || FI_Ix == -1)
       return std::nullopt;
     const auto &MFI = MF.getFrameInfo();
-    return EbpAddr{MFI.getObjectOffset(FI_Ecx), MFI.getObjectOffset(FI_Edx),
-                   MFI.getObjectOffset(FI_Sd), MFI.getObjectOffset(FI_Ix)};
+    EbpAddr A{MFI.getObjectOffset(FI_Ecx), MFI.getObjectOffset(FI_Edx),
+              MFI.getObjectOffset(FI_Sd), MFI.getObjectOffset(FI_Ix),
+              std::nullopt};
+    const int FI_Rhs = MovMFI->getAddRewriteRhsFI();
+    if (FI_Rhs != -1)
+      A.RhsDisp = MFI.getObjectOffset(FI_Rhs);
+    return A;
   }
+
+  // Per-byte source for the RHS operand `b_byte`. ADD32ri slices its
+  // compile-time immediate (`ByteSource::Imm`); ADD32rr reads the
+  // byte from a per-function memory spill (`ByteSource::MemDisp`,
+  // `EBP + Disp + i`).
+  struct ByteSource {
+    enum class Kind { Imm, MemDisp } K;
+    union {
+      uint8_t Imm;
+      int64_t MemDisp;
+    };
+    static ByteSource fromImm(uint8_t I) {
+      ByteSource S;
+      S.K = Kind::Imm;
+      S.Imm = I;
+      return S;
+    }
+    static ByteSource fromMem(int64_t D) {
+      ByteSource S;
+      S.K = Kind::MemDisp;
+      S.MemDisp = D;
+      return S;
+    }
+  };
 
   // Emit one per-byte stage of the carry chain. `ByteIdx` controls two
   // boundary conditions:
@@ -182,13 +211,13 @@ private:
   //     leaves idx[2] = 0 = correct cin for byte 0.
   //   - On byte 3 we don't need the carry-out for a following stage,
   //     so we skip the trailing `mov cl, [carry_table + ecx]` read.
-  // The IMM operand is the per-byte slice of the original 32-bit
-  // immediate (operand 2 of ADD32ri, masked to a u8 and shifted into
-  // the right byte position).
+  // `BSrc` selects how the b_byte (RHS i-th byte) is loaded into DL —
+  // either a compile-time immediate slice (ADD32ri) or a load from
+  // the per-function RHS spill buffer (ADD32rr).
   static void emitByteStage(MachineBasicBlock &MBB,
                             MachineBasicBlock::iterator I, const DebugLoc &DL,
                             const TargetInstrInfo &TII, const EbpAddr &A,
-                            unsigned ByteIdx, uint8_t ImmByte) {
+                            unsigned ByteIdx, ByteSource BSrc) {
     const int64_t SrcByteDisp = A.SrcDstDisp + static_cast<int64_t>(ByteIdx);
     const int64_t IdxBaseDisp = A.IdxDisp;
 
@@ -224,8 +253,16 @@ private:
         .addImm(IdxBaseDisp + 1)
         .addReg(Mov::DL);
 
-    // mov dl, IMM8                   ; immediate slice (b_byte)
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(ImmByte);
+    // Load b_byte. Two shapes:
+    if (BSrc.K == ByteSource::Kind::Imm) {
+      // mov dl, IMM8                 ; b_byte = compile-time immediate slice
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(BSrc.Imm);
+    } else {
+      // mov dl, byte ptr [rhs_buf + i]  ; b_byte = ADD32rr RHS spill byte
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP)
+          .addImm(BSrc.MemDisp + static_cast<int64_t>(ByteIdx));
+    }
     // mov byte ptr [idx + 0], dl     ; b_byte
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
         .addReg(Mov::EBP)
@@ -318,12 +355,85 @@ private:
     // its original value at positions ≥ ByteIdx) and writes the sum
     // back in place; the carry-out is left in CL for the next stage.
     for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
-      emitByteStage(MBB, Insert, DL, TII, *Addr, ByteIdx, ImmBytes[ByteIdx]);
+      emitByteStage(MBB, Insert, DL, TII, *Addr, ByteIdx,
+                    ByteSource::fromImm(ImmBytes[ByteIdx]));
 
     // EPILOGUE — restore the parent regs, then reload DST32 from the
     // srcdst buffer. Order matters when DST32 happens to be ECX or
     // EDX: the restore writes the original saved value, then the
     // result load overwrites it with the actual result.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        .addReg(Mov::EBP)
+        .addImm(Addr->SaveEcxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+        .addReg(Mov::EBP)
+        .addImm(Addr->SaveEdxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
+        .addReg(Mov::EBP)
+        .addImm(Addr->SrcDstDisp);
+
+    MI.eraseFromParent();
+    return true;
+  }
+
+  // Stage 7a1+ — `add DST32, DST32, RHS32` legalisation. Same byte
+  // chain as legalizeADD32ri, but the RHS bytes come from a per-
+  // function spill buffer (`rhs_buf`) reserved by FrameLowering when
+  // ADD32rr is present, instead of being compile-time immediate
+  // slices. Returns false (no rewrite) when either the base scratch
+  // slots or the rhs_buf slot is missing — the latter signals that
+  // FrameLowering's pre-PEI scan didn't see this ADD32rr (e.g. an
+  // ADJCALLSTACKUP/DOWN lowering inserted it after the scan), and the
+  // safe thing is to leave the `add reg, reg` alone.
+  bool legalizeADD32rr(MachineInstr &MI, MachineBasicBlock &MBB,
+                       const TargetInstrInfo &TII) const {
+    const MachineFunction &MF = *MBB.getParent();
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr || !Addr->RhsDisp)
+      return false;
+
+    // ADD32rr operands: $dst (def, GPR32, tied to $src1), $src1 (use,
+    // GPR32), $src2 (use, GPR32). RA gives us op0.reg == op1.reg
+    // post-tie, and op2 is the RHS — possibly the same physreg as
+    // op0 (e.g. `add eax, eax`), which is fine because we spill both
+    // operands before borrowing any byte registers.
+    assert(MI.getOperand(0).isReg() && "ADD32rr op 0 must be reg");
+    assert(MI.getOperand(2).isReg() && "ADD32rr op 2 must be reg");
+    const Register Dst = MI.getOperand(0).getReg();
+    const Register Rhs = MI.getOperand(2).getReg();
+
+    auto Insert = MachineBasicBlock::iterator(&MI);
+    const DebugLoc DL = MI.getDebugLoc();
+    const int64_t RhsDisp = *Addr->RhsDisp;
+
+    // PROLOGUE — save ECX, EDX, then spill both operands. Order:
+    // ECX/EDX saves first (they don't touch DST32 or RHS32), then
+    // srcdst <- Dst, then rhs_buf <- Rhs. If Dst == Rhs, both spills
+    // capture the same current value; legal.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP)
+        .addImm(Addr->SaveEcxDisp)
+        .addReg(Mov::ECX);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP)
+        .addImm(Addr->SaveEdxDisp)
+        .addReg(Mov::EDX);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP)
+        .addImm(Addr->SrcDstDisp)
+        .addReg(Dst);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP)
+        .addImm(RhsDisp)
+        .addReg(Rhs);
+
+    // CHAIN — four byte stages, RHS bytes read from rhs_buf.
+    for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
+      emitByteStage(MBB, Insert, DL, TII, *Addr, ByteIdx,
+                    ByteSource::fromMem(RhsDisp));
+
+    // EPILOGUE — restore ECX/EDX, then load DST32 from srcdst (same
+    // ordering rationale as legalizeADD32ri: handles DST32 ∈ {ECX, EDX}).
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
         .addReg(Mov::EBP)
         .addImm(Addr->SaveEcxDisp);

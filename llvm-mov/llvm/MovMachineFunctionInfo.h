@@ -75,6 +75,17 @@ public:
   int getAddRewriteIdxFI() const { return AddRewriteIdxFI; }
   void setAddRewriteIdxFI(int FI) { AddRewriteIdxFI = FI; }
 
+  // Stage 7a1+: extra spill slot used by ADD32**rr** for the RHS
+  // register operand. ADD32ri's RHS is a compile-time immediate that
+  // the rewrite slices into byte-sized `mov dl, IMM8` operands;
+  // ADD32rr's RHS is a generic register and needs to be spilled to
+  // memory so each byte can be read with `mov dl, byte ptr
+  // [rhs_buf + i]`. Reserved by MovFrameLowering only when at least
+  // one ADD32rr is in the function, so ADD32ri-only functions stay
+  // at 16 bytes of scratch instead of 20.
+  int getAddRewriteRhsFI() const { return AddRewriteRhsFI; }
+  void setAddRewriteRhsFI(int FI) { AddRewriteRhsFI = FI; }
+
 private:
   // Keyed on the *parent* (full-width) physreg, e.g. Mov::ECX for the
   // slot that backs CL-uses. We don't key by the byte subreg because
@@ -85,6 +96,7 @@ private:
 
   int AddRewriteSrcDstFI = -1;
   int AddRewriteIdxFI = -1;
+  int AddRewriteRhsFI = -1;
 };
 
 } // namespace llvm

@@ -88,28 +88,38 @@ MovFrameLowering::eliminateCallFramePseudoInstr(
 
 void MovFrameLowering::processFunctionBeforeFrameFinalized(
     MachineFunction &MF, RegScavenger * /*RS*/) const {
-  // Walk every MachineInstr in the function to decide whether
-  // MovOnlyLegalize will need to spill ECX while it borrows CL as a
-  // table index. Today the only legalize-eligible opcodes are
-  // ADD32rr/ri; stage 7b/c/d will extend this set, and the scratch
-  // slot becomes useful as soon as legalizeADD32 starts rewriting
-  // (stage 7a1). Reserving here, even though prep-2c is still a
-  // no-op consumer, lets us verify the wiring end-to-end (an extra
-  // local slot shows up as `sub esp, +4` in the prologue of ADD-having
-  // fixtures) without piling state on the legalize pass itself.
-  bool NeedsAddLegalizeScratch = false;
+  // Walk every MachineInstr in the function to figure out which
+  // scratch slots the post-PEI MovOnlyLegalize rewrite will need.
+  // Two independent questions:
+  //
+  //   NeedsAddScratch     — does any ADD32 (rr or ri) appear? If so
+  //                         reserve the 4 base slots (save_ecx,
+  //                         save_edx, srcdst, idx).
+  //   NeedsAddRhsScratch  — does any ADD32rr specifically appear? If
+  //                         so reserve a 5th slot for the RHS register
+  //                         spill. ADD32ri's RHS is a compile-time
+  //                         immediate that doesn't need memory.
+  //
+  // So an ADD32ri-only function reserves 16 bytes; an ADD-rr-having
+  // function reserves 20 bytes; an ADD-less function reserves none.
+  bool NeedsAddScratch = false;
+  bool NeedsAddRhsScratch = false;
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
       const unsigned Op = MI.getOpcode();
-      if (Op == Mov::ADD32rr || Op == Mov::ADD32ri) {
-        NeedsAddLegalizeScratch = true;
-        break;
+      if (Op == Mov::ADD32rr) {
+        NeedsAddScratch = true;
+        NeedsAddRhsScratch = true;
+      } else if (Op == Mov::ADD32ri) {
+        NeedsAddScratch = true;
       }
+      if (NeedsAddScratch && NeedsAddRhsScratch)
+        break;
     }
-    if (NeedsAddLegalizeScratch)
+    if (NeedsAddScratch && NeedsAddRhsScratch)
       break;
   }
-  if (!NeedsAddLegalizeScratch)
+  if (!NeedsAddScratch)
     return;
 
   auto *MovMFI = MF.getInfo<MovMachineFunctionInfo>();
@@ -119,26 +129,18 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
                                  /*isSpillSlot=*/false, /*Alloca=*/nullptr,
                                  /*ID=*/0);
   };
-  // Four slots are needed by the stage-7a1 ADD32ri byte-chain rewrite:
-  //
-  //   - save_ecx, save_edx: spill/restore for the two parent registers
-  //     the rewrite borrows (ECX as the table-index register, EDX/DL
-  //     as the temp byte register that shuffles bytes between memory
-  //     and the index slot).
-  //   - srcdst:  result buffer. The 32-bit operand register is spilled
-  //              here at the start; per-byte sums are written back into
-  //              it in place; the final result is reloaded into the dst
-  //              register at the end. ADD32 is 2-address-tied so one
-  //              slot doubles as both source spill and result buffer.
-  //   - idx:    where the (cin, a, b) index triple is packed before
-  //             `mov ecx, dword ptr [idx]` loads it into the index reg.
-  //             Needed because GR8 only models AL/CL/DL/BL, so we
-  //             can't write the CH byte of ECX directly.
-  //
-  // Total of 16 bytes added to the local frame of every ADD-having
-  // function. Stage 7b/c/d will extend this when more opcodes legalize.
+
+  // Base 4 slots: save_ecx, save_edx, srcdst (source spill + result
+  // buffer), idx (4-byte index pack slot). See stage 7a1 commit msg /
+  // MovOnlyLegalize.cpp for layout rationale.
   MovMFI->setSavedParentSlotFI(Mov::ECX, Make());
   MovMFI->setSavedParentSlotFI(Mov::EDX, Make());
   MovMFI->setAddRewriteSrcDstFI(Make());
   MovMFI->setAddRewriteIdxFI(Make());
+
+  // 5th slot — RHS spill — only when ADD32rr is present. Without this
+  // conditional, ADD32ri-only functions would grow by 4 bytes of dead
+  // frame space.
+  if (NeedsAddRhsScratch)
+    MovMFI->setAddRewriteRhsFI(Make());
 }
