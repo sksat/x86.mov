@@ -36,6 +36,56 @@ type Start struct {
 
 func (Start) inboundKind() string { return "start" }
 
+// Regs is the canonical i386 guest-visible register state for engine
+// migration. Held common between turbo86 and movie86 so a snapshot from
+// one can resume on the other. Segment registers and OrigEax are
+// intentionally omitted — they're either constant in 32-bit user mode
+// (segments) or transient syscall machinery (OrigEax).
+type Regs struct {
+	Eax    uint32 `json:"eax"`
+	Ebx    uint32 `json:"ebx"`
+	Ecx    uint32 `json:"ecx"`
+	Edx    uint32 `json:"edx"`
+	Esi    uint32 `json:"esi"`
+	Edi    uint32 `json:"edi"`
+	Ebp    uint32 `json:"ebp"`
+	Esp    uint32 `json:"esp"`
+	Eip    uint32 `json:"eip"`
+	Eflags uint32 `json:"eflags"`
+}
+
+// MemRegion is one contiguous chunk of guest memory in a Context.
+// Multiple MemRegions can carry disjoint or overlapping ranges; the
+// receiver applies them in order.
+type MemRegion struct {
+	Addr  uint32 `json:"addr"`
+	Bytes []byte `json:"bytes"`
+}
+
+// Context is a transferable snapshot of guest execution: enough state
+// for either engine to pick up from where the other left off. The
+// receiver loads memory regions first, then sets Regs, then resumes
+// execution (and may keep streaming additional Code messages after
+// LoadContext).
+//
+// v1 ships the simplest workable schema — full memory in Regions, no
+// signal disposition, no generation counter. Both can be added later
+// without breaking existing payloads (additive JSON fields).
+type Context struct {
+	Regs    Regs        `json:"regs"`
+	Regions []MemRegion `json:"regions"`
+}
+
+// LoadContext hands a Context to the runner: write each MemRegion into
+// guest memory, set Regs, and continue. Used for engine migration —
+// e.g., the frontend takes a Context out of movie86 and hands it to
+// turbo86 for the hot path.
+type LoadContext struct {
+	Context Context `json:"context"`
+}
+
+func (LoadContext) inboundKind() string { return "load_context" }
+
 // MarshalInbound encodes an Inbound as a JSON object with a "type" field.
 func MarshalInbound(msg Inbound) ([]byte, error) {
 	switch m := msg.(type) {
@@ -48,6 +98,11 @@ func MarshalInbound(msg Inbound) ([]byte, error) {
 		return json.Marshal(struct {
 			Type string `json:"type"`
 			Start
+		}{m.inboundKind(), m})
+	case LoadContext:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			LoadContext
 		}{m.inboundKind(), m})
 	default:
 		return nil, fmt.Errorf("proto: unknown Inbound type %T", msg)
@@ -74,6 +129,12 @@ func UnmarshalInbound(data []byte) (Inbound, error) {
 		var m Start
 		if err := json.Unmarshal(data, &m); err != nil {
 			return nil, fmt.Errorf("proto: parsing Start payload: %w", err)
+		}
+		return m, nil
+	case "load_context":
+		var m LoadContext
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, fmt.Errorf("proto: parsing LoadContext payload: %w", err)
 		}
 		return m, nil
 	default:

@@ -27,6 +27,27 @@ func TestInboundRoundTrip(t *testing.T) {
 			"Start zero",
 			Start{Entry: 0, StackTop: 0},
 		},
+		{
+			"LoadContext typical",
+			LoadContext{Context: Context{
+				Regs: Regs{
+					Eax: 0x11111111, Ebx: 0x22222222, Ecx: 0x33333333, Edx: 0x44444444,
+					Esi: 0x55555555, Edi: 0x66666666, Ebp: 0x77777777, Esp: 0x701FFFF0,
+					Eip: 0x08048000, Eflags: 0x202,
+				},
+				Regions: []MemRegion{
+					{Addr: 0x08048000, Bytes: []byte{0xB8, 0x01, 0x00, 0x00, 0x00}},
+					{Addr: 0x08049000, Bytes: []byte{0xCD, 0x80}},
+				},
+			}},
+		},
+		{
+			"LoadContext zero regs and no regions",
+			LoadContext{Context: Context{
+				Regs:    Regs{},
+				Regions: []MemRegion{},
+			}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
