@@ -133,22 +133,44 @@ Switched to the mov-loop CRT (`crt0.o` + `crtf.o` + `crtd.o` + `softfloat32.o` +
 
 ### Real movfuscator binaries: end-to-end demos
 
-movfuscator's libc-call ABI is **cdecl**. `jmp_extern` pushes args then a return label and sets `esp = sp` so the callee sees the standard `[esp+0] = retaddr, [esp+4] = arg1` layout. The minimal stubs in [`scripts/link-real-return42.sh`](scripts/link-real-return42.sh) and [`scripts/link-real-hello.sh`](scripts/link-real-hello.sh) follow that convention.
+There are now **two** ways to bridge libc calls into movie86:
+
+- **cdecl stubs.** A fixture-specific assembly stub for each libc fn,
+  ending in a real `int 0x80` syscall (e.g. `printf` → `write(1, …)`).
+  Stubs hardcode their own behavior (the `hello` stub hardcodes a
+  6-byte write because mov-only `strlen` needs `cmp + jcc` + EFLAGS).
+  Doesn't scale, but the binary still runs on real hardware.
+
+- **Host-wrapper stubs** (current preferred path). Every wrapped fn is a
+  uniform `int $0x81; ret` sentinel. movie86 traps on int 0x81, the
+  host-side [`LibcHost`](core/src/libc_host.rs) reads cdecl args from
+  `[esp+4..]` and does the work — `printf`'s format parser lives in
+  Rust, no in-guest `strlen` needed. Designed for wasm portability:
+  the same trait will plug a wasm host in later.
+
+  `StdHost::scan_libc_stubs` walks the ELF symbol table at load time
+  and registers any sentinel it finds (looks for `CD 81` at &exit /
+  &sigaction / &printf), so both link styles coexist in the same
+  movie86 binary — no flag needed.
 
 | Program | Linker script | Behavior through movie86 | Notes |
 |---|---|---|---|
-| `return42.c` | `link-real-return42.sh` | exits with status **0** | movfuscator's crt0 hardcodes `push("$0"); jmp_extern("exit")` — it **ignores main's return value** and always exits 0. Confirmed against the dynamically-linked native build too. |
-| `hello.c` | `link-real-hello.sh` | prints `Hello` to stdout, exits 0 | The `printf` stub hardcodes a 6-byte write (= length of `"Hello\n"`) because real `strlen` needs `cmp + jcc` + EFLAGS modeling, which is outside movie86's mov-only scope. Sufficient for the committed fixture; won't generalize. |
+| `return42.c` | `link-real-return42.sh` | exits with status **0** | cdecl `int 0x80` exit stub. crt0 hardcodes `push("$0"); jmp_extern("exit")` — main's return value is **ignored**. Confirmed against the native build too. |
+| `hello.c` | `link-real-hello.sh` | prints `Hello`, exits 0 | cdecl stub with **hardcoded 6-byte** `write` (= `"Hello\n"`). Sufficient for the committed fixture; doesn't generalize. |
+| `hello.c` | `link-real-hello-host.sh` | prints `Hello`, exits 0 | **Host-wrapper** stub. printf goes through `LibcHost::libc_call` → Rust's format parser. No 6-byte hardcode; would handle `%s`/`%d`/`%c` for any longer format too. |
 
-Both demos exercise the same end-to-end path:
+All demos exercise the same end-to-end path through master_loop:
 
 ```
 crt0 → master_loop → main (mov-only body) → return → master_loop's
   exit-call block → push retaddr + args on shadow stack →
   set external = &callee → NULL deref → SIGSEGV →
   Cpu::step routes Unmapped(0) → SIGSEGV handler →
-  dispatch (mov esp, [sp]; jmp [external]) → libc stub → int 0x80
+  dispatch (mov esp, [sp]; jmp [external]) → libc stub
 ```
+
+Only the last hop differs: the cdecl stub ends in `int 0x80`; the
+host-wrapper stub ends in `int $0x81; ret`.
 
 ### How to reproduce
 
@@ -156,16 +178,20 @@ crt0 → master_loop → main (mov-only body) → return → master_loop's
 # Materialize the gitignored runtime objects (5–15 min):
 cd ../movfuscator-wasm && make setup && make build-native && cd -
 
-# return42 demo:
+# return42 demo (cdecl exit stub):
 movie86/scripts/link-real-return42.sh
 cargo run --release --bin movie86 -- /tmp/movie86-link/return42-real.elf
 echo $?    # → 0  (movfuscator quirk — see table)
 
-# hello demo:
+# hello demo (cdecl printf stub, hardcoded length):
 movie86/scripts/link-real-hello.sh
 cargo run --release --bin movie86 -- /tmp/movie86-link/hello-real.elf
-# prints: Hello
-echo $?    # → 0
+# prints: Hello — echo $? = 0
+
+# hello demo (host-wrapper printf, no hardcoded length):
+movie86/scripts/link-real-hello-host.sh
+cargo run --release --bin movie86 -- /tmp/movie86-link/hello-host.elf
+# prints: Hello — echo $? = 0  (same output, but through the wrapper)
 ```
 
 ## 2026-05-28 follow-up: why `jmp main` exists
@@ -293,18 +319,35 @@ because both rely on `main`'s return value, which the crt0 always
 overrides with `exit(0)`. That is a movfuscator convention, not a
 movie86 limitation, and is the same reason `return42` exits 0.
 
-## Library-stub generality (open question)
+## Library-stub generality (resolved → host-wrapper ABI)
 
-The `printf` stub in `link-real-hello.sh` hardcodes a 6-byte write
-because real `strlen` needs `cmp r/m32, r32` + `jcc rel8/32` + a real
-EFLAGS model (ZF at minimum). movie86 today implements neither — `cmp`
-is unimplemented and there is no flags register. Adding both is the
-natural next milestone (call it "milestone 4: branches"); it would also
-let us drop the hardcoded `exit` length and link against a real
-mov-only libc instead of hand-written cdecl trampolines. Until then,
-each new libc-using fixture would need its own fixture-specific stub,
-which doesn't scale — so the deliberate plan is: no more hand-written
-libc stubs until cmp/jcc/EFLAGS land.
+The original hello demo's `printf` stub hardcoded a 6-byte write
+because real `strlen` needs `cmp + jcc` + EFLAGS, which movie86
+doesn't implement. The fix could have been "add cmp/jcc/EFLAGS" — a
+multi-week milestone — but the cheaper and more wasm-friendly answer
+was to **move the libc body out of the guest**:
+
+- Every wrapped fn is a uniform sentinel stub `int $0x81; ret` (3
+  bytes).
+- movie86 dispatches `int 0x81` to the host's [`LibcHost`] trait,
+  which reads cdecl args from `[esp+4..]` and does the work in Rust.
+- `printf`'s format parser lives on the host — bounded fmt scan
+  (`PRINTF_MAX_LEN = 4096`), `%s`/`%d`/`%c`/`%%` only, `%n` rejected
+  (returns -1 + flushes partial output).
+- `StdHost::scan_libc_stubs` auto-detects sentinel stubs by walking
+  the ELF symbol table at load time, so the host code never has to
+  hand-register addresses.
+- Designed for the planned wasm runtime: the wasm host plugs in the
+  same `LibcHost` trait, the cdecl ABI is unchanged.
+
+The previous cdecl `int 0x80` stubs (e.g. `link-real-hello.sh`) still
+work — both link styles coexist, scan_libc_stubs only fires when it
+sees the `CD 81` sentinel byte pattern.
+
+`cmp`/`jcc`/EFLAGS remain on the roadmap for the guest's own
+control-flow needs (movfuscator only avoids them via the master_loop
+trick; a future mov-only LLVM backend may want them honestly), but
+they are no longer load-bearing for libc-using fixtures.
 
 ## CI
 
