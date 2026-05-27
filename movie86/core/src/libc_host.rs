@@ -25,6 +25,7 @@
 //! function table, the core only knows the ABI. A future wasm host
 //! plugs the same trait in.
 
+use crate::elf::LoadedElf;
 use crate::insn::Reg32;
 use crate::{Fault, Memory};
 
@@ -90,8 +91,9 @@ pub enum LibcResult {
 /// which function fired. Returning [`Fault::Exit`] terminates the run
 /// (used by `exit`).
 ///
-/// The default impl traps with [`Fault::UnsupportedInterrupt(0x81)`]
-/// so that a test host that doesn't care about libc calls can write
+/// The default impls trap with [`Fault::UnsupportedInterrupt(0x81)`]
+/// for `libc_call` and do nothing for `scan_libc_stubs` — that lets
+/// a test host that doesn't care about libc calls write
 /// `impl LibcHost for MyHost {}` and get the right behavior.
 pub trait LibcHost {
     /// Handle the libc call. `call.trap_addr` identifies which stub
@@ -103,4 +105,10 @@ pub trait LibcHost {
     fn libc_call(&mut self, _call: &mut LibcCall<'_>) -> Result<LibcResult, Fault> {
         Err(Fault::UnsupportedInterrupt(0x81))
     }
+
+    /// Called by the runtime once the ELF is loaded and memory is
+    /// initialized. Hosts that want to auto-discover sentinel stubs
+    /// (`CD 81` = `int 0x81`) by walking the ELF symbol table can do
+    /// it here. The default impl does nothing so this is opt-in.
+    fn scan_libc_stubs(&mut self, _elf: &LoadedElf<'_>, _mem: &dyn Memory) {}
 }
