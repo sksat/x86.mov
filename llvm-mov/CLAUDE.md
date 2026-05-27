@@ -123,11 +123,21 @@ test/
 - **`MovOnlyLegalize` is its own staging story** (per codex's stage-7 design pass):
   - **7a/7b are local rewrites**: per-MI, deterministic, no CFG/ABI changes.
     `7a0` ships the empty pass + `addPreEmitPass` wiring + `make test-mov-only`
-    gate. `7a1` is the first real legalization (`ADD32r{r,i}` via i32-cell
-    lookup tables — deliberately *not* introducing `MOV8/MOV16rm` here so
-    the table machinery stays scoped to the existing addressing modes).
-    `7b1 = AND/OR/XOR`, `7b2 = SHL/SHR/SAR` (separate from logic because
-    shift carry/bit-extraction is a different table shape).
+    gate. `7a1` is the first real legalization (`ADD32r{r,i}` via a
+    **byte-chain carry table** — `__mov_add8_sum_table[cin][a][b]` +
+    `__mov_add8_carry_table[cin][a][b]`, 128 KiB each, indexed by an 8-bit
+    register held in `CL`/`AL`/etc.; the four byte additions are chained
+    via `mov` of the carry between them). The required prerequisites live
+    in **stage 7-prep-2**: (2a) hand-written `.byte` table emission in
+    `MovAsmPrinter::emitEndOfAsmFile`; (2b) a new index-register mem operand
+    kind + a legalize-only `MOV8rm_idx` patternless instruction for
+    `[base + index]` table lookup; (2c) a post-RA scratch-slot helper
+    (purpose-keyed `getOrCreateScratchSlot`) to spill parent regs when
+    `CL`/`AL` is needed but `ECX`/`EAX` is live. Earlier drafts of this
+    section mentioned an "i32-cell" lookup that avoided MOV8 — that path
+    turned out not to actually skip byte extraction, so we're going
+    byte-chain. `7b1 = AND/OR/XOR`, `7b2 = SHL/SHR/SAR` (separate from
+    logic because shift carry/bit-extraction is a different table shape).
   - **7c and 7d swap the execution substrate**: control flow and ABI move
     to dispatcher / lookup-driven mechanisms. These are *much* harder than
     7a/7b and should not be opened until 7a/7b are stable. Codex's

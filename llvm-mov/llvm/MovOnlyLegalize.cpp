@@ -13,10 +13,15 @@
 //
 // Stage breakdown for what's coming, per codex's stage-7 design pass:
 //   7a0  this commit — pass skeleton + addPreEmitPass wiring + docs
-//   7a1  ADD32rr/ri  — first real legalization, via .rodata lookup
-//                      tables widened to i32 cells (so MOV8/16rm isn't
-//                      a prerequisite); a PoC fixture verifies one
-//                      function lowers to mov-only.
+//   7a1  ADD32rr/ri  — first real legalization, via .rodata byte-add
+//                      lookup tables. Each 32-bit add is decomposed into
+//                      four 8-bit adds chained by carry; the per-byte
+//                      add is a pair of table reads
+//                      (__mov_add8_sum_table / __mov_add8_carry_table)
+//                      indexed by (cin, a_byte, b_byte). A PoC fixture
+//                      verifies one function lowers to mov-only.
+//                      Requires the stage 7-prep-2 infrastructure (see
+//                      legalizeADD32 below).
 //   7b1  AND/OR/XOR  — straightforward extension of the 7a1 framework.
 //   7b2  SHL/SHR/SAR — separate because shift carry/bit-extraction is a
 //                      different table shape from add.
