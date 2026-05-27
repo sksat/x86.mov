@@ -106,6 +106,17 @@ public:
   int getShiftShiftedBufFI() const { return ShiftShiftedBufFI; }
   void setShiftShiftedBufFI(int FI) { ShiftShiftedBufFI = FI; }
 
+  // Stage 7c — branchless-dispatcher scratch. `next_pc_buf` holds the
+  // code pointer that the dispatcher MBB reads on each indirect jump
+  // (`jmp dword ptr [ebp + next_pc_disp]`). From stage 7c1 onwards,
+  // every legalised branch ends with `mov [next_pc_buf], <target>;
+  // jmp dispatcher`, and the dispatcher loads the pointer and jumps.
+  // Reserved by MovFrameLowering only when the function has at least
+  // one terminator (JMP/Jcc) that 7c+ legalises; pre-7c1 commits do
+  // not yet allocate the slot.
+  int getDispatcherNextPCBufFI() const { return DispatcherNextPCBufFI; }
+  void setDispatcherNextPCBufFI(int FI) { DispatcherNextPCBufFI = FI; }
+
 private:
   // Keyed on the *parent* (full-width) physreg, e.g. Mov::ECX for the
   // slot that backs CL-uses. We don't key by the byte subreg because
@@ -120,6 +131,7 @@ private:
   int ShiftSignBufFI = -1;
   int ShiftAmountBufFI = -1;
   int ShiftShiftedBufFI = -1;
+  int DispatcherNextPCBufFI = -1;
 };
 
 } // namespace llvm

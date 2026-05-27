@@ -353,6 +353,20 @@ def JA  : JccInst<"ja">;
 def JBE : JccInst<"jbe">;
 def JAE : JccInst<"jae">;
 
+// Stage 7c0 — indirect jump through a memory operand. Reads a 32-bit
+// code pointer from `[base + disp]` and jumps to it. Used by the
+// branchless-dispatcher CFG transformation: from stage 7c1 onwards,
+// the rewrites of JMP/Jcc/fallthrough store a target BB's address
+// into a per-function `next_pc` scratch slot and end with a
+// `jmp dword ptr [ebp + next_pc_disp]` that reads + dispatches.
+//
+// codegen-only — no DAG pattern. MovOnlyLegalize builds these via
+// BuildMI from the dispatcher MBB it constructs per function.
+let isBranch = 1, isTerminator = 1, isBarrier = 1,
+    isIndirectBranch = 1, mayLoad = 1, isCodeGenOnly = 1 in
+def JMP32m : MovInst<(outs), (ins MovMemOperand:$tgt),
+                     "jmp\tdword ptr $tgt", []>;
+
 //===----------------------------------------------------------------------===//
 // RET
 //===----------------------------------------------------------------------===//
