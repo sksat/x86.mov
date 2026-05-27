@@ -109,14 +109,15 @@ impl Cpu {
                 Ok(())
             }
             Err(e) => {
-                // `Unmapped` during execution is movfuscator's deliberate
-                // NULL-deref SIGSEGV trigger (`movl (%eax), %eax` with
-                // eax=0) — emitted by `jmp_extern` (movfuscator.c:2397)
-                // before each external libc call. If a SIGSEGV handler
-                // is registered we jump there (matching the kernel's
-                // signal-delivery behaviour); otherwise the unmapped
-                // access is a real bug and propagates.
-                if let (Fault::Unmapped(_), Some(handler)) = (e, self.sigsegv_handler) {
+                // movfuscator's deliberate NULL-deref SIGSEGV trigger
+                // (`movl (%eax), %eax` with eax=0) is emitted by
+                // `jmp_extern` (movfuscator.c:2397) before each external
+                // libc call. We narrow the redirect to **address 0
+                // specifically** so other unmapped accesses (stack
+                // underflow, wild pointer, etc.) still surface as
+                // emulator faults instead of being masked by the
+                // dispatch handler.
+                if let (Fault::Unmapped(0), Some(handler)) = (e, self.sigsegv_handler) {
                     self.eip = handler;
                     Ok(())
                 } else {

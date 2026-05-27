@@ -95,6 +95,8 @@ fn main() -> ExitCode {
     if let RunOutcome::LoadError(e) = &outcome {
         eprintln!("movie86: load error: {e:?}");
     }
+    // DebugStop already printed its own diagnostic from inside the
+    // run loop; no extra message needed here.
     let code = u8::try_from(outcome.process_exit_code() & 0xff).unwrap_or(1);
     ExitCode::from(code)
 }

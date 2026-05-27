@@ -27,18 +27,24 @@ pub enum RunOutcome {
     Fault(Fault),
     /// ELF could not be loaded (bad magic, wrong machine, etc.).
     LoadError(ElfError),
+    /// Debug-driven stop (e.g. `--break-at` hit, `--max-steps` reached).
+    /// Distinct from `Fault` so callers — and the CLI's exit code —
+    /// don't conflate "user asked us to stop here" with "guest crashed".
+    DebugStop(DebugStop),
 }
 
 impl RunOutcome {
     /// Map an outcome to a `std::process::exit` status code.
     ///
     /// Exit syscalls produce the low 8 bits of the status (Linux
-    /// convention). Other faults return 1.
+    /// convention). Faults / load errors return 1. Debug stops also
+    /// return 1 — the user is asking the emulator to halt before the
+    /// guest finishes, so we can't claim success.
     #[must_use]
     pub fn process_exit_code(&self) -> i32 {
         match self {
             Self::Exit(status) => i32::from((status & 0xff) as u8),
-            Self::Fault(_) | Self::LoadError(_) => 1,
+            Self::Fault(_) | Self::LoadError(_) | Self::DebugStop(_) => 1,
         }
     }
 }
@@ -65,6 +71,11 @@ impl SysHost for StdHost {
     }
 }
 
+// `write_syscall` no longer hits any `?` paths after the P2 fix (it
+// converts all memory faults into -EFAULT returns). The Result wrapper
+// is kept so the signature matches `SysHost::syscall`'s and future
+// I/O paths that DO need to propagate a Fault.
+#[allow(clippy::unnecessary_wraps)]
 /// Linux i386 `write(fd, buf, count)`.
 ///
 /// Streams the guest buffer in 4 KiB chunks via a stack-allocated
@@ -90,7 +101,16 @@ fn write_syscall(args: &SyscallArgs, mem: &mut dyn Memory) -> Result<SyscallResu
     while remaining > 0 {
         let this = remaining.min(CHUNK);
         let slice = &mut scratch[..this];
-        mem.read_bytes(addr, slice)?;
+        // Match Linux's behavior: an unmapped/unreadable buffer makes
+        // `write(2)` return -EFAULT (14) in EAX, not a hard process
+        // fault. Return any bytes already written instead of -EFAULT
+        // if we got partway through (glibc convention).
+        if mem.read_bytes(addr, slice).is_err() {
+            if written > 0 {
+                return Ok(SyscallResult::Return(written));
+            }
+            return Ok(SyscallResult::Return(errno_to_eax(14)));
+        }
         let n_res = match fd {
             1 => io::stdout().write(slice),
             2 => io::stderr().write(slice),
@@ -229,7 +249,7 @@ pub fn run_elf_with_debug<H: SysHost>(bytes: &[u8], host: &mut H, cfg: &DebugCon
                     Err(f) => eprintln!("movie86: dump {addr:#010x} faulted: {f:?}"),
                 }
             }
-            return RunOutcome::Fault(Fault::Unmapped(cpu.eip)); // borrow Unmapped as a "stopped" signal; the CLI prints DebugStop separately
+            return RunOutcome::DebugStop(DebugStop::Break(cpu.eip));
         }
         if let Some(max) = cfg.max_steps {
             if step_count >= max {
@@ -237,7 +257,7 @@ pub fn run_elf_with_debug<H: SysHost>(bytes: &[u8], host: &mut H, cfg: &DebugCon
                     "movie86: --max-steps {max} reached at eip={:#010x}",
                     cpu.eip
                 );
-                return RunOutcome::Fault(Fault::Unmapped(cpu.eip));
+                return RunOutcome::DebugStop(DebugStop::MaxSteps(max));
             }
         }
         if trace {

@@ -53,6 +53,27 @@ fn write_with_bad_fd_does_not_dereference_guest_buffer() {
 }
 
 #[test]
+fn write_with_unmapped_buf_returns_negative_efault() {
+    // Linux convention: write(2) with an unreadable user buffer returns
+    // -EFAULT, not a hard segfault. We must mirror that — otherwise a
+    // guest probing user pointers via syscall reads sees an emulator
+    // panic instead of the syscall failure.
+    let mut mem = FlatMemory::new_zeroed(0x1000, 16);
+    let args = SyscallArgs {
+        eax: 4,
+        ebx: 1,           // stdout (valid fd, so we pass the fd check)
+        ecx: 0xdead_0000, // unmapped buf
+        edx: 64,
+        esi: 0,
+        edi: 0,
+        ebp: 0,
+    };
+    let r = write_syscall(&args, &mut mem).expect("should not Fault on unmapped buf");
+    let SyscallResult::Return(v) = r;
+    assert_eq!(v, errno_to_eax(14), "-EFAULT (14)");
+}
+
+#[test]
 fn write_with_huge_count_does_not_pre_allocate_4gb() {
     // The guest claims to want to write 4 GiB, but the buffer is
     // unmapped past the first page. We should not allocate 4 GiB to
