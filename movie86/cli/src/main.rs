@@ -5,7 +5,7 @@ use movie86_cli::{run_elf_with_debug, DebugConfig, RunOutcome, StdHost};
 fn print_usage(arg0: &str) {
     eprintln!(
         "usage: {arg0} [--trace] [--break-at HEX] [--max-steps N] \
-         [--watch HEX]... <elf-file>"
+         [--watch HEX]... [--dump-u32 HEX]... <elf-file>"
     );
 }
 
@@ -47,6 +47,13 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 };
                 cfg.watch_u32.push(v);
+            }
+            "--dump-u32" => {
+                let Some(v) = it.next().and_then(|s| parse_u32_hex(&s)) else {
+                    eprintln!("movie86: --dump-u32 needs a hex address");
+                    return ExitCode::from(2);
+                };
+                cfg.dump_u32.push(v);
             }
             "-h" | "--help" => {
                 print_usage(&progname);

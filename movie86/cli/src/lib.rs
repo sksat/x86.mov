@@ -159,6 +159,9 @@ pub struct DebugConfig {
     /// addresses changes value (write detection by sampling — catches
     /// any kind of mov, jmp-self-modifying-code, syscall, etc.).
     pub watch_u32: Vec<u32>,
+    /// Dump the current `u32` values at these guest addresses whenever
+    /// execution stops at `break_at`.
+    pub dump_u32: Vec<u32>,
 }
 
 /// Reason the debug-driven run stopped *short* of the guest exiting on
@@ -212,6 +215,20 @@ pub fn run_elf_with_debug<H: SysHost>(bytes: &[u8], host: &mut H, cfg: &DebugCon
                 "movie86: --break-at hit eip={:#010x} (after {step_count} steps)",
                 cpu.eip
             );
+            eprintln!(
+                "movie86: regs eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x} esp={:#010x}",
+                cpu.reg(Reg32::Eax),
+                cpu.reg(Reg32::Ebx),
+                cpu.reg(Reg32::Ecx),
+                cpu.reg(Reg32::Edx),
+                cpu.reg(Reg32::Esp),
+            );
+            for &addr in &cfg.dump_u32 {
+                match mem.read_u32(addr) {
+                    Ok(v) => eprintln!("movie86: dump {addr:#010x} = {v:#010x}"),
+                    Err(f) => eprintln!("movie86: dump {addr:#010x} faulted: {f:?}"),
+                }
+            }
             return RunOutcome::Fault(Fault::Unmapped(cpu.eip)); // borrow Unmapped as a "stopped" signal; the CLI prints DebugStop separately
         }
         if let Some(max) = cfg.max_steps {
