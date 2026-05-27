@@ -1,8 +1,9 @@
 //go:build linux
 
 // Package runner drives the ptraced child stub: spawn, inject guest
-// code, set registers, intercept syscalls via PTRACE_SYSEMU, route them
-// through the bridge, and collect the resulting protocol events.
+// code, set registers, intercept syscalls via PTRACE_SYSCALL (entry +
+// exit stop pairs), route them through the bridge, and collect the
+// resulting protocol events.
 //
 // All ptrace operations target the OS thread that started the child, so
 // callers MUST runtime.LockOSThread() before invoking RunOnce and not
@@ -24,11 +25,6 @@ import (
 	"github.com/sksat/x86.mov/turbo86/proto"
 )
 
-// PTRACE_SYSEMU stops the child at syscall entry and skips kernel
-// dispatch entirely; the tracer is responsible for setting eax to the
-// syscall's synthetic return value. Not exposed by the Go stdlib.
-const ptraceSysEmu = 31
-
 // PTRACE_GETREGSET / PTRACE_SETREGSET with NT_PRSTATUS — the only
 // way to read/write the *architecture-appropriate* register set from a
 // 64-bit tracer to a 32-bit tracee. The stdlib's PtraceGetRegs/SetRegs
@@ -40,6 +36,13 @@ const (
 	ptraceSetRegset = 0x4205
 	ntPrstatus      = 1
 )
+
+// orig_eax = -1 tells the kernel "this syscall number is invalid" — the
+// syscall is rejected, eax is set to -ENOSYS at the exit stop, and no
+// real kernel-side syscall runs. We overwrite eax with our synthetic
+// return value at the exit stop to make the no-op transparent to the
+// guest. Used by the emulate path under PTRACE_SYSCALL.
+const suppressedSyscall = uint32(0xFFFFFFFF)
 
 // __NR_memfd_create on amd64 Linux. Not exposed by syscall package.
 const sysMemfdCreate = 319
@@ -140,14 +143,6 @@ func memfdCreate(name string, flags uint) (int, error) {
 	return int(r0), nil
 }
 
-// ptraceSysEmuStep is PTRACE_SYSEMU via raw syscall (no Go stdlib wrapper).
-func ptraceSysEmuStep(pid int) error {
-	_, _, errno := syscall.Syscall6(syscall.SYS_PTRACE, ptraceSysEmu, uintptr(pid), 0, 0, 0, 0)
-	if errno != 0 {
-		return errno
-	}
-	return nil
-}
 
 // protoRegs copies the GP + control fields from the kernel reg layout
 // to the wire-protocol Regs (the canonical migration schema).
@@ -513,11 +508,33 @@ func (r *Runner) emitFault(reason string) {
 	r.eventsCh <- proto.Fault{Reason: reason}
 }
 
+// pendingEmulation holds state between the entry and exit syscall stops
+// of an emulated syscall. The entry stop suppresses the kernel syscall
+// (orig_eax = -1) and remembers the synthetic return value the bridge
+// computed; the next stop is the matching exit, at which we overwrite
+// eax with that value.
+type pendingEmulation struct {
+	active      bool
+	returnValue uint32
+}
+
+// syscallLoop drives the child through PTRACE_SYSCALL entry/exit pairs:
+// entry stops route through the bridge; the bridge either emulates (we
+// suppress the real syscall and return a synthetic value at the exit
+// stop) or terminates the session. Signal stops fall to the Paused path.
+//
+// Two stops per syscall vs one with PTRACE_SYSEMU; the trade-off buys
+// passthrough support for syscalls the runner shouldn't intercept
+// (rt_sigaction, rt_sigreturn, …). Those are added in a follow-up
+// slice; for now every emulated syscall goes through the entry+exit
+// state machine.
 func (r *Runner) syscallLoop(regs *regs32) {
 	var ws syscall.WaitStatus
+	var pending pendingEmulation
+
 	for {
-		if err := ptraceSysEmuStep(r.pid); err != nil {
-			r.emitFault(fmt.Sprintf("PTRACE_SYSEMU: %v", err))
+		if err := syscall.PtraceSyscall(r.pid, 0); err != nil {
+			r.emitFault(fmt.Sprintf("PTRACE_SYSCALL: %v", err))
 			return
 		}
 		if _, err := syscall.Wait4(r.pid, &ws, 0, nil); err != nil {
@@ -553,8 +570,26 @@ func (r *Runner) syscallLoop(regs *regs32) {
 			return
 		}
 
+		// Syscall-trap stop. Distinguish entry from exit via our pending
+		// state: an active pending means the last stop was an entry that
+		// suppressed a syscall and now needs its eax overwritten.
+		if pending.active {
+			if err := ptraceGetRegs32(r.pid, regs); err != nil {
+				r.emitFault(fmt.Sprintf("get i386 regs (exit stop): %v", err))
+				return
+			}
+			regs.Eax = pending.returnValue
+			if err := ptraceSetRegs32(r.pid, regs); err != nil {
+				r.emitFault(fmt.Sprintf("set i386 regs (exit stop): %v", err))
+				return
+			}
+			pending = pendingEmulation{}
+			continue
+		}
+
+		// Entry stop: read syscall number + args, route through bridge.
 		if err := ptraceGetRegs32(r.pid, regs); err != nil {
-			r.emitFault(fmt.Sprintf("get i386 regs (syscall stop): %v", err))
+			r.emitFault(fmt.Sprintf("get i386 regs (entry stop): %v", err))
 			return
 		}
 		args := bridge.SyscallArgs{
@@ -575,11 +610,15 @@ func (r *Runner) syscallLoop(regs *regs32) {
 		case bridge.ActionExit, bridge.ActionFault:
 			return
 		case bridge.ActionResume:
-			regs.Eax = result.Return
+			// Suppress the kernel syscall: orig_eax=-1 makes the kernel
+			// return -ENOSYS; we overwrite eax with our synthetic value
+			// at the upcoming exit stop.
+			regs.OrigEax = suppressedSyscall
 			if err := ptraceSetRegs32(r.pid, regs); err != nil {
-				r.emitFault(fmt.Sprintf("set i386 regs (return value): %v", err))
+				r.emitFault(fmt.Sprintf("set i386 regs (suppress syscall): %v", err))
 				return
 			}
+			pending = pendingEmulation{active: true, returnValue: result.Return}
 		}
 	}
 }
