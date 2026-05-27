@@ -110,17 +110,119 @@ Three candidate explanations explored and three ruled out:
 2. ~~Signal-handler-return restores saved state~~ — *ruled out*: master_loop never reads `[esp+...]` (the signal-frame layout). It runs on the movfuscator shadow stack via `mov esp, [sp]`, completely independent of the signal-stack context.
 3. ~~Decoder bug in `crt0_cf` / `crtf_cf`~~ — *ruled out*: the `investigate_decoder_coverage` test (`#[ignore]`, env-var-driven; `MOVIE86_FIXTURE=path cargo test -- --ignored investigate_decoder_coverage`) walks both `.text`s through `decode()` cleanly. crt0_cf is 115 instructions, crtf_cf is 2.
 
-### Real next puzzle
+### Real next puzzle — solved
 
-Master_loop's body has **two** jumps out:
-- `0x0804922e: jmp main` (continue executing)
-- `0x08049287: jmp exit` (terminate)
+The whole investigation above was operating on the **wrong CRT**. smart-friend tracked it down by reading `movfuscator.c` and confirming with `readelf -r` on `crt0_cf.o` vs `crt0.o`:
 
-So master_loop picks one per iteration. Currently it always picks `jmp main` and never reaches `jmp exit`. The state condition that makes it pick `jmp exit` (when the program is supposed to terminate) is the next thing to understand. Hint: not `toggle_execution`, not `on`, not `target` — all of these are stable after iteration 1. It's something else movfuscator computes via mov-only logic.
+- `crt0_cf.o` / `crtf_cf.o` / `crtd_cf.o` are the **control-flow CRT** (`--no-mov-flow` build). They use native `e9 jmp main` / `e9 jmp exit` in master_loop. That's the design — those direct jumps come from real R_386_PC32 relocations in the `_cf` objects.
+- `crt0.o` / `crtf.o` / `crtd.o` are the **mov-loop CRT** (the actual mov-only build movfuscator-wasm uses). master_loop has no native `jmp main` / `jmp exit` — it routes via `target` / `branch_temp` and the SIGSEGV / SIGILL dispatch tricks.
 
-Concrete next step: run the dynamically-linked `return42` binary under `gdb` natively, breakpoint on `0x08049287`, watch what's different about that iteration's state vs iteration N. Or — easier — print main's full return path symbol-by-symbol from the movfuscator source generator (movfuscator.c) and trace how `jmp exit` is reached from there.
+My static-link attempt used `_cf` objects, which is why master_loop appeared to "always direct-jump back to main with no escape" — that was the intended `_cf` shape, not a bug.
+
+### What landed in this PR (final)
+
+Switched to the mov-loop CRT (`crt0.o` + `crtf.o` + `crtd.o` + `softfloat32.o` + `stubs.o`) and re-ran. With the wiring:
+
+- `mov cs, ax` → `Insn::MovfuscatorDispatchJump` → SIGILL handler (`master_loop`)
+- **Unmapped-on-read** → SIGSEGV handler (`dispatch`) — this is movfuscator's `mov (%eax), %eax` with `eax=0` NULL-deref trigger, used to call libc functions including `exit`.
+- ELF symbol-table lookup of `dispatch` / `master_loop` → handler registration.
+
+…the binary runs end-to-end through movie86: 1019 steps through crt0 startup → master_loop dispatch → main body → return → master_loop → `external = &exit` → NULL deref → SIGSEGV → dispatch → `jmp [external]` → my `exit` stub → `int 0x80` syscall 1 → process termination.
+
+**`movie86 /tmp/movie86-link/return42-real.elf` exits cleanly.** Real movfuscator-built mov-only binary now runs.
+
+### Remaining gap (follow-up)
+
+Exit status is `0` instead of `42`. movfuscator's main-return-value-to-exit-arg propagation puts `0` in the exit syscall's `ebx` slot. Suspect an emulation gap somewhere in main's return-value path (or main's pushed-arg state). Concretely: at the moment of NULL-deref (eip `0x08049588`), `[esp+4]` is `0` instead of `42`. Investigation needed — but no longer blocking end-to-end execution.
 
 Tooling needed to dig in: `cd movfuscator-wasm && make setup && make build-native` to materialize the runtime objects (gitignored under `vendor/movfuscator/build/`).
+
+## 2026-05-28 follow-up: why `jmp main` exists
+
+The key finding is that the puzzling `0x0804922e: e9 ... jmp main` in our
+static fixture is **not** a mov-only path that failed to self-modify at
+runtime. It comes from linking against the **wrong CRT family**.
+
+- The static ELF we were debugging (`/tmp/movie86-link/return42.elf`) was
+  linked with `crt0_cf.o/crtf_cf.o/crtd_cf.o`.
+- `crt0_cf.o` really does contain direct branch relocations:
+  - at `.text+0x223`: `R_386_PC32 main`
+  - at `.text+0x27c`: `R_386_PC32 exit`
+- After link those become the exact bytes we observed in the fixture:
+  - `0x0804922e: e9 59 00 00 00    jmp 0x0804928c <main>`
+  - `0x08049287: e9 ...            jmp exit`
+
+So hypothesis `X` is false in its original form: the `e9` bytes are not
+"supposed to turn into movs later". They were emitted that way by
+`crt0_cf.o` at link time.
+
+The decisive comparison is with the non-`_cf` CRT:
+
+- `vendor/movfuscator/build/crt0.o` does **not** have a `R_386_PC32 main`
+  relocation there.
+- Instead, at `.text+0x223` it has `R_386_32 main`, immediately followed by
+  stores through `branch_temp` and `sel_target`, then a spill of the jmp
+  register bank.
+- In the linked dynamic ELF (`/tmp/inst-check/return42.elf`), that becomes:
+  - `0x0804920e: mov eax, 0x88049339`
+  - `0x08049215: mov [stack_temp], eax`
+  - `0x0804925e: mov eax, 0x880495ba`
+  - `0x08049263: mov [branch_temp], eax`
+  - `0x08049268..0x08049333`: store target + jmp regs via `sel_target` /
+    `sel_data`
+- There is **no direct `jmp main`** in that dynamic binary's `master_loop`.
+
+This matches movfuscator's source generator:
+
+- `movfuscator.c:3094`:
+  - when `mov_loop` is enabled, the runtime ends with `movw %ax, %cs`
+    (the SIGILL re-entry trick)
+  - otherwise it emits `jmp master_loop`
+- `crt0_cf.o` is the non-`mov_loop` control-flow CRT.
+- `crt0.o` is the mov-loop CRT that uses `target`/`branch_temp` state instead
+  of direct branches.
+
+## Signal-handler hypothesis
+
+Hypothesis `Y` also looks false.
+
+- `movfuscator.c:876-889` emits `sa_dispatch` / `sa_loop` as plain `struct
+  sigaction` objects with `.sa_handler = dispatch/master_loop`.
+- `movfuscator.c:2817-2835` just installs them with `sigaction(SIGSEGV, ...)`
+  and `sigaction(SIGILL, ...)`.
+- There is no generated code here that rewrites a saved `ucontext_t` / signal
+  frame to redirect `EIP`.
+
+So the rich "handler mutates saved EIP on signal return" model does not appear
+to be what this runtime is doing.
+
+## What this means for movie86
+
+The emulator bug hunt was being driven by a fixture mismatch:
+
+- Our static bring-up fixture used `*_cf.o`, which intentionally contains
+  native direct jumps in `master_loop`.
+- `movfuscator-wasm`'s `test-ld` / production link flow uses `crt0.o/crtf.o/crtd.o`,
+  whose `master_loop` is mov-only in the relevant sense and routes control by
+  writing `target` / `branch_temp`.
+
+So the "master_loop always direct-jumps back to main, therefore movfuscator's
+design is inconsistent" conclusion was an artifact of linking the wrong CRT.
+
+## Recommended fix
+
+1. Stop using `crt0_cf.o/crtf_cf.o/crtd_cf.o` for the real-binary fixture.
+2. Rebuild the fixture with `crt0.o/crtf.o/crtd.o` so it matches
+   `movfuscator-wasm`'s `test-ld` output.
+3. Re-run the emulator against that fixture before changing signal semantics
+   again; the next real problem should be in mov-loop control-state handling,
+   not in the presence of impossible direct `jmp main` bytes.
+
+I could not complete the "native dynamic execution" check inside this sandbox:
+invoking `/lib/ld-linux.so.2 /tmp/inst-check/return42.elf` terminates with
+`Bad system call`, so the environment is blocking the guest rather than the
+binary proving success/failure. The disassembly / relocation delta above is
+still decisive for the original `jmp main` question.
 
 ## CI
 

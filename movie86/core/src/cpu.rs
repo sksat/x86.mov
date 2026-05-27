@@ -103,8 +103,27 @@ impl Cpu {
             Err(e) => return Err(e),
         };
         let next_eip_default = self.eip.wrapping_add(u32::from(len));
-        self.eip = self.execute(insn, mem, host, next_eip_default)?;
-        Ok(())
+        match self.execute(insn, mem, host, next_eip_default) {
+            Ok(new_eip) => {
+                self.eip = new_eip;
+                Ok(())
+            }
+            Err(e) => {
+                // `Unmapped` during execution is movfuscator's deliberate
+                // NULL-deref SIGSEGV trigger (`movl (%eax), %eax` with
+                // eax=0) — emitted by `jmp_extern` (movfuscator.c:2397)
+                // before each external libc call. If a SIGSEGV handler
+                // is registered we jump there (matching the kernel's
+                // signal-delivery behaviour); otherwise the unmapped
+                // access is a real bug and propagates.
+                if let (Fault::Unmapped(_), Some(handler)) = (e, self.sigsegv_handler) {
+                    self.eip = handler;
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     fn execute<M, H>(
