@@ -76,6 +76,17 @@ func TestOutboundRoundTrip(t *testing.T) {
 		{"Exit zero", Exit{Code: 0}},
 		{"Exit nonzero", Exit{Code: 42}},
 		{"Fault message", Fault{Reason: "unknown syscall 99"}},
+		{
+			"Paused signal",
+			Paused{
+				Regs: Regs{
+					Eax: 0xDEADBEEF, Ebx: 0, Esp: 0x701FFFF0,
+					Eip: 0x08048005, Eflags: 0x202,
+				},
+				Signal: 11,
+				Reason: "guest received SIGSEGV",
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

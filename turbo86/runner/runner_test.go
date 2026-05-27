@@ -91,3 +91,47 @@ func TestRunOnce_WriteThenExit(t *testing.T) {
 		t.Errorf("events:\n  got:  %#v\n  want: %#v", events, want)
 	}
 }
+
+// TestRunOnce_NullDerefBecomesPaused exercises the recoverable-stop
+// path: a guest write to the unmapped null page raises SIGSEGV, which
+// the runner surfaces as Paused (not Fault) with the regs at the
+// faulting instruction. This is the structural prerequisite for handing
+// the session to movie86 to handle e.g. the movfuscator SIGSEGV
+// dispatch trick.
+func TestRunOnce_NullDerefBecomesPaused(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	const entry uint32 = 0x08048000
+	//   B8 EF BE AD DE              mov eax, 0xDEADBEEF   ; (5 bytes)
+	//   89 05 00 00 00 00           mov DWORD PTR [0], eax; (6 bytes; faults)
+	code := []byte{
+		0xB8, 0xEF, 0xBE, 0xAD, 0xDE,
+		0x89, 0x05, 0x00, 0x00, 0x00, 0x00,
+	}
+
+	events, err := RunOnce(stub.Bytes, map[uint32][]byte{entry: code}, entry, testStackTop)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d: %#v", len(events), events)
+	}
+	paused, ok := events[0].(proto.Paused)
+	if !ok {
+		t.Fatalf("expected Paused, got %T: %#v", events[0], events[0])
+	}
+	if paused.Signal != 11 {
+		t.Errorf("Signal: got %d, want 11 (SIGSEGV)", paused.Signal)
+	}
+	// The first mov should have completed before the second faulted.
+	if paused.Regs.Eax != 0xDEADBEEF {
+		t.Errorf("Regs.Eax: got 0x%x, want 0xDEADBEEF (post-first-mov)", paused.Regs.Eax)
+	}
+	// EIP must point AT the faulting instruction (offset 5), not past
+	// it — otherwise a peer engine resuming via LoadContext would skip
+	// the operation the original engine couldn't perform.
+	if want := entry + 5; paused.Regs.Eip != want {
+		t.Errorf("Regs.Eip: got 0x%x, want 0x%x (faulting mov [0], eax)", paused.Regs.Eip, want)
+	}
+}

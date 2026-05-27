@@ -21,8 +21,9 @@ import (
 // What this test demonstrates:
 //   - turbo86 accepts real movfuscator-produced bytes through the same
 //     Code-then-Start streaming path the frontend will drive.
-//   - The failure mode is graceful: a single Fault event closes the
-//     session, no host-side crash, no stuck child process.
+//   - The signal stop becomes a Paused event (not a Fault): the same
+//     boundary movie86 could in principle take over from once memory
+//     snapshot delivery lands.
 //
 // What it does NOT yet prove (planned follow-ups):
 //   - Full execution to exit(42). Needs the runtime objects materialized
@@ -77,12 +78,16 @@ func TestRunOnce_MovfuscatorReturn42_TextStreams(t *testing.T) {
 		t.Fatalf("RunOnce returned host-side error: %v", runErr)
 	}
 	if len(events) == 0 {
-		t.Fatal("no events emitted; expected at least a Fault")
+		t.Fatal("no events emitted; expected at least a Paused")
 	}
 
 	final := events[len(events)-1]
-	if _, ok := final.(proto.Fault); !ok {
-		t.Errorf("final event: got %T %#v, want proto.Fault", final, final)
+	paused, ok := final.(proto.Paused)
+	if !ok {
+		t.Errorf("final event: got %T %#v, want proto.Paused", final, final)
+	} else if paused.Signal != 11 {
+		// Page-zero write from unresolved runtime symbol → SIGSEGV (11).
+		t.Errorf("Paused.Signal: got %d, want 11 (SIGSEGV)", paused.Signal)
 	}
 	for i, ev := range events {
 		t.Logf("  event %d: %#v", i, ev)

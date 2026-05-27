@@ -155,6 +155,23 @@ func ptraceSysEmuStep(pid int) error {
 // (RunWithContext).
 type setupFunc func(mem *procMem, regs *regs32) error
 
+// protoRegs copies the GP + control fields from the kernel reg layout
+// to the wire-protocol Regs (the canonical migration schema).
+func protoRegs(r *regs32) proto.Regs {
+	return proto.Regs{
+		Eax:    r.Eax,
+		Ebx:    r.Ebx,
+		Ecx:    r.Ecx,
+		Edx:    r.Edx,
+		Esi:    r.Esi,
+		Edi:    r.Edi,
+		Ebp:    r.Ebp,
+		Esp:    r.Esp,
+		Eip:    r.Eip,
+		Eflags: r.Eflags,
+	}
+}
+
 // RunOnce executes a single guest session starting fresh.
 //
 // `code` maps guest virtual addresses → bytes to write into the guest's
@@ -309,9 +326,19 @@ func runWithStub(stubBytes []byte, setup setupFunc) ([]proto.Outbound, error) {
 			return events, nil
 		}
 		if sig := ws.StopSignal(); sig != syscallTrap {
-			// SIGSEGV, SIGILL (e.g. the stub's ud2 trap), etc.
-			events = append(events, proto.Fault{
-				Reason: fmt.Sprintf("guest stopped on signal %d (want syscall-trap)", sig),
+			// SIGSEGV / SIGILL / ... — a recoverable stop boundary the
+			// runner doesn't model natively. Surface as Paused with the
+			// current regs so a peer engine (movie86, with its modeled
+			// signal-handler dispatch) can pick the session up via
+			// LoadContext + accompanying memory snapshot (snapshot
+			// delivery lands in a later slice).
+			if err := ptraceGetRegs32(pid, &regs); err != nil {
+				return events, fmt.Errorf("get i386 regs (signal stop): %w", err)
+			}
+			events = append(events, proto.Paused{
+				Regs:   protoRegs(&regs),
+				Signal: uint8(sig),
+				Reason: fmt.Sprintf("guest received signal %d", sig),
 			})
 			return events, nil
 		}

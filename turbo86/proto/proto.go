@@ -170,13 +170,30 @@ type Exit struct {
 
 func (Exit) outboundKind() string { return "exit" }
 
-// Fault reports a non-recoverable runner error (unsupported syscall, guest
-// fault, memory violation, ...) and ends the session.
+// Fault reports a non-recoverable condition the runner can't gracefully
+// hand off (unsupported syscall, bad memory range on a host operation,
+// …) and ends the session. Distinct from Paused: Fault is "give up", a
+// receiving engine can't resume usefully from this.
 type Fault struct {
 	Reason string `json:"reason"`
 }
 
 func (Fault) outboundKind() string { return "fault" }
+
+// Paused reports that the guest stopped at a recoverable boundary the
+// current engine doesn't handle natively — typically a synchronous
+// signal (SIGSEGV from the movfuscator dispatch trick, SIGILL from the
+// alt master_loop trick, …). The Regs snapshot is enough for another
+// engine to pick the session up via LoadContext IF it also has the
+// guest memory (delivered separately by a future Snapshot event; v1
+// ships regs-only so the protocol shape lands first).
+type Paused struct {
+	Regs   Regs   `json:"regs"`
+	Signal uint8  `json:"signal"`
+	Reason string `json:"reason"`
+}
+
+func (Paused) outboundKind() string { return "paused" }
 
 // MarshalOutbound encodes an Outbound as a JSON object with a "type" field.
 func MarshalOutbound(msg Outbound) ([]byte, error) {
@@ -200,6 +217,11 @@ func MarshalOutbound(msg Outbound) ([]byte, error) {
 		return json.Marshal(struct {
 			Type string `json:"type"`
 			Fault
+		}{m.outboundKind(), m})
+	case Paused:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			Paused
 		}{m.outboundKind(), m})
 	default:
 		return nil, fmt.Errorf("proto: unknown Outbound type %T", msg)
@@ -238,6 +260,12 @@ func UnmarshalOutbound(data []byte) (Outbound, error) {
 		var m Fault
 		if err := json.Unmarshal(data, &m); err != nil {
 			return nil, fmt.Errorf("proto: parsing Fault payload: %w", err)
+		}
+		return m, nil
+	case "paused":
+		var m Paused
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, fmt.Errorf("proto: parsing Paused payload: %w", err)
 		}
 		return m, nil
 	default:
