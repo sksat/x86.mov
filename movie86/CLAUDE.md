@@ -104,12 +104,21 @@ The emulator is stuck in a **deterministic infinite loop** inside `master_loop` 
 
 So the missing piece is whatever's supposed to flip `toggle_execution` back to 1 between iterations. We checked the binary; the **only** write to `toggle_execution` is the `→ 0` at `0x0804909f`. There is no `→ 1` write. The flip must happen via an indirect store, and we haven't found which `mov [reg], val` site has `reg == &toggle_execution`.
 
-Three candidate explanations:
-1. **Some `mov [data_p], val` site stores to `&toggle_execution`** via data_p taking that value at some point. Our `--watch` (value-change-only) would miss it if it writes the same value. The next debugger feature should be a "raw write log" — every memory store, regardless of value-change.
-2. **The signal-handler-return mechanism is supposed to flip it.** On real Linux the kernel restores saved register state when the SIGILL handler returns; that restore-through-saved-context might land on a memory location, possibly `toggle_execution`. We don't simulate signal-frame restoration.
-3. **Our decoder has a wrong semantic for some rare encoding in master_loop / crt0_cf.** Our `decoder_covers_return42_o_text` test only pins `return42.o`'s `.text`; the runtime objects (`crt0_cf.o`, `crtd_cf.o`, `crtf_cf.o`) have not been coverage-tested.
+Three candidate explanations explored and three ruled out:
 
-Pick one of these for the next investigation pass. (3) is the easiest to rule in/out — just add a coverage test for the runtime `.o` files.
+1. ~~Indirect store via `mov [data_p], val` with `data_p == &toggle_execution`~~ — *ruled out*: `grep` of the linked binary shows the value `0x848611c` (= `&toggle_execution`) appears in zero data slots and only at the two direct-reference instructions (`mov eax, ds:0x848611c` at 0x804908d and the `→ 0` write at 0x804909f). No indirect path can ever target this slot.
+2. ~~Signal-handler-return restores saved state~~ — *ruled out*: master_loop never reads `[esp+...]` (the signal-frame layout). It runs on the movfuscator shadow stack via `mov esp, [sp]`, completely independent of the signal-stack context.
+3. ~~Decoder bug in `crt0_cf` / `crtf_cf`~~ — *ruled out*: the `investigate_decoder_coverage` test (`#[ignore]`, env-var-driven; `MOVIE86_FIXTURE=path cargo test -- --ignored investigate_decoder_coverage`) walks both `.text`s through `decode()` cleanly. crt0_cf is 115 instructions, crtf_cf is 2.
+
+### Real next puzzle
+
+Master_loop's body has **two** jumps out:
+- `0x0804922e: jmp main` (continue executing)
+- `0x08049287: jmp exit` (terminate)
+
+So master_loop picks one per iteration. Currently it always picks `jmp main` and never reaches `jmp exit`. The state condition that makes it pick `jmp exit` (when the program is supposed to terminate) is the next thing to understand. Hint: not `toggle_execution`, not `on`, not `target` — all of these are stable after iteration 1. It's something else movfuscator computes via mov-only logic.
+
+Concrete next step: run the dynamically-linked `return42` binary under `gdb` natively, breakpoint on `0x08049287`, watch what's different about that iteration's state vs iteration N. Or — easier — print main's full return path symbol-by-symbol from the movfuscator source generator (movfuscator.c) and trace how `jmp exit` is reached from there.
 
 Tooling needed to dig in: `cd movfuscator-wasm && make setup && make build-native` to materialize the runtime objects (gitignored under `vendor/movfuscator/build/`).
 

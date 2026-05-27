@@ -215,6 +215,90 @@ fn decoder_covers_return42_o_text() {
     assert!(insns > 100, "expected >100 instructions, got {insns}");
 }
 
+/// One-off decoder-coverage probe: walk the `.text` section of an
+/// arbitrary committed-or-not ELF32 `.o` file through `decode()` and
+/// report the first byte that fails. Gated behind `#[ignore]` + env var
+/// so vendor-derived `.o`s don't have to be checked in.
+///
+/// Usage: `MOVIE86_FIXTURE=path/to/crt0_cf.o cargo test -- --ignored \
+///         investigate_decoder_coverage`
+#[test]
+#[ignore = "requires MOVIE86_FIXTURE to point at an ELF32 .o"]
+fn investigate_decoder_coverage() {
+    let Ok(path) = std::env::var("MOVIE86_FIXTURE") else {
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("read fixture");
+    // Minimal ET_REL .text locator: find the section header table,
+    // walk sections, find SHT_PROGBITS named ".text" via the section
+    // string table. Keeps the test self-contained.
+    let e_shoff = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+    let e_shentsize = u16::from_le_bytes(bytes[46..48].try_into().unwrap()) as usize;
+    let e_shnum = u16::from_le_bytes(bytes[48..50].try_into().unwrap()) as usize;
+    let e_shstrndx = u16::from_le_bytes(bytes[50..52].try_into().unwrap()) as usize;
+    let shstr_h_off = e_shoff + e_shstrndx * e_shentsize;
+    let shstr_off = u32::from_le_bytes(
+        bytes[shstr_h_off + 16..shstr_h_off + 20]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let shstr_size = u32::from_le_bytes(
+        bytes[shstr_h_off + 20..shstr_h_off + 24]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let shstr = &bytes[shstr_off..shstr_off + shstr_size];
+
+    let mut text_off = 0usize;
+    let mut text_size = 0usize;
+    for i in 0..e_shnum {
+        let h_off = e_shoff + i * e_shentsize;
+        let sh_name = u32::from_le_bytes(bytes[h_off..h_off + 4].try_into().unwrap()) as usize;
+        let nul = shstr[sh_name..].iter().position(|&b| b == 0).unwrap_or(0);
+        let name = std::str::from_utf8(&shstr[sh_name..sh_name + nul]).unwrap_or("");
+        if name == ".text" {
+            text_off =
+                u32::from_le_bytes(bytes[h_off + 16..h_off + 20].try_into().unwrap()) as usize;
+            text_size =
+                u32::from_le_bytes(bytes[h_off + 20..h_off + 24].try_into().unwrap()) as usize;
+            break;
+        }
+    }
+    assert!(text_size > 0, "no .text section in {path}");
+    let text = &bytes[text_off..text_off + text_size];
+
+    let mut pos = 0;
+    let mut insns = 0;
+    while pos < text.len() {
+        match movie86_core::decode(&text[pos..]) {
+            Ok((insn, len)) => {
+                assert!(len > 0);
+                pos += usize::from(len);
+                insns += 1;
+                // Print every 20th instruction so we can scan the trace.
+                if insns % 20 == 0 || pos >= text.len() {
+                    eprintln!("  ok  +{pos:04x}  insn#{insns}  ({insn:?})");
+                }
+            }
+            Err(e) => {
+                let window: Vec<String> = text[pos..(pos + 8).min(text.len())]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                panic!(
+                    "decode failed at {path} .text offset {pos:#x} \
+                     after {insns} instructions: {e:?}; bytes: {}",
+                    window.join(" ")
+                );
+            }
+        }
+    }
+    eprintln!(
+        "=== {path}: {insns} insns covering {} bytes of .text ===",
+        text.len()
+    );
+}
+
 #[test]
 fn fault_on_unsupported_syscall() {
     // mov eax, 999 ; int 0x80  → syscall 999 is unimplemented
