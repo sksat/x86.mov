@@ -111,6 +111,7 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
   bool NeedsRhsScratch = false;
   bool NeedsShiftSignScratch = false;
   bool NeedsShiftVarScratch = false;
+  bool NeedsCmpMaskScratch = false;
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
       switch (MI.getOpcode()) {
@@ -142,6 +143,18 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
         NeedsByteOpScratch = true;
         NeedsShiftSignScratch = true;
         NeedsShiftVarScratch = true;
+        break;
+      case Mov::CMP32rr:
+      case Mov::CMP32ri:
+        // Stage 7c2 — CMP+Jcc(E/NE) legalize. Needs base 4 slots
+        // (save_ecx/save_edx/srcdst/idx) plus rhs_buf (used to hold
+        // the F-target label during the mask-based select; CMP32ri's
+        // RHS is a compile-time immediate but we still need a
+        // 4-byte slot for the F-label) plus a 1-byte mask buf
+        // (mask at +0, inv_mask at +1).
+        NeedsByteOpScratch = true;
+        NeedsRhsScratch = true;
+        NeedsCmpMaskScratch = true;
         break;
       default:
         break;
@@ -202,4 +215,12 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
     MovMFI->setShiftAmountBufFI(Make());
     MovMFI->setShiftShiftedBufFI(Make());
   }
+
+  // Stage 7c2 slot — CMP+Jcc(E/NE) mask buffer. Holds the predicate
+  // mask byte (0x00 / 0xFF) at +0 and its bitwise inverse at +1 so
+  // the per-byte mask-select during the cmp+jcc rewrite has stable
+  // access to both across the AND/OR table lookups (which clobber
+  // ECX/DL/CL on every step).
+  if (NeedsCmpMaskScratch)
+    MovMFI->setCmpMaskBufFI(Make());
 }

@@ -91,8 +91,15 @@ public:
 
     // Stage 7c1: CFG-level rewrite for branches. Runs FIRST, before any
     // per-MI byte-chain rewrite below. Touches uncond JMP and fallthrough
-    // edges; conditional Jcc stays as-is until 7c2+ lands flag math.
+    // edges; conditional Jcc stays as-is and is handled by 7c2 below.
     Changed |= legalizeCFG(MF, TII);
+
+    // Stage 7c2: CMP+Jcc(E/NE) pair legalize. Runs AFTER legalizeCFG so it
+    // sees the post-7c1 shape `cmp; mov [next_pc], F; jcc T; jmp
+    // dispatcher` and can pick up the F-store left by 7c1. Replaces
+    // the cmp + mov + jcc triplet with a mov-only sequence that writes
+    // the predicate-selected target to next_pc.
+    Changed |= legalizeCmpJccPairs(MF, TII);
 
     for (MachineBasicBlock &MBB : MF) {
       for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
@@ -165,6 +172,7 @@ private:
     std::optional<int64_t> SignBufDisp;
     std::optional<int64_t> AmountBufDisp;
     std::optional<int64_t> ShiftedBufDisp;
+    std::optional<int64_t> CmpMaskBufDisp;
   };
 
   // Stage 7c1: resolve just the dispatcher's `next_pc` slot. CFG
@@ -179,6 +187,279 @@ private:
     if (FI == -1)
       return std::nullopt;
     return MF.getFrameInfo().getObjectOffset(FI);
+  }
+
+  // Stage 7c2 — pre-pass that legalises `cmp; mov [next_pc], F; jcc(E/NE) T`
+  // shapes (which is what 7c1 leaves behind after rewriting the trailing
+  // uncond JMP / fallthrough). Each pair is replaced with a mov-only
+  // sequence that writes the predicate-selected target to next_pc:
+  //
+  //   1. spill ECX, EDX, lhs, rhs (rhs is imm slice for CMP32ri)
+  //   2. compute `lhs XOR rhs` byte-by-byte into srcdst (in place)
+  //   3. OR-reduce srcdst[0..3] → DL = or_byte (0 iff lhs == rhs)
+  //   4. mask = select_mask_table[or_byte]  ; 0xFF if !=, 0x00 if ==
+  //      for JE, invert with XOR 0xFF; stash mask + inv_mask in cmp_mask_buf
+  //   5. write T-label to srcdst (4-byte), F-label to rhs_buf (4-byte)
+  //   6. per-byte select: next_pc[i] = (mask & T[i]) | (~mask & F[i])
+  //   7. restore ECX, EDX
+  //   8. erase CMP, the F-store MOV32mi, and Jcc; the trailing
+  //      `jmp dispatcher` (also added by 7c1) is left intact.
+  bool legalizeCmpJccPairs(MachineFunction &MF,
+                           const TargetInstrInfo &TII) const {
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr || !Addr->RhsDisp || !Addr->CmpMaskBufDisp)
+      return false;
+    const std::optional<int64_t> NextPCDispOpt = resolveDispatcherDisp(MF);
+    if (!NextPCDispOpt)
+      return false;
+    const int64_t NextPCDisp = *NextPCDispOpt;
+
+    bool Changed = false;
+    for (MachineBasicBlock &MBB : MF) {
+      auto It = MBB.begin();
+      while (It != MBB.end()) {
+        const unsigned Op = It->getOpcode();
+        if (Op != Mov::CMP32rr && Op != Mov::CMP32ri) {
+          ++It;
+          continue;
+        }
+        MachineInstr &CmpMI = *It;
+
+        // Look forward (skipping debug instrs) for:
+        //   - an optional MOV32mi to [EBP + NextPCDisp] (the F-store
+        //     that 7c1 inserted before the Jcc)
+        //   - immediately followed by JE or JNE
+        // Anything else aborts the pattern match.
+        MachineInstr *FStore = nullptr;
+        MachineInstr *Jcc = nullptr;
+        auto Probe = std::next(It);
+        for (; Probe != MBB.end(); ++Probe) {
+          if (Probe->isDebugInstr())
+            continue;
+          const unsigned POp = Probe->getOpcode();
+          if (POp == Mov::MOV32mi && !FStore) {
+            // Check it targets the next_pc slot.
+            if (Probe->getNumOperands() >= 2 &&
+                Probe->getOperand(0).isReg() &&
+                Probe->getOperand(0).getReg() == Mov::EBP &&
+                Probe->getOperand(1).isImm() &&
+                Probe->getOperand(1).getImm() == NextPCDisp) {
+              FStore = &*Probe;
+              continue;
+            }
+            break;
+          }
+          if (POp == Mov::JE || POp == Mov::JNE) {
+            Jcc = &*Probe;
+            break;
+          }
+          // Anything else (other Jcc, RET, JMP, ...) breaks the pattern.
+          break;
+        }
+
+        if (!Jcc) {
+          ++It;
+          continue;
+        }
+
+        // Extract operands.
+        const Register LhsReg = CmpMI.getOperand(0).getReg();
+        const bool IsImmRhs = (Op == Mov::CMP32ri);
+        Register RhsReg;
+        uint32_t Imm = 0;
+        if (IsImmRhs)
+          Imm = static_cast<uint32_t>(CmpMI.getOperand(1).getImm());
+        else
+          RhsReg = CmpMI.getOperand(1).getReg();
+
+        MachineBasicBlock *TTarget = Jcc->getOperand(0).getMBB();
+        MachineBasicBlock *FTarget = nullptr;
+        if (FStore) {
+          // MOV32mi operand layout: 0=base reg, 1=disp imm, 2=value
+          // (here a MBB symbol).
+          FTarget = FStore->getOperand(2).getMBB();
+        }
+        if (!FTarget) {
+          ++It;
+          continue;
+        }
+        const bool IsEQ = (Jcc->getOpcode() == Mov::JE);
+
+        // Save the iterator past the Jcc — we'll resume scanning there
+        // after the rewrite, since the dispatcher JMP that follows is
+        // left intact.
+        auto NextOuter = std::next(MachineBasicBlock::iterator(Jcc));
+        auto Insert = MachineBasicBlock::iterator(&CmpMI);
+        const DebugLoc DL = CmpMI.getDebugLoc();
+
+        // === PROLOGUE: save ECX/EDX, spill lhs (and rhs for rr-form) ===
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+            .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+            .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(LhsReg);
+        if (!IsImmRhs) {
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+              .addReg(Mov::EBP).addImm(*Addr->RhsDisp).addReg(RhsReg);
+        }
+
+        // === PHASE 1: in-place XOR of srcdst[i] with rhs[i] ===
+        // For each byte i, srcdst[i] = srcdst[i] XOR rhs[i]. After this
+        // loop srcdst is the byte-wise XOR result (all-zero iff lhs == rhs).
+        for (unsigned i = 0; i < 4; ++i) {
+          const int64_t LhsByteDisp =
+              Addr->SrcDstDisp + static_cast<int64_t>(i);
+
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(LhsByteDisp);
+          emitIdxZero(MBB, Insert, DL, TII, *Addr);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+
+          if (IsImmRhs) {
+            const uint8_t RhsByte =
+                static_cast<uint8_t>((Imm >> (8u * i)) & 0xFFu);
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
+                .addImm(RhsByte);
+          } else {
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+                .addReg(Mov::EBP).addImm(*Addr->RhsDisp + static_cast<int64_t>(i));
+          }
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+              .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(LhsByteDisp).addReg(Mov::DL);
+        }
+
+        // === PHASE 2: OR-reduce srcdst[0..3] into DL ===
+        // DL accumulates the OR: DL := srcdst[0]; then for i in 1..3,
+        // DL := DL OR srcdst[i] via the OR8 table.
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+            .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
+        for (unsigned i = 1; i < 4; ++i) {
+          emitIdxZero(MBB, Insert, DL, TII, *Addr);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+              .addExternalSymbol("__mov_or8_table").addReg(Mov::ECX);
+        }
+        // DL = or_byte (0 iff lhs == rhs).
+
+        // === PHASE 3: compute predicate mask + invert for EQ + stash ===
+        // mask := select_mask_table[or_byte]  → 0xFF if !=, 0x00 if ==.
+        // For JE we invert with XOR 0xFF so mask matches "take T".
+        emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
+                            "__mov_select_mask_table", Mov::DL);
+        if (IsEQ) {
+          emitIdxZero(MBB, Insert, DL, TII, *Addr);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+              .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+        }
+        // Stash mask at cmp_mask_buf[0]
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp).addReg(Mov::DL);
+        // Compute inv_mask = mask XOR 0xFF, stash at cmp_mask_buf[1]
+        emitIdxZero(MBB, Insert, DL, TII, *Addr);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+            .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 1).addReg(Mov::DL);
+
+        // === PHASE 4: write T-label to srcdst, F-label to rhs_buf ===
+        // 4-byte stores of label addresses via MOV32mi.
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
+            .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addMBB(TTarget);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
+            .addReg(Mov::EBP).addImm(*Addr->RhsDisp).addMBB(FTarget);
+
+        // === PHASE 5: per-byte mask-based select into next_pc ===
+        // next_pc[i] = (mask & T[i]) | (~mask & F[i])
+        for (unsigned i = 0; i < 4; ++i) {
+          const int64_t NextPCByteDisp = NextPCDisp + static_cast<int64_t>(i);
+
+          // (~mask & F[i]) → DL; stash to next_pc[i].
+          emitIdxZero(MBB, Insert, DL, TII, *Addr);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 1);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(*Addr->RhsDisp + static_cast<int64_t>(i));
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+              .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(NextPCByteDisp).addReg(Mov::DL);
+
+          // (mask & T[i]) → DL.
+          emitIdxZero(MBB, Insert, DL, TII, *Addr);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+              .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+
+          // OR the stashed (~mask & F[i]) at next_pc[i] with DL (mask & T[i]).
+          emitOrByteAndStore(MBB, Insert, DL, TII, *Addr, NextPCDisp, i);
+        }
+
+        // === EPILOGUE: restore ECX, EDX ===
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+            .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+
+        // Erase the original CMP, the FStore MOV32mi (if present), and
+        // the Jcc. The trailing `jmp dispatcher` (also added by 7c1)
+        // stays — control flow now reaches it after our mov-only chain
+        // has already populated next_pc.
+        CmpMI.eraseFromParent();
+        if (FStore)
+          FStore->eraseFromParent();
+        Jcc->eraseFromParent();
+
+        // Resume scanning past the Jcc we just erased.
+        It = NextOuter;
+        Changed = true;
+      }
+    }
+    return Changed;
   }
 
   // True for our 10 conditional-branch opcodes. Mirrors MovInstrInfo.cpp's
@@ -419,6 +700,9 @@ private:
     const int FI_Shifted = MovMFI->getShiftShiftedBufFI();
     if (FI_Shifted != -1)
       A.ShiftedBufDisp = MFI.getObjectOffset(FI_Shifted);
+    const int FI_CmpMask = MovMFI->getCmpMaskBufFI();
+    if (FI_CmpMask != -1)
+      A.CmpMaskBufDisp = MFI.getObjectOffset(FI_CmpMask);
     return A;
   }
 

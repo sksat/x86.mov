@@ -117,6 +117,15 @@ public:
   int getDispatcherNextPCBufFI() const { return DispatcherNextPCBufFI; }
   void setDispatcherNextPCBufFI(int FI) { DispatcherNextPCBufFI = FI; }
 
+  // Stage 7c2 — `cmp_mask_buf` holds the predicate mask byte (0x00
+  // or 0xFF) at offset +0 and its inverse at offset +1 during a
+  // CMP+Jcc legalize site. Used by the per-byte mask-select that
+  // chooses between the T-label and F-label bytes when writing to
+  // `next_pc`. Reserved only when at least one CMP32{rr,ri} appears
+  // in the function.
+  int getCmpMaskBufFI() const { return CmpMaskBufFI; }
+  void setCmpMaskBufFI(int FI) { CmpMaskBufFI = FI; }
+
 private:
   // Keyed on the *parent* (full-width) physreg, e.g. Mov::ECX for the
   // slot that backs CL-uses. We don't key by the byte subreg because
@@ -132,6 +141,7 @@ private:
   int ShiftAmountBufFI = -1;
   int ShiftShiftedBufFI = -1;
   int DispatcherNextPCBufFI = -1;
+  int CmpMaskBufFI = -1;
 };
 
 } // namespace llvm
