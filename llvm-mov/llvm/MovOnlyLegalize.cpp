@@ -755,19 +755,20 @@ private:
     }
   };
 
-  // Helper: zero ECX, then zero the idx slot. After this returns,
-  // ECX = 0 and idx[0..3] = 0. DL is untouched (callers that need to
-  // preserve CL into DL before zeroing must do so themselves).
+  // Helper: zero the idx slot (4 bytes) in a SINGLE instruction via
+  // `mov dword ptr [idx], 0`. After this returns, idx[0..3] = 0 and
+  // **no GPR is clobbered** (previous versions used `mov ecx, 0;
+  // mov [idx], ecx`, paying both an extra instruction and an ECX
+  // clobber). The ECX-preservation is what lets ADD's carry chain
+  // hold `carry_out` in CL across the zeroing without first copying
+  // it through DL — see emitByteStageAdd's removed `mov dl, cl`.
   static void emitIdxZero(MachineBasicBlock &MBB,
                           MachineBasicBlock::iterator I, const DebugLoc &DL,
                           const TargetInstrInfo &TII, const EbpAddr &A) {
-    // mov ecx, 0
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
-    // mov dword ptr [idx], ecx
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV32mr))
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV32mi))
         .addReg(Mov::EBP)
         .addImm(A.IdxDisp)
-        .addReg(Mov::ECX);
+        .addImm(0);
   }
 
   // Helper: pack the a-byte (read from srcdst[ByteIdx]) and the
@@ -836,25 +837,29 @@ private:
   // ADD per-byte stage: builds the index from (carry-in, a, b),
   // looks up the sum, writes it to srcdst[i], and loads the carry-out
   // into CL for the next stage. The boundary cases:
-  //   - byte 0 has no carry-in — skip the `mov dl, cl` preserve and
-  //     the `mov [idx+2], dl` write. emitIdxZero zeros idx[2] anyway.
+  //   - byte 0 has no carry-in — skip the `mov [idx+2], cl` write.
+  //     emitIdxZero zeros idx[2] anyway.
   //   - byte 3 doesn't need carry-out — skip the trailing load.
+  //
+  // Since emitIdxZero no longer clobbers ECX, CL (carry from the
+  // previous stage's `mov cl, [carry_table + ecx]`) survives across
+  // the zeroing and can be written directly to idx[2] without an
+  // intermediate `mov dl, cl` copy. Saves one mov per inner stage
+  // (3 stages × 1 = 3 movs / ADD32 site, on top of the 4 movs the
+  // emitIdxZero change buys directly).
   static void emitByteStageAdd(MachineBasicBlock &MBB,
                                MachineBasicBlock::iterator I,
                                const DebugLoc &DL,
                                const TargetInstrInfo &TII, const EbpAddr &A,
                                unsigned ByteIdx, ByteSource BSrc) {
-    if (ByteIdx > 0) {
-      // mov dl, cl              ; preserve carry across the next ECX zero
-      BuildMI(MBB, I, DL, TII.get(Mov::MOV8rr), Mov::DL).addReg(Mov::CL);
-    }
     emitIdxZero(MBB, I, DL, TII, A);
     if (ByteIdx > 0) {
-      // mov byte ptr [idx + 2], dl   ; carry-in byte
+      // mov byte ptr [idx + 2], cl   ; carry-in byte (held in CL by
+      // the previous stage's `mov cl, [carry_table + ecx]`)
       BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP)
           .addImm(A.IdxDisp + 2)
-          .addReg(Mov::DL);
+          .addReg(Mov::CL);
     }
     emitIdxPackAB(MBB, I, DL, TII, A, ByteIdx, BSrc);
     emitTableLookupAndStore(MBB, I, DL, TII, A, ByteIdx,
@@ -1196,9 +1201,9 @@ private:
                                   const EbpAddr &A, Register InputByteReg,
                                   const char *TableSym,
                                   Register OutputByteReg) {
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(A.IdxDisp).addReg(Mov::ECX);
+    // Zero the 4-byte idx slot in one instruction (no ECX clobber).
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV32mi))
+        .addReg(Mov::EBP).addImm(A.IdxDisp).addImm(0);
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
         .addReg(Mov::EBP).addImm(A.IdxDisp).addReg(InputByteReg);
     BuildMI(MBB, I, DL, TII.get(Mov::MOV32rm), Mov::ECX)
