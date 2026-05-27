@@ -54,6 +54,7 @@ public:
   void emitEndOfAsmFile(Module & /*M*/) override {
     emitAdd8Tables();
     emitBitwise8Tables();
+    emitShift8Tables();
   }
 
 private:
@@ -61,6 +62,8 @@ private:
   void emitAdd8Tables();
   void emitBitwise8Tables();
   void emitBitwise8Table(StringRef Name, uint8_t (*Op)(uint8_t, uint8_t));
+  void emitShift8Tables();
+  void emitUnaryByteTable(StringRef Name, uint8_t (*Op)(uint8_t));
 };
 } // namespace
 
@@ -227,6 +230,84 @@ void MovAsmPrinter::emitBitwise8Tables() {
   emitBitwise8Table(
       "__mov_xor8_table",
       [](uint8_t a, uint8_t b) -> uint8_t { return a ^ b; });
+}
+
+// Stage 7b2 — unary byte tables for shift legalization.
+//
+//   __mov_shl_byte_k[a] = (a << k) & 0xFF     (k = 1..7)
+//   __mov_shr_byte_k[a] = a >> k              (k = 1..7, unsigned)
+//   __mov_sar_sign_byte[a] = (a >> 7) ? 0xFF : 0x00
+//
+// SAR doesn't need its own shifted-byte tables: it's "SHR with the
+// out-of-range high-side source byte replaced by the sign byte"
+// (computed once per legalize site from orig[3] via __mov_sar_sign_byte).
+//
+// Total 15 tables × 256 bytes = 3840 bytes of additional rodata. Each
+// lives in its own `.rodata.<sym>` section so `ld --gc-sections` can
+// drop the ones whose corresponding shift amount isn't used.
+void MovAsmPrinter::emitUnaryByteTable(StringRef Name,
+                                       uint8_t (*Op)(uint8_t)) {
+  static constexpr unsigned kSize = 256u;
+  SmallVector<uint8_t, kSize> Data;
+  Data.reserve(kSize);
+  for (unsigned a = 0; a < 256; ++a) {
+    Data.push_back(Op(static_cast<uint8_t>(a)));
+  }
+
+  std::string SecName = (".rodata." + Name).str();
+  MCSection *Sec = OutContext.getELFSection(SecName, ELF::SHT_PROGBITS,
+                                            ELF::SHF_ALLOC);
+  OutStreamer->switchSection(Sec);
+
+  MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
+  OutStreamer->emitLabel(Sym);
+  OutStreamer->emitBytes(StringRef(
+      reinterpret_cast<const char *>(Data.data()), Data.size()));
+}
+
+void MovAsmPrinter::emitShift8Tables() {
+  emitUnaryByteTable(
+      "__mov_shl_byte_1",
+      [](uint8_t a) -> uint8_t { return static_cast<uint8_t>(a << 1); });
+  emitUnaryByteTable(
+      "__mov_shl_byte_2",
+      [](uint8_t a) -> uint8_t { return static_cast<uint8_t>(a << 2); });
+  emitUnaryByteTable(
+      "__mov_shl_byte_3",
+      [](uint8_t a) -> uint8_t { return static_cast<uint8_t>(a << 3); });
+  emitUnaryByteTable(
+      "__mov_shl_byte_4",
+      [](uint8_t a) -> uint8_t { return static_cast<uint8_t>(a << 4); });
+  emitUnaryByteTable(
+      "__mov_shl_byte_5",
+      [](uint8_t a) -> uint8_t { return static_cast<uint8_t>(a << 5); });
+  emitUnaryByteTable(
+      "__mov_shl_byte_6",
+      [](uint8_t a) -> uint8_t { return static_cast<uint8_t>(a << 6); });
+  emitUnaryByteTable(
+      "__mov_shl_byte_7",
+      [](uint8_t a) -> uint8_t { return static_cast<uint8_t>(a << 7); });
+
+  emitUnaryByteTable(
+      "__mov_shr_byte_1", [](uint8_t a) -> uint8_t { return a >> 1; });
+  emitUnaryByteTable(
+      "__mov_shr_byte_2", [](uint8_t a) -> uint8_t { return a >> 2; });
+  emitUnaryByteTable(
+      "__mov_shr_byte_3", [](uint8_t a) -> uint8_t { return a >> 3; });
+  emitUnaryByteTable(
+      "__mov_shr_byte_4", [](uint8_t a) -> uint8_t { return a >> 4; });
+  emitUnaryByteTable(
+      "__mov_shr_byte_5", [](uint8_t a) -> uint8_t { return a >> 5; });
+  emitUnaryByteTable(
+      "__mov_shr_byte_6", [](uint8_t a) -> uint8_t { return a >> 6; });
+  emitUnaryByteTable(
+      "__mov_shr_byte_7", [](uint8_t a) -> uint8_t { return a >> 7; });
+
+  emitUnaryByteTable(
+      "__mov_sar_sign_byte",
+      [](uint8_t a) -> uint8_t {
+        return (a & 0x80) ? static_cast<uint8_t>(0xFFu) : static_cast<uint8_t>(0);
+      });
 }
 
 extern "C" void LLVMInitializeMovAsmPrinter() {

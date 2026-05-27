@@ -81,10 +81,19 @@ public:
   // ADD32rr's RHS is a generic register and needs to be spilled to
   // memory so each byte can be read with `mov dl, byte ptr
   // [rhs_buf + i]`. Reserved by MovFrameLowering only when at least
-  // one ADD32rr is in the function, so ADD32ri-only functions stay
-  // at 16 bytes of scratch instead of 20.
+  // one rr-form byte-op (ADD/AND/OR/XOR rr) is in the function, so
+  // ri-only functions stay at 16 bytes of scratch instead of 20.
   int getAddRewriteRhsFI() const { return AddRewriteRhsFI; }
   void setAddRewriteRhsFI(int FI) { AddRewriteRhsFI = FI; }
+
+  // Stage 7b2: scratch byte used by SAR32ri to stash the sign byte
+  // (0x00 or 0xFF, computed from orig[3] via __mov_sar_sign_byte at
+  // the start of the rewrite). Each per-byte stage that walks "off
+  // the high end" of the original 32-bit value substitutes this byte
+  // in place of the orig byte that would otherwise be 0. Reserved
+  // only when at least one SAR32ri is in the function.
+  int getShiftSignBufFI() const { return ShiftSignBufFI; }
+  void setShiftSignBufFI(int FI) { ShiftSignBufFI = FI; }
 
 private:
   // Keyed on the *parent* (full-width) physreg, e.g. Mov::ECX for the
@@ -97,6 +106,7 @@ private:
   int AddRewriteSrcDstFI = -1;
   int AddRewriteIdxFI = -1;
   int AddRewriteRhsFI = -1;
+  int ShiftSignBufFI = -1;
 };
 
 } // namespace llvm

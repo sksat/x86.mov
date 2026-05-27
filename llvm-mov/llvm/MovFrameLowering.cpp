@@ -109,6 +109,7 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
   // 20 bytes; functions with no legalize target reserve none.
   bool NeedsByteOpScratch = false;
   bool NeedsRhsScratch = false;
+  bool NeedsShiftSignScratch = false;
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
       switch (MI.getOpcode()) {
@@ -123,16 +124,18 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
       case Mov::AND32ri:
       case Mov::OR32ri:
       case Mov::XOR32ri:
+      case Mov::SHL32ri:
+      case Mov::SHR32ri:
         NeedsByteOpScratch = true;
+        break;
+      case Mov::SAR32ri:
+        NeedsByteOpScratch = true;
+        NeedsShiftSignScratch = true;
         break;
       default:
         break;
       }
-      if (NeedsByteOpScratch && NeedsRhsScratch)
-        break;
     }
-    if (NeedsByteOpScratch && NeedsRhsScratch)
-      break;
   }
   if (!NeedsByteOpScratch)
     return;
@@ -158,4 +161,12 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
   // of dead frame space.
   if (NeedsRhsScratch)
     MovMFI->setAddRewriteRhsFI(Make());
+
+  // 6th slot — SAR sign byte buffer. Only allocated when at least one
+  // SAR32ri is in the function. The byte that ends up here is the
+  // sign-extended byte (0x00 or 0xFF) used to substitute the
+  // out-of-range source bytes that an arithmetic shift right pulls in
+  // from "above" the 32-bit value.
+  if (NeedsShiftSignScratch)
+    MovMFI->setShiftSignBufFI(Make());
 }
