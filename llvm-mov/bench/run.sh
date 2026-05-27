@@ -54,7 +54,11 @@ DEFAULT_FIXTURES=(
     sum10
 )
 
-FIXTURE_NAMES=("${@:-${DEFAULT_FIXTURES[@]}}")
+if [ $# -gt 0 ]; then
+    FIXTURE_NAMES=("$@")
+else
+    FIXTURE_NAMES=("${DEFAULT_FIXTURES[@]}")
+fi
 
 # -- prerequisites -------------------------------------------------------
 
@@ -74,10 +78,16 @@ trap 'rm -rf "$WORK"' EXIT
 # -- helpers -------------------------------------------------------------
 
 # count_mov_ratio <ELF> → "<mov_count> <total_count> <ratio_percent>"
+#
+# `objdump -j .text` restricts disassembly to the user-code section,
+# excluding linker-generated stubs (`.plt`, `.init`, `.fini`, ELF entry
+# trampolines) that would otherwise inflate the count and corrupt the
+# comparison — movfuscator's binary in particular embeds a sizeable
+# runtime in non-.text executable sections.
 count_mov_ratio() {
     local elf="$1"
     local mnem
-    mnem="$(objdump -d -Mintel --no-show-raw-insn "$elf" 2>/dev/null \
+    mnem="$(objdump -d -Mintel --no-show-raw-insn -j .text "$elf" 2>/dev/null \
         | awk '/^[[:space:]]*[0-9a-f]+:/ { print $2 }')"
     local total
     total="$(printf '%s\n' "$mnem" | grep -c .)"
@@ -91,9 +101,10 @@ count_mov_ratio() {
 }
 
 # non_mov_mnemonics <ELF> → space-separated list of unique non-mov opcodes
+# (also `.text`-only, same rationale as count_mov_ratio).
 non_mov_mnemonics() {
     local elf="$1"
-    objdump -d -Mintel --no-show-raw-insn "$elf" 2>/dev/null \
+    objdump -d -Mintel --no-show-raw-insn -j .text "$elf" 2>/dev/null \
         | awk '/^[[:space:]]*[0-9a-f]+:/ { print $2 }' \
         | grep -vE '^(mov|movabs|movzx|movsx)$' \
         | sort -u \

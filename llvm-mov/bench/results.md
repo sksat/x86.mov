@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-27T22:05:40Z on x86_64 (Linux).
+Generated 2026-05-27T22:08:35Z on x86_64 (Linux).
 
 ## return0
 
@@ -18,8 +18,8 @@ int main(void) { return 0; }
 | total ELF (bytes) | 4656 | 10221108 |
 | .text size | 37 | 4194 |
 | .rodata size | 0 | 0 |
-| mov count / total | 7 / 13 (53.8%) | 776 / 788 (98.5%) |
-| non-mov mnemonics | `call int pop push ret sub` | `add call jmp push` |
+| mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
+| non-mov mnemonics | `call int pop push ret sub` | `call` |
 
 ## return42
 
@@ -32,8 +32,8 @@ int main(void) { return 42; }
 | total ELF (bytes) | 4656 | 10221108 |
 | .text size | 37 | 4194 |
 | .rodata size | 0 | 0 |
-| mov count / total | 7 / 13 (53.8%) | 776 / 788 (98.5%) |
-| non-mov mnemonics | `call int pop push ret sub` | `add call jmp push` |
+| mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
+| non-mov mnemonics | `call int pop push ret sub` | `call` |
 
 ## sum10
 
@@ -51,6 +51,6 @@ int main(void) {
 | total ELF (bytes) | 270980 | 10221108 |
 | .text size | 441 | 6706 |
 | .rodata size | 262144 | 0 |
-| mov count / total | 119 / 131 (90.8%) | 1226 / 1238 (99.0%) |
-| non-mov mnemonics | `call cmp int jg jmp pop push ret sub` | `add call jmp push` |
+| mov count / total | 119 / 131 (90.8%) | 1225 / 1227 (99.8%) |
+| non-mov mnemonics | `call cmp int jg jmp pop push ret sub` | `call` |
 
