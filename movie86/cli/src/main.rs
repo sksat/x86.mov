@@ -87,7 +87,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut host = StdHost;
+    let mut host = StdHost::default();
     let outcome = run_elf_with_debug(&bytes, &mut host, &cfg);
     if let RunOutcome::Fault(f) = &outcome {
         eprintln!("movie86: guest fault: {f:?}");

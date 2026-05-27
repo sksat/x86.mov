@@ -5,6 +5,7 @@
 use std::io::{self, Write};
 
 use movie86_core::elf::{flatten_with_stack, parse, ElfError};
+use movie86_core::libc_host::{LibcCall, LibcHost, LibcResult};
 use movie86_core::syscall::{SysHost, SyscallArgs, SyscallResult};
 use movie86_core::{Cpu, Fault, Memory, Reg32, Signal};
 
@@ -52,8 +53,57 @@ impl RunOutcome {
 /// Host that wires Linux i386 syscalls to the surrounding process:
 /// `write` goes to the matching stdio stream, `exit` raises
 /// [`Fault::Exit`]. Anything else traps with [`Fault::UnknownSyscall`].
+///
+/// Also implements the host-side libc-wrapper ABI via [`LibcHost`] —
+/// the table mapping trap address → wrapped function is populated by
+/// [`run_elf_with_debug`] from the ELF symbol table at load time. Stub
+/// addresses with no registered wrapper trap with
+/// [`Fault::UnsupportedInterrupt(0x81)`] (the trait's default impl).
 #[derive(Debug, Default)]
-pub struct StdHost;
+pub struct StdHost {
+    /// `trap_addr` (the address of the `int 0x81` byte) → which libc
+    /// wrapper to invoke. Populated by `run_elf_with_debug` from the
+    /// ELF symbol table — host code never has to hand-write addresses.
+    libc_stubs: std::collections::BTreeMap<u32, LibcFn>,
+}
+
+/// Identifies one of the host-implemented libc wrappers.
+///
+/// Kept small on purpose: each variant requires a host implementation,
+/// and the smart-friend review pinned the "treat printf as guest-data
+/// marshaling" boundary — we only accept functions we can implement
+/// safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibcFn {
+    /// `void exit(int status)` — terminates the run. The host returns
+    /// [`Fault::Exit`] with the cdecl arg.
+    Exit,
+    /// `int sigaction(int signum, const struct sigaction *act, ...)` —
+    /// records the (signum, handler) pair on the CPU so the SIGSEGV /
+    /// SIGILL dispatch tricks find a target. movie86's signal model
+    /// doesn't run a real signal frame; we just need the handler addr.
+    Sigaction,
+    /// `int printf(const char *fmt, ...)` — formatted output. Parsed
+    /// on the host (a constrained `%s`/`%d`/`%c` subset, no `%n`).
+    Printf,
+}
+
+impl StdHost {
+    /// Register that the stub at `trap_addr` should dispatch to `fn`.
+    /// Called once per intercepted symbol at ELF load time.
+    pub fn register_libc_stub(&mut self, trap_addr: u32, which: LibcFn) {
+        self.libc_stubs.insert(trap_addr, which);
+    }
+}
+
+impl LibcHost for StdHost {
+    fn libc_call(&mut self, _call: &mut LibcCall<'_>) -> Result<LibcResult, Fault> {
+        // Wrapper impls land in follow-up commits. For now any
+        // registered stub still traps via the trait default — that
+        // keeps the routing change isolated and reviewable.
+        Err(Fault::UnsupportedInterrupt(0x81))
+    }
+}
 
 impl SysHost for StdHost {
     fn syscall(
@@ -154,14 +204,14 @@ fn errno_to_eax(errno: u32) -> u32 {
 /// outcome. Syscalls go through [`StdHost`] (stdio + exit).
 #[must_use]
 pub fn run_elf(bytes: &[u8]) -> RunOutcome {
-    let mut host = StdHost;
+    let mut host = StdHost::default();
     run_elf_with_host(bytes, &mut host)
 }
 
 /// Same as [`run_elf`] but with a caller-supplied host. Lets integration
 /// tests substitute a recording host (capture stdout, assert no syscall
 /// happens, etc.) without spawning a subprocess.
-pub fn run_elf_with_host<H: SysHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
+pub fn run_elf_with_host<H: SysHost + LibcHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
     run_elf_with_debug(bytes, host, &DebugConfig::default())
 }
 
@@ -196,7 +246,11 @@ pub enum DebugStop {
 
 /// Like [`run_elf_with_host`] but also accepts a `DebugConfig`. This
 /// is the entry the `movie86 --watch ...` CLI uses, exposed for tests.
-pub fn run_elf_with_debug<H: SysHost>(bytes: &[u8], host: &mut H, cfg: &DebugConfig) -> RunOutcome {
+pub fn run_elf_with_debug<H: SysHost + LibcHost>(
+    bytes: &[u8],
+    host: &mut H,
+    cfg: &DebugConfig,
+) -> RunOutcome {
     let elf = match parse(bytes) {
         Ok(e) => e,
         Err(e) => return RunOutcome::LoadError(e),

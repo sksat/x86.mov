@@ -3,6 +3,7 @@
 //! TDD style the rest of the repo uses.
 
 use movie86_cli::{run_elf, run_elf_with_host, RunOutcome};
+use movie86_core::libc_host::LibcHost;
 use movie86_core::syscall::{SysHost, SyscallArgs, SyscallResult};
 use movie86_core::{decode, Fault, Memory};
 
@@ -74,6 +75,10 @@ impl SysHost for CapturingHost {
         }
     }
 }
+
+// CapturingHost has no libc-wrapper expectations — empty impl picks
+// up the trait's default `Fault::UnsupportedInterrupt(0x81)` trap.
+impl LibcHost for CapturingHost {}
 
 #[test]
 fn runs_minimal_exit_42_elf() {

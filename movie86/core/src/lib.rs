@@ -6,6 +6,7 @@ pub mod cpu;
 pub mod decode;
 pub mod elf;
 pub mod insn;
+pub mod libc_host;
 pub mod mem;
 pub mod syscall;
 
@@ -13,6 +14,7 @@ pub use cpu::{Cpu, Signal};
 pub use decode::decode;
 pub use elf::{ElfError, LoadSegment, LoadedElf};
 pub use insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
+pub use libc_host::{LibcCall, LibcHost, LibcResult};
 pub use mem::{FlatMemory, Memory};
 pub use syscall::{SysHost, SyscallArgs, SyscallResult};
 

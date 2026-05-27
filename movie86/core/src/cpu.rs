@@ -7,6 +7,7 @@
 
 use crate::decode::decode;
 use crate::insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
+use crate::libc_host::{LibcCall, LibcHost, LibcResult};
 use crate::syscall::{SysHost, SyscallArgs, SyscallResult};
 use crate::{Fault, Memory};
 
@@ -84,7 +85,7 @@ impl Cpu {
     pub fn step<M, H>(&mut self, mem: &mut M, host: &mut H) -> Result<(), Fault>
     where
         M: Memory,
-        H: SysHost,
+        H: SysHost + LibcHost,
     {
         let mut buf = [0u8; MAX_INSN_LEN];
         let (n, partial_fault) = fetch(mem, self.eip, &mut buf)?;
@@ -136,7 +137,7 @@ impl Cpu {
     ) -> Result<u32, Fault>
     where
         M: Memory,
-        H: SysHost,
+        H: SysHost + LibcHost,
     {
         match insn {
             Insn::Mov { dst, src } => {
@@ -153,6 +154,32 @@ impl Cpu {
                 let args = SyscallArgs::from_regs(&self.regs);
                 match host.syscall(&args, mem)? {
                     SyscallResult::Return(v) => {
+                        self.set_reg(Reg32::Eax, v);
+                        Ok(next_eip_default)
+                    }
+                }
+            }
+            Insn::Int(0x81) => {
+                // Host-side libc-wrapper ABI. The stub at `self.eip`
+                // is `CD 81 C3` (`int 0x81; ret`); on trap, the host
+                // reads cdecl args from `[esp+4..]`, performs the work,
+                // and returns a value for EAX. The guest's own `ret`
+                // (next instruction) pops the cdecl return address.
+                let trap_addr = self.eip;
+                // Snapshot registers up front so the immutable borrow
+                // ends before we call `set_reg`. Matches the
+                // `SyscallArgs::from_regs` pattern just above.
+                let regs_snapshot = self.regs;
+                let result = {
+                    let mut call = LibcCall {
+                        trap_addr,
+                        regs: &regs_snapshot,
+                        mem,
+                    };
+                    host.libc_call(&mut call)?
+                };
+                match result {
+                    LibcResult::Return(v) => {
                         self.set_reg(Reg32::Eax, v);
                         Ok(next_eip_default)
                     }
@@ -400,7 +427,8 @@ mod tests {
 
     /// Test host that refuses every syscall. Use for tests that aren't
     /// supposed to issue one — keeps us honest if the CPU spuriously
-    /// invokes the host path.
+    /// invokes the host path. The empty `LibcHost` impl picks up the
+    /// trait's default trap, so `int 0x81` faults too.
     struct PanicHost;
     impl SysHost for PanicHost {
         fn syscall(
@@ -411,6 +439,7 @@ mod tests {
             panic!("unexpected syscall {:#x}", args.eax);
         }
     }
+    impl LibcHost for PanicHost {}
 
     /// Test host that records the last syscall and returns a fixed value.
     struct RecordingHost {
@@ -435,6 +464,7 @@ mod tests {
             Ok(SyscallResult::Return(self.return_value))
         }
     }
+    impl LibcHost for RecordingHost {}
 
     /// Build a memory region and encode `mov r32, imm32` at its base.
     fn make_mov_r32_imm32(reg_idx: u8, imm: u32, base: u32) -> FlatMemory {
@@ -878,6 +908,92 @@ mod tests {
         assert_eq!(
             cpu.step(&mut mem, &mut PanicHost).unwrap_err(),
             Fault::UnsupportedInterrupt(0x03),
+        );
+    }
+
+    /// Test host for the libc-wrapper ABI. Records what it saw and
+    /// returns a fixed value for EAX.
+    struct RecordingLibcHost {
+        last_trap: Option<u32>,
+        last_args: [Option<u32>; 4],
+        return_value: u32,
+    }
+    impl RecordingLibcHost {
+        fn new(return_value: u32) -> Self {
+            Self {
+                last_trap: None,
+                last_args: [None; 4],
+                return_value,
+            }
+        }
+    }
+    impl SysHost for RecordingLibcHost {
+        fn syscall(
+            &mut self,
+            args: &SyscallArgs,
+            _mem: &mut dyn Memory,
+        ) -> Result<SyscallResult, Fault> {
+            panic!("unexpected syscall {:#x}", args.eax);
+        }
+    }
+    impl LibcHost for RecordingLibcHost {
+        fn libc_call(&mut self, call: &mut LibcCall<'_>) -> Result<LibcResult, Fault> {
+            self.last_trap = Some(call.trap_addr);
+            for (i, slot) in self.last_args.iter_mut().enumerate() {
+                *slot = call.arg_u32(i).ok();
+            }
+            Ok(LibcResult::Return(self.return_value))
+        }
+    }
+
+    #[test]
+    fn step_int_0x81_invokes_libc_host_with_trap_addr_and_cdecl_args() {
+        // Layout: int 0x81 stub at 0x1000, a guest stack at 0x2000.
+        // Pre-stage `[esp+0]=retaddr, [esp+4]=arg0, [esp+8]=arg1` so
+        // the host can read them via `LibcCall::arg_u32`.
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x2000);
+        mem.write_bytes(0x1000, &[0xcd, 0x81]).unwrap(); // int 0x81
+        mem.write_u32(0x2000, 0xdead_beef).unwrap(); // [esp+0] retaddr
+        mem.write_u32(0x2004, 42).unwrap(); // [esp+4] arg0
+        mem.write_u32(0x2008, 0x1234_5678).unwrap(); // [esp+8] arg1
+        let mut cpu = Cpu::new(0x1000);
+        cpu.set_reg(Reg32::Esp, 0x2000);
+        let mut host = RecordingLibcHost::new(/* return = */ 99);
+        cpu.step(&mut mem, &mut host).unwrap();
+        assert_eq!(
+            host.last_trap,
+            Some(0x1000),
+            "trap_addr should be the eip of the int 0x81 instruction"
+        );
+        assert_eq!(host.last_args[0], Some(42), "[esp+4] = arg0");
+        assert_eq!(host.last_args[1], Some(0x1234_5678), "[esp+8] = arg1");
+        assert_eq!(
+            cpu.reg(Reg32::Eax),
+            99,
+            "host's LibcResult::Return value should land in EAX"
+        );
+        assert_eq!(
+            cpu.eip, 0x1002,
+            "eip should advance past the CD 81 bytes — the stub's own `ret` runs next"
+        );
+        assert_eq!(
+            cpu.reg(Reg32::Esp),
+            0x2000,
+            "esp must not move — the stub's `ret` will pop the cdecl retaddr"
+        );
+    }
+
+    #[test]
+    fn step_int_0x81_traps_when_no_libc_host_impl() {
+        // PanicHost has the default LibcHost impl, which traps with
+        // Fault::UnsupportedInterrupt(0x81). Verify the routing fires.
+        let mut mem = FlatMemory::new_zeroed(0x1000, 16);
+        mem.write_bytes(0x1000, &[0xcd, 0x81]).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.set_reg(Reg32::Esp, 0x100c);
+        assert_eq!(
+            cpu.step(&mut mem, &mut PanicHost).unwrap_err(),
+            Fault::UnsupportedInterrupt(0x81),
         );
     }
 
