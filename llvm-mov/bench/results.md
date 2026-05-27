@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-27T23:16:51Z on x86_64 (Linux).
+Generated 2026-05-27T23:22:54Z on x86_64 (Linux).
 
 ## return0
 
@@ -20,7 +20,7 @@ int main(void) { return 0; }
 | .rodata size | 0 | 0 |
 | mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.144 ms | 0.567 ms |
+| wall-clock runtime (hyperfine mean) | 0.136 ms | 0.523 ms |
 
 ## return42
 
@@ -35,7 +35,61 @@ int main(void) { return 42; }
 | .rodata size | 0 | 0 |
 | mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.139 ms | 0.515 ms |
+| wall-clock runtime (hyperfine mean) | 0.130 ms | 0.527 ms |
+
+## eq42
+
+```c
+/* Stage 7c2 visibility — pure EQ/NE comparison. The branch lowers to
+ * CMP32ri + JNE which the 7c2 pass collapses into a mov-only sequence
+ * (byte-XOR + OR-reduce + select_mask_table + per-byte select into
+ * next_pc). After 7c2 the `.text` should have no `cmp` and no `je/jne`,
+ * only the dispatcher's `jmp [next_pc]` for the indirect branch. */
+int main(void) {
+    int x = 42;
+    if (x == 42) return 1;
+    return 0;
+}
+```
+
+| metric | llvm-mov | movfuscator |
+|---|---:|---:|
+| total ELF (bytes) | 205764 | 10221108 |
+| .text size | 681 | 5716 |
+| .rodata size | 196864 | 0 |
+| mov count / total | 170 / 180 (94.4%) | 1050 / 1052 (99.8%) |
+| non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.156 ms | 0.544 ms |
+
+## bitops
+
+```c
+/* Stage 7b1 visibility — bitwise ops without arithmetic.
+ *
+ * Compiles to AND + XOR + OR chains that all go through the stage
+ * 7b1 byte-table rewrites. After legalize the `.text` should contain
+ * only mov-family opcodes for the actual computation; the only
+ * non-mov mnemonics remaining are the prologue/epilogue
+ * (push/pop/sub/ret) and the dispatcher's jmp.
+ *
+ * `(0xCAFE & 0xBABE) | (0xCAFE ^ 0xBABE)` evaluates to
+ * 0xCAFE | 0xBABE = 0xFAFE = 64254. Truncated to a byte exit code
+ * that's 0xFE = 254. */
+int main(void) {
+    int x = 0xCAFE;
+    int y = 0xBABE;
+    return (x & y) | (x ^ y);
+}
+```
+
+| metric | llvm-mov | movfuscator |
+|---|---:|---:|
+| total ELF (bytes) | 74332 | 10221108 |
+| .text size | 199 | 4963 |
+| .rodata size | 65536 | 0 |
+| mov count / total | 51 / 57 (89.5%) | 922 / 924 (99.8%) |
+| non-mov mnemonics | `call int pop push ret sub` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.138 ms | 0.557 ms |
 
 ## sum10
 
@@ -55,5 +109,43 @@ int main(void) {
 | .rodata size | 262144 | 0 |
 | mov count / total | 103 / 116 (88.8%) | 1225 / 1227 (99.8%) |
 | non-mov mnemonics | `call cmp int jg jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.175 ms | 0.580 ms |
+| wall-clock runtime (hyperfine mean) | 0.144 ms | 0.562 ms |
+
+## fib10
+
+```c
+/* Stage 7a + 7c1 visibility — a small Fibonacci loop.
+ *
+ * The loop body has 3 add operations and the loop header has a signed
+ * compare (cmp + jl), so this fixture exercises:
+ *
+ *   - 7a1 ADD32rr legalize (the t/a/b updates)
+ *   - 7c1 CFG dispatcher (every BB ends with `mov [next_pc], target;
+ *     jmp .Ldispatcher`)
+ *
+ * The signed compare on the loop bound stays as native `cmp + jl` —
+ * stage 7c4 (signed predicates) hasn't landed yet, so this fixture
+ * surfaces "cmp / jl" in the non-mov mnemonic column. When 7c4 lands
+ * the bench-check diff will show those mnemonics dropping out and
+ * the mov ratio rising. main returns fib(10) = 55. */
+int main(void) {
+    int a = 0, b = 1, t;
+    int i;
+    for (i = 0; i < 10; i++) {
+        t = a + b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+```
+
+| metric | llvm-mov | movfuscator |
+|---|---:|---:|
+| total ELF (bytes) | 270980 | 10221108 |
+| .text size | 458 | 6943 |
+| .rodata size | 262144 | 0 |
+| mov count / total | 108 / 121 (89.3%) | 1267 / 1269 (99.8%) |
+| non-mov mnemonics | `call cmp int jg jmp pop push ret sub` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.162 ms | 0.582 ms |
 

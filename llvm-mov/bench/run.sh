@@ -32,7 +32,29 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 LLVM_MOV_DIR="$(cd "$HERE/.." && pwd)"
 ROOT="$(cd "$LLVM_MOV_DIR/.." && pwd)"
 MOVFUSCATOR_WASM="$ROOT/movfuscator-wasm"
-FIXTURES="$MOVFUSCATOR_WASM/tests/fixtures"
+
+# Fixture lookup: a name resolves to the first match in this search
+# order, so llvm-mov-specific fixtures live alongside the bench (in
+# bench/fixtures/) and override the shared movfuscator-wasm test set
+# if a name collides. Shared fixtures (return0, return42, etc.) stay
+# in movfuscator-wasm/tests/fixtures so both subprojects test against
+# the same C source.
+FIXTURE_DIRS=(
+    "$HERE/fixtures"
+    "$MOVFUSCATOR_WASM/tests/fixtures"
+)
+
+# Resolve <name> → absolute path to <name>.c, or empty string.
+resolve_fixture() {
+    local name="$1" dir
+    for dir in "${FIXTURE_DIRS[@]}"; do
+        if [ -f "$dir/$name.c" ]; then
+            printf '%s\n' "$dir/$name.c"
+            return
+        fi
+    done
+    printf '\n'
+}
 
 BUILD_DIR="${BUILD_DIR:-$LLVM_MOV_DIR/build}"
 LLVM_MOV_LLC="$BUILD_DIR/bin/llvm-mov-llc"
@@ -42,16 +64,31 @@ CLANG="${CLANG:-clang-22}"
 
 # -- fixture selection ---------------------------------------------------
 
-# Default set: single-file fixtures that both pipelines build end-to-end
-# from $FIXTURES/<name>.c. `sum10` is the most interesting comparison —
-# arithmetic-only would compress to a constant in clang's optimiser
-# (LLVM constant folds the whole sum), so the loop keeps the addition
-# alive across all 4 32-bit byte stages, exercising the ADD legalize
-# tables. `return0`/`return42` show the trivial floor.
+# Default set: single-file fixtures that both pipelines build end-to-end.
+# Each fixture targets a different legalize-stage surface so bench-check
+# can show the effect of each future change in isolation:
+#
+#   return0/return42  — trivial floor. Almost no work for either backend;
+#                       shows fixed-overhead difference (4.6 KiB vs 10 MiB).
+#   eq42              — pure `==` comparison. Exercises stage 7c2
+#                       (CMP+Jcc EQ/NE legalize). After 7c2 the function
+#                       body has no cmp/je/jne — only mov + dispatcher jmp.
+#   bitops            — bitwise AND/XOR/OR chain. Exercises stage 7b1
+#                       (per-op byte tables). No control flow.
+#   sum10             — arithmetic loop. Exercises stage 7a (ADD32 byte
+#                       chain) heavily and links the 256 KiB add tables.
+#                       Has signed cmp+jg (loop bound) that stage 7c4 will
+#                       legalize.
+#   fib10             — small Fibonacci loop. ADD32rr chain + signed
+#                       compare; same story as sum10 but with an extra
+#                       loop carried dependency (a/b/t).
 DEFAULT_FIXTURES=(
     return0
     return42
+    eq42
+    bitops
     sum10
+    fib10
 )
 
 if [ $# -gt 0 ]; then
@@ -219,9 +256,12 @@ RESULTS="${RESULTS_OUT:-$HERE/results.md}"
 } > "$RESULTS"
 
 for name in "${FIXTURE_NAMES[@]}"; do
-    src="$FIXTURES/$name.c"
-    if [ ! -f "$src" ]; then
-        echo "warn: fixture $src not found, skipping" >&2
+    src="$(resolve_fixture "$name")"
+    if [ -z "$src" ]; then
+        echo "warn: fixture '$name.c' not found in any of:" >&2
+        for dir in "${FIXTURE_DIRS[@]}"; do
+            echo "  $dir" >&2
+        done
         continue
     fi
     echo "$name"
