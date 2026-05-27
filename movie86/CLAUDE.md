@@ -255,6 +255,57 @@ invoking `/lib/ld-linux.so.2 /tmp/inst-check/return42.elf` terminates with
 binary proving success/failure. The disassembly / relocation delta above is
 still decisive for the original `jmp main` question.
 
+## 2026-05-28 follow-up: other fixtures tried
+
+After the return42/hello demos landed, the remaining fixtures
+(`return0`, `sum10`, `branch`, `multi-add`) were linked against the same
+mov-loop CRT (`crt0.o/crtf.o/crtd.o`) + the minimal `sigaction`/`exit`
+cdecl stub from `link-real-return42.sh` (no `printf` needed since none
+print).
+
+| Program | Steps to exit | Status |
+|---|---|---|
+| `return0.c` | ~1k | exits 0 ✓ |
+| `sum10.c` | <1M | exits 0 ✓ (return value invisible — crt0 hardcodes exit 0) |
+| `branch.c` | <1M | exits 0 ✓ (same) |
+| `multi-add.c` | >5×10⁸ | **does not terminate within 500M steps** |
+
+`multi-add.c` calls `add(20, 22)` — a real C-level function call. Tracing
+the master_loop shows only **1474 unique PCs** visited across 1M steps,
+and that same set of PCs across 100M steps. movfuscator's master_loop
+executes a fixed mov-only instruction sequence each iteration; logical
+progress is encoded in *memory state*, not in different code paths. So
+PC-cycling alone cannot distinguish "stuck" from "extremely slow" —
+each C-level statement may need many master_loop iterations once the
+function-call machinery (shadow-stack push, target dispatch via
+`branch_temp`, callee prologue/epilogue) is exercised.
+
+For now: documented as a known-slow fixture; not a movie86 bug we can
+point to without disassembling master_loop and tracing the
+`target`/`sel_target`/`branch_temp` memory cells through the call.
+Function-call throughput would be a natural focus for a perf pass once
+movie86 has more native-code coverage (current 1474-PC body suggests
+each iteration is dominated by movfuscator's dispatch overhead, which
+movie86 emulates one mov at a time).
+
+`sum10` and `branch` have no observable side effects through movie86
+because both rely on `main`'s return value, which the crt0 always
+overrides with `exit(0)`. That is a movfuscator convention, not a
+movie86 limitation, and is the same reason `return42` exits 0.
+
+## Library-stub generality (open question)
+
+The `printf` stub in `link-real-hello.sh` hardcodes a 6-byte write
+because real `strlen` needs `cmp r/m32, r32` + `jcc rel8/32` + a real
+EFLAGS model (ZF at minimum). movie86 today implements neither — `cmp`
+is unimplemented and there is no flags register. Adding both is the
+natural next milestone (call it "milestone 4: branches"); it would also
+let us drop the hardcoded `exit` length and link against a real
+mov-only libc instead of hand-written cdecl trampolines. Until then,
+each new libc-using fixture would need its own fixture-specific stub,
+which doesn't scale — so the deliberate plan is: no more hand-written
+libc stubs until cmp/jcc/EFLAGS land.
+
 ## CI
 
 `.github/workflows/movie86.yaml` at the repo root. Runs on push/PR to `mov`: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test --workspace --all-targets`, and a `wasm32-unknown-unknown` build of `movie86-core`. Actions pinned to `vMAJOR.MINOR.PATCH` per project convention.
