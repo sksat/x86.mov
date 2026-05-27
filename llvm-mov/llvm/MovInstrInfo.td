@@ -146,6 +146,23 @@ def MOV32mr : MovInst<(outs), (ins MovMemOperand:$dst, GPR32:$src),
                       "mov\tdword ptr $dst, $src",
                       [(store GPR32:$src, addr:$dst)]>;
 
+// MOV32mi — store an i32 immediate (or 32-bit symbol expression) into
+// memory. No DAG pattern: MovOnlyLegalize uses this from stage 7c1
+// onward to write a target MBB's code pointer into the dispatcher
+// `next_pc` slot without needing a scratch GPR. Operand 1 accepts
+// MO_Immediate, MO_MachineBasicBlock, and MO_GlobalAddress — all
+// lowered to MCExpr by MovAsmPrinter::lower.
+//
+// The asmstr uses the `offset` keyword on the immediate operand. GAS
+// Intel syntax requires it for label/symbol immediates in mem-imm mov
+// (`mov dword ptr [...], .Llabel` is rejected; `offset .Llabel` is
+// the unambiguous form for "address of symbol"). For numeric
+// immediates `offset N` evaluates to N, so this is safe for both
+// shapes.
+let mayStore = 1, isCodeGenOnly = 1 in
+def MOV32mi : MovInst<(outs), (ins MovMemOperand:$dst, i32imm_op:$src),
+                      "mov\tdword ptr $dst, offset $src", []>;
+
 // 8-bit MOV family — stage 7-prep. No DAG patterns: these instructions
 // are reserved for MovOnlyLegalize (post-RA) to build mov-only
 // table-lookup chains. The MOV{8rm,8mr,8rr,8ri} forms mirror the

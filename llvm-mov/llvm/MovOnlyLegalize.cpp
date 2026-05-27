@@ -55,6 +55,8 @@
 #include "MovSubtarget.h"
 #include "MovTargetMachine.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -86,6 +88,12 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override {
     bool Changed = false;
     const TargetInstrInfo &TII = *MF.getSubtarget<MovSubtarget>().getInstrInfo();
+
+    // Stage 7c1: CFG-level rewrite for branches. Runs FIRST, before any
+    // per-MI byte-chain rewrite below. Touches uncond JMP and fallthrough
+    // edges; conditional Jcc stays as-is until 7c2+ lands flag math.
+    Changed |= legalizeCFG(MF, TII);
+
     for (MachineBasicBlock &MBB : MF) {
       for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
         switch (MI.getOpcode()) {
@@ -158,6 +166,187 @@ private:
     std::optional<int64_t> AmountBufDisp;
     std::optional<int64_t> ShiftedBufDisp;
   };
+
+  // Stage 7c1: resolve just the dispatcher's `next_pc` slot. CFG
+  // legalize doesn't need any of the byte-chain scratch — it only
+  // writes a 32-bit target address (via MOV32mi) and routes through
+  // a JMP32m dispatcher MBB. Returns nullopt when the FrameLowering
+  // scan didn't reserve the slot (single-BB function).
+  static std::optional<int64_t>
+  resolveDispatcherDisp(const MachineFunction &MF) {
+    const auto *MovMFI = MF.getInfo<MovMachineFunctionInfo>();
+    const int FI = MovMFI->getDispatcherNextPCBufFI();
+    if (FI == -1)
+      return std::nullopt;
+    return MF.getFrameInfo().getObjectOffset(FI);
+  }
+
+  // True for our 10 conditional-branch opcodes. Mirrors MovInstrInfo.cpp's
+  // analyzeBranch helper — duplicated here so this pass doesn't have to
+  // depend on internals of MovInstrInfo.
+  static bool isJcc(unsigned Opc) {
+    switch (Opc) {
+    case Mov::JE:
+    case Mov::JNE:
+    case Mov::JL:
+    case Mov::JG:
+    case Mov::JLE:
+    case Mov::JGE:
+    case Mov::JB:
+    case Mov::JA:
+    case Mov::JBE:
+    case Mov::JAE:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  // Stage 7c1 — CFG-level legalization. Replaces unconditional JMPs and
+  // implicit fallthrough edges with a uniform "store target address +
+  // jump through a dispatcher MBB" pattern, so the per-branch direct
+  // jump is replaced by a single indirect jump in the dispatcher.
+  //
+  // For each non-dispatcher BB:
+  //   - terminator is uncond JMP: insert `MOV32mi [next_pc], <target>`
+  //     before the first terminator, erase the JMP, append `JMP dispatcher`.
+  //   - terminator is Jcc + (fallthrough or no explicit JMP for false
+  //     side): insert `MOV32mi [next_pc], <layout_succ>` before the Jcc,
+  //     append `JMP dispatcher`. The Jcc continues to take the
+  //     true-side direct branch; the false side now flows through the
+  //     dispatcher to layout_succ.
+  //   - terminator is RET (or anything else non-branching): leave alone.
+  //   - no terminator (pure fallthrough): insert mov + JMP dispatcher
+  //     at the end.
+  //
+  // The dispatcher MBB at the end of the function holds a single
+  // `JMP32m [next_pc]` (indirect jump through the slot we just wrote).
+  //
+  // The MOV32mi is inserted BEFORE the first existing terminator to
+  // preserve the MIR invariant that terminators are contiguous at the
+  // end of an MBB. `mov` doesn't touch EFLAGS, so a preceding Jcc that
+  // reads EFLAGS from a `cmp` further up still sees the right flags.
+  //
+  // Returns true when at least one BB was rewritten.
+  bool legalizeCFG(MachineFunction &MF, const TargetInstrInfo &TII) const {
+    if (MF.size() < 2)
+      return false;
+    const std::optional<int64_t> NextPCDispOpt = resolveDispatcherDisp(MF);
+    if (!NextPCDispOpt)
+      return false;
+    const int64_t NextPCDisp = *NextPCDispOpt;
+
+    // (1) Create dispatcher MBB at the end of the function.
+    MachineBasicBlock *Dispatcher = MF.CreateMachineBasicBlock();
+    MF.push_back(Dispatcher);
+    const DebugLoc EmptyDL;
+    BuildMI(Dispatcher, EmptyDL, TII.get(Mov::JMP32m))
+        .addReg(Mov::EBP)
+        .addImm(NextPCDisp);
+
+    SetVector<MachineBasicBlock *> DispatcherTargets;
+
+    // (2) Snapshot the BB list before iterating — push_back of the
+    // dispatcher above already happened, so we walk MBB list and skip
+    // the dispatcher itself.
+    SmallVector<MachineBasicBlock *, 8> BBList;
+    for (MachineBasicBlock &MBB : MF)
+      if (&MBB != Dispatcher)
+        BBList.push_back(&MBB);
+
+    bool Changed = false;
+    for (MachineBasicBlock *MBB : BBList) {
+      auto TermIt = MBB->getFirstTerminator();
+
+      // Find the last terminator (if any) and classify the BB's exit.
+      // Jcc instances are ignored on the scan — they stay where they
+      // are; only RET (skip the BB entirely) and uncond JMP (rewrite
+      // it) drive the decision.
+      MachineInstr *UncondJmp = nullptr;
+      bool HasReturn = false;
+      for (auto It = TermIt; It != MBB->end(); ++It) {
+        const unsigned Op = It->getOpcode();
+        if (Op == Mov::JMP)
+          UncondJmp = &*It;
+        else if (Op == Mov::RET)
+          HasReturn = true;
+      }
+
+      // RET-terminated BB: leave alone. Stage 7d handles the return
+      // path; for 7c1, returning BBs don't go through the dispatcher.
+      if (HasReturn)
+        continue;
+
+      // Determine the rewrite target.
+      MachineBasicBlock *Target = nullptr;
+      if (UncondJmp) {
+        // Uncond JMP — its operand is the target MBB.
+        Target = UncondJmp->getOperand(0).getMBB();
+      } else {
+        // No uncond JMP. Either Jcc-only-terminated (falls through to
+        // layout_succ on the false side) or completely terminator-less
+        // (also falls through). Both cases route the fallthrough to
+        // layout_succ via dispatcher.
+        const MachineFunction::iterator NextLayout =
+            std::next(MachineFunction::iterator(MBB));
+        if (NextLayout == MF.end())
+          continue; // last MBB with no terminator — shouldn't happen
+        if (&*NextLayout == Dispatcher)
+          continue; // already at end (dispatcher is the next layout
+                    // slot); no fallthrough action needed.
+        Target = &*NextLayout;
+      }
+
+      if (!Target)
+        continue;
+
+      DispatcherTargets.insert(Target);
+
+      // (3a) Insert `MOV32mi [next_pc], <target>` BEFORE the first
+      // existing terminator (which may be a Jcc that reads EFLAGS;
+      // mov doesn't touch EFLAGS so the Jcc still sees correct flags).
+      const DebugLoc InsDL =
+          (TermIt != MBB->end()) ? TermIt->getDebugLoc() : DebugLoc();
+      BuildMI(*MBB, TermIt, InsDL, TII.get(Mov::MOV32mi))
+          .addReg(Mov::EBP)
+          .addImm(NextPCDisp)
+          .addMBB(Target);
+
+      // (3b) Erase the original uncond JMP if present (its CFG edge
+      // gets recreated via the dispatcher).
+      if (UncondJmp) {
+        if (MBB->isSuccessor(Target))
+          MBB->removeSuccessor(Target);
+        UncondJmp->eraseFromParent();
+      } else {
+        // Fallthrough case: removeSuccessor for layout-succ Target.
+        if (MBB->isSuccessor(Target))
+          MBB->removeSuccessor(Target);
+      }
+
+      // (3c) Append `JMP dispatcher` at the end of MBB.
+      BuildMI(MBB, EmptyDL, TII.get(Mov::JMP)).addMBB(Dispatcher);
+      if (!MBB->isSuccessor(Dispatcher))
+        MBB->addSuccessor(Dispatcher);
+
+      Changed = true;
+    }
+
+    // (4) Add each target to the dispatcher's successor list so MIR
+    // verifier / liveness understand reachability from the indirect
+    // jump.
+    for (MachineBasicBlock *T : DispatcherTargets) {
+      if (!Dispatcher->isSuccessor(T))
+        Dispatcher->addSuccessor(T);
+    }
+
+    if (!Changed) {
+      // Nothing to dispatch — remove the dispatcher MBB to keep the CFG
+      // tidy (no unreachable empty BB littering the asm).
+      Dispatcher->eraseFromParent();
+    }
+    return Changed;
+  }
 
   // Stage-7a1 placeholder — see the file-level comment for the design.
   //

@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-27T22:08:35Z on x86_64 (Linux).
+Generated 2026-05-27T22:26:44Z on x86_64 (Linux).
 
 ## return0
 
@@ -49,8 +49,8 @@ int main(void) {
 | metric | llvm-mov | movfuscator |
 |---|---:|---:|
 | total ELF (bytes) | 270980 | 10221108 |
-| .text size | 441 | 6706 |
+| .text size | 478 | 6706 |
 | .rodata size | 262144 | 0 |
-| mov count / total | 119 / 131 (90.8%) | 1225 / 1227 (99.8%) |
+| mov count / total | 123 / 136 (90.4%) | 1225 / 1227 (99.8%) |
 | non-mov mnemonics | `call cmp int jg jmp pop push ret sub` | `call` |
 

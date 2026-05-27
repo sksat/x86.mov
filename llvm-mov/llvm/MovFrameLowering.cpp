@@ -148,7 +148,14 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
       }
     }
   }
-  if (!NeedsByteOpScratch)
+  // Stage 7c1: any function with at least two basic blocks gets a
+  // dispatcher `next_pc` slot reserved. The CFG rewrite in
+  // MovOnlyLegalize uses it to store the next BB's code-pointer
+  // before jumping through the dispatcher MBB. Single-BB functions
+  // don't need the slot (no branches to rewrite).
+  const bool NeedsDispatcher = MF.size() >= 2;
+
+  if (!NeedsByteOpScratch && !NeedsDispatcher)
     return;
 
   auto *MovMFI = MF.getInfo<MovMachineFunctionInfo>();
@@ -158,6 +165,12 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
                                  /*isSpillSlot=*/false, /*Alloca=*/nullptr,
                                  /*ID=*/0);
   };
+
+  if (NeedsDispatcher)
+    MovMFI->setDispatcherNextPCBufFI(Make());
+
+  if (!NeedsByteOpScratch)
+    return;
 
   // Base 4 slots: save_ecx, save_edx, srcdst (source spill + result
   // buffer), idx (4-byte index pack slot). See stage 7a1 commit msg /
