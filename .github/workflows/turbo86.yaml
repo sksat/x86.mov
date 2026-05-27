@@ -1,0 +1,58 @@
+name: turbo86
+
+on:
+  push:
+    branches: [mov]
+  pull_request:
+    branches: [mov]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: turbo86
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: setup go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version: '1.24'
+          cache-dependency-path: turbo86/go.sum
+
+      # Run from the subproject root so go.mod is in scope.
+      - name: gofmt -l
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted Go files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The runner package + server package + cmd/turbo86 are all
+      # //go:build linux; CI runs on ubuntu so they're exercised.
+      - name: go test
+        run: go test -v ./...
+
+      - name: build cmd/turbo86
+        run: go build -o /tmp/turbo86 ./cmd/turbo86
+
+      # Drift check: regenerating the i386 child stub from _stub.s must
+      # not change the committed binary in a way that breaks reproducibility.
+      # We don't require byte-identical output (toolchain versions vary
+      # cross-distro), only that a fresh build succeeds and the result is
+      # a valid 32-bit i386 ELF.
+      - name: stub rebuild from source
+        run: |
+          cd stub
+          make
+          file stub | grep -q "ELF 32-bit LSB executable, Intel 80386"
