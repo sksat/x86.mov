@@ -1,0 +1,127 @@
+//go:build linux
+
+package server_test
+
+import (
+	"context"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+
+	"github.com/sksat/x86.mov/turbo86/proto"
+	"github.com/sksat/x86.mov/turbo86/server"
+)
+
+// TestE2E_ExitFortyTwo_OverWebSocket is the headline end-to-end test:
+// a mock client connects to the server, streams the same exit(42) byte
+// sequence the runner tests use, and reads the resulting Exit{42} event
+// back over the wire. Exercises proto + runner + stub + server in one
+// pass.
+func TestE2E_ExitFortyTwo_OverWebSocket(t *testing.T) {
+	srv := httptest.NewServer(server.Handler())
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer ws.CloseNow()
+
+	const entry uint32 = 0x08048000
+	//   B8 01 00 00 00         mov eax, 1
+	//   BB 2A 00 00 00         mov ebx, 42
+	//   CD 80                  int 0x80
+	exit42 := []byte{
+		0xB8, 0x01, 0x00, 0x00, 0x00,
+		0xBB, 0x2A, 0x00, 0x00, 0x00,
+		0xCD, 0x80,
+	}
+
+	sendInbound(t, ctx, ws, proto.Code{Offset: entry, Bytes: exit42})
+	sendInbound(t, ctx, ws, proto.Start{Entry: entry, StackTop: 0x701FFFF0})
+
+	got := readAllEvents(t, ctx, ws)
+	want := []proto.Outbound{proto.Exit{Code: 42}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", got, want)
+	}
+}
+
+// TestE2E_LoadContext_OverWebSocket exercises the migration receive
+// path through the WS: a client hands a Context (regs preloaded for
+// SYS_exit with status 42) and a single int 0x80 instruction, and the
+// session exits as 42 without the guest code ever touching eax/ebx.
+func TestE2E_LoadContext_OverWebSocket(t *testing.T) {
+	srv := httptest.NewServer(server.Handler())
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer ws.CloseNow()
+
+	const entry uint32 = 0x08048000
+	sendInbound(t, ctx, ws, proto.LoadContext{Context: proto.Context{
+		Regs: proto.Regs{
+			Eax: 1, Ebx: 42, Esp: 0x701FFFF0, Eip: entry,
+		},
+		Regions: []proto.MemRegion{
+			{Addr: entry, Bytes: []byte{0xCD, 0x80}},
+		},
+	}})
+
+	got := readAllEvents(t, ctx, ws)
+	want := []proto.Outbound{proto.Exit{Code: 42}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", got, want)
+	}
+}
+
+func sendInbound(t *testing.T, ctx context.Context, ws *websocket.Conn, msg proto.Inbound) {
+	t.Helper()
+	data, err := proto.MarshalInbound(msg)
+	if err != nil {
+		t.Fatalf("marshal %T: %v", msg, err)
+	}
+	if err := ws.Write(ctx, websocket.MessageText, data); err != nil {
+		t.Fatalf("write %T: %v", msg, err)
+	}
+}
+
+// readAllEvents reads frames until the server closes the connection
+// (normal closure = end of session) or the context expires. Returns
+// the collected Outbound events in order.
+func readAllEvents(t *testing.T, ctx context.Context, ws *websocket.Conn) []proto.Outbound {
+	t.Helper()
+	var events []proto.Outbound
+	for {
+		_, data, err := ws.Read(ctx)
+		if err != nil {
+			// Normal closure (status 1000) is the expected session-end signal.
+			closeErr := websocket.CloseStatus(err)
+			if closeErr == websocket.StatusNormalClosure || closeErr == -1 {
+				return events
+			}
+			t.Fatalf("read frame: %v (close=%d)", err, closeErr)
+		}
+		msg, err := proto.UnmarshalOutbound(data)
+		if err != nil {
+			t.Fatalf("parse frame %q: %v", data, err)
+		}
+		events = append(events, msg)
+	}
+}
