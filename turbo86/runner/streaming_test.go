@@ -19,19 +19,19 @@ import (
 //
 // Guest program: write(1, "A", 1); exit(42)  (two syscalls, no branches)
 // Test sequence:
-//   1. New + WriteCode (initial program) + Run.
-//   2. Receive Stdout("A") — confirms the first syscall has been
-//      processed and the child is between syscalls.
-//   3. Call WriteCode at an address the guest never reads; this is
-//      the streaming write that must not error mid-session.
-//   4. Receive Exit{42}.
-//   5. Drain the channel close.
+//  1. New + WriteCode (initial program) + Run.
+//  2. Receive Stdout("A") — confirms the first syscall has been
+//     processed and the child is between syscalls.
+//  3. Call WriteCode at an address the guest never reads; this is
+//     the streaming write that must not error mid-session.
+//  4. Receive Exit{42}.
+//  5. Drain the channel close.
 func TestRunner_WriteCodeWhileRunning(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	const entry uint32 = 0x08048000
-	const aAddr uint32 = 0x08048100   // where "A" is stored, read by write(2)
+	const aAddr uint32 = 0x08048100    // where "A" is stored, read by write(2)
 	const lateAddr uint32 = 0x08049000 // the post-Run write target
 
 	r, err := New(stub.Bytes)
