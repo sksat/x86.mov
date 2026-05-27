@@ -17,10 +17,11 @@ add_subdirectory(TargetInfo)
 
 add_llvm_component_library(LLVMMovCodeGen
   MovAsmPrinter.cpp
-  MovFrameLowering.cpp  # header-only currently; placeholder for the .cpp once it has body
+  MovFrameLowering.cpp
   MovISelDAGToDAG.cpp
   MovISelLowering.cpp
   MovInstrInfo.cpp
+  MovMachineFunctionInfo.cpp
   MovOnlyLegalize.cpp
   MovRegisterInfo.cpp
   MovSubtarget.cpp

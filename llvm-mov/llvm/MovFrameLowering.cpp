@@ -2,6 +2,7 @@
 #include "MovFrameLowering.h"
 #include "MCTargetDesc/MovMCTargetDesc.h"
 #include "MovInstrInfo.h"
+#include "MovMachineFunctionInfo.h"
 #include "MovSubtarget.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -83,4 +84,39 @@ MovFrameLowering::eliminateCallFramePseudoInstr(
         .addImm(Amount);
   }
   return MBB.erase(MI);
+}
+
+void MovFrameLowering::processFunctionBeforeFrameFinalized(
+    MachineFunction &MF, RegScavenger * /*RS*/) const {
+  // Walk every MachineInstr in the function to decide whether
+  // MovOnlyLegalize will need to spill ECX while it borrows CL as a
+  // table index. Today the only legalize-eligible opcodes are
+  // ADD32rr/ri; stage 7b/c/d will extend this set, and the scratch
+  // slot becomes useful as soon as legalizeADD32 starts rewriting
+  // (stage 7a1). Reserving here, even though prep-2c is still a
+  // no-op consumer, lets us verify the wiring end-to-end (an extra
+  // local slot shows up as `sub esp, +4` in the prologue of ADD-having
+  // fixtures) without piling state on the legalize pass itself.
+  bool NeedsAddLegalizeScratch = false;
+  for (const MachineBasicBlock &MBB : MF) {
+    for (const MachineInstr &MI : MBB) {
+      const unsigned Op = MI.getOpcode();
+      if (Op == Mov::ADD32rr || Op == Mov::ADD32ri) {
+        NeedsAddLegalizeScratch = true;
+        break;
+      }
+    }
+    if (NeedsAddLegalizeScratch)
+      break;
+  }
+  if (!NeedsAddLegalizeScratch)
+    return;
+
+  auto *MovMFI = MF.getInfo<MovMachineFunctionInfo>();
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  const int FI = MFI.CreateStackObject(/*Size=*/4, Align(4),
+                                       /*isSpillSlot=*/false,
+                                       /*Alloca=*/nullptr,
+                                       /*ID=*/0);
+  MovMFI->setSavedParentSlot(Mov::ECX, FI);
 }

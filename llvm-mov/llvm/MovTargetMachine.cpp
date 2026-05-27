@@ -1,5 +1,6 @@
 //===-- MovTargetMachine.cpp ----------------------------------------------===//
 #include "MovTargetMachine.h"
+#include "MovMachineFunctionInfo.h"
 #include "TargetInfo/MovTargetInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
@@ -64,6 +65,13 @@ public:
 
 TargetPassConfig *MovTargetMachine::createPassConfig(PassManagerBase &PM) {
   return new MovPassConfig(*this, PM);
+}
+
+MachineFunctionInfo *MovTargetMachine::createMachineFunctionInfo(
+    BumpPtrAllocator &Allocator, const Function &F,
+    const TargetSubtargetInfo *STI) const {
+  return MovMachineFunctionInfo::create<MovMachineFunctionInfo>(Allocator, F,
+                                                                STI);
 }
 
 extern "C" void LLVMInitializeMovTarget() {

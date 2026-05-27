@@ -47,6 +47,7 @@
 
 #include "MCTargetDesc/MovMCTargetDesc.h"
 #include "MovInstrInfo.h"
+#include "MovMachineFunctionInfo.h"
 #include "MovTargetMachine.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -95,30 +96,37 @@ public:
 private:
   // Stage-7a1 placeholder — see the file-level comment for the design.
   //
-  // Stage 7-prep-2 builds the three infrastructure pieces this rewrite
-  // depends on, in separate commits:
+  // All three prep-2 infrastructure pieces are now landed:
   //
   //   2a. `.rodata.__mov_add8_tables` emission for the byte-add lookup
-  //       tables. Done in MovAsmPrinter::emitEndOfAsmFile — landed.
+  //       tables (MovAsmPrinter::emitEndOfAsmFile).
   //
-  //   2b. `[<symbol> + <index_reg>]` addressing for byte loads. Done as
-  //       a new MI-only operand `MovIdxMemOperand` + the codegen-only
+  //   2b. `[<symbol> + <index_reg>]` addressing for byte loads via the
+  //       MI-only operand `MovIdxMemOperand` + the codegen-only
   //       instruction `MOV8rm_idx` + printer routine
-  //       `printIdxMemOperand` — landed. No SelectAddr / ComplexPattern
-  //       changes (MOV8rm_idx has no DAG pattern; legalize uses BuildMI
-  //       directly with `.addExternalSymbol("__mov_add8_sum_table")` +
-  //       `.addReg(IdxReg)`).
+  //       `printIdxMemOperand`. No SelectAddr / ComplexPattern changes
+  //       — legalize uses BuildMI directly with
+  //       `.addExternalSymbol("__mov_add8_sum_table")` +
+  //       `.addReg(IdxReg)`.
   //
-  //   2c. Per-function scratch slots for spilling parent regs (EAX/etc.)
-  //       around byte-reg usage. MovOnlyLegalize must allocate these
-  //       via MFI.CreateStackObject, since RA has already finished —
-  //       not yet implemented.
+  //   2c. Pre-PEI scratch-slot reservation in
+  //       MovFrameLowering::processFunctionBeforeFrameFinalized, with
+  //       the FI stored on MovMachineFunctionInfo and looked up here
+  //       via `getSavedParentSlot(MF, Mov::ECX)`. Post-PEI
+  //       MFI.CreateStackObject would be unsafe — by the time this
+  //       pass runs, `sub esp, N` is already baked into the prologue
+  //       and existing FIs are resolved.
   //
-  // Until 2c lands (and this routine starts using all three), this
-  // returns false so the pass stays a no-op for ADD32. Gated by the
-  // test/MovOnly/ harness which has no ADD-focused fixtures yet.
-  // Returning false here keeps the existing 39 execution tests + Rust
-  // example green; the mov-only gate stays empty.
+  // Stage 7a1 itself (the real ADD32 byte-chain rewrite) is the next
+  // commit; until then legalizeADD32 keeps returning false so the
+  // 39 execution fixtures + Rust example stay green and the
+  // test/MovOnly gate stays empty.
+
+  static int getSavedParentSlot(const MachineFunction &MF,
+                                Register ParentReg) {
+    return MF.getInfo<MovMachineFunctionInfo>()->getSavedParentSlot(
+        ParentReg);
+  }
   bool legalizeADD32(MachineInstr & /*MI*/) const {
     // TODO(stage 7a1, post 7-prep-2): byte-split + carry-chain table
     // lookups. See file-level comment.

@@ -33,5 +33,15 @@ public:
   MachineBasicBlock::iterator
   eliminateCallFramePseudoInstr(MachineFunction &MF, MachineBasicBlock &MBB,
                                 MachineBasicBlock::iterator MI) const override;
+
+  // Stage 7-prep-2c: reserve any scratch slots the post-PEI
+  // MovOnlyLegalize pass will need before PEI finalises the frame
+  // layout. Allocating from inside the legalize pass is unsafe — by
+  // then `emitPrologue` has already burned `sub esp, N` into the
+  // prologue and `eliminateFrameIndex` has replaced every FI with
+  // (EBP, disp), so a new FI created at that point is never resolved.
+  // The slots end up in the per-function MovMachineFunctionInfo.
+  void processFunctionBeforeFrameFinalized(
+      MachineFunction &MF, RegScavenger *RS = nullptr) const override;
 };
 } // namespace llvm

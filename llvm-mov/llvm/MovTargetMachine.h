@@ -24,6 +24,13 @@ public:
     return TLOF.get();
   }
 
+  // Stage 7-prep-2c: per-function MovMachineFunctionInfo holding the
+  // scratch-slot bookkeeping that MovFrameLowering reserves pre-PEI
+  // and MovOnlyLegalize consumes post-PEI.
+  MachineFunctionInfo *
+  createMachineFunctionInfo(BumpPtrAllocator &Allocator, const Function &F,
+                            const TargetSubtargetInfo *STI) const override;
+
 private:
   std::unique_ptr<TargetLoweringObjectFile> TLOF;
   MovSubtarget Subtarget;
