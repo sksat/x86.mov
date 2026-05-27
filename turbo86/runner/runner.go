@@ -525,25 +525,66 @@ type syscallPending struct {
 	returnValue   uint32 // only meaningful when overwriteEax is true
 }
 
+// isForwardableSignal returns true for signals that should be delivered
+// to the child via PTRACE_SYSCALL(pid, sig) so the guest's own handler
+// (registered via rt_sigaction passthrough) can run. SIGTRAP is
+// excluded — it's reserved for tracer-owned breakpoints (future int3
+// library bridging). Uncatchable signals (SIGKILL) and job-control
+// (SIGSTOP/SIGCONT/...) aren't appropriate to forward; they fall to the
+// Paused path.
+func isForwardableSignal(sig syscall.Signal) bool {
+	switch sig {
+	case syscall.SIGILL, syscall.SIGSEGV, syscall.SIGBUS,
+		syscall.SIGFPE, syscall.SIGPIPE,
+		syscall.SIGUSR1, syscall.SIGUSR2:
+		return true
+	}
+	return false
+}
+
 // syscallLoop drives the child through PTRACE_SYSCALL entry/exit pairs:
 // entry stops route through the bridge; the bridge either emulates (we
 // suppress the real syscall and return a synthetic value at the exit
-// stop) or terminates the session. Signal stops fall to the Paused path.
-//
-// Two stops per syscall vs one with PTRACE_SYSEMU; the trade-off buys
-// passthrough support for syscalls the runner shouldn't intercept
-// (rt_sigaction, rt_sigreturn, …). Those are added in a follow-up
-// slice; for now every emulated syscall goes through the entry+exit
-// state machine.
+// stop), passes through (kernel runs the real syscall), or terminates
+// the session. Signal stops either forward the signal to the guest
+// (so its registered handler runs) or fall to the Paused path.
+// pausedSnapshot is captured at a forwardable signal stop *before* the
+// signal is delivered to the guest. Held in case the kernel kills the
+// child (no handler registered), so the resulting Paused event can
+// still carry the regs/memory state at the moment of the fault. If the
+// guest's handler runs successfully, the snapshot is discarded on the
+// next stop (the child is alive, the snapshot would be stale).
+type pausedSnapshot struct {
+	regs    proto.Regs
+	regions []proto.MemRegion
+	signal  uint8
+}
+
+func (r *Runner) capturePausedSnapshot(sig syscall.Signal) (pausedSnapshot, error) {
+	var snap pausedSnapshot
+	var rs regs32
+	if err := ptraceGetRegs32(r.pid, &rs); err != nil {
+		return snap, err
+	}
+	regions, err := snapshotMemory(r.mem)
+	if err != nil {
+		return snap, err
+	}
+	return pausedSnapshot{regs: protoRegs(&rs), regions: regions, signal: uint8(sig)}, nil
+}
+
 func (r *Runner) syscallLoop(regs *regs32) {
 	var ws syscall.WaitStatus
 	var pending syscallPending
+	nextSignal := 0                  // signal to deliver on the next PTRACE_SYSCALL resume
+	var heldSnapshot *pausedSnapshot // held across a signal forward in case the child dies
 
 	for {
-		if err := syscall.PtraceSyscall(r.pid, 0); err != nil {
+		if err := syscall.PtraceSyscall(r.pid, nextSignal); err != nil {
 			r.emitFault(fmt.Sprintf("PTRACE_SYSCALL: %v", err))
 			return
 		}
+		nextSignal = 0
 		if _, err := syscall.Wait4(r.pid, &ws, 0, nil); err != nil {
 			r.emitFault(fmt.Sprintf("wait syscall stop: %v", err))
 			return
@@ -552,27 +593,61 @@ func (r *Runner) syscallLoop(regs *regs32) {
 			r.emitFault(fmt.Sprintf("child exited unexpectedly (status %d)", ws.ExitStatus()))
 			return
 		}
+		if ws.Signaled() {
+			// Forwarded signal had no handler; kernel killed the child.
+			// Emit Paused with the snapshot we took before forwarding,
+			// if any (rare for it to be missing — would mean the kill
+			// came from somewhere other than a forwarded signal).
+			s := uint8(ws.Signal())
+			ev := proto.Paused{
+				Signal: s,
+				Reason: fmt.Sprintf("guest killed by signal %d (no handler)", s),
+			}
+			if heldSnapshot != nil {
+				ev.Regs = heldSnapshot.regs
+				ev.Regions = heldSnapshot.regions
+			}
+			r.eventsCh <- ev
+			return
+		}
 		if !ws.Stopped() {
 			r.emitFault(fmt.Sprintf("unexpected wait status %v", ws))
 			return
 		}
+		// Child is alive at a stop; any held snapshot is stale.
+		heldSnapshot = nil
+
 		if sig := ws.StopSignal(); sig != syscallTrap {
-			// SIGSEGV / SIGILL / ... — a recoverable stop boundary the
-			// runner doesn't model natively. Surface as Paused.
-			if err := ptraceGetRegs32(r.pid, regs); err != nil {
-				r.emitFault(fmt.Sprintf("get i386 regs (signal stop): %v", err))
+			if sig == syscall.SIGTRAP {
+				// Plain SIGTRAP (not SIGTRAP|0x80) is reserved for
+				// tracer-owned traps — int3 breakpoints will use this
+				// when library-call bridging lands. Unexpected here.
+				r.emitFault("unexpected SIGTRAP (reserved for tracer)")
 				return
 			}
-			regions, err := snapshotMemory(r.mem)
+			if isForwardableSignal(sig) {
+				// Snapshot the fault state in case the child dies from
+				// this signal (no handler), then forward.
+				snap, err := r.capturePausedSnapshot(sig)
+				if err != nil {
+					r.emitFault(fmt.Sprintf("snapshot at signal forward: %v", err))
+					return
+				}
+				heldSnapshot = &snap
+				nextSignal = int(sig)
+				continue
+			}
+			// Not forwardable (job-control, etc.) — surface as Paused.
+			snap, err := r.capturePausedSnapshot(sig)
 			if err != nil {
-				r.emitFault(fmt.Sprintf("memory snapshot at pause: %v", err))
+				r.emitFault(fmt.Sprintf("snapshot at non-forwardable signal: %v", err))
 				return
 			}
 			r.eventsCh <- proto.Paused{
-				Regs:    protoRegs(regs),
-				Regions: regions,
-				Signal:  uint8(sig),
-				Reason:  fmt.Sprintf("guest received signal %d", sig),
+				Regs:    snap.regs,
+				Regions: snap.regions,
+				Signal:  snap.signal,
+				Reason:  fmt.Sprintf("guest received non-forwardable signal %d", sig),
 			}
 			return
 		}
