@@ -12,7 +12,7 @@ BUILD_TYPE   ?= Release
 LLVM_CMAKE_DIR := $(shell $(LLVM_CONFIG) --cmakedir 2>/dev/null)
 
 .PHONY: all build configure test test-exec test-codegen test-mov-only \
-        test-rust-example clean distclean help
+        test-rust-example bench clean distclean help
 
 all: build
 
@@ -26,6 +26,9 @@ help:
 	@echo "                       must disassemble to mov-only opcodes (stage 7+)"
 	@echo "  test-rust-example  — rustc → llvm-mov-llc → ELF round-trip (stage 6.5;"
 	@echo "                       needs 'rustup target add i686-unknown-linux-gnu')"
+	@echo "  bench              — side-by-side ELF comparison vs movfuscator on the"
+	@echo "                       shared .c fixtures; writes bench/results.md"
+	@echo "                       (needs 'make -C ../movfuscator-wasm setup build-native')"
 	@echo "  clean              — remove build artefacts"
 	@echo "  distclean          — also remove the build directory entirely"
 	@echo ""
@@ -77,6 +80,12 @@ test-rust-example: build
 # 7d CALL/RET) lights up the next group.
 test-mov-only: build
 	@./test/MovOnly/run.sh $(BUILD_DIR)
+
+# Side-by-side ELF comparison against movfuscator on the shared C
+# fixtures. Regenerates bench/results.md; commit the result so PRs
+# show the size/mov-ratio diff.
+bench: build
+	BUILD_DIR=$(BUILD_DIR) ./bench/run.sh
 
 clean:
 	@[ -d $(BUILD_DIR) ] && ninja -C $(BUILD_DIR) clean || true
