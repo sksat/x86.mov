@@ -58,6 +58,9 @@ jobs:
       - name: test (execution)
         run: make test-exec
 
+      - name: test (mov-only gate)
+        run: make test-mov-only
+
       # Stage 6.5 — rustc → llvm-mov-llc → ELF end-to-end. The ubuntu-24.04
       # runner already ships with a recent rustup-managed rustc, but the
       # i686 std rlibs are not preinstalled. Adding the target is ~10 MB
@@ -67,3 +70,34 @@ jobs:
 
       - name: test-rust-example (stage 6.5)
         run: make test-rust-example
+
+      # bench-check (regression test against committed bench/results.md)
+      # ──────────────────────────────────────────────────────────────────
+      # Requires the native movfuscator (`movcc`) and hyperfine. The
+      # movfuscator build clones upstream + builds LCC + softfloat, ~1
+      # minute on a cold cache; we cache the vendor checkout + build
+      # outputs keyed on the patch set and pinned commit so subsequent
+      # runs skip the rebuild entirely.
+
+      - name: cache movfuscator-wasm/vendor + build
+        uses: actions/cache@v5.0.5
+        with:
+          path: |
+            movfuscator-wasm/vendor
+          key: movfuscator-vendor-${{ runner.os }}-${{ hashFiles('movfuscator-wasm/scripts/fetch.sh', 'movfuscator-wasm/patches/**') }}
+
+      - name: build native movfuscator (for bench)
+        working-directory: movfuscator-wasm
+        run: |
+          if [ ! -x vendor/movfuscator/build/movcc ]; then
+            make setup build-native
+          else
+            echo "movfuscator already built (cache hit)"
+          fi
+
+      - name: install hyperfine (for bench runtime measurement)
+        working-directory: .
+        run: sudo apt-get install -y --no-install-recommends hyperfine
+
+      - name: bench regression check
+        run: make bench-check

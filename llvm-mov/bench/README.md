@@ -39,12 +39,52 @@ function prologue/epilogue) and, for branching fixtures,
 ## Usage
 
 ```
-make bench                            # default fixtures
+make bench                            # regenerate bench/results.md
 ./bench/run.sh return0 return42 …     # specific fixtures
+make bench-check                      # CI: regression-check vs committed baseline
 ```
 
 Prerequisites: `make build` (for `bin/llvm-mov-llc`),
-`make -C ../movfuscator-wasm setup build-native` (for `movcc`).
+`make -C ../movfuscator-wasm setup build-native` (for `movcc`),
+and `hyperfine` on PATH (for the runtime row).
+
+## As an optimisation regression test
+
+`bench/results.md` is **committed** and `make bench-check` re-runs the
+bench, diffs against the committed numbers, and fails on any
+divergence in the deterministic rows (ELF/section sizes, mov counts,
+non-mov mnemonic sets). The runtime row and the generation timestamp
+are intentionally excluded from the comparison — runtime is too
+noisy for a hard threshold and timestamps trivially differ.
+
+`make bench-check` is wired into CI alongside `make test-exec` etc.,
+so any silent codegen regression (or unintended growth in the
+fixture's `.text`/`.rodata`/mov-count) blocks the PR with a clear
+diff:
+
+```
+bench-check: drift detected vs committed baseline
+
+@@ -14,7 +14,7 @@
+ | metric | llvm-mov | movfuscator |
+ |---|---:|---:|
+-| total ELF (bytes) | 4656 | 10221108 |
++| total ELF (bytes) | 9999 | 10221108 |
+```
+
+When the change IS intentional (an optimisation, or a deliberately
+larger codegen shape), the developer regenerates the baseline:
+
+```
+make bench
+git add bench/results.md
+```
+
+and commits it alongside the implementation. The PR diff then shows
+exactly what changed — every `mov` shaved off a byte-chain rewrite
+or every byte trimmed from the `.text` shows up in the bench delta.
+This makes mov-count and binary-size optimisations a first-class,
+reviewable concern rather than something you have to take on faith.
 
 ## Roadmap
 

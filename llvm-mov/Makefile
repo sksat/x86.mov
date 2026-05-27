@@ -12,7 +12,7 @@ BUILD_TYPE   ?= Release
 LLVM_CMAKE_DIR := $(shell $(LLVM_CONFIG) --cmakedir 2>/dev/null)
 
 .PHONY: all build configure test test-exec test-codegen test-mov-only \
-        test-rust-example bench clean distclean help
+        test-rust-example bench bench-check clean distclean help
 
 all: build
 
@@ -29,6 +29,9 @@ help:
 	@echo "  bench              — side-by-side ELF comparison vs movfuscator on the"
 	@echo "                       shared .c fixtures; writes bench/results.md"
 	@echo "                       (needs 'make -C ../movfuscator-wasm setup build-native')"
+	@echo "  bench-check        — regression test: re-run bench, diff against the"
+	@echo "                       committed bench/results.md (runtime excluded);"
+	@echo "                       fails on any deterministic-number drift"
 	@echo "  clean              — remove build artefacts"
 	@echo "  distclean          — also remove the build directory entirely"
 	@echo ""
@@ -86,6 +89,16 @@ test-mov-only: build
 # show the size/mov-ratio diff.
 bench: build
 	BUILD_DIR=$(BUILD_DIR) ./bench/run.sh
+
+# CI-grade regression check: re-runs the bench into a temp file and
+# diffs against the committed bench/results.md. The intentionally-
+# volatile rows (generation timestamp + wall-clock runtime) are
+# stripped before comparing; every other row must match exactly.
+# When this fails, either the change is a regression to investigate,
+# or it's intentional and the dev should `make bench` + commit the
+# updated results.md alongside.
+bench-check: build
+	BUILD_DIR=$(BUILD_DIR) ./bench/check.sh
 
 clean:
 	@[ -d $(BUILD_DIR) ] && ninja -C $(BUILD_DIR) clean || true
