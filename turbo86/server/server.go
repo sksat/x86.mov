@@ -81,9 +81,15 @@ func handleSession(ctx context.Context, ws *websocket.Conn) error {
 
 	// Phase 2: post-run. A side goroutine accepts streaming Code; the
 	// main goroutine forwards events. Either side ending tears the
-	// session down (defer r.Close() + deferred ws.CloseNow()).
+	// session down. CRITICAL: the reader goroutine MUST call r.Close()
+	// when it exits — otherwise a guest in a tight loop (no syscalls,
+	// no signals) leaves the tracer blocked in wait4 forever, the
+	// events channel never closes, and the main loop hangs. Close()
+	// sends SIGKILL to the child, which unblocks wait4 → Paused →
+	// channel close → main exits.
 	readDone := make(chan error, 1)
 	go func() {
+		defer r.Close()
 		for {
 			msg, err := readInbound(ctx, ws)
 			if err != nil {

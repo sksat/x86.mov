@@ -153,6 +153,52 @@ func TestE2E_PostStartCodeStreaming(t *testing.T) {
 	}
 }
 
+// TestE2E_ClientDisconnectStopsTightLoop verifies that closing the WS
+// connection while the guest is in a no-syscall tight loop tears the
+// session down. Without the reader goroutine's `defer r.Close()`, a
+// runaway guest would leave the handler blocked on the events channel
+// forever — and httptest.Server.Close() would hang waiting for it.
+func TestE2E_ClientDisconnectStopsTightLoop(t *testing.T) {
+	srv := httptest.NewServer(server.Handler())
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	const entry uint32 = 0x08048000
+	// jmp short -2: infinite loop with no syscalls. The runner has
+	// no natural stop point — it's stuck in wait4 until something
+	// from outside (Close → SIGKILL) wakes it up.
+	sendInbound(t, ctx, ws, proto.Code{Offset: entry, Bytes: []byte{0xEB, 0xFE}})
+	sendInbound(t, ctx, ws, proto.Start{Entry: entry, StackTop: 0x701FFFF0})
+
+	// Let the guest spin briefly.
+	time.Sleep(50 * time.Millisecond)
+
+	// Disconnect. The reader goroutine should see ws.Read fail, call
+	// r.Close, the runner kills the child, the loop exits.
+	_ = ws.CloseNow()
+
+	// srv.Close blocks until all handlers return. If the bug is back,
+	// this hangs forever.
+	done := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Server cleaned up — pass.
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not return after client disconnect — runner stuck in tight loop?")
+	}
+}
+
 // readNextEvent reads exactly one outbound frame.
 func readNextEvent(t *testing.T, ctx context.Context, ws *websocket.Conn) proto.Outbound {
 	t.Helper()
