@@ -262,17 +262,23 @@ bool MovDAGToDAGISel::SelectAddr(SDValue Addr, SDValue &Base, SDValue &Disp) {
     return true;
   }
 
-  // Case 2/3: ADD(base, imm) or OR(base, imm). DAGCombine canonicalises
-  // constants to the RHS, so we only check that side. Base may itself
-  // be a FrameIndex (alloca + GEP-style offset) — handled inline.
+  // Case 2/3: ADD(base, imm), or the disjoint-OR equivalent. DAGCombine
+  // canonicalises constants to the RHS, so we only check that side.
+  // Base may itself be a FrameIndex (alloca + GEP-style offset) —
+  // handled inline.
   //
   // The OR shape arises when the optimiser knows the low N bits of
   // `base` are zero — e.g. an aligned FrameIndex with a small const
-  // offset added — and `add(base, K) == or(base, K)` for K that fits
-  // in the zero-bits. Treating OR-by-constant identically to ADD
-  // here is exactly what eliminateFrameIndex needs (it only cares
-  // about the (FI, disp) pair the operand carries).
-  if (Addr.getOpcode() == ISD::ADD || Addr.getOpcode() == ISD::OR) {
+  // offset added — and emits `or disjoint` instead of `add` because
+  // the two are bitwise-equivalent. We *must* gate on the disjoint
+  // flag (codex review): a non-disjoint OR (tagged pointer, bit-
+  // twiddled index, etc.) shares the SDNode opcode but is *not* an
+  // additive offset, and silently treating it as base+disp would
+  // miscompile. ADD always implies an additive semantic and is safe.
+  const bool IsAdd     = Addr.getOpcode() == ISD::ADD;
+  const bool IsDisjOr  = Addr.getOpcode() == ISD::OR &&
+                         Addr->getFlags().hasDisjoint();
+  if (IsAdd || IsDisjOr) {
     SDValue LHS = Addr.getOperand(0);
     SDValue RHS = Addr.getOperand(1);
     if (auto *C = dyn_cast<ConstantSDNode>(RHS)) {

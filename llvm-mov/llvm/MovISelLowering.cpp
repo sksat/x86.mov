@@ -368,8 +368,14 @@ SDValue MovTargetLowering::LowerCall(CallLoweringInfo &CLI,
 
     // Stage 6b — byval struct passing. Source is a pointer to the
     // caller's struct; cdecl wants the struct's bytes copied to the
-    // outgoing arg slot. Emit a getMemcpy and skip the scalar
-    // extend/store path below.
+    // outgoing arg slot. Emit a getMemcpy with AlwaysInline=true so
+    // SelectionDAG expands the copy in-line as i32 / byte stores
+    // instead of synthesising a `call memcpy` libcall (our standalone
+    // runtime does not link libc; a libcall would fail at link time).
+    // Codex review: with AlwaysInline=false the threshold-based
+    // expansion path could emit a libcall for large aggregates — a
+    // silent correctness issue, since the call would land on an
+    // unresolved external symbol.
     if (Flags.isByVal()) {
       const unsigned Size = Flags.getByValSize();
       const Align Alignment = Flags.getNonZeroByValAlign();
@@ -380,7 +386,7 @@ SDValue MovTargetLowering::LowerCall(CallLoweringInfo &CLI,
                                 StackPtr, Offset);
       SDValue MemcpyChain = DAG.getMemcpy(
           Chain, DL, Dst, Arg, SizeNode, Alignment,
-          /*isVolatile=*/false, /*AlwaysInline=*/false,
+          /*isVolatile=*/false, /*AlwaysInline=*/true,
           /*CI=*/nullptr, std::nullopt,
           MachinePointerInfo::getStack(MF, VA.getLocMemOffset()),
           MachinePointerInfo());

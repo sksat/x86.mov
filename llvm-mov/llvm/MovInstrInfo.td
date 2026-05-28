@@ -96,16 +96,19 @@ def MovIdxMemOperand : Operand<i32> {
 // `(add (CopyFromReg ESP), imm)`, which is a register-base + displacement.
 //
 // SelectAddr (in MovISelDAGToDAG.cpp) handles these shapes:
-//   1. plain FrameIndex             → (TargetFrameIndex, 0)
-//   2. ADD(FrameIndex, imm)         → (TargetFrameIndex, imm)
-//   3. ADD(reg, imm)                → (reg, imm)
-//   4. OR(FrameIndex/reg, imm)      → (base, imm)    (stage 6c)
-//   5. any other reg                → (reg, 0)
+//   1. plain FrameIndex                    → (TargetFrameIndex, 0)
+//   2. ADD(FrameIndex, imm)                → (TargetFrameIndex, imm)
+//   3. ADD(reg, imm)                       → (reg, imm)
+//   4. OR-disjoint(FrameIndex/reg, imm)    → (base, imm)    (stage 6c)
+//   5. any other reg                       → (reg, 0)
 // Cases (1)/(2)/(4-on-FI) feed eliminateFrameIndex (EBP-relative
 // resolution); the others bypass it and emit straight register-base
 // addresses. The OR shape (case 4) shows up when DAGCombine proves
 // the low bits of `base` are zero, e.g. an aligned alloca + small
-// const offset — semantically identical to ADD by the same imm.
+// const offset — bitwise-identical to ADD by the same imm. Critically,
+// SelectAddr only accepts the *disjoint* OR form (codex review);
+// a non-disjoint OR is not necessarily an additive offset and
+// would miscompile if treated as one.
 def addr : ComplexPattern<i32, 2, "SelectAddr",
                           [frameindex, add, or]>;
 
