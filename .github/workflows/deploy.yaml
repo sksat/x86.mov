@@ -40,6 +40,29 @@ jobs:
         with:
           node-version: '24'
 
+      # movie86/wasm builds movie86 (Rust) for wasm32 and ships through
+      # wasm-bindgen-cli. The toolchain action pins the version + caches
+      # the wasm32 target install. wasm-bindgen-cli install is cached on
+      # the binstall artifact path so it doesn't recompile per deploy.
+      - name: setup rust (stable + wasm32 target)
+        uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          cache-workspaces: movie86/wasm
+
+      - name: cache wasm-bindgen-cli
+        uses: actions/cache@v5.0.5
+        id: wbg-cache
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-${{ runner.os }}-0.2.122
+
+      - name: install wasm-bindgen-cli
+        if: steps.wbg-cache.outputs.cache-hit != 'true'
+        working-directory: .
+        run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
+
       - name: install host packages
         working-directory: .
         run: |
@@ -86,7 +109,15 @@ jobs:
           make build-wasm-ld-browser
           make stage-link-libs
 
+      - name: build movie86/wasm
+        working-directory: movie86/wasm
+        run: make build-wasm
+
       - name: stage dist/
+        run: make stage-deploy
+
+      - name: stage movie86/wasm into dist/movie86/
+        working-directory: movie86/wasm
         run: make stage-deploy
 
       - name: upload to Cloudflare Pages
@@ -117,7 +148,7 @@ jobs:
             // thread from accumulating one comment per push.
             const marker = '<!-- cloudflare-pages-preview -->';
             const url = process.env.URL;
-            const body = `${marker}\n🚀 **Preview deployed**: ${url}\n\n- Root: ${url}/\n- movfuscator-wasm demo: ${url}/movfuscator-wasm/\n`;
+            const body = `${marker}\n🚀 **Preview deployed**: ${url}\n\n- Root: ${url}/\n- movfuscator-wasm demo: ${url}/movfuscator-wasm/\n- movie86 demo: ${url}/movie86/\n`;
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
             const comments = await github.paginate(

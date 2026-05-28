@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>movie86</title>
+<style>
+  :root { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; line-height: 1.4; }
+  body { margin: 0; padding: 1.5rem; }
+  h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
+  p.intro { margin: 0 0 1rem; color: #555; font-size: 0.9rem; }
+  p.intro a { color: #06c; }
+
+  .controls { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; flex-wrap: wrap; }
+  .controls > * { font: inherit; }
+  button { padding: 0.35rem 0.7rem; cursor: pointer; }
+  button.primary { background: #1d6; border: 1px solid #0a5; color: white; }
+  button.primary:disabled { background: #aaa; border-color: #888; cursor: wait; }
+  button.danger { background: #d52; border: 1px solid #a31; color: white; }
+  select, input[type=text], input[type=number] { padding: 0.3rem 0.4rem; }
+  input.addr { width: 11ch; font: inherit; }
+  input.num  { width: 7ch;  font: inherit; }
+  label { font-size: 0.85rem; color: #555; }
+
+  .status { font-size: 0.85rem; color: #666; margin-left: auto; }
+  .status.err { color: #b00; }
+
+  /* Status cards — each metric gets its own small panel with a big
+     value and a short uppercase label underneath. The "total mov" card
+     leans into the project's "is Turing-complete" joke: every
+     executed instruction counts as a mov in spirit. */
+  .meta {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+      gap: 0.5rem;
+      margin: 0.5rem 0 1rem;
+  }
+  .meta .card {
+      background: linear-gradient(180deg, #f6f9fc 0%, #eaf0f6 100%);
+      border: 1px solid #cfd8dc;
+      padding: 0.45rem 0.7rem;
+      border-radius: 4px;
+      min-width: 0;  /* prevent overflow inside the grid track */
+  }
+  .meta .card .v {
+      font-size: 1.05rem; font-weight: bold; color: #111;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.2;
+      word-break: break-all;
+  }
+  .meta .card .k {
+      font-size: 0.7rem; color: #557; margin-top: 0.1rem;
+      text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .meta .card.fault .v { color: #b00; }
+  .meta .card.exit  .v { color: #060; }
+
+  /* Top row is the live state — Registers + Disassembly + Memory side
+     by side; the console (stdout/stderr) sits full-width underneath so
+     it has room to grow and autoscroll vertically as output lands. */
+  .grid {
+      display: grid;
+      grid-template-columns: minmax(13rem, 0.9fr) minmax(26rem, 1.8fr) minmax(26rem, 1.8fr);
+      gap: 1rem;
+  }
+  .grid .io { grid-column: 1 / -1; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: minmax(13rem, 1fr) minmax(26rem, 2fr); } }
+  @media (max-width: 800px)  { .grid { grid-template-columns: minmax(0, 1fr); } }
+
+  h2 { font-size: 0.95rem; margin: 0 0 0.4rem; color: #333; }
+
+  .panel { border: 1px solid #ccc; padding: 0.5rem; background: #fafafa; }
+  .panel-head { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.4rem; font-size: 0.85rem; }
+  .panel-head h2 { margin: 0; }
+
+  /* Registers */
+  .regs { display: grid; grid-template-columns: auto 1fr; column-gap: 0.6rem; row-gap: 0.15rem; font-size: 0.9rem; }
+  .regs .rn { color: #666; }
+  .regs .rv { font-variant-numeric: tabular-nums; }
+  .regs .reg { display: contents; }
+  .regs .reg.changed .rv { background: #ffeb88; padding: 0 0.2rem; }
+  .regs .reg.eip .rn { color: #1a5; font-weight: bold; }
+  .regs .reg.eip .rv { color: #1a5; }
+  .regs hr {
+      grid-column: 1 / -1;
+      border: 0; border-top: 1px dashed #ddd;
+      margin: 0.25rem 0;
+  }
+  .regs .note {
+      grid-column: 1 / -1;
+      font-size: 0.7rem; color: #888; line-height: 1.2;
+      margin-top: 0.2rem;
+  }
+
+  /* Memory — fixed height for the same reason as Disassembly:
+     readMem can clip to the mapped region and return fewer than 16
+     rows of bytes, but we want the panel to keep the same vertical
+     footprint either way. */
+  #mem { min-height: 19rem; }
+  .memrow { font-size: 0.85rem; white-space: pre; font-variant-numeric: tabular-nums; height: 1.4em; }
+  .memaddr { color: #888; }
+  .memascii { color: #444; }
+  .memrow .cursor { background: #ffd84d; }
+
+  /* Disassembly — fixed height + own scroller so the pane doesn't
+     resize as the row count changes (decode failures, edge of mapped
+     region, etc. would otherwise leave fewer rows and the panel
+     would jitter shorter every render). */
+  .disasm-body {
+      height: 28rem; overflow: auto; font-size: 0.85rem;
+      font-variant-numeric: tabular-nums;
+  }
+  .dr {
+      display: grid; grid-template-columns: 8ch 16ch 1fr;
+      column-gap: 0.6rem; padding: 0 0.1rem;
+      white-space: nowrap;
+      height: 1.4em;  /* lock row height so partial-row content
+                         (a single space placeholder) still occupies
+                         the same vertical slot as a full row */
+  }
+  .dr .da { color: #888; }
+  .dr .db { color: #555; }
+  .dr .dt { color: #111; overflow: hidden; text-overflow: ellipsis; }
+  .dr.cur { background: #ffeb88; }
+  .dr.cur .da { color: #555; }
+  .dr.cur .db { color: #333; }
+  .dr.cur .dt { font-weight: bold; }
+
+  /* Console — sits full-width at the bottom so vertical content has
+     room to autoscroll. Side-by-side stdout/stderr on wide screens
+     uses the horizontal real estate the bottom row gets. */
+  .io { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 1100px) { .io { grid-template-columns: minmax(0, 1fr); } }
+  pre.out {
+    box-sizing: border-box; width: 100%;
+    font: inherit; border: 1px solid #ccc; padding: 0.5rem;
+    background: #fafafa;
+    min-height: 8rem; max-height: 28rem;
+    overflow: auto; white-space: pre;
+    margin: 0; font-size: 0.85rem;
+  }
+  pre.out.err { border-color: #d99; background: #fff5f5; }
+
+  /* Instruction preview (bytes + decoded @ EIP) */
+  .insn {
+    font-size: 0.85rem; color: #333;
+    background: #fff7d6; border: 1px solid #e6c674;
+    padding: 0.3rem 0.5rem; margin-bottom: 0.5rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .insn .lbl { color: #777; flex-shrink: 0; }
+  .insn .row {
+      display: flex; gap: 0.6rem;
+      /* Keep each row exactly one line — long decoded text would
+         otherwise wrap and grow the preview, jittering everything
+         below it. ellipsis on overflow. */
+      white-space: nowrap; overflow: hidden;
+  }
+  .insn .row + .row { margin-top: 0.2rem; }
+  .insn .ibytes { color: #444; overflow: hidden; text-overflow: ellipsis; }
+  .insn .itext { color: #111; font-weight: bold; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+</style>
+</head>
+<body>
+
+<h1>movie86</h1>
+<p class="intro">
+  Run mov-heavy ELF32 i386 binaries in your browser via the
+  <a href="https://github.com/sksat/x86.mov/tree/mov/movie86">movie86</a>
+  emulator core (Rust, <code>no_std</code>, compiled to wasm).
+  Pair with <a href="../movfuscator-wasm/">movfuscator-wasm</a> to
+  compile + run mov-only C end-to-end. Source:
+  <a href="https://github.com/sksat/x86.mov">github.com/sksat/x86.mov</a>.
+</p>
+
+<div class="controls">
+  <label>example:
+    <select id="preset">
+      <option value="return42" selected>return42 — exit 42 via int 0x80</option>
+      <option value="hello">hello — write(1, "Hello\n") + exit</option>
+      <option value="call_greet">call_greet — direct CALL/RET</option>
+      <option value="cycle">cycle — print "1 2 3 4 5" forever (CALL/RET loop)</option>
+      <option value="upload">(upload your own ELF)</option>
+    </select>
+  </label>
+  <input type="file" id="file" accept=".elf,application/octet-stream" hidden>
+  <button id="reset">Reset</button>
+  <button id="step">Step</button>
+  <button id="run" class="primary">Run</button>
+  <label><input type="checkbox" id="follow" checked> Follow execution</label>
+  <label>step delay: <input type="number" id="delay" class="num" value="0" min="0" step="50"> ms</label>
+  <label>batch: <input type="number" id="batch" class="num" value="50000" min="1" step="1000"></label>
+  <label>refresh: <input type="number" id="refresh" class="num" value="100" min="0" step="10"> ms</label>
+  <span id="status" class="status">init…</span>
+</div>
+
+<div class="meta">
+  <div class="card"><div class="v" id="m-steps">0</div><div class="k">total mov</div></div>
+  <div class="card"><div class="v" id="m-rate">—</div><div class="k">mov / sec</div></div>
+  <div class="card" id="card-halt"><div class="v" id="m-halt">—</div><div class="k">halt</div></div>
+  <div class="card"><div class="v" id="m-exit">—</div><div class="k">exit</div></div>
+  <div class="card"><div class="v" id="m-wall">—</div><div class="k">wall time</div></div>
+  <div class="card"><div class="v" id="m-memrange">—</div><div class="k">memory</div></div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Registers</h2>
+    <div class="insn">
+      <div class="row"><span class="lbl">bytes:</span><span class="ibytes" id="insn-bytes">—</span></div>
+      <div class="row"><span class="lbl">decoded:</span><span class="itext" id="insn-text">—</span></div>
+    </div>
+    <div class="regs" id="regs"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>Disassembly</h2>
+      <label>start: <input type="text" id="disasm-addr" class="addr" value="0x00001000"></label>
+      <label><input type="checkbox" id="disasm-follow" checked> follow EIP</label>
+    </div>
+    <div id="disasm" class="disasm-body"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>Memory</h2>
+      <label>addr: <input type="text" id="mem-addr" class="addr" value="0x00001000"></label>
+      <label><input type="checkbox" id="mem-follow" checked> follow EIP</label>
+    </div>
+    <div id="mem"></div>
+  </div>
+  <div class="io">
+    <div>
+      <h2>stdout</h2>
+      <pre id="stdout" class="out"></pre>
+    </div>
+    <div>
+      <h2>stderr</h2>
+      <pre id="stderr" class="out err"></pre>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { loadVm } from './movie86.mjs';
+
+const $ = (id) => document.getElementById(id);
+
+const EXAMPLES = {
+    return42:   './examples/return42.elf',
+    hello:      './examples/hello.elf',
+    call_greet: './examples/call_greet.elf',
+    cycle:      './examples/cycle.elf',
+};
+
+// Register file order matches movie86's `Reg32`: EAX, ECX, EDX, EBX,
+// ESP, EBP, ESI, EDI. EIP is rendered separately above the GPR rows.
+const REG_NAMES = ['EAX', 'ECX', 'EDX', 'EBX', 'ESP', 'EBP', 'ESI', 'EDI'];
+
+const DISASM_ROWS = 24;
+
+const state = {
+    vm: null,
+    elfBytes: null,
+    prevRegs: null,
+    prevEip: null,
+    // Bumping runId cancels any in-flight Run loop without needing
+    // shared mutable state to flip — the loop notices its id is stale
+    // and bails out cleanly.
+    runId: 0,
+    stdoutBuf: '',
+    stderrBuf: '',
+    // Disassembly window state: addr of the first decoded row, and
+    // (exclusive) addr just past the last row. We only recenter the
+    // window when EIP exits this range, so the "highlight moves down
+    // through a stable listing" effect works.
+    disasmStart: null,
+    disasmEnd: 0,
+    // mov/sec sampling — refreshed every ~250 ms so the displayed
+    // value is smooth instead of jittering with every render.
+    rateSampleSteps: 0n,
+    rateSampleTime: 0,
+    lastRate: null,
+};
+
+const dec = new TextDecoder('utf-8', { fatal: false });
+
+function fmt32(v) { return '0x' + v.toString(16).padStart(8, '0'); }
+
+function hexBytes(arr) {
+    return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join(' ');
+}
+
+// 1234567 → "1,234,567" — works on Number and BigInt.
+function fmtCount(n) {
+    return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+// 1234567 → "1.23 M" — short metric form for rates.
+function fmtRate(r) {
+    if (!isFinite(r)) return '—';
+    if (r >= 1e9) return (r / 1e9).toFixed(2) + ' G';
+    if (r >= 1e6) return (r / 1e6).toFixed(2) + ' M';
+    if (r >= 1e3) return (r / 1e3).toFixed(2) + ' k';
+    return r.toFixed(0);
+}
+
+function escapeHtml(s) {
+    return s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+function setStatus(text, isError = false) {
+    const s = $('status');
+    s.className = isError ? 'status err' : 'status';
+    s.textContent = text;
+}
+
+async function fetchExample(name) {
+    const r = await fetch(EXAMPLES[name]);
+    if (!r.ok) throw new Error(`fetch ${EXAMPLES[name]}: ${r.status} ${r.statusText}`);
+    return new Uint8Array(await r.arrayBuffer());
+}
+
+async function loadFromBytes(bytes, label) {
+    if (state.vm) { state.vm.free(); state.vm = null; }
+    state.elfBytes = bytes;
+    state.vm = await loadVm(bytes);
+    state.prevRegs = null;
+    state.prevEip = null;
+    state.stdoutBuf = '';
+    state.stderrBuf = '';
+    state.disasmStart = null;
+    state.disasmEnd = 0;
+    state.rateSampleSteps = 0n;
+    state.rateSampleTime = 0;
+    state.lastRate = null;
+    $('stdout').textContent = '';
+    $('stderr').textContent = '';
+    $('m-wall').textContent = '—';
+    const base = state.vm.memBase;
+    const len = state.vm.memLen;
+    $('m-memrange').textContent = `${fmt32(base)} +${len.toLocaleString()} B`;
+    setStatus(`loaded ${label} (${bytes.length} bytes)`);
+    render();
+}
+
+function renderRegs() {
+    const vm = state.vm; if (!vm) return;
+    const regs = vm.regs;  // Uint32Array(8)
+    const eip = vm.eip;
+    const rows = [];
+    const eipChanged = state.prevEip !== null && state.prevEip !== eip;
+    rows.push(
+        `<div class="reg eip${eipChanged ? ' changed' : ''}">` +
+        `<span class="rn">EIP</span><span class="rv">${fmt32(eip)}</span></div>`,
+    );
+    for (let i = 0; i < REG_NAMES.length; i++) {
+        const changed = state.prevRegs && state.prevRegs[i] !== regs[i];
+        rows.push(
+            `<div class="reg${changed ? ' changed' : ''}">` +
+            `<span class="rn">${REG_NAMES[i]}</span>` +
+            `<span class="rv">${fmt32(regs[i])}</span></div>`,
+        );
+    }
+
+    // Signal-handler addresses — real CPU state populated by the
+    // loader from the ELF symbol table. movie86 deliberately doesn't
+    // model EFLAGS (no arithmetic / no `cmp`/`jcc`) or segment
+    // registers (flat 32-bit mode, the only `mov sreg` form supported
+    // is the SIGILL dispatch trick), so they don't get a row here.
+    const segv = vm.sigsegvHandler;
+    const ill = vm.sigillHandler;
+    rows.push('<hr>');
+    rows.push(
+        `<div class="reg"><span class="rn">SIGSEGV</span>` +
+        `<span class="rv">${segv != null ? fmt32(segv) : '(none)'}</span></div>`,
+    );
+    rows.push(
+        `<div class="reg"><span class="rn">SIGILL</span>` +
+        `<span class="rv">${ill != null ? fmt32(ill) : '(none)'}</span></div>`,
+    );
+
+    rows.push(
+        '<div class="note">Handler addresses are wired from the ELF ' +
+        'symbol table at load time (movfuscator\'s <code>dispatch</code> / ' +
+        '<code>master_loop</code>). EFLAGS and segment registers aren\'t ' +
+        'modelled — none of the supported instructions touch them.</div>',
+    );
+
+    $('regs').innerHTML = rows.join('');
+    state.prevRegs = regs;
+    state.prevEip = eip;
+}
+
+function renderInsnPreview() {
+    const vm = state.vm; if (!vm) return;
+    const d = vm.disasmAt(vm.eip);
+    if (!d) {
+        // Fall back to raw bytes — useful even when decode fails (e.g.
+        // EIP landed inside data) so the user sees something.
+        const raw = vm.readMem(vm.eip, 15);
+        $('insn-bytes').textContent = raw.length ? hexBytes(raw) : '(unmapped)';
+        $('insn-text').textContent  = '(undecoded)';
+        return;
+    }
+    $('insn-bytes').textContent = hexBytes(d.bytes);
+    $('insn-text').textContent  = d.text;
+    d.free();
+}
+
+function parseAddr(text) {
+    const trimmed = text.trim().replace(/^0x/i, '');
+    const v = parseInt(trimmed, 16);
+    if (Number.isNaN(v)) return null;
+    return v >>> 0;
+}
+
+function renderDisasm() {
+    const vm = state.vm; if (!vm) return;
+    const eip = vm.eip;
+    let start;
+    if ($('disasm-follow').checked) {
+        // Recenter only when EIP exits the current window — keeps the
+        // listing stable so the user can watch the highlight march
+        // down the rows one step at a time.
+        if (state.disasmStart == null || eip < state.disasmStart || eip >= state.disasmEnd) {
+            state.disasmStart = eip;
+        }
+        start = state.disasmStart;
+        $('disasm-addr').value = fmt32(start);
+    } else {
+        start = parseAddr($('disasm-addr').value) ?? vm.memBase;
+        state.disasmStart = start;
+    }
+    let addr = start;
+    let last = start;
+    const rows = [];
+    for (let i = 0; i < DISASM_ROWS; i++) {
+        const d = vm.disasmAt(addr);
+        if (!d) break;
+        last = addr + d.len;
+        const isCur = addr === eip;
+        rows.push(
+            `<div class="dr${isCur ? ' cur' : ''}">` +
+            `<span class="da">${addr.toString(16).padStart(8, '0')}</span>` +
+            `<span class="db">${hexBytes(d.bytes)}</span>` +
+            `<span class="dt">${escapeHtml(d.text)}</span>` +
+            `</div>`,
+        );
+        addr = last;
+        d.free();
+    }
+    state.disasmEnd = last;
+    $('disasm').innerHTML = rows.join('') ||
+        `<div class="memrow">(no decodable instructions at ${fmt32(start)})</div>`;
+    // Scroll the current row into view so it stays visible as it
+    // progresses down the listing.
+    const cur = $('disasm').querySelector('.dr.cur');
+    if (cur) cur.scrollIntoView({ block: 'nearest' });
+}
+
+function renderMem() {
+    const vm = state.vm; if (!vm) return;
+    let addr;
+    if ($('mem-follow').checked) {
+        addr = (vm.eip & ~0xF) >>> 0;
+        $('mem-addr').value = fmt32(addr);
+    } else {
+        addr = parseAddr($('mem-addr').value) ?? 0;
+    }
+    const rows = 16;
+    const len = 16 * rows;
+    const bytes = vm.readMem(addr, len);
+    if (bytes.length === 0) {
+        $('mem').innerHTML =
+            `<div class="memrow">(addr ${fmt32(addr)} outside the mapped region — ` +
+            `<a href="#" id="jump-base">jump to base</a>)</div>`;
+        $('jump-base')?.addEventListener('click', (e) => {
+            e.preventDefault();
+            $('mem-follow').checked = false;
+            $('mem-addr').value = fmt32(vm.memBase);
+            renderMem();
+        });
+        return;
+    }
+    const eip = vm.eip;
+    // Highlight the whole instruction at EIP, not just the opcode
+    // byte — ask the decoder for the length so the span lines up with
+    // what the next step will actually consume. Fall back to a single
+    // byte if EIP doesn't decode (e.g. landed inside data).
+    const insnAtEip = vm.disasmAt(eip);
+    const insnLen = insnAtEip ? insnAtEip.len : 1;
+    insnAtEip?.free();
+    const insnEnd = (eip + insnLen) >>> 0;
+    const html = [];
+    for (let r = 0; r < Math.ceil(bytes.length / 16); r++) {
+        const off = addr + r * 16;
+        const slice = bytes.subarray(r * 16, r * 16 + 16);
+        const hex = Array.from(slice).map((b, i) => {
+            const a = (off + i) >>> 0;
+            const cls = (a >= eip && a < insnEnd) ? ' class="cursor"' : '';
+            return `<span${cls}>${b.toString(16).padStart(2, '0')}</span>`;
+        }).join(' ');
+        const ascii = Array.from(slice)
+            .map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.').join('');
+        html.push(
+            `<div class="memrow">` +
+            `<span class="memaddr">${off.toString(16).padStart(8, '0')}</span>  ` +
+            `${hex}  <span class="memascii">${ascii}</span></div>`,
+        );
+    }
+    $('mem').innerHTML = html.join('');
+}
+
+function renderMeta() {
+    const vm = state.vm; if (!vm) return;
+    const halt = vm.haltReason;
+
+    $('m-steps').textContent = fmtCount(vm.steps);
+
+    // mov/sec — sample steps + wall clock over a ~250 ms window so the
+    // displayed rate is smooth. Halted guests show the last rate so the
+    // user can read "how fast was it going before it stopped".
+    if (!halt) {
+        const now = performance.now();
+        const dt = now - state.rateSampleTime;
+        if (dt >= 250 && state.rateSampleTime !== 0) {
+            const dSteps = Number(vm.steps - state.rateSampleSteps);
+            state.lastRate = dSteps / (dt / 1000);
+            state.rateSampleSteps = vm.steps;
+            state.rateSampleTime = now;
+        } else if (state.rateSampleTime === 0) {
+            state.rateSampleSteps = vm.steps;
+            state.rateSampleTime = now;
+        }
+    }
+    $('m-rate').textContent = state.lastRate == null ? '—' : fmtRate(state.lastRate);
+
+    const haltCard = $('card-halt');
+    $('m-halt').textContent = halt ?? '—';
+    const isExit = halt && halt.startsWith('Exit(');
+    haltCard.classList.toggle('exit', !!isExit);
+    haltCard.classList.toggle('fault', !!halt && !isExit);
+    $('m-exit').textContent = vm.exitCode ?? '—';
+}
+
+// Snap-to-bottom only when the user was already there — if they
+// scrolled up to inspect earlier output, leave the view alone instead
+// of yanking them back every time another chunk lands.
+function appendAndAutoscroll(el, text) {
+    const stickToBottom =
+        el.scrollHeight - el.scrollTop - el.clientHeight < 5;
+    el.textContent = text;
+    if (stickToBottom) el.scrollTop = el.scrollHeight;
+}
+
+function pumpOutput() {
+    const vm = state.vm; if (!vm) return;
+    const so = vm.drainStdout();
+    if (so.length) {
+        state.stdoutBuf += dec.decode(so);
+        appendAndAutoscroll($('stdout'), state.stdoutBuf);
+    }
+    const se = vm.drainStderr();
+    if (se.length) {
+        state.stderrBuf += dec.decode(se);
+        appendAndAutoscroll($('stderr'), state.stderrBuf);
+    }
+}
+
+function render() {
+    renderRegs();
+    renderInsnPreview();
+    renderDisasm();
+    renderMem();
+    renderMeta();
+    pumpOutput();
+}
+
+function doStep() {
+    const vm = state.vm;
+    if (!vm || vm.haltReason) return;
+    vm.stepN(1n);
+    render();
+}
+
+function setRunButton(running) {
+    const b = $('run');
+    if (running) {
+        b.textContent = 'Stop';
+        b.classList.remove('primary');
+        b.classList.add('danger');
+        b.dataset.running = '1';
+    } else {
+        b.textContent = 'Run';
+        b.classList.add('primary');
+        b.classList.remove('danger');
+        delete b.dataset.running;
+    }
+}
+
+async function doRun() {
+    const vm = state.vm;
+    if (!vm || vm.haltReason) return;
+    const myRun = ++state.runId;
+    setRunButton(true);
+    const follow = $('follow').checked;
+    const batchSize = BigInt(Math.max(1, Math.floor(Number($('batch').value) || 50000)));
+    const refreshMs = Math.max(0, Math.floor(Number($('refresh').value) || 100));
+    // Follow-mode step delay — sleep this long between steps so the
+    // user can actually watch the highlight move. 0 = as-fast-as-the-
+    // -browser-allows (setTimeout(0) still yields ~4 ms in practice).
+    const delayMs = Math.max(0, Math.floor(Number($('delay').value) || 0));
+    const startWall = performance.now();
+    try {
+        if (follow) {
+            while (myRun === state.runId && !vm.haltReason) {
+                vm.stepN(1n);
+                render();
+                await new Promise(r => setTimeout(r, delayMs));
+            }
+        } else {
+            let lastRender = performance.now();
+            while (myRun === state.runId && !vm.haltReason) {
+                vm.stepN(batchSize);
+                const now = performance.now();
+                if (now - lastRender >= refreshMs) {
+                    render();
+                    lastRender = now;
+                }
+                await new Promise(r => setTimeout(r, 0));
+            }
+            render();
+        }
+    } finally {
+        if (myRun === state.runId) setRunButton(false);
+        const wall = Math.round(performance.now() - startWall);
+        $('m-wall').textContent = `${wall} ms`;
+    }
+}
+
+function doStop() {
+    state.runId++;
+    setRunButton(false);
+}
+
+async function doReset() {
+    if (!state.elfBytes) return;
+    state.runId++;
+    setRunButton(false);
+    await loadFromBytes(state.elfBytes, 'reset');
+}
+
+// --- URL query param sync ---
+//
+// Parameter selections (preset, follow toggles, delay / batch / refresh,
+// manually-pinned disasm/mem addrs) are mirrored in the URL so the demo
+// state is shareable / bookmarkable. Action buttons (reset / step /
+// run) deliberately stay out of the URL — they're imperative, not
+// configuration.
+const URL_PARAMS = ['preset', 'follow', 'delay', 'batch', 'refresh',
+                    'disasm-follow', 'disasm-addr',
+                    'mem-follow', 'mem-addr'];
+
+function syncUrlFromControls() {
+    const p = new URLSearchParams();
+    const presetVal = $('preset').value;
+    if (presetVal && presetVal !== 'upload') p.set('preset', presetVal);
+    p.set('follow', $('follow').checked ? '1' : '0');
+    p.set('delay', $('delay').value);
+    p.set('batch', $('batch').value);
+    p.set('refresh', $('refresh').value);
+    p.set('disasm-follow', $('disasm-follow').checked ? '1' : '0');
+    // Only round-trip the manually-pinned address when follow is off —
+    // when on, the renderer overwrites the field every frame so saving
+    // it would just round-trip whatever EIP happened to be at the time
+    // the URL was captured.
+    if (!$('disasm-follow').checked) p.set('disasm-addr', $('disasm-addr').value);
+    p.set('mem-follow', $('mem-follow').checked ? '1' : '0');
+    if (!$('mem-follow').checked) p.set('mem-addr', $('mem-addr').value);
+    const url = new URL(window.location.href);
+    url.search = p.toString();
+    history.replaceState(null, '', url.toString());
+}
+
+function applyUrlToControls() {
+    const p = new URLSearchParams(window.location.search);
+    const apply = (key, fn) => { if (p.has(key)) fn(p.get(key)); };
+    apply('preset', (v) => { if (EXAMPLES[v]) $('preset').value = v; });
+    apply('follow',        (v) => { $('follow').checked = v === '1'; });
+    apply('delay',         (v) => { $('delay').value = v; });
+    apply('batch',         (v) => { $('batch').value = v; });
+    apply('refresh',       (v) => { $('refresh').value = v; });
+    apply('disasm-follow', (v) => { $('disasm-follow').checked = v === '1'; });
+    apply('disasm-addr',   (v) => { $('disasm-addr').value = v; });
+    apply('mem-follow',    (v) => { $('mem-follow').checked = v === '1'; });
+    apply('mem-addr',      (v) => { $('mem-addr').value = v; });
+}
+
+// --- UI wiring ---
+
+$('preset').addEventListener('change', async (e) => {
+    const k = e.target.value;
+    if (k === 'upload') { $('file').click(); return; }
+    syncUrlFromControls();
+    try {
+        setStatus('loading…');
+        const bytes = await fetchExample(k);
+        await loadFromBytes(bytes, k);
+    } catch (err) {
+        setStatus(`load failed: ${err.message || err}`, true);
+    }
+});
+
+// Mirror every parameter input to the URL on change. Action buttons
+// (run/step/reset/upload) deliberately stay out of this set.
+for (const id of ['follow', 'delay', 'batch', 'refresh',
+                  'disasm-follow', 'mem-follow']) {
+    $(id).addEventListener('change', syncUrlFromControls);
+}
+// Sync the URL on every keystroke too — `change` only fires on blur /
+// Enter, so without an input handler the address typed into the bar
+// wouldn't land in the URL until the field loses focus. The sync fn
+// itself drops the addr param when its follow toggle is still on.
+$('disasm-addr').addEventListener('input', syncUrlFromControls);
+$('mem-addr').addEventListener('input', syncUrlFromControls);
+
+$('file').addEventListener('change', async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try {
+        const bytes = new Uint8Array(await f.arrayBuffer());
+        await loadFromBytes(bytes, f.name);
+    } catch (err) {
+        setStatus(`load failed: ${err.message || err}`, true);
+    }
+});
+
+$('step').addEventListener('click', doStep);
+$('run').addEventListener('click', () => {
+    if ($('run').dataset.running) doStop();
+    else doRun();
+});
+$('reset').addEventListener('click', doReset);
+
+$('mem-addr').addEventListener('change', () => {
+    // Hand-edit means the user wants to pin this address — turn off
+    // follow-EIP automatically so the next render doesn't snap back.
+    $('mem-follow').checked = false;
+    renderMem();
+    syncUrlFromControls();
+});
+$('mem-follow').addEventListener('change', renderMem);
+
+$('disasm-addr').addEventListener('change', () => {
+    $('disasm-follow').checked = false;
+    state.disasmStart = parseAddr($('disasm-addr').value) ?? state.vm?.memBase ?? 0;
+    renderDisasm();
+    syncUrlFromControls();
+});
+$('disasm-follow').addEventListener('change', () => {
+    // Re-snapping to EIP next render is desirable, so wipe the cached
+    // window bounds so the renderer treats EIP as outside.
+    if ($('disasm-follow').checked) {
+        state.disasmStart = null;
+        state.disasmEnd = 0;
+    }
+    renderDisasm();
+});
+
+// Boot: apply URL params to the controls (so the deep-linked state
+// takes effect before the first example load), then fetch the chosen
+// preset and seed the panes.
+(async () => {
+    applyUrlToControls();
+    const initialPreset = EXAMPLES[$('preset').value] ? $('preset').value : 'return42';
+    syncUrlFromControls();
+    try {
+        const bytes = await fetchExample(initialPreset);
+        await loadFromBytes(bytes, initialPreset);
+    } catch (err) {
+        setStatus(`init: ${err.message || err}`, true);
+    }
+})();
+</script>
+
+</body>
+</html>

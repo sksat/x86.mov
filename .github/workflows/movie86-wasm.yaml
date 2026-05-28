@@ -1,0 +1,63 @@
+name: movie86-wasm
+
+on:
+  push:
+    branches: [mov]
+  pull_request:
+    branches: [mov]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: movie86/wasm
+
+# Per-ref concurrency so a new push supersedes the in-flight build for
+# the same branch/PR but production (mov) doesn't fight a preview.
+concurrency:
+  group: movie86-wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      # Pin the toolchain like the movie86 workflow does — wasm32 is the
+      # only target we actually build for here.
+      - name: setup rust (stable + wasm32 target)
+        uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
+        with:
+          toolchain: stable
+          components: clippy
+          target: wasm32-unknown-unknown
+          cache-workspaces: movie86/wasm
+
+      - name: cargo clippy -D warnings (wasm32 target)
+        run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+      - name: cache wasm-bindgen-cli
+        uses: actions/cache@v5.0.5
+        id: wbg-cache
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-${{ runner.os }}-0.2.122
+
+      - name: install wasm-bindgen-cli
+        if: steps.wbg-cache.outputs.cache-hit != 'true'
+        working-directory: .
+        run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
+
+      - name: build-wasm (cargo + wasm-bindgen)
+        run: make build-wasm
+
+      - name: stage ../../dist/movie86/
+        run: make stage-deploy
+
+      # End-to-end: load the wasm in Node and run both sample ELFs through
+      # runElf, asserting the expected exit code + stdout. Catches the
+      # binding (JS ↔ Rust) regressing in a way `cargo build` would miss.
+      - name: smoke test (node + samples)
+        run: node tests/smoke.mjs
