@@ -58,6 +58,7 @@ public:
     emitSub8Tables();
     emitPopcount8Table();
     emitBitscan8Tables();
+    emitMul8Tables();
     emitReturnAddrSlot();
     emitEspDecScratch();
     emitIndirectCalleeSlot();
@@ -73,6 +74,7 @@ private:
   void emitSub8Tables();
   void emitPopcount8Table();
   void emitBitscan8Tables();
+  void emitMul8Tables();
   void emitReturnAddrSlot();
   void emitEspDecScratch();
   void emitIndirectCalleeSlot();
@@ -461,6 +463,50 @@ void MovAsmPrinter::emitBitscan8Tables() {
         }
         return c;
       });
+}
+
+// Stage 7f — `__mov_mul8_lo_table` and `__mov_mul8_hi_table`, each
+// 256 × 256 = 64 KiB:
+//
+//   __mov_mul8_lo_table[a*256 + b] = (a * b) & 0xFF        (low byte)
+//   __mov_mul8_hi_table[a*256 + b] = (a * b) >> 8          (high byte)
+//
+// Indexed by `mov dl, byte ptr [__mov_mul8_*_table + ecx]` after the
+// caller has packed (a_byte << 8) | b_byte into ECX via the standard
+// idx-slot dance (idx[0] = b, idx[1] = a, idx[2..3] = 0 → ecx =
+// a*256+b). The two tables live in a shared `.rodata.__mov_mul8_tables`
+// section because every MUL site looks up both; per-table sections
+// would waste a section header for no GC win.
+//
+// Total 128 KiB rodata, only paid by TUs that contain at least one
+// MUL32{rr,ri}; bench-check confirms TUs without MUL stay byte-
+// identical via `ld --gc-sections`.
+void MovAsmPrinter::emitMul8Tables() {
+  static constexpr unsigned kSize = 256u * 256u;
+  SmallVector<uint8_t, kSize> Lo;
+  SmallVector<uint8_t, kSize> Hi;
+  Lo.reserve(kSize);
+  Hi.reserve(kSize);
+  for (unsigned a = 0; a < 256; ++a) {
+    for (unsigned b = 0; b < 256; ++b) {
+      const unsigned p = a * b;
+      Lo.push_back(static_cast<uint8_t>(p & 0xFFu));
+      Hi.push_back(static_cast<uint8_t>(p >> 8));
+    }
+  }
+
+  MCSection *TableSec = OutContext.getELFSection(
+      ".rodata.__mov_mul8_tables", ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
+  OutStreamer->switchSection(TableSec);
+
+  const auto emitTable = [&](StringRef Name, ArrayRef<uint8_t> Data) {
+    MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
+    OutStreamer->emitLabel(Sym);
+    OutStreamer->emitBytes(StringRef(
+        reinterpret_cast<const char *>(Data.data()), Data.size()));
+  };
+  emitTable("__mov_mul8_lo_table", Lo);
+  emitTable("__mov_mul8_hi_table", Hi);
 }
 
 // Stage 7d2 — `__mov_esp_dec_scratch`: a 16-byte cell in .bss used

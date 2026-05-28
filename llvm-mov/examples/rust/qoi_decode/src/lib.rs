@@ -13,21 +13,11 @@
 fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
 
 // libcall stubs — identical shape to examples/rust/base64_decode/.
-// Each crate that needs MUL/DIV ships its own copy because the
-// backend Expand-s to libcall and we have no compiler-rt to link.
+// Each crate that needs DIV/REM ships its own copy because the
+// backend Expand-s those to libcalls and we have no compiler-rt to
+// link. MUL is handled directly by the byte-table MUL32{rr,ri}
+// pseudos (stage 7f) so `__mulsi3` is no longer required.
 
-#[inline(always)]
-fn umul(mut a: u32, mut b: u32) -> u32 {
-    let mut r: u32 = 0;
-    let mut i = 0u32;
-    while i < 32 {
-        if (b & 1) != 0 { r = r.wrapping_add(a); }
-        a = a << 1;
-        b = b >> 1;
-        i = i + 1;
-    }
-    r
-}
 #[inline(always)]
 fn udiv(n: u32, d: u32) -> u32 {
     if d == 0 { return 0; }
@@ -41,10 +31,9 @@ fn udiv(n: u32, d: u32) -> u32 {
     }
     q
 }
-#[unsafe(no_mangle)] pub extern "C" fn __mulsi3(a: i32, b: i32) -> i32 { umul(a as u32, b as u32) as i32 }
 #[unsafe(no_mangle)] pub extern "C" fn __udivsi3(n: u32, d: u32) -> u32 { udiv(n, d) }
 #[unsafe(no_mangle)] pub extern "C" fn __umodsi3(n: u32, d: u32) -> u32 {
-    let q = udiv(n, d); n.wrapping_sub(umul(q, d))
+    let q = udiv(n, d); n.wrapping_sub(q.wrapping_mul(d))
 }
 #[unsafe(no_mangle)] pub extern "C" fn __divsi3(a: i32, b: i32) -> i32 {
     let neg = (a < 0) ^ (b < 0);
@@ -57,7 +46,7 @@ fn udiv(n: u32, d: u32) -> u32 {
     let abs_a = if a < 0 { (a as u32).wrapping_neg() } else { a as u32 };
     let abs_b = if b < 0 { (b as u32).wrapping_neg() } else { b as u32 };
     let q = udiv(abs_a, abs_b);
-    let r = abs_a.wrapping_sub(umul(q, abs_b)) as i32;
+    let r = abs_a.wrapping_sub(q.wrapping_mul(abs_b)) as i32;
     if a < 0 { r.wrapping_neg() } else { r }
 }
 #[unsafe(no_mangle)]
