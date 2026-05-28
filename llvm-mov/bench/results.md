@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-28T01:32:16Z on x86_64 (Linux).
+Generated 2026-05-28T02:42:53Z on x86_64 (Linux).
 
 ## return0
 
@@ -20,7 +20,7 @@ int main(void) { return 0; }
 | .rodata size | 524288 | 0 |
 | mov count / total | 129 / 132 (97.7%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.156 ms | 0.521 ms |
+| wall-clock runtime (hyperfine mean) | 0.160 ms | 0.540 ms |
 
 ## return42
 
@@ -35,7 +35,7 @@ int main(void) { return 42; }
 | .rodata size | 524288 | 0 |
 | mov count / total | 129 / 132 (97.7%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.143 ms | 0.529 ms |
+| wall-clock runtime (hyperfine mean) | 0.150 ms | 0.534 ms |
 
 ## eq42
 
@@ -59,7 +59,7 @@ int main(void) {
 | .rodata size | 721152 | 0 |
 | mov count / total | 292 / 299 (97.7%) | 1050 / 1052 (99.8%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.174 ms | 0.522 ms |
+| wall-clock runtime (hyperfine mean) | 0.185 ms | 0.534 ms |
 
 ## lt_unsigned
 
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 | .rodata size | 721152 | 0 |
 | mov count / total | 324 / 331 (97.9%) | 1045 / 1047 (99.8%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.157 ms | 0.546 ms |
+| wall-clock runtime (hyperfine mean) | 0.161 ms | 0.568 ms |
 
 ## bitops
 
@@ -134,7 +134,7 @@ int main(void) {
 | .rodata size | 589824 | 0 |
 | mov count / total | 173 / 176 (98.3%) | 922 / 924 (99.8%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.161 ms | 0.555 ms |
+| wall-clock runtime (hyperfine mean) | 0.175 ms | 0.566 ms |
 
 ## sum10
 
@@ -154,7 +154,7 @@ int main(void) {
 | .rodata size | 721408 | 0 |
 | mov count / total | 442 / 450 (98.2%) | 1225 / 1227 (99.8%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.173 ms | 0.532 ms |
+| wall-clock runtime (hyperfine mean) | 0.186 ms | 0.545 ms |
 
 ## fib10
 
@@ -191,5 +191,126 @@ int main(void) {
 | .rodata size | 721408 | 0 |
 | mov count / total | 447 / 455 (98.2%) | 1267 / 1269 (99.8%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.203 ms | 0.716 ms |
+| wall-clock runtime (hyperfine mean) | 0.172 ms | 0.616 ms |
+
+## shifts
+
+```c
+/* Stage 7b2 / 7b3 visibility — shift-heavy bit manipulation.
+ *
+ * Exercises:
+ *   - SHL32ri (`x << 4`)        — legalized via __mov_shl_byte_k tables
+ *   - SHR32ri (`x >> 1`)        — __mov_shr_byte_k tables
+ *
+ * `argc` is the runtime LHS (prevents constant folding); the constants
+ * are picked so the bench only measures shapes, not exit codes.
+ *
+ * Written in C89 (declarations before statements) because the
+ * movfuscator side's LCC frontend rejects C99 mixed decl/code, and we
+ * want a fair side-by-side build.
+ */
+int main(int argc, char **argv) {
+    int x;
+    int y;
+    int s;
+    (void)argv;
+    x = argc << 4;     /* SHL32ri */
+    y = (x | 0x32);
+    s = y >> 1;        /* SHR32ri */
+    return (s << 1) | (y & 0xFF);
+}
+```
+
+| metric | llvm-mov | movfuscator |
+|---|---:|---:|
+| total ELF (bytes) | 666488 | 10221108 |
+| .text size | 1815 | 7650 |
+| .rodata size | 657152 | 0 |
+| mov count / total | 469 / 472 (99.4%) | 1423 / 1425 (99.9%) |
+| non-mov mnemonics | `call int jmp` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.160 ms | 0.521 ms |
+
+## fib_rec
+
+```c
+/* Stage 7d1 / 7d3 visibility — recursive fibonacci.
+ *
+ * The 7d1 return-address slot `__mov_return_addr_slot` is a SINGLE
+ * global cell shared across all functions and call frames. Smart-
+ * friend's design review flagged "ra in a single slot will break
+ * recursion" as the top trap — the safety invariant is that each
+ * `ret` writes its own RA into the slot THEN immediately jumps,
+ * before any nested call can return. Recursive fib() stresses this
+ * by stacking up multiple in-flight call frames; if the slot model
+ * were wrong, the recursive descent would mis-jump.
+ *
+ * Also exercises:
+ *   - 7d3 (CALL legalize) twice per recursion level
+ *   - 7c4 (signed predicate `n < 2`)
+ *   - 7a1 (ADD32rr on the return-value sum)
+ *
+ * fib(10) = 55. The runner doesn't pass argc/argv to main so the
+ * computed exit code is non-deterministic; the bench measures static
+ * shape + average runtime, neither of which depends on the exact
+ * result.
+ */
+int fib(int n) {
+    if (n < 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+
+int main(void) {
+    return fib(10);
+}
+```
+
+| metric | llvm-mov | movfuscator |
+|---|---:|---:|
+| total ELF (bytes) | 730640 | 10225224 |
+| .text size | 3821 | 12208 |
+| .rodata size | 721408 | 0 |
+| mov count / total | 974 / 985 (98.9%) | 2248 / 2250 (99.9%) |
+| non-mov mnemonics | `call int jmp` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.272 ms | 1.484 ms |
+
+## multi_call
+
+```c
+/* Stage 7d3 visibility — multiple sequential calls in the same
+ * basic block. The 7d3 rewrite splits the MBB at each `CALL32d`
+ * and the legalizer must re-enter the continuation block to catch
+ * later calls (codex P2 review on 7d3). This fixture lands several
+ * sequential calls inside `main` so the bench's `.text` shape
+ * directly reflects the per-call mov-chain cost.
+ *
+ * Also exercises:
+ *   - 7a1 (ADD32rr / ri on the accumulator chain)
+ *
+ * Written in C89 (declarations before statements) because the
+ * movfuscator side's LCC frontend rejects C99 mixed decl/code.
+ */
+int bump(int x) {
+    return x + 1;
+}
+
+int main(int argc, char **argv) {
+    int a;
+    int b;
+    int c;
+    (void)argv;
+    a = bump(argc);
+    b = bump(a);
+    c = bump(b);
+    return a + b + c;
+}
+```
+
+| metric | llvm-mov | movfuscator |
+|---|---:|---:|
+| total ELF (bytes) | 533352 | 10225224 |
+| .text size | 2923 | 10999 |
+| .rodata size | 524288 | 0 |
+| mov count / total | 750 / 757 (99.1%) | 2036 / 2038 (99.9%) |
+| non-mov mnemonics | `call int jmp` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.162 ms | 0.560 ms |
 

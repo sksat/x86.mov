@@ -90,6 +90,9 @@ DEFAULT_FIXTURES=(
     bitops
     sum10
     fib10
+    shifts
+    fib_rec
+    multi_call
 )
 
 if [ $# -gt 0 ]; then
