@@ -92,21 +92,31 @@
       margin-top: 0.2rem;
   }
 
-  /* Memory */
-  .memrow { font-size: 0.85rem; white-space: pre; font-variant-numeric: tabular-nums; }
+  /* Memory — fixed height for the same reason as Disassembly:
+     readMem can clip to the mapped region and return fewer than 16
+     rows of bytes, but we want the panel to keep the same vertical
+     footprint either way. */
+  #mem { min-height: 19rem; }
+  .memrow { font-size: 0.85rem; white-space: pre; font-variant-numeric: tabular-nums; height: 1.4em; }
   .memaddr { color: #888; }
   .memascii { color: #444; }
   .memrow .cursor { background: #ffd84d; }
 
-  /* Disassembly */
+  /* Disassembly — fixed height + own scroller so the pane doesn't
+     resize as the row count changes (decode failures, edge of mapped
+     region, etc. would otherwise leave fewer rows and the panel
+     would jitter shorter every render). */
   .disasm-body {
-      max-height: 28rem; overflow: auto; font-size: 0.85rem;
+      height: 28rem; overflow: auto; font-size: 0.85rem;
       font-variant-numeric: tabular-nums;
   }
   .dr {
       display: grid; grid-template-columns: 8ch 16ch 1fr;
       column-gap: 0.6rem; padding: 0 0.1rem;
       white-space: nowrap;
+      height: 1.4em;  /* lock row height so partial-row content
+                         (a single space placeholder) still occupies
+                         the same vertical slot as a full row */
   }
   .dr .da { color: #888; }
   .dr .db { color: #555; }
@@ -138,11 +148,17 @@
     padding: 0.3rem 0.5rem; margin-bottom: 0.5rem;
     font-variant-numeric: tabular-nums;
   }
-  .insn .lbl { color: #777; }
-  .insn .row { display: flex; gap: 0.6rem; }
+  .insn .lbl { color: #777; flex-shrink: 0; }
+  .insn .row {
+      display: flex; gap: 0.6rem;
+      /* Keep each row exactly one line — long decoded text would
+         otherwise wrap and grow the preview, jittering everything
+         below it. ellipsis on overflow. */
+      white-space: nowrap; overflow: hidden;
+  }
   .insn .row + .row { margin-top: 0.2rem; }
-  .insn .ibytes { color: #444; }
-  .insn .itext { color: #111; font-weight: bold; }
+  .insn .ibytes { color: #444; overflow: hidden; text-overflow: ellipsis; }
+  .insn .itext { color: #111; font-weight: bold; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 </style>
 </head>
 <body>
