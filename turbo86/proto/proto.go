@@ -119,6 +119,25 @@ type Stop struct{}
 
 func (Stop) inboundKind() string { return "stop" }
 
+// Pause asks the runner to cooperatively halt the current session and
+// emit a Paused Outbound carrying the canonical Context (Regs +
+// sparse Regions). This is the engine-handoff trigger: a peer engine
+// can take the resulting Context and resume execution via its own
+// LoadContext. Server-side, this sends SIGSTOP to the guest child;
+// the kernel reports a non-forwardable signal stop, which the
+// runner's existing Paused path snapshots regs + memory for. No
+// payload — the response data lives entirely in the Paused.
+//
+// Boundary semantics: pause lands at whatever ptrace-stop granularity
+// the child happens to be at — typically an instruction boundary, but
+// possibly mid-syscall-trap if SIGSTOP arrives between an entry and
+// exit stop. The same caveat applies to the existing signal-driven
+// Paused (which fires at the faulting instruction), so peer engines
+// already tolerate non-end-of-instruction boundaries.
+type Pause struct{}
+
+func (Pause) inboundKind() string { return "pause" }
+
 // MarshalInbound encodes an Inbound as a JSON object with a "type" field.
 func MarshalInbound(msg Inbound) ([]byte, error) {
 	switch m := msg.(type) {
@@ -138,6 +157,10 @@ func MarshalInbound(msg Inbound) ([]byte, error) {
 			LoadContext
 		}{m.inboundKind(), m})
 	case Stop:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+		}{m.inboundKind()})
+	case Pause:
 		return json.Marshal(struct {
 			Type string `json:"type"`
 		}{m.inboundKind()})
@@ -176,6 +199,8 @@ func UnmarshalInbound(data []byte) (Inbound, error) {
 		return m, nil
 	case "stop":
 		return Stop{}, nil
+	case "pause":
+		return Pause{}, nil
 	default:
 		return nil, fmt.Errorf("proto: unknown Inbound type %q", probe.Type)
 	}

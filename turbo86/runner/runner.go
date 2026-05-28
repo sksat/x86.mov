@@ -12,6 +12,7 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -439,6 +440,41 @@ func (r *Runner) Close() error {
 		}
 	})
 	<-r.done
+	return nil
+}
+
+// Pause asks the runner to cooperatively halt the current session and
+// emit a Paused Outbound carrying the canonical Context (Regs +
+// sparse Regions). The session ends; the events channel closes
+// normally after the Paused is delivered. Safe from any goroutine —
+// like Close, this just signals the kernel and lets the tracer
+// goroutine handle the resulting ptrace-stop.
+//
+// Mechanism: sends SIGSTOP to the child. SIGSTOP is non-forwardable
+// (job-control), so the existing tracer path that handles
+// non-forwardable signal stops fires — it captures regs + sparse
+// memory and emits a Paused. The same path runs whether the SIGSTOP
+// came from a Pause Inbound or any other source.
+//
+// Boundary semantics: the stop lands at whatever ptrace-stop
+// granularity the child happens to be at — usually an instruction
+// boundary, but possibly mid-syscall-trap. Peer engines already
+// tolerate the same caveat for signal-driven Paused events.
+//
+// Race tolerance: if the child has already exited (because the guest
+// returned naturally, or a fault took the session down) before
+// SIGSTOP could be delivered, the kernel returns
+// `os.ErrProcessDone` — that's benign for an engine-handoff trigger
+// (the caller just sees the natural end-of-session event instead of
+// a Paused), so we swallow it.
+func (r *Runner) Pause() error {
+	if r.cmd == nil || r.cmd.Process == nil {
+		return nil
+	}
+	if err := r.cmd.Process.Signal(syscall.SIGSTOP); err != nil &&
+		!errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
 	return nil
 }
 

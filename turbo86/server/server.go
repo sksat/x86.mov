@@ -123,6 +123,20 @@ func handleSession(ctx context.Context, ws *websocket.Conn) error {
 				// returns Signaled → Paused → events channel close).
 				readDone <- nil
 				return
+			case proto.Pause:
+				// Caller-requested cooperative pause for engine
+				// handoff. Pause sends SIGSTOP to the child; the
+				// tracer's non-forwardable signal path emits a
+				// Paused (carrying regs + sparse Regions) and
+				// returns, closing the events channel. The main
+				// goroutine forwards the Paused, then this reader
+				// loop is unblocked by the WS close from serve's
+				// defer. No `return` here — keep accepting Code /
+				// Stop until the tracer ends the session.
+				if err := r.Pause(); err != nil {
+					readDone <- fmt.Errorf("pause: %w", err)
+					return
+				}
 			default:
 				readDone <- fmt.Errorf("unexpected inbound %T after Start/LoadContext", msg)
 				return
