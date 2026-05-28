@@ -49,6 +49,7 @@ func TestInboundRoundTrip(t *testing.T) {
 			}},
 		},
 		{"Stop", Stop{}},
+		{"Pause", Pause{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

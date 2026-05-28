@@ -352,6 +352,67 @@ fn snapshot_at_step_zero_captures_initial_state_before_any_step() {
 }
 
 #[test]
+fn handover_round_trip_via_dump_load_context_continues_to_exit() {
+    // Phase 2 of the engine-handoff plumbing: a single guest run can
+    // be cut in two by dumping the canonical Context to JSON mid-way
+    // and feeding it back to a fresh load. The combined outcome must
+    // match an uninterrupted single-pass run — same exit code, same
+    // observable side effects.
+    use movie86_cli::context_json::from_json;
+    use movie86_cli::{run_elf_with_debug, DebugConfig, DebugStop, StdHost};
+
+    // mov eax, 1 ; mov ebx, 42 ; int 0x80  → exit(42).
+    let program: &[u8] = &[
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+        0xbb, 0x2a, 0x00, 0x00, 0x00, // mov ebx, 42
+        0xcd, 0x80, // int 0x80
+    ];
+    let entry: u32 = 0x0804_8000;
+    let elf = build_elf(entry, program);
+
+    let dump_path =
+        std::env::temp_dir().join(format!("movie86-ctx-roundtrip-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&dump_path);
+
+    // Pass 1: run 2 steps, dump context, halt at the int 0x80.
+    let mut host1 = StdHost::default();
+    let cfg1 = DebugConfig {
+        max_steps: Some(2),
+        dump_context_at_step: Some((2, dump_path.clone())),
+        ..DebugConfig::default()
+    };
+    match run_elf_with_debug(&elf, &mut host1, &cfg1) {
+        RunOutcome::DebugStop(DebugStop::MaxSteps(2)) => {}
+        other => panic!("pass 1: expected MaxSteps(2), got {other:?}"),
+    }
+
+    let json = std::fs::read(&dump_path).expect("context json file should exist");
+    let ctx = from_json(&json).expect("ctx json should parse");
+
+    // Sanity-check the captured regs: 2 movs done, eip at the int 0x80.
+    assert_eq!(ctx.regs.eax, 1, "after step 1: eax=1");
+    assert_eq!(ctx.regs.ebx, 42, "after step 2: ebx=42");
+    assert_eq!(
+        ctx.regs.eip,
+        entry + 10,
+        "eip should sit at the int 0x80 (10 bytes in)"
+    );
+
+    // Pass 2: same ELF, load the captured context, run to completion.
+    let mut host2 = StdHost::default();
+    let cfg2 = DebugConfig {
+        load_context: Some(ctx),
+        ..DebugConfig::default()
+    };
+    match run_elf_with_debug(&elf, &mut host2, &cfg2) {
+        RunOutcome::Exit(42) => {}
+        other => panic!("pass 2: expected Exit(42), got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&dump_path);
+}
+
+#[test]
 fn fault_on_unsupported_syscall() {
     // mov eax, 999 ; int 0x80  → syscall 999 is unimplemented
     let program: &[u8] = &[

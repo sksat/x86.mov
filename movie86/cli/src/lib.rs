@@ -15,10 +15,13 @@ use movie86::{Cpu, Fault, Memory, Reg32, Signal};
 /// already-large segment range.
 const DEFAULT_STACK_SIZE: u32 = 64 * 1024;
 
+pub mod context_json;
 pub mod diff;
 pub mod gdb_target;
+pub mod handover;
 pub mod logging_memory;
 pub mod snapshot;
+pub mod turbo86_wire;
 
 pub use diff::diff_snapshots;
 pub use gdb_target::{run_elf_with_gdb, GdbRunError};
@@ -423,6 +426,20 @@ pub struct DebugConfig {
     /// PC cycling alone hides logical progress — see
     /// [`logging_memory`] for the per-write capture mechanism.
     pub log_writes_in: Vec<std::ops::Range<u32>>,
+    /// Apply this [`movie86::Context`] to the CPU + memory before
+    /// entering the run loop. The receiving end of an engine
+    /// handoff: regions are written into the loaded image first
+    /// (overlaying any ELF bytes), then regs are loaded into the
+    /// CPU. Caller is responsible for parsing the JSON wire form
+    /// — see [`crate::context_json`].
+    pub load_context: Option<movie86::Context>,
+    /// After step N completes, dump the current CPU + memory as a
+    /// turbo86-compatible [`Context`] JSON to the given path. The
+    /// sending end of an engine handoff. Sparse regions are
+    /// captured over the loaded `FlatMemory` extent.
+    ///
+    /// [`Context`]: movie86::Context
+    pub dump_context_at_step: Option<(u64, std::path::PathBuf)>,
 }
 
 /// Reason the debug-driven run stopped *short* of the guest exiting on
@@ -472,6 +489,18 @@ pub fn run_elf_with_debug<H: SysHost + LibcHost>(
     // (`CD 81 ...` = `int 0x81; ret`). Default-impl is a no-op, so
     // hosts that don't care about libc wrappers skip this entirely.
     host.scan_libc_stubs(&elf, &mem);
+    // Engine handoff (receiving side): apply the loaded Context after
+    // the ELF + host setup so its regions can overlay code pages and
+    // its regs override the freshly-set entry/esp. Signal handlers
+    // were already re-derived from the ELF symbol table above; the
+    // Context schema deliberately doesn't carry them (turbo86 v1
+    // doctrine; see core/src/context.rs).
+    if let Some(ctx) = &cfg.load_context {
+        if let Err(e) = apply_context_to_fresh_extent(ctx, &mut cpu, &mut mem) {
+            eprintln!("movie86: load_context failed: {e:?}");
+            return RunOutcome::Fault(e);
+        }
+    }
     // Per-instruction tracing is gated on the DebugConfig (or the
     // legacy MOVIE86_TRACE env var) so the hot path costs at most an
     // integer load in the common case.
@@ -590,6 +619,16 @@ pub fn run_elf_with_debug<H: SysHost + LibcHost>(
                         write_step_snapshot(path, step_count, &cpu, &mem);
                     }
                 }
+                // `--dump-context-at-step N` is the engine-handoff
+                // sibling of `--snapshot-at-step`: same timing rule
+                // (after step N completes) but emits the
+                // turbo86-compatible Context JSON instead of the
+                // debug Snapshot binary.
+                if let Some((target, path)) = &cfg.dump_context_at_step {
+                    if step_count == *target {
+                        write_context_at_step(path, &cpu, &mem);
+                    }
+                }
             }
             Err(Fault::Exit(status)) => {
                 write_stop_snapshot(
@@ -662,6 +701,69 @@ fn write_stop_snapshot(
         return;
     };
     write_snapshot(path, kind, detail, step_count, cpu, mem);
+}
+
+/// Receiver-side Context apply.
+///
+/// `capture_sparse_regions` deliberately omits all-zero pages from the
+/// sparse Context, so the canonical invariant
+///   `load(capture(state)) == state`
+/// only holds if the receiver starts from a zeroed extent. The CLI's
+/// `--load-context` runs on top of an already-`flatten_with_stack`'d
+/// `FlatMemory` (which has ELF bytes + stack scaffold), so we wipe
+/// the captured extent first, then overlay the Context's regions.
+/// This matches turbo86's `LoadContext` runner path, where the guest
+/// stub's fresh mmap pages start zero.
+///
+/// Side effect: writes through `LoggingMemory` populate the pending
+/// log. Drain it before the run loop so setup writes don't get
+/// mis-attributed to the first guest step under `--log-writes-in`.
+fn apply_context_to_fresh_extent(
+    ctx: &movie86::Context,
+    cpu: &mut Cpu,
+    mem: &mut LoggingMemory<movie86::FlatMemory>,
+) -> Result<(), Fault> {
+    let base = mem.base();
+    let zeros = vec![0u8; mem.len()];
+    mem.write_bytes(base, &zeros)?;
+    movie86::load_context(ctx, cpu, mem)?;
+    let _ = mem.drain_pending();
+    Ok(())
+}
+
+/// Capture sparse Context from the live run state and write its
+/// turbo86-compatible JSON to `path`. Mirrors `write_step_snapshot`
+/// for the debug Snapshot side — same step-N timing, different
+/// payload (migration vs debugging).
+fn write_context_at_step(
+    path: &std::path::Path,
+    cpu: &Cpu,
+    mem: &LoggingMemory<movie86::FlatMemory>,
+) {
+    let mem_len = u32::try_from(mem.len()).unwrap_or(u32::MAX);
+    let regions = match movie86::capture_sparse_regions(mem, mem.base(), mem_len) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("movie86: context capture failed: {e:?}");
+            return;
+        }
+    };
+    let ctx = movie86::Context {
+        regs: movie86::Regs::from_cpu(cpu),
+        regions,
+    };
+    let bytes = match context_json::to_json_pretty(&ctx) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("movie86: context json encode failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(path, &bytes) {
+        eprintln!("movie86: context write to {} failed: {e}", path.display());
+    } else {
+        eprintln!("movie86: context written to {}", path.display());
+    }
 }
 
 fn write_snapshot(

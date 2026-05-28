@@ -13,6 +13,7 @@ fn print_usage(arg0: &str) {
          [--watch HEX]... [--dump-u32 HEX]... \
          [--log-writes-in START:END]... \
          [--snapshot-at-step N PATH] [--snapshot-on-stop PATH] \
+         [--dump-context-at-step N PATH] [--load-context PATH] \
          [--gdb-listen ADDR] <elf-file>"
     );
     eprintln!();
@@ -122,6 +123,37 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 };
                 cfg.snapshot_on_stop = Some(PathBuf::from(p));
+            }
+            "--dump-context-at-step" => {
+                let Some(n) = it.next().and_then(|s| s.parse::<u64>().ok()) else {
+                    eprintln!("movie86: --dump-context-at-step needs a decimal step count");
+                    return ExitCode::from(2);
+                };
+                let Some(p) = it.next() else {
+                    eprintln!("movie86: --dump-context-at-step needs a path after the step count");
+                    return ExitCode::from(2);
+                };
+                cfg.dump_context_at_step = Some((n, PathBuf::from(p)));
+            }
+            "--load-context" => {
+                let Some(p) = it.next() else {
+                    eprintln!("movie86: --load-context needs a path");
+                    return ExitCode::from(2);
+                };
+                let json = match std::fs::read(&p) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("movie86: --load-context: cannot read {p}: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                match movie86_cli::context_json::from_json(&json) {
+                    Ok(ctx) => cfg.load_context = Some(ctx),
+                    Err(e) => {
+                        eprintln!("movie86: --load-context: bad JSON in {p}: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
             }
             "--gdb-listen" => {
                 let Some(addr) = it.next() else {
