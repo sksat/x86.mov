@@ -87,6 +87,12 @@ Companion to [`movie86`](../movie86/): movie86 is the in-browser interpreter ("w
 
 - **Sparse memory snapshot at Paused.** `snapshotMemory` reads the stub's mmap'd regions (16 MiB code + 2 MiB stack) but emits only the non-zero 4 KiB pages, merging adjacent runs. For a freshly-faulted guest this collapses ~18 MiB into a few KiB on the wire.
 
+- **Trap-mode signal dispatch pushes a restorer trampoline.** At session start in trap mode, the runner writes a 7-byte `mov eax, 173; int 0x80` trampoline at `0x09040000` (near the end of the 16 MiB code region). At signal time, the runner pushes that address onto the guest stack before redirecting EIP into the handler — so a normally-returning handler `ret`s into the trampoline, which then invokes `rt_sigreturn` (which the runner intercepts and restores from `r.signalRegs`). Without this push, exit-from-handler works but a returning handler `ret`s to garbage, diverging from host mode.
+
+- **The WebSocket Accept does NOT set `InsecureSkipVerify`.** Turning it on would disable the browser Origin check, letting any visited web page open `ws://127.0.0.1:<port>` and drive the runner (cross-site RCE — this endpoint accepts and executes arbitrary guest bytes natively). coder/websocket's default Origin check passes when no Origin header is sent (the test client's case) and requires Origin to match Host otherwise. When deploying with a fixed browser frontend origin, add `OriginPatterns: []string{"https://x86.mov", …}` — don't reach for `InsecureSkipVerify`.
+
+- **`rt_sigaction` in trap mode honors `oldact`.** A non-NULL `oldact` argument gets the previous handler written into its first 4 bytes (sa_handler offset); `act == NULL` is treated as a query. Without this, programs that swap+restore handlers (or sample the current handler) silently see SIG_DFL where the real kernel would return the prior value, breaking the host/trap parity doctrine.
+
 - **Interrupting a no-syscall tight loop.** A guest in `jmp $` makes no syscalls and never signals; the tracer's wait4 would block forever. `Runner.Close()` sends SIGKILL to the child, which wakes wait4 (returning Signaled). The session ends with a `Paused{Signal: SIGKILL}`. This is the kill-switch for runaway guests; the server reader goroutine has a `defer r.Close()` so a WS disconnect triggers it automatically, and the `Stop` Inbound message is the polite caller-initiated form.
 
 ## CI

@@ -27,10 +27,14 @@ func Handler() http.Handler {
 }
 
 func serve(w http.ResponseWriter, r *http.Request) {
-	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// Allow tests / local clients on different ports.
-		InsecureSkipVerify: true,
-	})
+	// Defaults from coder/websocket: if the client sends an Origin
+	// header, it must match the Host. Tests using github.com/coder/websocket
+	// don't set Origin, so they pass; browser cross-origin attempts
+	// fail. This endpoint accepts arbitrary guest bytes and runs them
+	// natively, so we deliberately do NOT set InsecureSkipVerify —
+	// turning it on would let any web page open ws://127.0.0.1:1234
+	// and drive turbo86 (cross-site RCE).
+	ws, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
 	}

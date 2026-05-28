@@ -44,6 +44,23 @@ const (
 // guest. Used by the emulate path under PTRACE_SYSCALL.
 const suppressedSyscall = uint32(0xFFFFFFFF)
 
+// In trap mode, the runner needs a guest-executable restorer trampoline
+// so a normal-returning signal handler's `ret` lands somewhere the
+// runner can intercept (rt_sigreturn). We write 7 bytes at a fixed
+// address near the top of the guest's code region, then push that
+// address onto the guest stack at signal dispatch so the handler's
+// final `ret` pops into the trampoline.
+//
+//	B8 AD 00 00 00       mov  eax, 173       (__NR_rt_sigreturn)
+//	CD 80                int  0x80
+//
+// 0x09040000 is near the top of the stub's 16 MiB RWX region (which
+// starts at 0x08048000) and out of the way of typical mov-only code
+// + data layouts.
+const trapTrampolineAddr uint32 = 0x09040000
+
+var trapTrampolineBytes = []byte{0xB8, 0xAD, 0x00, 0x00, 0x00, 0xCD, 0x80}
+
 // __NR_memfd_create on amd64 Linux. Not exposed by syscall package.
 const sysMemfdCreate = 319
 
@@ -122,6 +139,13 @@ func (m *procMem) WriteAt(addr uint32, data []byte) error {
 		return fmt.Errorf("short write at 0x%x: wrote %d want %d", addr, n, len(data))
 	}
 	return nil
+}
+
+// writeMem is an internal alias used by trap-mode helpers that want to
+// stay readable next to the ReadAt calls; the runner's `mem` is a
+// procMem so this just forwards.
+func (r *Runner) writeMem(addr uint32, data []byte) error {
+	return r.mem.WriteAt(addr, data)
 }
 
 // memfdCreate is a thin wrapper around the memfd_create(2) syscall.
@@ -437,6 +461,10 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 	}
 	if r.mode == proto.ModeTrap {
 		r.handlers = make(map[uint8]uint32)
+		if err := r.mem.WriteAt(trapTrampolineAddr, trapTrampolineBytes); err != nil {
+			r.emitFault(fmt.Sprintf("write trap-mode restorer trampoline: %v", err))
+			return
+		}
 	}
 
 	// Apply setup (memory + regs) from the start command.
@@ -663,7 +691,31 @@ func (r *Runner) syscallLoop(regs *regs32) {
 							r.emitFault(fmt.Sprintf("get regs (trap signal): %v", err))
 							return
 						}
+						// Save the pre-signal regs for rt_sigreturn. ESP is
+						// the original, so when the handler eventually
+						// returns and rt_sigreturn restores from this
+						// snapshot, the stack is back to where it was.
 						r.signalRegs = append(r.signalRegs, *regs)
+
+						// Push the restorer trampoline address onto the
+						// guest stack so a returning handler `ret`s into
+						// it and triggers rt_sigreturn. Matches what the
+						// kernel does for host-mode signal delivery
+						// (modulo the full sigframe layout we don't need
+						// for handlers that don't read ucontext).
+						newEsp := regs.Esp - 4
+						addr := uint32(trapTrampolineAddr)
+						addrBuf := [4]byte{
+							byte(addr),
+							byte(addr >> 8),
+							byte(addr >> 16),
+							byte(addr >> 24),
+						}
+						if err := r.mem.WriteAt(newEsp, addrBuf[:]); err != nil {
+							r.emitFault(fmt.Sprintf("push trap-mode restorer: %v", err))
+							return
+						}
+						regs.Esp = newEsp
 						regs.Eip = handlerAddr
 						if err := ptraceSetRegs32(r.pid, regs); err != nil {
 							r.emitFault(fmt.Sprintf("set regs (trap signal): %v", err))
@@ -811,18 +863,44 @@ func (r *Runner) handleTrapModeSyscall(regs *regs32) (bool, uint32, error) {
 	switch regs.OrigEax {
 	case sysRtSigaction:
 		// rt_sigaction(signum, &act, &oldact, sigsetsize)
-		// ebx = signum, ecx = &act
-		if regs.Ecx == 0 {
-			// Querying (act==NULL); nothing to record. Return 0.
-			return true, 0, nil
+		// ebx = signum, ecx = &act (may be NULL for pure-query call),
+		// edx = &oldact (may be NULL).
+		signum := uint8(regs.Ebx)
+
+		// Snapshot the pre-call handler so a non-NULL oldact reads
+		// the *previous* disposition (sigaction semantics: the new
+		// handler replaces the old, and the caller can retrieve the
+		// old one even when also setting a new one).
+		prevHandler, prevSet := r.handlers[signum]
+
+		// If act is non-NULL, install a new handler from
+		// userspace struct sigaction's sa_handler (offset 0).
+		if regs.Ecx != 0 {
+			var buf [4]byte
+			if err := r.mem.ReadAt(regs.Ecx, buf[:]); err != nil {
+				return true, 0, fmt.Errorf("read sa_handler at 0x%x: %w", regs.Ecx, err)
+			}
+			handler := uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24
+			r.handlers[signum] = handler
 		}
-		// Userspace struct sigaction has sa_handler at offset 0.
-		var buf [4]byte
-		if err := r.mem.ReadAt(regs.Ecx, buf[:]); err != nil {
-			return true, 0, fmt.Errorf("read sa_handler at 0x%x: %w", regs.Ecx, err)
+
+		// If oldact is non-NULL, fill the userspace struct sigaction
+		// (140 bytes on i386 glibc) with the previous disposition.
+		// We only track sa_handler; the rest of the struct is
+		// zero-filled — sufficient for query callers that only check
+		// the handler against SIG_DFL / SIG_IGN / their own address.
+		if regs.Edx != 0 {
+			var out [140]byte
+			if prevSet {
+				out[0] = byte(prevHandler)
+				out[1] = byte(prevHandler >> 8)
+				out[2] = byte(prevHandler >> 16)
+				out[3] = byte(prevHandler >> 24)
+			}
+			if err := r.writeMem(regs.Edx, out[:]); err != nil {
+				return true, 0, fmt.Errorf("write oldact at 0x%x: %w", regs.Edx, err)
+			}
 		}
-		handler := uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24
-		r.handlers[uint8(regs.Ebx)] = handler
 		return true, 0, nil
 
 	case sysRtSigreturn:
