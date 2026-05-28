@@ -4,6 +4,5 @@
 # noted it's the only non-mov a branchless dispatcher truly needs).
 push
 pop
-sub
 ret
 jmp

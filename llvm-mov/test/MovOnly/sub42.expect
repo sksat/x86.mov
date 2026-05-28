@@ -1,0 +1,4 @@
+# Stage 7d (CALL/RET + push/pop) remaining gate.
+push
+pop
+ret

@@ -4,11 +4,10 @@
 # push / pop  — function prologue/epilogue save+restore of EBP.
 #               Legalised by stage 7d alongside CALL/RET when the
 #               return-address machinery is rewritten.
-# sub         — `sub esp, N` in the prologue. Stage 7d's prologue
-#               rewrite will replace it with a mov sequence (or remove
-#               the explicit reserve once the frame is mov-only).
 # ret         — function return. Stage 7d.
+#
+# Stage 7d0 already legalised the prologue `sub esp, N` (no longer
+# in the list).
 push
 pop
-sub
 ret

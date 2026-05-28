@@ -118,6 +118,16 @@ public:
         case Mov::ADD32rr:
           Changed |= legalizeADD32rr(MI, MBB, TII);
           break;
+        case Mov::SUB32ri:
+          // Stage 7d0. `sub reg, 0` is a no-op (consistent with the
+          // ADD32ri opt 3 fold).
+          if (MI.getOperand(2).getImm() == 0) {
+            MI.eraseFromParent();
+            Changed = true;
+            break;
+          }
+          Changed |= legalizeSUB32ri(MI, MBB, TII);
+          break;
         case Mov::AND32ri:
           // opt 3 — `and reg, 0` zeroes Dst; `and reg, ~0` is a no-op.
           if (MI.getOperand(2).getImm() == 0) {
@@ -1244,6 +1254,39 @@ private:
     }
   }
 
+  // SUB per-byte stage — same shape as emitByteStageAdd but indexes
+  // __mov_sub8_{diff,borrow}_table instead. CL holds the borrow-in /
+  // borrow-out chain across the four bytes. Used by stage 7d0
+  // legalizeSUB32ri to lower `sub reg, K` into a mov-only sequence
+  // (the same byte SUB chain the stage 7c3 CMP+Jcc rewrite uses
+  // against a memory operand, but here writing the diff back into
+  // srcdst directly so `mov DST32, [srcdst]` at the end loads the
+  // 32-bit result).
+  static void emitByteStageSub(MachineBasicBlock &MBB,
+                               MachineBasicBlock::iterator I,
+                               const DebugLoc &DL,
+                               const TargetInstrInfo &TII, const EbpAddr &A,
+                               unsigned ByteIdx, ByteSource BSrc) {
+    emitIdxZero(MBB, I, DL, TII, A);
+    if (ByteIdx > 0) {
+      // mov byte ptr [idx + 2], cl   ; borrow-in (CL holds borrow_out
+      // from previous stage's sub8_borrow lookup)
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP)
+          .addImm(A.IdxDisp + 2)
+          .addReg(Mov::CL);
+    }
+    emitIdxPackAB(MBB, I, DL, TII, A, ByteIdx, BSrc);
+    emitTableLookupAndStore(MBB, I, DL, TII, A, ByteIdx,
+                            "__mov_sub8_diff_table");
+    if (ByteIdx < 3) {
+      // mov cl, byte ptr [sub8_borrow_table + ecx]  ; borrow-out
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
+          .addExternalSymbol("__mov_sub8_borrow_table")
+          .addReg(Mov::ECX);
+    }
+  }
+
   // Bitwise per-byte stage: AND/OR/XOR are per-bit, so each byte is
   // independent (no carry chain). Single table lookup, single store.
   // The (cin, a, b) index used by ADD becomes just (a, b) here —
@@ -1331,6 +1374,77 @@ private:
     // srcdst buffer. Order matters when DST32 happens to be ECX or
     // EDX: the restore writes the original saved value, then the
     // result load overwrites it with the actual result.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        .addReg(Mov::EBP)
+        .addImm(Addr->SaveEcxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+        .addReg(Mov::EBP)
+        .addImm(Addr->SaveEdxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
+        .addReg(Mov::EBP)
+        .addImm(Addr->SrcDstDisp);
+
+    MI.eraseFromParent();
+    return true;
+  }
+
+  // Stage 7d0 — lower `SUB32ri DST32, DST32, IMM32` into a mov-only
+  // byte SUB chain. Same prologue/epilogue shape as legalizeADD32ri;
+  // the per-byte stage reads __mov_sub8_diff_table for the difference
+  // and __mov_sub8_borrow_table for the borrow-out into CL.
+  //
+  // The most common SUB32ri site at this stage is the prologue
+  // `sub esp, K` that FrameLowering::emitPrologue emits after
+  // `mov ebp, esp`. EBP is valid at that point, so the byte-chain
+  // scratch reads/writes at [EBP + scratch_disp] resolve correctly.
+  //
+  // Note on stack-frame ordering: between this rewrite's first scratch
+  // write and the final `mov esp, [srcdst]`, ESP still points to where
+  // it did before the SUB — i.e. the scratch writes land below ESP
+  // briefly. Asynchronous signals would overwrite the scratch in that
+  // window, but the bootstrap pipeline doesn't install any.
+  bool legalizeSUB32ri(MachineInstr &MI, MachineBasicBlock &MBB,
+                       const TargetInstrInfo &TII) const {
+    const MachineFunction &MF = *MBB.getParent();
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr)
+      return false;
+
+    assert(MI.getOperand(0).isReg() && "SUB32ri op 0 must be reg");
+    assert(MI.getOperand(2).isImm() && "SUB32ri op 2 must be imm");
+    const Register Dst = MI.getOperand(0).getReg();
+    const uint32_t Imm = static_cast<uint32_t>(MI.getOperand(2).getImm());
+    const std::array<uint8_t, 4> ImmBytes = {
+        static_cast<uint8_t>(Imm & 0xFFu),
+        static_cast<uint8_t>((Imm >> 8) & 0xFFu),
+        static_cast<uint8_t>((Imm >> 16) & 0xFFu),
+        static_cast<uint8_t>((Imm >> 24) & 0xFFu),
+    };
+
+    auto Insert = MachineBasicBlock::iterator(&MI);
+    const DebugLoc DL = MI.getDebugLoc();
+
+    // PROLOGUE — spill ECX, EDX, and DST32 to scratch. Spill DST32
+    // last so it captures its original value.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP)
+        .addImm(Addr->SaveEcxDisp)
+        .addReg(Mov::ECX);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP)
+        .addImm(Addr->SaveEdxDisp)
+        .addReg(Mov::EDX);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP)
+        .addImm(Addr->SrcDstDisp)
+        .addReg(Dst);
+
+    // CHAIN — four per-byte SUB stages. CL holds borrow_in / borrow_out.
+    for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
+      emitByteStageSub(MBB, Insert, DL, TII, *Addr, ByteIdx,
+                       ByteSource::fromImm(ImmBytes[ByteIdx]));
+
+    // EPILOGUE — restore parent regs, then load DST32 from srcdst.
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
         .addReg(Mov::EBP)
         .addImm(Addr->SaveEcxDisp);

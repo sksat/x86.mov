@@ -123,6 +123,7 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
         NeedsRhsScratch = true;
         break;
       case Mov::ADD32ri:
+      case Mov::SUB32ri:
       case Mov::AND32ri:
       case Mov::OR32ri:
       case Mov::XOR32ri:
@@ -161,6 +162,16 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
       }
     }
   }
+  // Stage 7d0 — if the function has any pre-existing stack object
+  // (alloca, spill, fixed object), emitPrologue will land a
+  // `sub esp, K` to reserve the frame. Force NeedsByteOpScratch so
+  // MovOnlyLegalize::legalizeSUB32ri has the scratch it needs to
+  // rewrite that prologue SUB into a mov-only byte chain. Without
+  // this, -O0 fixtures whose only "interesting" instruction is the
+  // prologue SUB itself would leave `sub` in `.text`.
+  if (MF.getFrameInfo().getNumObjects() > 0)
+    NeedsByteOpScratch = true;
+
   // Stage 7c1: any function with at least two basic blocks gets a
   // dispatcher `next_pc` slot reserved. The CFG rewrite in
   // MovOnlyLegalize uses it to store the next BB's code-pointer

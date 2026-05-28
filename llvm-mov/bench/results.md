@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-28T00:17:10Z on x86_64 (Linux).
+Generated 2026-05-28T00:34:42Z on x86_64 (Linux).
 
 ## return0
 
@@ -15,12 +15,12 @@ int main(void) { return 0; }
 
 | metric | llvm-mov | movfuscator |
 |---|---:|---:|
-| total ELF (bytes) | 4656 | 10221108 |
-| .text size | 37 | 4194 |
-| .rodata size | 0 | 0 |
-| mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
-| non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.150 ms | 0.536 ms |
+| total ELF (bytes) | 270984 | 10221108 |
+| .text size | 184 | 4194 |
+| .rodata size | 262144 | 0 |
+| mov count / total | 45 / 50 (90.0%) | 775 / 777 (99.7%) |
+| non-mov mnemonics | `call int pop push ret` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.150 ms | 0.544 ms |
 
 ## return42
 
@@ -30,12 +30,12 @@ int main(void) { return 42; }
 
 | metric | llvm-mov | movfuscator |
 |---|---:|---:|
-| total ELF (bytes) | 4656 | 10221108 |
-| .text size | 37 | 4194 |
-| .rodata size | 0 | 0 |
-| mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
-| non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.137 ms | 0.526 ms |
+| total ELF (bytes) | 270988 | 10221108 |
+| .text size | 184 | 4194 |
+| .rodata size | 262144 | 0 |
+| mov count / total | 45 / 50 (90.0%) | 775 / 777 (99.7%) |
+| non-mov mnemonics | `call int pop push ret` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.139 ms | 0.617 ms |
 
 ## eq42
 
@@ -54,12 +54,12 @@ int main(void) {
 
 | metric | llvm-mov | movfuscator |
 |---|---:|---:|
-| total ELF (bytes) | 205764 | 10221108 |
-| .text size | 681 | 5716 |
-| .rodata size | 196864 | 0 |
-| mov count / total | 170 / 180 (94.4%) | 1050 / 1052 (99.8%) |
-| non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.142 ms | 0.518 ms |
+| total ELF (bytes) | 467984 | 10221108 |
+| .text size | 828 | 5716 |
+| .rodata size | 459008 | 0 |
+| mov count / total | 208 / 217 (95.9%) | 1050 / 1052 (99.8%) |
+| non-mov mnemonics | `call int jmp pop push ret` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.160 ms | 0.528 ms |
 
 ## lt_unsigned
 
@@ -100,11 +100,11 @@ int main(int argc, char **argv) {
 | metric | llvm-mov | movfuscator |
 |---|---:|---:|
 | total ELF (bytes) | 467992 | 10221108 |
-| .text size | 813 | 5692 |
+| .text size | 960 | 5692 |
 | .rodata size | 459008 | 0 |
-| mov count / total | 202 / 212 (95.3%) | 1045 / 1047 (99.8%) |
-| non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.169 ms | 0.607 ms |
+| mov count / total | 240 / 249 (96.4%) | 1045 / 1047 (99.8%) |
+| non-mov mnemonics | `call int jmp pop push ret` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.154 ms | 0.598 ms |
 
 ## bitops
 
@@ -129,12 +129,12 @@ int main(void) {
 
 | metric | llvm-mov | movfuscator |
 |---|---:|---:|
-| total ELF (bytes) | 74332 | 10221108 |
-| .text size | 199 | 4963 |
-| .rodata size | 65536 | 0 |
-| mov count / total | 51 / 57 (89.5%) | 922 / 924 (99.8%) |
-| non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.141 ms | 0.530 ms |
+| total ELF (bytes) | 336552 | 10221108 |
+| .text size | 346 | 4963 |
+| .rodata size | 327680 | 0 |
+| mov count / total | 89 / 94 (94.7%) | 922 / 924 (99.8%) |
+| non-mov mnemonics | `call int pop push ret` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.158 ms | 0.528 ms |
 
 ## sum10
 
@@ -150,11 +150,11 @@ int main(void) {
 | metric | llvm-mov | movfuscator |
 |---|---:|---:|
 | total ELF (bytes) | 730496 | 10221108 |
-| .text size | 1287 | 6706 |
+| .text size | 1434 | 6706 |
 | .rodata size | 721408 | 0 |
-| mov count / total | 320 / 331 (96.7%) | 1225 / 1227 (99.8%) |
-| non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.154 ms | 0.555 ms |
+| mov count / total | 358 / 368 (97.3%) | 1225 / 1227 (99.8%) |
+| non-mov mnemonics | `call int jmp pop push ret` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.154 ms | 0.539 ms |
 
 ## fib10
 
@@ -187,9 +187,9 @@ int main(void) {
 | metric | llvm-mov | movfuscator |
 |---|---:|---:|
 | total ELF (bytes) | 730496 | 10221108 |
-| .text size | 1302 | 6943 |
+| .text size | 1449 | 6943 |
 | .rodata size | 721408 | 0 |
-| mov count / total | 325 / 336 (96.7%) | 1267 / 1269 (99.8%) |
-| non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.165 ms | 0.574 ms |
+| mov count / total | 363 / 373 (97.3%) | 1267 / 1269 (99.8%) |
+| non-mov mnemonics | `call int jmp pop push ret` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.161 ms | 0.539 ms |
 

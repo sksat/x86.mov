@@ -1,5 +1,4 @@
 push
 pop
-sub
 ret
 jmp
