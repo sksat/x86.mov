@@ -1190,12 +1190,14 @@ private:
   bool legalizeCallSites(MachineFunction &MF,
                          const TargetInstrInfo &TII) const {
     bool Changed = false;
-    for (MachineFunction::iterator BBIt = MF.begin(), BBEnd = MF.end();
-         BBIt != BBEnd; ) {
-      MachineBasicBlock &MBB = *BBIt++;
-      // Walk the MBB looking for CALL32d. Each rewrite splits the
-      // MBB and inserts a continuation, so we restart the scan in
-      // the continuation block on the next outer iteration.
+    auto BBIt = MF.begin();
+    while (BBIt != MF.end()) {
+      MachineBasicBlock &MBB = *BBIt;
+      // Walk the MBB looking for the first CALL32d. Each rewrite
+      // splits the MBB and the continuation goes into ContMBB —
+      // we keep BBIt on this MBB position so the very next loop
+      // iteration descends into ContMBB and picks up any further
+      // CALL32d sites in the same logical block (codex P2).
       MachineInstr *CallMI = nullptr;
       for (MachineInstr &MI : MBB) {
         if (MI.getOpcode() == Mov::CALL32d) {
@@ -1203,8 +1205,10 @@ private:
           break;
         }
       }
-      if (!CallMI)
+      if (!CallMI) {
+        ++BBIt;
         continue;
+      }
 
       MachineFunction *MFp = MBB.getParent();
       const DebugLoc DL = CallMI->getDebugLoc();
@@ -1237,6 +1241,36 @@ private:
       // The pre-CALL MBB now ends in our JMP32d_CALL with ContMBB
       // as the sole successor (the call continuation edge).
       MBB.addSuccessor(ContMBB);
+
+      // Propagate live-ins to ContMBB so MachineVerifier doesn't
+      // reject the post-call code (codex P1). After CALL32d the
+      // caller-clobbered registers (EAX/ECX/EDX) are technically
+      // "undefined", but the existing byte-chain legalize passes
+      // (e.g. legalizeADD32ri on ADJCALLSTACKUP's
+      // `add esp, <args>`) save ECX/EDX into scratch and restore
+      // them at the end — they don't read the saved values
+      // semantically, but the verifier still flags the save's
+      // read of ECX/EDX as "using undefined physical register".
+      // Listing them as live-in formally lets the chain pretend
+      // those bytes carry through; the values are functionally
+      // garbage but they get overwritten before any user code
+      // observes them.
+      //
+      // EFLAGS is also clobbered by CALL32d's Defs, but no mov-only
+      // instruction reads EFLAGS, so it's not needed in live-ins.
+      ContMBB->addLiveIn(Mov::EAX);
+      ContMBB->addLiveIn(Mov::ECX);
+      ContMBB->addLiveIn(Mov::EDX);
+      // Also propagate any callee-saved live-ins the original MBB
+      // had at its head — the post-call code may reference them
+      // (EBP for frame access, ESP for stack access, callee-saved
+      // EBX/ESI/EDI if used).
+      for (const auto &LI : MBB.liveins())
+        ContMBB->addLiveIn(LI.PhysReg, LI.LaneMask);
+      // ESP is the active stack pointer at the post-call point;
+      // make it explicit.
+      ContMBB->addLiveIn(Mov::ESP);
+      ContMBB->addLiveIn(Mov::EBP);
 
       // Emit the rewrite at the CALL position:
       //   mov [esp - 4], offset <ContMBB symbol>
@@ -1323,6 +1357,13 @@ private:
       // Erase the original CALL32d.
       CallMI->eraseFromParent();
       Changed = true;
+
+      // Advance BBIt to ContMBB so the next loop iteration scans
+      // the continuation for any further CALL32d sites that lived
+      // in the same original block (codex P2). Without this the
+      // outer loop would skip ContMBB and only the first call in
+      // each original block would be legalised.
+      BBIt = MachineFunction::iterator(ContMBB);
     }
     return Changed;
   }
