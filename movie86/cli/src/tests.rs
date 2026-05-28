@@ -1,8 +1,11 @@
 //! Unit tests for the host-side syscall translation.
 
-use super::{errno_to_eax, write_syscall, LibcFn, StdHost, SyscallArgs, SyscallResult};
+use super::{
+    apply_context_to_fresh_extent, errno_to_eax, write_syscall, LibcFn, LoggingMemory, StdHost,
+    SyscallArgs, SyscallResult,
+};
 use movie86::libc_host::{LibcCall, LibcHost};
-use movie86::{Fault, FlatMemory, Memory, Reg32};
+use movie86::{Cpu, Fault, FlatMemory, MemRegion, Memory, Reg32, Regs};
 
 #[test]
 fn errno_to_eax_matches_two_complement() {
@@ -246,4 +249,90 @@ fn libc_printf_unmapped_fmt_pointer_propagates_fault() {
         Err(Fault::Unmapped(0xdead_0000)) => {}
         other => panic!("expected Unmapped(0xdead_0000), got {other:?}"),
     }
+}
+
+// --- handoff: receiver-side Context apply ---
+
+#[test]
+fn apply_context_zeros_extent_before_overlaying_regions() {
+    // Regression for the code-review P2 finding: sparse capture omits
+    // all-zero pages, so on the receive side, addresses the source
+    // had cleared must not retain whatever ELF/stack bytes happen to
+    // be there. The pre-zero pass guarantees the invariant
+    //   load(capture(state)) == state
+    // even for pages the sender had wiped post-load.
+    let mut inner = FlatMemory::new_zeroed(0x1000, 0x2000);
+    inner.write_u32(0x1000, 0xdead_beef).unwrap();
+    inner.write_u32(0x1ffc, 0xcafe_d00d).unwrap();
+    let mut mem = LoggingMemory::new(inner, Vec::new());
+    let mut cpu = Cpu::new(0);
+    let ctx = movie86::Context {
+        regs: Regs {
+            eip: 0x1234,
+            eax: 7,
+            ..Default::default()
+        },
+        regions: Vec::new(),
+    };
+    apply_context_to_fresh_extent(&ctx, &mut cpu, &mut mem).unwrap();
+    assert_eq!(
+        mem.read_u32(0x1000).unwrap(),
+        0,
+        "page omitted from Context must be zeroed, not left at the pre-load value"
+    );
+    assert_eq!(
+        mem.read_u32(0x1ffc).unwrap(),
+        0,
+        "tail of extent must be zeroed too"
+    );
+    assert_eq!(cpu.eip, 0x1234, "regs should be loaded");
+    assert_eq!(cpu.reg(Reg32::Eax), 7);
+}
+
+#[test]
+fn apply_context_overlays_regions_after_zeroing() {
+    // Same invariant the other way: non-empty regions land at their
+    // declared addresses despite the pre-zero pass.
+    let inner = FlatMemory::new_zeroed(0x1000, 0x2000);
+    let mut mem = LoggingMemory::new(inner, Vec::new());
+    let mut cpu = Cpu::new(0);
+    let ctx = movie86::Context {
+        regs: Regs::default(),
+        regions: vec![MemRegion {
+            addr: 0x1100,
+            bytes: vec![0xaa, 0xbb, 0xcc, 0xdd],
+        }],
+    };
+    apply_context_to_fresh_extent(&ctx, &mut cpu, &mut mem).unwrap();
+    assert_eq!(mem.read_u32(0x1100).unwrap(), 0xddcc_bbaa);
+    assert_eq!(
+        mem.read_u32(0x1000).unwrap(),
+        0,
+        "unwritten region stays zero"
+    );
+}
+
+#[test]
+#[allow(clippy::single_range_in_vec_init)] // one log range deliberately, mirroring the public API shape
+fn apply_context_drains_pending_log_writes_so_setup_does_not_taint_step_zero() {
+    // Regression for the code-review P3 finding: load_context writes
+    // through LoggingMemory; without an explicit drain, those setup
+    // writes are still pending when the run loop's first
+    // `drain_pending()` fires (after step 0), and would be reported
+    // as if the first guest instruction had performed them.
+    let inner = FlatMemory::new_zeroed(0x1000, 0x1000);
+    let mut mem = LoggingMemory::new(inner, vec![0x1000..0x2000]);
+    let mut cpu = Cpu::new(0);
+    let ctx = movie86::Context {
+        regs: Regs::default(),
+        regions: vec![MemRegion {
+            addr: 0x1100,
+            bytes: vec![0xff; 8],
+        }],
+    };
+    apply_context_to_fresh_extent(&ctx, &mut cpu, &mut mem).unwrap();
+    assert!(
+        mem.drain_pending().is_empty(),
+        "setup writes must not bleed into the first step's --log-writes-in trace"
+    );
 }

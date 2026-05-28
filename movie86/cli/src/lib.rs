@@ -494,7 +494,7 @@ pub fn run_elf_with_debug<H: SysHost + LibcHost>(
     // Context schema deliberately doesn't carry them (turbo86 v1
     // doctrine; see core/src/context.rs).
     if let Some(ctx) = &cfg.load_context {
-        if let Err(e) = movie86::load_context(ctx, &mut cpu, &mut mem) {
+        if let Err(e) = apply_context_to_fresh_extent(ctx, &mut cpu, &mut mem) {
             eprintln!("movie86: load_context failed: {e:?}");
             return RunOutcome::Fault(e);
         }
@@ -699,6 +699,34 @@ fn write_stop_snapshot(
         return;
     };
     write_snapshot(path, kind, detail, step_count, cpu, mem);
+}
+
+/// Receiver-side Context apply.
+///
+/// `capture_sparse_regions` deliberately omits all-zero pages from the
+/// sparse Context, so the canonical invariant
+///   `load(capture(state)) == state`
+/// only holds if the receiver starts from a zeroed extent. The CLI's
+/// `--load-context` runs on top of an already-`flatten_with_stack`'d
+/// `FlatMemory` (which has ELF bytes + stack scaffold), so we wipe
+/// the captured extent first, then overlay the Context's regions.
+/// This matches turbo86's `LoadContext` runner path, where the guest
+/// stub's fresh mmap pages start zero.
+///
+/// Side effect: writes through `LoggingMemory` populate the pending
+/// log. Drain it before the run loop so setup writes don't get
+/// mis-attributed to the first guest step under `--log-writes-in`.
+fn apply_context_to_fresh_extent(
+    ctx: &movie86::Context,
+    cpu: &mut Cpu,
+    mem: &mut LoggingMemory<movie86::FlatMemory>,
+) -> Result<(), Fault> {
+    let base = mem.base();
+    let zeros = vec![0u8; mem.len()];
+    mem.write_bytes(base, &zeros)?;
+    movie86::load_context(ctx, cpu, mem)?;
+    let _ = mem.drain_pending();
+    Ok(())
 }
 
 /// Capture sparse Context from the live run state and write its
