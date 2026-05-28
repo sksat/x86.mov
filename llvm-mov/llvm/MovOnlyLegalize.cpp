@@ -1398,11 +1398,19 @@ private:
   // `mov ebp, esp`. EBP is valid at that point, so the byte-chain
   // scratch reads/writes at [EBP + scratch_disp] resolve correctly.
   //
-  // Note on stack-frame ordering: between this rewrite's first scratch
+  // Stack-frame ordering hazard: between this rewrite's first scratch
   // write and the final `mov esp, [srcdst]`, ESP still points to where
-  // it did before the SUB — i.e. the scratch writes land below ESP
-  // briefly. Asynchronous signals would overwrite the scratch in that
-  // window, but the bootstrap pipeline doesn't install any.
+  // it did before the SUB. The scratch writes land below ESP briefly.
+  // For small frames (< one page) those writes stay on the same memory
+  // page as EBP/ESP, so no guard-page fault. For large frames the
+  // most-negative scratch offset can cross a page boundary into an
+  // unmapped guard page, which would fault before ESP has been moved.
+  // The kPrologueScratchPageBudget guard below bails out of the
+  // rewrite when that's the case — the original SUB32ri ESP stays
+  // un-legalized (so `sub` remains in `.text`) until a later 7d
+  // stage adds explicit stack probing.
+  static constexpr int64_t kPrologueScratchPageBudget = 4000;
+
   bool legalizeSUB32ri(MachineInstr &MI, MachineBasicBlock &MBB,
                        const TargetInstrInfo &TII) const {
     const MachineFunction &MF = *MBB.getParent();
@@ -1413,6 +1421,24 @@ private:
     assert(MI.getOperand(0).isReg() && "SUB32ri op 0 must be reg");
     assert(MI.getOperand(2).isImm() && "SUB32ri op 2 must be imm");
     const Register Dst = MI.getOperand(0).getReg();
+
+    // Guard: when rewriting `sub esp, K` (the prologue SUB), refuse
+    // the rewrite if any scratch slot we'd touch sits more than
+    // kPrologueScratchPageBudget bytes below EBP. The byte-chain
+    // emits its first store before ESP has moved, and a write to
+    // [EBP + scratch_disp] beyond a page boundary would fault on
+    // an unmapped guard page. Non-ESP SUB32ri is unaffected since
+    // it doesn't reorder the stack pointer's visible value.
+    if (Dst == Mov::ESP) {
+      auto FarBelowEbp = [&](int64_t Disp) {
+        return Disp < -kPrologueScratchPageBudget;
+      };
+      if (FarBelowEbp(Addr->SaveEcxDisp) ||
+          FarBelowEbp(Addr->SaveEdxDisp) ||
+          FarBelowEbp(Addr->SrcDstDisp) ||
+          FarBelowEbp(Addr->IdxDisp))
+        return false;
+    }
     const uint32_t Imm = static_cast<uint32_t>(MI.getOperand(2).getImm());
     const std::array<uint8_t, 4> ImmBytes = {
         static_cast<uint8_t>(Imm & 0xFFu),
