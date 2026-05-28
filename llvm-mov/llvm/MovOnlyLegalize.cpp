@@ -1267,38 +1267,124 @@ private:
       ContMBB->addLiveIn(Mov::ESP);
       ContMBB->addLiveIn(Mov::EBP);
 
-      // Emit the rewrite at the CALL position:
-      //   mov [esp - 4], offset <ContMBB symbol>
-      //   mov eax, offset __mov_esp_dec_scratch
-      //   mov [eax], esp
-      //   <4 byte stages SUB by 4>
-      //   mov esp, [eax]
-      //   JMP32d_CALL <callee>  (with regmask + implicit clobbers)
+      // opt 5 — fold the preceding ADJCALLSTACKDOWN's `sub esp, N`
+      // (post-PEI, that's the SUB32ri ESP, N right before the arg
+      // store chain) into THIS rewrite's byte chain. The combined
+      // chain decrements ESP by N+4 in one shot instead of doing
+      // ADJCALLSTACKDOWN's chain + 7d3's chain separately. Saves one
+      // full ~30-mov byte chain per call site whose ADJCALLSTACKDOWN
+      // is non-zero (i.e. every call with at least one arg).
+      //
+      // Scan backward from the CALL collecting arg stores
+      // (MOV32mr [esp+disp]) and the preceding SUB32ri ESP, N (if
+      // any). We also tolerate intervening non-ESP-touching reg-def
+      // MIs — Rust's codegen interleaves `mov eax, IMM` between an
+      // arg value's computation and its `mov [esp+i], eax` store,
+      // and clang sometimes does the same when an arg flows through
+      // a virtual register that ended up on a different physreg
+      // than the spill destination. Anything that *could* read or
+      // write ESP (or write to memory at [esp + …]) breaks the
+      // scan and aborts the fold.
+      SmallVector<MachineInstr *, 8> ArgStores;
+      MachineInstr *AdjSub = nullptr;
+      auto MayTouchEsp = [&](const MachineInstr &MI) -> bool {
+        // The reg-def-only patterns we're willing to skip: MOV32ri,
+        // MOV32rr, MOV32rm (load from a non-ESP base into a non-ESP
+        // dst). Anything that could touch ESP or write through ESP
+        // is fatal to the fold.
+        switch (MI.getOpcode()) {
+        case Mov::MOV32ri:
+        case Mov::MOV32rr:
+        case Mov::MOV32rm:
+          // Op 0 is the dst register (def).
+          if (MI.getNumOperands() < 1 || !MI.getOperand(0).isReg())
+            return true;
+          if (MI.getOperand(0).getReg() == Mov::ESP)
+            return true;
+          // MOV32rr's src reg must not be ESP either (technically the
+          // value of ESP being copied is fine, but folding past it
+          // would change which ESP value the chain captures).
+          if (MI.getOpcode() == Mov::MOV32rr &&
+              MI.getNumOperands() >= 2 && MI.getOperand(1).isReg() &&
+              MI.getOperand(1).getReg() == Mov::ESP)
+            return true;
+          // MOV32rm's base must not be ESP-via-frame for the same
+          // reason (its load value could be the to-be-folded ESP).
+          if (MI.getOpcode() == Mov::MOV32rm &&
+              MI.getNumOperands() >= 2 && MI.getOperand(1).isReg() &&
+              MI.getOperand(1).getReg() == Mov::ESP)
+            return true;
+          return false;
+        default:
+          return true;
+        }
+      };
+      {
+        auto Probe = MachineBasicBlock::iterator(CallMI);
+        while (Probe != MBB.begin()) {
+          --Probe;
+          unsigned POp = Probe->getOpcode();
+          if (POp == Mov::MOV32mr &&
+              Probe->getOperand(0).isReg() &&
+              Probe->getOperand(0).getReg() == Mov::ESP) {
+            ArgStores.push_back(&*Probe);
+            continue;
+          }
+          if (POp == Mov::SUB32ri &&
+              Probe->getOperand(0).isReg() &&
+              Probe->getOperand(0).getReg() == Mov::ESP &&
+              Probe->getOperand(2).isImm()) {
+            AdjSub = &*Probe;
+            break;
+          }
+          if (MayTouchEsp(*Probe))
+            break;
+          // Reg-def-only MI that doesn't touch ESP — keep scanning.
+        }
+      }
+
+      uint32_t ExtraK = 0;
+      // ChainPos = where the combined byte chain should be inserted.
+      // - With fold: just before the (now-erased) ADJCALLSTACKDOWN
+      //   SUB, so the chain runs BEFORE the arg stores.
+      // - Without fold: at the CALL itself.
+      MachineBasicBlock::iterator ChainPos =
+          MachineBasicBlock::iterator(CallMI);
+      if (AdjSub) {
+        ExtraK = static_cast<uint32_t>(AdjSub->getOperand(2).getImm());
+        // Arg stores will execute with ESP already decremented by N+4
+        // (instead of just N), so each [esp + disp] needs disp += 4.
+        for (auto *MI : ArgStores) {
+          MachineOperand &Disp = MI->getOperand(1);
+          Disp.setImm(Disp.getImm() + 4);
+        }
+        ChainPos = std::next(MachineBasicBlock::iterator(AdjSub));
+        AdjSub->eraseFromParent();
+      }
+      const uint32_t K = 4 + ExtraK;
+
+      // Emit the rewrite. ChainPos is where the byte chain goes (= SUB
+      // pos for fold, = CALL pos otherwise); RA-store + JMP32d_CALL
+      // are always at CALL pos so they land after any arg stores.
       auto Insert = MachineBasicBlock::iterator(CallMI);
 
-      constexpr int64_t SavedRADisp = -4;
       constexpr int64_t SrcDstBase = 0;
       constexpr int64_t IdxBase = 4;
-      constexpr uint32_t K = 4;
 
-      // Step 1 — store return-address label at [esp - 4].
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
-          .addReg(Mov::ESP).addImm(SavedRADisp).addMBB(ContMBB);
-
-      // Step 2 — point EAX at the global scratch and seed srcdst = ESP.
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32ri), Mov::EAX)
+      // Step 1 — point EAX at the global scratch and seed srcdst = ESP.
+      BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV32ri), Mov::EAX)
           .addExternalSymbol("__mov_esp_dec_scratch");
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+      BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV32mr))
           .addReg(Mov::EAX).addImm(SrcDstBase).addReg(Mov::ESP);
 
-      // Step 3 — 4 byte stages of SUB by K=4.
+      // Step 2 — 4 byte stages of SUB by K=4+ExtraK.
       for (unsigned i = 0; i < 4; ++i) {
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
+        BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV32mi))
             .addReg(Mov::EAX).addImm(IdxBase).addImm(0);
 
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+        BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV8rm), Mov::DL)
             .addReg(Mov::EAX).addImm(SrcDstBase + static_cast<int64_t>(i));
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+        BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV8mr))
             .addReg(Mov::EAX).addImm(IdxBase + 1).addReg(Mov::DL);
 
         // opt 4 — direct MOV8mi for K_byte (skip if 0, idx already
@@ -1306,32 +1392,43 @@ private:
         const uint8_t KByte =
             static_cast<uint8_t>((K >> (8u * i)) & 0xFFu);
         if (KByte != 0) {
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+          BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV8mi))
               .addReg(Mov::EAX).addImm(IdxBase).addImm(KByte);
         }
 
         if (i > 0) {
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV8mr))
               .addReg(Mov::EAX).addImm(IdxBase + 2).addReg(Mov::CL);
         }
 
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV32rm), Mov::ECX)
             .addReg(Mov::EAX).addImm(IdxBase);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+        BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
             .addExternalSymbol("__mov_sub8_diff_table").addReg(Mov::ECX);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+        BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV8mr))
             .addReg(Mov::EAX).addImm(SrcDstBase + static_cast<int64_t>(i))
             .addReg(Mov::DL);
         if (i < 3) {
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
+          BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
               .addExternalSymbol("__mov_sub8_borrow_table")
               .addReg(Mov::ECX);
         }
       }
 
-      // Step 4 — load decremented ESP back into ESP.
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ESP)
+      // Step 3 — load decremented ESP back into ESP. After this ESP
+      // points at the (eventual) RA slot, with the arg stores'
+      // disp-adjusted writes still ahead in MBB order between
+      // ChainPos and Insert.
+      BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV32rm), Mov::ESP)
           .addReg(Mov::EAX).addImm(SrcDstBase);
+
+      // Step 4 — store the return-address label at [esp + 0]. This
+      // runs AFTER the arg stores so it lands at the final ESP
+      // position. (In the non-fold K=4 case this is at the same
+      // physical address as the previous "mov [esp - 4], ret_label"
+      // pre-chain shape, since ESP has been decremented by 4.)
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
+          .addReg(Mov::ESP).addImm(0).addMBB(ContMBB);
 
       // Step 5 — emit JMP32d_CALL with the callee, carrying over the
       // regmask + implicit defs from the original CALL32d so late
