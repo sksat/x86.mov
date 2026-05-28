@@ -1,14 +1,12 @@
 # Opcodes this fixture acknowledges as not-yet-legalised. Each later
 # 7-stage should be able to delete entries from this file as it ships.
 #
-# push — prologue `push ebp`. Stage 7d's remaining gate. Legalisation
-#        replaces it with `mov [esp - 4], ebp; <esp -= 4 byte chain>`.
-# jmp  — dispatcher `jmp dword ptr [ebp + next_pc]` (added by stage
-#        7c1) and the trailing `jmp dword ptr [ecx]` of stage 7d1's
-#        epilogue rewrite. Both are mov-equivalent indirect jumps
-#        through memory; the objdump gate treats them as accepted
-#        non-mov mnemonics.
+# jmp — dispatcher `jmp dword ptr [ebp + next_pc]` (added by stage
+#       7c1) and the trailing `jmp dword ptr [ecx]` of stage 7d1's
+#       epilogue rewrite. Both are mov-equivalent indirect jumps
+#       through memory; the objdump gate treats them as accepted
+#       non-mov mnemonics.
 #
-# Already legalised: sub (stage 7d0), pop ebp + ret (stage 7d1).
-push
+# Already legalised: sub (stage 7d0), pop ebp + ret (stage 7d1),
+# push ebp (stage 7d2).
 jmp

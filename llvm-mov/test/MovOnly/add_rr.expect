@@ -1,4 +1,3 @@
 # Opcodes this fixture acknowledges as not-yet-legalised. Stage 7d
 # (CALL/RET + prologue/epilogue) should drive this file to empty.
-push
 jmp

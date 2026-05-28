@@ -2,5 +2,4 @@
 # (CALL/RET + prologue/epilogue) should drive this file to empty
 # except for `jmp` (the dispatcher's indirect jump stays — codex
 # noted it's the only non-mov a branchless dispatcher truly needs).
-push
 jmp

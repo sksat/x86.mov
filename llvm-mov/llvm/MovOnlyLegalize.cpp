@@ -109,6 +109,13 @@ public:
     // sequences (uses MOV32mr/MOV32rm/MOV8rm_idx etc., not ADD32ri).
     Changed |= legalizeRetEpilogueTail(MF, TII);
 
+    // Stage 7d2: prologue head (`push ebp`) → mov-only sequence that
+    // saves ebp_caller to [esp - 4] and decrements ESP by 4 via a
+    // hand-rolled byte SUB chain using ESP-relative scratch (we can't
+    // use the usual [ebp + …] scratch yet because the original `mov
+    // ebp, esp` hasn't run — EBP still holds the caller's value).
+    Changed |= legalizePushEbpPrologue(MF, TII);
+
     for (MachineBasicBlock &MBB : MF) {
       for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
         switch (MI.getOpcode()) {
@@ -1029,6 +1036,120 @@ private:
       }
     }
     return Changed;
+  }
+
+  // Stage 7d2 — `push ebp` at the head of the function prologue →
+  // mov-only sequence. Has to be hand-rolled (not via the EBP-scratch
+  // byte-chain helpers) because at this MI EBP still holds the
+  // *caller's* frame pointer: `[ebp + scratch_disp]` would resolve
+  // into the caller's frame, not our scratch. We use ESP-relative
+  // scratch slots below the current ESP instead.
+  //
+  // Memory layout during the rewrite (ESP == esp_caller throughout):
+  //   [esp - 4]            saved ebp_caller (the standard push slot)
+  //   [esp - 12]           srcdst (4-byte ESP value being decremented)
+  //   [esp - 16 .. -13]    idx (4-byte index pack for sub8 lookup)
+  //
+  // After the rewrite finishes, the original `mov ebp, esp` (already
+  // mov, untouched by this pass) sets EBP to esp_caller - 4 so all
+  // subsequent EBP-relative addressing — including stage 7d0's
+  // prologue SUB legalize for `sub esp, K` — sees our frame.
+  //
+  // The scratch writes briefly land below ESP. Same signal-handler
+  // hazard as 7d0/7d1: not a concern for the bootstrap pipeline,
+  // which installs none.
+  bool legalizePushEbpPrologue(MachineFunction &MF,
+                               const TargetInstrInfo &TII) const {
+    if (MF.empty())
+      return false;
+    MachineBasicBlock &EntryMBB = MF.front();
+    auto It = EntryMBB.begin();
+    while (It != EntryMBB.end() && It->isDebugInstr())
+      ++It;
+    if (It == EntryMBB.end())
+      return false;
+    if (It->getOpcode() != Mov::PUSH32r ||
+        It->getOperand(0).getReg() != Mov::EBP)
+      return false;
+
+    MachineInstr &PushMI = *It;
+    const DebugLoc DL = PushMI.getDebugLoc();
+    auto Insert = MachineBasicBlock::iterator(&PushMI);
+
+    constexpr int64_t SavedEbpDisp = -4;
+    constexpr int64_t SrcDstBase = -12;
+    constexpr int64_t IdxBase = -16;
+    constexpr uint32_t K = 4;
+
+    // Step 1 — save ebp_caller at the standard push slot.
+    BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::ESP).addImm(SavedEbpDisp).addReg(Mov::EBP);
+
+    // Step 2 — srcdst[0..3] = esp_caller (the value the byte chain
+    // decrements). Using `mov [esp - 12], esp` writes the current ESP
+    // bytes; the addressing base reads ESP before the store, so
+    // there's no read/write ordering subtlety.
+    BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::ESP).addImm(SrcDstBase).addReg(Mov::ESP);
+
+    // Step 3 — 4 byte stages of SUB by K=4.
+    //
+    // ECX/EDX/CL/DL are all caller-saved per cdecl, free to use here.
+    // CL carries the borrow_out across stages; the first stage sees
+    // borrow_in = 0 (zeroed via the idx MOV32mi 0 init), subsequent
+    // stages overwrite idx[2] with CL.
+    for (unsigned i = 0; i < 4; ++i) {
+      // mov [idx + 0..3], 0   ; zero the 4 idx bytes
+      BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV32mi))
+          .addReg(Mov::ESP).addImm(IdxBase).addImm(0);
+
+      // mov dl, [srcdst + i]
+      BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::ESP).addImm(SrcDstBase + static_cast<int64_t>(i));
+      // mov [idx + 1], dl     ; idx[1] = a_byte
+      BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::ESP).addImm(IdxBase + 1).addReg(Mov::DL);
+
+      // mov dl, K_byte_i      ; b_byte
+      const uint8_t KByte = static_cast<uint8_t>((K >> (8u * i)) & 0xFFu);
+      BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
+          .addImm(KByte);
+      // mov [idx + 0], dl     ; idx[0] = b_byte
+      BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::ESP).addImm(IdxBase).addReg(Mov::DL);
+
+      // if i > 0: mov [idx + 2], cl  ; idx[2] = borrow_in
+      if (i > 0) {
+        BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::ESP).addImm(IdxBase + 2).addReg(Mov::CL);
+      }
+
+      // mov ecx, [idx]
+      BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::ESP).addImm(IdxBase);
+      // mov dl, [__mov_sub8_diff_table + ecx]
+      BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_sub8_diff_table").addReg(Mov::ECX);
+      // mov [srcdst + i], dl
+      BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::ESP).addImm(SrcDstBase + static_cast<int64_t>(i))
+          .addReg(Mov::DL);
+      // if i < 3: mov cl, [__mov_sub8_borrow_table + ecx]  ; borrow_out
+      if (i < 3) {
+        BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
+            .addExternalSymbol("__mov_sub8_borrow_table").addReg(Mov::ECX);
+      }
+    }
+
+    // Step 4 — load the decremented ESP value back into ESP.
+    // After this, ESP = esp_caller - 4, matching the post-`push ebp`
+    // state. The subsequent `mov ebp, esp` (already mov, left in
+    // place) brings EBP up to esp_caller - 4 too.
+    BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ESP)
+        .addReg(Mov::ESP).addImm(SrcDstBase);
+
+    PushMI.eraseFromParent();
+    return true;
   }
 
   // Returns true when at least one BB was rewritten.
