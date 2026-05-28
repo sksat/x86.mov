@@ -189,15 +189,27 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
 
   // Bit-count intrinsics (count leading zeros, count trailing zeros,
   // popcount, parity). No `bsf` / `bsr` / `popcnt` in mov-only land.
-  // The qoi / png decoders touch these via integer hashing in their
-  // hot path; Expand makes the legalizer synthesise them as long
-  // shift + add / and chains, which all stay in the legal i32 op
-  // set + byte-chain. CTPOP / CTLZ / CTTZ + the *_ZERO_UNDEF
-  // variants are kept Expand for the same reason — the alternative
-  // would be a libcall to compiler-rt which our runtime can't link.
+  //
+  // Stage 7e — CTPOP / CTLZ / CTTZ each get a dedicated codegen-only
+  // pseudo + byte-table lowering in MovOnlyLegalize. The TableGen
+  // patterns on the pseudos match the SDAG nodes directly; this
+  // `Legal` action lets DAG-ISel dispatch to them instead of
+  // synthesising the SWAR Hamming-weight (CTPOP) / Hacker's Delight
+  // population-of-(x | x>>1 | … | x>>16) (CTLZ/CTTZ) expansions.
+  //
+  // The CTPOP Expand left a `sub eax, ecx` un-lowered and bloated
+  // `.text` by ~4×; the CTLZ/CTTZ Expand stayed mov-only but came
+  // in at ~600 movs per site (the shift-chain expansion uses 8+
+  // 32-bit ops, each of which becomes a ~50-mov byte chain). Byte-
+  // table lowering brings CTLZ/CTTZ down to ~150 movs per site.
+  //
+  // CTLZ_ZERO_UNDEF / CTTZ_ZERO_UNDEF target the same pseudos via
+  // `Pat<>` rules in MovInstrInfo.td — the byte-table lowering
+  // returns the defined value 32 for x=0, which is a valid result
+  // for both the regular and ZERO_UNDEF variants.
   for (auto Op : {ISD::CTPOP, ISD::CTLZ, ISD::CTLZ_ZERO_UNDEF,
                   ISD::CTTZ, ISD::CTTZ_ZERO_UNDEF})
-    setOperationAction(Op, MVT::i32, Expand);
+    setOperationAction(Op, MVT::i32, Legal);
 
   // Stage 6c — inline llvm.memset / llvm.memcpy / llvm.memmove
   // rather than emitting libcalls. Our standalone runtime doesn't

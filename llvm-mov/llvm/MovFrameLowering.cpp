@@ -176,6 +176,31 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
         // so the trigger doesn't depend on that incidental signal.
         NeedsByteOpScratch = true;
         break;
+      case Mov::CTPOP32r:
+        // Stage 7e — count-set-bits pseudo. Rewrite uses the base 4
+        // byte-op scratch slots: srcdst holds the spilled input (then
+        // accumulates the popcount via the add8 byte chain), idx is
+        // the table-lookup index slot, save_ecx/save_edx preserve the
+        // chain's clobber-set across the rewrite. No rhs_buf needed
+        // (CTPOP is unary) and no sign/var-shift slots.
+        NeedsByteOpScratch = true;
+        break;
+      case Mov::CTLZ32r:
+      case Mov::CTTZ32r:
+        // Stage 7e — count-leading / count-trailing-zeros pseudos.
+        // The branchless 4-byte scan needs the base 4 slots (srcdst
+        // mirrors the input read-only across iterations; idx pages
+        // the various table indices) plus rhs_buf to carry the
+        // 2-byte rewrite state across iterations: rhs_buf[0] = the
+        // `alive` mask (0xFF while still searching, 0x00 once a
+        // non-zero byte has been crossed) and rhs_buf[1] = the
+        // accumulated running total. CTLZ/CTTZ are unary, so the
+        // "regular" rhs_buf consumer (ADD/AND/OR/XOR32rr's RHS spill
+        // or CMP+Jcc's F-label) is unused here and rhs_buf[2..3] are
+        // free as a 1-byte choice/zm holding slot during the chain.
+        NeedsByteOpScratch = true;
+        NeedsRhsScratch = true;
+        break;
       default:
         break;
       }

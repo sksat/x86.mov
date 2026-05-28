@@ -330,6 +330,55 @@ def SHR32rCL : ShiftRCL<"shr">;
 def SAR32rCL : ShiftRCL<"sar">;
 
 //===----------------------------------------------------------------------===//
+// Stage 7e — bit-count pseudos (popcount / count-leading-zeros /
+// count-trailing-zeros). Codegen-only: never reach the AsmPrinter;
+// MovOnlyLegalize rewrites each one before emission into the
+// byte-table mov-only sequence. The print strings are comments so
+// that if a future bug leaks one through, `as` parses it rather than
+// choking on a fictional mnemonic.
+//
+// Untied operands — input and output are independent: the rewrite
+// reads the src value once (spilled to `srcdst`), runs the byte
+// chain in scratch, then loads the accumulated count into dst.
+// `mayLoad = 1` because the byte-table lookups read rodata; this
+// stops late MachineCSE / scheduler from reordering across table
+// re-emission boundaries.
+//
+//   CTPOP32r — `__mov_popcount8_table` × 4 + 3-step byte-add via
+//              the existing `__mov_add8_sum_table`.
+//
+//   CTLZ32r  — 4-byte branchless scan from MSB to LSB. Per byte:
+//              choice = `__mov_clz_or_8_table[b]` (0..8), then
+//              `contribution = alive AND choice`, accumulate via
+//              add8, update `alive = alive AND zero_mask[b]`.
+//              Result for x=0 is 32 (defined), so the same pseudo
+//              also matches `ctlz_zero_undef` (Pat below).
+//
+//   CTTZ32r  — symmetric to CTLZ32r, scanning LSB→MSB with
+//              `__mov_ctz_or_8_table`.
+let isCodeGenOnly = 1, mayLoad = 1 in {
+def CTPOP32r : MovInst<(outs GPR32:$dst), (ins GPR32:$src),
+                       "# ctpop32 $dst, $src",
+                       [(set GPR32:$dst, (ctpop GPR32:$src))]>;
+
+def CTLZ32r  : MovInst<(outs GPR32:$dst), (ins GPR32:$src),
+                       "# ctlz32 $dst, $src",
+                       [(set GPR32:$dst, (ctlz  GPR32:$src))]>;
+
+def CTTZ32r  : MovInst<(outs GPR32:$dst), (ins GPR32:$src),
+                       "# cttz32 $dst, $src",
+                       [(set GPR32:$dst, (cttz  GPR32:$src))]>;
+}
+
+// `ctlz_zero_undef` / `cttz_zero_undef` are separate SDAG nodes
+// (Rust's `u32::leading_zeros` / `trailing_zeros` emit them at
+// opt-level=0, and the standard `ctlz` variants live on the same
+// pseudo because our byte-table lowering already returns the
+// defined value 32 for x=0). Just retarget the SDNodes.
+def : Pat<(ctlz_zero_undef GPR32:$src), (CTLZ32r GPR32:$src)>;
+def : Pat<(cttz_zero_undef GPR32:$src), (CTTZ32r GPR32:$src)>;
+
+//===----------------------------------------------------------------------===//
 // PUSH / POP — used by emitPrologue/emitEpilogue (stage 4a) to save and
 // restore EBP for the frame pointer. No DAG patterns: these are
 // target-only, emitted directly via BuildMI from FrameLowering. The

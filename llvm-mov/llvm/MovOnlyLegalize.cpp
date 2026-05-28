@@ -237,6 +237,15 @@ public:
         case Mov::SAR32rCL:
           Changed |= legalizeShift32rCL(MI, MBB, TII, ShiftDir::SAR);
           break;
+        case Mov::CTPOP32r:
+          Changed |= legalizeCTPOP32r(MI, MBB, TII);
+          break;
+        case Mov::CTLZ32r:
+          Changed |= legalizeBitScan32r(MI, MBB, TII, /*IsCTTZ=*/false);
+          break;
+        case Mov::CTTZ32r:
+          Changed |= legalizeBitScan32r(MI, MBB, TII, /*IsCTTZ=*/true);
+          break;
         // SUB rr/ri, CMP+Jcc, CALL32d + CALLSEQ, RET, and the
         // prologue/epilogue PUSH/POP/SUB/MOV sequence light up
         // across stages 7c → 7d.
@@ -2298,6 +2307,312 @@ private:
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
         .addReg(Mov::EBP)
         .addImm(Addr->SrcDstDisp);
+
+    MI.eraseFromParent();
+    return true;
+  }
+
+  // Stage 7e — lower a single `CTPOP32r DST, SRC` into a mov-only
+  // sequence using the popcount8 byte table + the existing add8
+  // accumulator. Two phases:
+  //
+  //   Phase 1 (in-place per-byte popcount8 lookup) — for each byte
+  //     i ∈ 0..3 of the spilled source, replace srcdst[i] with
+  //     `__mov_popcount8_table[srcdst[i]]` (a value in 0..8).
+  //
+  //   Phase 2 (byte-add accumulator) — collapse srcdst[0..3] into
+  //     srcdst[0] via 3 single-stage byte adds against
+  //     `__mov_add8_sum_table`. Each intermediate is ≤ 32 (= 4×8), so
+  //     it fits in one byte and the carry-out path is never read.
+  //     idx[2] is left at 0 by emitIdxZero (= zero carry-in), so we
+  //     just reuse the existing add8 sum table without touching the
+  //     carry chain.
+  //
+  // After Phase 2 the popcount value is in srcdst[0] as a byte; we
+  // zero srcdst[1..3] with three MOV8mi so the final
+  // `mov DST32, [srcdst]` loads it as a plain u32.
+  //
+  // CTPOP is untied (dst ≠ src is allowed) — the rewrite spills src
+  // before any clobber and loads dst at the very end, so dst ∈
+  // {src, ECX, EDX} all work without special-casing.
+  bool legalizeCTPOP32r(MachineInstr &MI, MachineBasicBlock &MBB,
+                        const TargetInstrInfo &TII) const {
+    const MachineFunction &MF = *MBB.getParent();
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr)
+      return false;
+
+    assert(MI.getOperand(0).isReg() && "CTPOP32r op 0 must be reg");
+    assert(MI.getOperand(1).isReg() && "CTPOP32r op 1 must be reg");
+    const Register Dst = MI.getOperand(0).getReg();
+    const Register Src = MI.getOperand(1).getReg();
+
+    auto Insert = MachineBasicBlock::iterator(&MI);
+    const DebugLoc DL = MI.getDebugLoc();
+
+    // PROLOGUE — save ECX/EDX (clobbered by the chain's table
+    // lookups) and spill the source to srcdst. Spilling Src last
+    // captures its actual value (the ECX/EDX saves don't touch it).
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Src);
+
+    // PHASE 1 — in-place per-byte popcount8 lookup. Each stage is the
+    // standard idx-pack + table-load + store-back: idx zeroed, idx[0]
+    // = srcdst[i] (idx[1..3] stay 0), load `__mov_popcount8_table[ecx]`
+    // into DL, write DL into srcdst[i]. No carry chain — popcount is
+    // a pure per-byte function.
+    for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx) {
+      emitIdxZero(MBB, Insert, DL, TII, *Addr);
+      // mov dl, byte ptr [srcdst + i]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP)
+          .addImm(Addr->SrcDstDisp + static_cast<int64_t>(ByteIdx));
+      // mov byte ptr [idx + 0], dl
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+      // mov ecx, dword ptr [idx]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+      // mov dl, byte ptr [__mov_popcount8_table + ecx]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_popcount8_table").addReg(Mov::ECX);
+      // mov byte ptr [srcdst + i], dl
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP)
+          .addImm(Addr->SrcDstDisp + static_cast<int64_t>(ByteIdx))
+          .addReg(Mov::DL);
+    }
+
+    // PHASE 2 — accumulate srcdst[0] += srcdst[i] for i = 1..3 via
+    // the add8 sum table. cin is 0 throughout (emitIdxZero takes care
+    // of idx[2] = 0), and intermediate sums stay ≤ 32 so we never
+    // need the carry-out byte. Each step is one idx-pack + lookup +
+    // store-back into srcdst[0].
+    for (unsigned i = 1; i < 4; ++i) {
+      emitIdxZero(MBB, Insert, DL, TII, *Addr);
+      // idx[1] = srcdst[0]   ; running accumulator
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+      // idx[0] = srcdst[i]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP)
+          .addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+      // mov ecx, dword ptr [idx]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+      // mov dl, byte ptr [__mov_add8_sum_table + ecx]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_add8_sum_table").addReg(Mov::ECX);
+      // mov byte ptr [srcdst], dl
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Mov::DL);
+    }
+
+    // Zero srcdst[1..3] so the trailing MOV32rm picks up only the
+    // accumulated popcount byte (max value 32 ⊆ 1 byte).
+    for (unsigned i = 1; i < 4; ++i) {
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+          .addReg(Mov::EBP)
+          .addImm(Addr->SrcDstDisp + static_cast<int64_t>(i))
+          .addImm(0);
+    }
+
+    // EPILOGUE — restore ECX/EDX, then load result into Dst. Same
+    // ordering rationale as legalizeADD32ri: if Dst ∈ {ECX, EDX}
+    // the restore writes the saved value and the result-load
+    // immediately overwrites it with the popcount.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
+
+    MI.eraseFromParent();
+    return true;
+  }
+
+  // Stage 7e — lower `CTLZ32r DST, SRC` (IsCTTZ=false) or
+  // `CTTZ32r DST, SRC` (IsCTTZ=true) into a mov-only branchless
+  // 4-byte scan against `__mov_{clz,ctz}_or_8_table` +
+  // `__mov_zero_mask_table` + the existing AND/ADD byte tables.
+  //
+  // State (held in rhs_buf across iterations):
+  //   rhs_buf[0] = alive       — 0xFF while still searching, 0x00
+  //                              once a non-zero source byte has
+  //                              been crossed
+  //   rhs_buf[1] = running     — accumulated count (≤ 32, fits in
+  //                              one byte)
+  //   rhs_buf[2] = temp        — 1-byte scratch (choice / zm) held
+  //                              between two consecutive lookups
+  //                              that both need DL as the destination
+  //
+  // Per byte (scanned in CTLZ direction = MSB→LSB, CTTZ = LSB→MSB):
+  //   1. choice = (b == 0) ? 8 : (CLZ8/CTZ8 of b)   — single
+  //      `__mov_{clz,ctz}_or_8_table` lookup; save to temp.
+  //   2. contribution = AND(alive, choice)          — via
+  //      `__mov_and8_table`.
+  //   3. running += contribution                    — via
+  //      `__mov_add8_sum_table` (single byte, no carry; cin=0
+  //      from emitIdxZero's idx[2]=0).
+  //   4. zm = (b == 0) ? 0xFF : 0x00                — `__mov_zero_mask_table`.
+  //   5. alive = AND(alive, zm)                     — via and8.
+  //
+  // For x == 0 every iteration adds 8 with alive=0xFF throughout,
+  // total = 32 — the defined result, valid for both `(ctlz x, 0)`
+  // and `ctlz_zero_undef` (and symmetrically for CTTZ).
+  //
+  // For x != 0 with leading nonzero at byte j (CTLZ) / trailing
+  // nonzero at byte j (CTTZ): iterations on zero bytes before j add
+  // 8 each, iteration j adds CLZ8/CTZ8[b_j], iterations after j
+  // contribute 0 because alive has flipped. Total =
+  // ((bytes_scanned_before_j) * 8) + CLZ8/CTZ8[b_j], which is the
+  // correct 32-bit count.
+  bool legalizeBitScan32r(MachineInstr &MI, MachineBasicBlock &MBB,
+                          const TargetInstrInfo &TII, bool IsCTTZ) const {
+    const MachineFunction &MF = *MBB.getParent();
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr || !Addr->RhsDisp)
+      return false;
+
+    assert(MI.getOperand(0).isReg() && "BitScan32r op 0 must be reg");
+    assert(MI.getOperand(1).isReg() && "BitScan32r op 1 must be reg");
+    const Register Dst = MI.getOperand(0).getReg();
+    const Register Src = MI.getOperand(1).getReg();
+
+    auto Insert = MachineBasicBlock::iterator(&MI);
+    const DebugLoc DL = MI.getDebugLoc();
+    const int64_t RhsDisp = *Addr->RhsDisp;
+    const int64_t AliveDisp = RhsDisp + 0;
+    const int64_t RunningDisp = RhsDisp + 1;
+    const int64_t TempDisp = RhsDisp + 2;
+
+    const char *PerByteTable =
+        IsCTTZ ? "__mov_ctz_or_8_table" : "__mov_clz_or_8_table";
+
+    // Lambda: zero idx and load `byte ptr [base + disp]` into idx[0].
+    // Caller wants ECX = byte_value after this returns.
+    auto loadByteToIdx0 = [&](int64_t ByteDisp) {
+      emitIdxZero(MBB, Insert, DL, TII, *Addr);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(ByteDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+    };
+
+    // Lambda: pack idx = (0, 0, a_byte, b_byte) where both bytes
+    // come from memory (LhsDisp at idx[1], RhsDisp at idx[0]).
+    // Load ECX = idx afterwards.
+    auto packTwoBytesAndLoad = [&](int64_t LhsDisp, int64_t Rhs2Disp) {
+      emitIdxZero(MBB, Insert, DL, TII, *Addr);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(LhsDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(Rhs2Disp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+    };
+
+    // PROLOGUE — save ECX/EDX, spill Src to srcdst.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Src);
+
+    // Initialise rhs_buf[0] = alive = 0xFF, rhs_buf[1] = running = 0.
+    // rhs_buf[2] is dirty; each iteration writes it before reading.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+        .addReg(Mov::EBP).addImm(AliveDisp).addImm(0xFF);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+        .addReg(Mov::EBP).addImm(RunningDisp).addImm(0);
+
+    // Iterate over 4 bytes. CTLZ scans MSB → LSB (3,2,1,0); CTTZ
+    // scans LSB → MSB (0,1,2,3). The state update is identical;
+    // only the source byte position changes per iteration.
+    const std::array<unsigned, 4> CTLZOrder = {3, 2, 1, 0};
+    const std::array<unsigned, 4> CTTZOrder = {0, 1, 2, 3};
+    const auto &Order = IsCTTZ ? CTTZOrder : CTLZOrder;
+
+    for (unsigned ByteIdx : Order) {
+      const int64_t SrcByteDisp =
+          Addr->SrcDstDisp + static_cast<int64_t>(ByteIdx);
+
+      // Step 1: DL = `__mov_{clz,ctz}_or_8_table[byte]`. Save to temp.
+      loadByteToIdx0(SrcByteDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol(PerByteTable).addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(TempDisp).addReg(Mov::DL);
+
+      // Step 2: DL = AND(alive, choice).  idx[1] = alive, idx[0] = temp.
+      packTwoBytesAndLoad(AliveDisp, TempDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+
+      // Step 3: running += contribution.  Save contribution to temp,
+      // then pack (running, contribution) and look up add8_sum.
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(TempDisp).addReg(Mov::DL);
+      packTwoBytesAndLoad(RunningDisp, TempDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_add8_sum_table").addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(RunningDisp).addReg(Mov::DL);
+
+      // Step 4: DL = `__mov_zero_mask_table[byte]`. Save to temp.
+      loadByteToIdx0(SrcByteDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_zero_mask_table").addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(TempDisp).addReg(Mov::DL);
+
+      // Step 5: alive = AND(alive, zm) — once a non-zero byte is
+      // crossed, alive flips to 0x00 and stays there.
+      packTwoBytesAndLoad(AliveDisp, TempDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(AliveDisp).addReg(Mov::DL);
+    }
+
+    // Move the running total (1 byte, max value 32) into srcdst[0]
+    // and zero srcdst[1..3] so the trailing `mov dst, [srcdst]`
+    // picks it up as a clean u32.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+        .addReg(Mov::EBP).addImm(RunningDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Mov::DL);
+    for (unsigned i = 1; i < 4; ++i) {
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+          .addReg(Mov::EBP)
+          .addImm(Addr->SrcDstDisp + static_cast<int64_t>(i))
+          .addImm(0);
+    }
+
+    // EPILOGUE — restore ECX/EDX, then load result into Dst (same
+    // ordering rationale as CTPOP32r / ADD32ri).
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
 
     MI.eraseFromParent();
     return true;
