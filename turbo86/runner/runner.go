@@ -884,13 +884,16 @@ func (r *Runner) handleTrapModeSyscall(regs *regs32) (bool, uint32, error) {
 			r.handlers[signum] = handler
 		}
 
-		// If oldact is non-NULL, fill the userspace struct sigaction
-		// (140 bytes on i386 glibc) with the previous disposition.
-		// We only track sa_handler; the rest of the struct is
-		// zero-filled — sufficient for query callers that only check
-		// the handler against SIG_DFL / SIG_IGN / their own address.
+		// If oldact is non-NULL, fill the *kernel* struct k_sigaction
+		// (20 bytes on i386: sa_handler/sa_flags/sa_restorer/sa_mask[2])
+		// — matching the byte count the kernel writes in host mode.
+		// Writing the 140-byte userspace layout here would clobber
+		// adjacent guest memory and diverge from host-mode behavior.
+		// We only track sa_handler; sa_flags/sa_restorer/sa_mask stay
+		// zero. libc-using guests handle the 20↔140 layout translation
+		// on their side, exactly as they do for host-mode passthrough.
 		if regs.Edx != 0 {
-			var out [140]byte
+			var out [20]byte
 			if prevSet {
 				out[0] = byte(prevHandler)
 				out[1] = byte(prevHandler >> 8)
