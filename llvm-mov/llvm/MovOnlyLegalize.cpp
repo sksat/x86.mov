@@ -116,6 +116,14 @@ public:
     // ebp, esp` hasn't run — EBP still holds the caller's value).
     Changed |= legalizePushEbpPrologue(MF, TII);
 
+    // Stage 7d3: each `CALL32d` rewrites into a mov-only sequence
+    // that stores the return-address label at [esp - 4], decrements
+    // ESP by 4, and falls into a direct `JMP32d_CALL <callee>`. The
+    // MBB is split right after the CALL so the continuation has its
+    // own symbol — that label is the return target the callee will
+    // jmp back to via the 7d1 `__mov_return_addr_slot` machinery.
+    Changed |= legalizeCallSites(MF, TII);
+
     for (MachineBasicBlock &MBB : MF) {
       for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
         switch (MI.getOpcode()) {
@@ -1048,16 +1056,16 @@ private:
   // but writing 12-16 bytes below ESP can fault on a stack guard
   // page when the caller enters with ESP close to a page boundary
   // (codex P1 review on 7d2). Instead we use the `.bss` slot
-  // `__mov_prologue_scratch` (16 bytes, always mapped) as the
+  // `__mov_esp_dec_scratch` (16 bytes, always mapped) as the
   // scratch base, loaded into EAX:
   //
-  //   __mov_prologue_scratch + 0   srcdst (ESP value being decremented)
-  //   __mov_prologue_scratch + 4   idx (4-byte sub8-table index pack)
+  //   __mov_esp_dec_scratch + 0   srcdst (ESP value being decremented)
+  //   __mov_esp_dec_scratch + 4   idx (4-byte sub8-table index pack)
   //
   // Sequence:
   //   mov  [esp - 4], ebp                       ; save ebp_caller at
   //                                              ; standard push slot
-  //   mov  eax, offset __mov_prologue_scratch    ; eax = &global scratch
+  //   mov  eax, offset __mov_esp_dec_scratch    ; eax = &global scratch
   //   mov  [eax + 0], esp                        ; srcdst = esp_caller
   //   <4 byte stages SUB by 4 via [eax + 0..7], ECX/EDX/CL/DL transient>
   //   mov  esp, [eax + 0]                        ; esp = esp_caller - 4
@@ -1100,7 +1108,7 @@ private:
 
     // Step 2 — point EAX at the global scratch and seed srcdst = ESP.
     BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV32ri), Mov::EAX)
-        .addExternalSymbol("__mov_prologue_scratch");
+        .addExternalSymbol("__mov_esp_dec_scratch");
     BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EAX).addImm(SrcDstBase).addReg(Mov::ESP);
 
@@ -1160,6 +1168,163 @@ private:
 
     PushMI.eraseFromParent();
     return true;
+  }
+
+  // Stage 7d3 — each `CALL32d` is rewritten into a mov-only sequence
+  // that stores the return-address label at [esp - 4], decrements
+  // ESP by 4 via __mov_esp_dec_scratch byte chain, and falls into a
+  // direct `JMP32d_CALL <callee>` terminator. The MBB is split
+  // immediately after the CALL so the continuation gets its own
+  // symbol — that label is the return target the callee's 7d1
+  // `pop ebp + ret` will jump back to via __mov_return_addr_slot.
+  //
+  // CFG: the original MBB ending in CALL now ends in JMP32d_CALL with
+  // its continuation MBB as the sole successor. JMP32d_CALL is
+  // marked `isBarrier=1` (no fallthrough) — the successor edge is
+  // purely a "call continuation" annotation, mirroring how 7c1's
+  // dispatcher gets indirect successors. The callee's regmask +
+  // implicit caller-clobber operands from CALL32d are transferred
+  // to the new JMP32d_CALL so late liveness analysis still sees
+  // the call's clobber semantics (critical for `call_live_across`
+  // shapes).
+  bool legalizeCallSites(MachineFunction &MF,
+                         const TargetInstrInfo &TII) const {
+    bool Changed = false;
+    for (MachineFunction::iterator BBIt = MF.begin(), BBEnd = MF.end();
+         BBIt != BBEnd; ) {
+      MachineBasicBlock &MBB = *BBIt++;
+      // Walk the MBB looking for CALL32d. Each rewrite splits the
+      // MBB and inserts a continuation, so we restart the scan in
+      // the continuation block on the next outer iteration.
+      MachineInstr *CallMI = nullptr;
+      for (MachineInstr &MI : MBB) {
+        if (MI.getOpcode() == Mov::CALL32d) {
+          CallMI = &MI;
+          break;
+        }
+      }
+      if (!CallMI)
+        continue;
+
+      MachineFunction *MFp = MBB.getParent();
+      const DebugLoc DL = CallMI->getDebugLoc();
+      MachineOperand CalleeOp = CallMI->getOperand(0);
+
+      // Split: continuation MBB owns everything after the CALL
+      // (exclusive). The split point is the iterator just past the
+      // CALL MI. splitAt transfers MIs and updates successor edges.
+      MachineBasicBlock *ContMBB = MFp->CreateMachineBasicBlock(
+          MBB.getBasicBlock());
+      MFp->insert(std::next(MachineFunction::iterator(&MBB)), ContMBB);
+      // Force the AsmPrinter to emit ContMBB's label even though it
+      // looks like a fallthrough — the MOV32mi above stores
+      // `offset <ContMBB symbol>` as the return address, and the
+      // callee's 7d1 epilogue jumps to that symbol via
+      // `__mov_return_addr_slot`, so the symbol must exist in
+      // the linked ELF.
+      ContMBB->setLabelMustBeEmitted();
+
+      // Move everything past the CALL into the continuation MBB.
+      auto SplitIt = std::next(MachineBasicBlock::iterator(CallMI));
+      ContMBB->splice(ContMBB->end(), &MBB, SplitIt, MBB.end());
+
+      // Transfer the original MBB's existing successors to ContMBB
+      // (the CALL itself was not a terminator in the LLVM CFG, so
+      // the original MBB's successors flow from whatever came after
+      // CALL — which is now in ContMBB).
+      ContMBB->transferSuccessors(&MBB);
+
+      // The pre-CALL MBB now ends in our JMP32d_CALL with ContMBB
+      // as the sole successor (the call continuation edge).
+      MBB.addSuccessor(ContMBB);
+
+      // Emit the rewrite at the CALL position:
+      //   mov [esp - 4], offset <ContMBB symbol>
+      //   mov eax, offset __mov_esp_dec_scratch
+      //   mov [eax], esp
+      //   <4 byte stages SUB by 4>
+      //   mov esp, [eax]
+      //   JMP32d_CALL <callee>  (with regmask + implicit clobbers)
+      auto Insert = MachineBasicBlock::iterator(CallMI);
+
+      constexpr int64_t SavedRADisp = -4;
+      constexpr int64_t SrcDstBase = 0;
+      constexpr int64_t IdxBase = 4;
+      constexpr uint32_t K = 4;
+
+      // Step 1 — store return-address label at [esp - 4].
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
+          .addReg(Mov::ESP).addImm(SavedRADisp).addMBB(ContMBB);
+
+      // Step 2 — point EAX at the global scratch and seed srcdst = ESP.
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32ri), Mov::EAX)
+          .addExternalSymbol("__mov_esp_dec_scratch");
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+          .addReg(Mov::EAX).addImm(SrcDstBase).addReg(Mov::ESP);
+
+      // Step 3 — 4 byte stages of SUB by K=4.
+      for (unsigned i = 0; i < 4; ++i) {
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
+            .addReg(Mov::EAX).addImm(IdxBase).addImm(0);
+
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+            .addReg(Mov::EAX).addImm(SrcDstBase + static_cast<int64_t>(i));
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EAX).addImm(IdxBase + 1).addReg(Mov::DL);
+
+        const uint8_t KByte =
+            static_cast<uint8_t>((K >> (8u * i)) & 0xFFu);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
+            .addImm(KByte);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EAX).addImm(IdxBase).addReg(Mov::DL);
+
+        if (i > 0) {
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EAX).addImm(IdxBase + 2).addReg(Mov::CL);
+        }
+
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+            .addReg(Mov::EAX).addImm(IdxBase);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+            .addExternalSymbol("__mov_sub8_diff_table").addReg(Mov::ECX);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EAX).addImm(SrcDstBase + static_cast<int64_t>(i))
+            .addReg(Mov::DL);
+        if (i < 3) {
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
+              .addExternalSymbol("__mov_sub8_borrow_table")
+              .addReg(Mov::ECX);
+        }
+      }
+
+      // Step 4 — load decremented ESP back into ESP.
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ESP)
+          .addReg(Mov::EAX).addImm(SrcDstBase);
+
+      // Step 5 — emit JMP32d_CALL with the callee, carrying over the
+      // regmask + implicit defs from the original CALL32d so late
+      // liveness sees the same caller-saved clobbers.
+      auto NewJmp = BuildMI(MBB, Insert, DL, TII.get(Mov::JMP32d_CALL));
+      if (CalleeOp.isGlobal())
+        NewJmp.addGlobalAddress(CalleeOp.getGlobal(), CalleeOp.getOffset(),
+                                CalleeOp.getTargetFlags());
+      else if (CalleeOp.isSymbol())
+        NewJmp.addExternalSymbol(CalleeOp.getSymbolName(),
+                                 CalleeOp.getTargetFlags());
+      else if (CalleeOp.isMBB())
+        NewJmp.addMBB(CalleeOp.getMBB(), CalleeOp.getTargetFlags());
+      else
+        report_fatal_error("CALL32d: unexpected callee operand kind");
+      // Transfer remaining operands (regmask + implicit defs/uses).
+      for (unsigned i = 1, e = CallMI->getNumOperands(); i < e; ++i)
+        NewJmp.add(CallMI->getOperand(i));
+
+      // Erase the original CALL32d.
+      CallMI->eraseFromParent();
+      Changed = true;
+    }
+    return Changed;
   }
 
   // Returns true when at least one BB was rewritten.

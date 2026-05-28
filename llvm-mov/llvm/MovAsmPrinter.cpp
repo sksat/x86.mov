@@ -57,7 +57,7 @@ public:
     emitShift8Tables();
     emitSub8Tables();
     emitReturnAddrSlot();
-    emitPrologueScratch();
+    emitEspDecScratch();
   }
 
 private:
@@ -69,7 +69,7 @@ private:
   void emitUnaryByteTable(StringRef Name, uint8_t (*Op)(uint8_t));
   void emitSub8Tables();
   void emitReturnAddrSlot();
-  void emitPrologueScratch();
+  void emitEspDecScratch();
 };
 } // namespace
 
@@ -373,7 +373,7 @@ void MovAsmPrinter::emitSub8Tables() {
   emitTable("__mov_sub8_borrow_table", Borrow);
 }
 
-// Stage 7d2 — `__mov_prologue_scratch`: a 16-byte cell in .bss used
+// Stage 7d2 — `__mov_esp_dec_scratch`: a 16-byte cell in .bss used
 // by the prologue-head rewrite (PUSH32r EBP → mov-only sequence).
 // At the entry MI EBP still holds the caller's value, so the usual
 // [ebp + scratch_disp] addressing isn't available. The earlier draft
@@ -389,12 +389,12 @@ void MovAsmPrinter::emitSub8Tables() {
 //
 // Lives in its own section so --gc-sections drops it from TUs that
 // don't reference the symbol.
-void MovAsmPrinter::emitPrologueScratch() {
+void MovAsmPrinter::emitEspDecScratch() {
   MCSection *Sec = OutContext.getELFSection(
-      ".bss.__mov_prologue_scratch",
+      ".bss.__mov_esp_dec_scratch",
       ELF::SHT_NOBITS, ELF::SHF_ALLOC | ELF::SHF_WRITE);
   OutStreamer->switchSection(Sec);
-  MCSymbol *Sym = OutContext.getOrCreateSymbol("__mov_prologue_scratch");
+  MCSymbol *Sym = OutContext.getOrCreateSymbol("__mov_esp_dec_scratch");
   OutStreamer->emitLabel(Sym);
   OutStreamer->emitZeros(/*NumBytes=*/16);
 }

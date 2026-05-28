@@ -392,6 +392,22 @@ let isBranch = 1, isTerminator = 1, isBarrier = 1,
 def JMP32m : MovInst<(outs), (ins MovMemOperand:$tgt),
                      "jmp\tdword ptr $tgt", []>;
 
+// Stage 7d3 — direct jump to an external symbol. Used by the
+// `CALL32d` → mov-only-call rewrite as the trailing `jmp <callee>`
+// after the rewrite has pushed the return label and decremented ESP
+// itself. Conceptually equivalent to the existing `JMP` but its
+// operand is a `calltarget` symbol rather than an MBB — i.e. the
+// "call continuation" form. Marked `isReturn=1` so MachineVerifier
+// accepts the MBB ending in this MI even when its only successor is
+// the call-continuation MBB (added by the rewrite); the implicit
+// regmask + caller-clobber operands from the original CALL32d are
+// preserved on this instruction so late liveness analysis still
+// sees the call's clobber semantics.
+let isBranch = 1, isTerminator = 1, isBarrier = 1,
+    isCodeGenOnly = 1, hasSideEffects = 1 in
+def JMP32d_CALL : MovInst<(outs), (ins calltarget:$dst),
+                          "jmp\t$dst", []>;
+
 //===----------------------------------------------------------------------===//
 // RET
 //===----------------------------------------------------------------------===//
