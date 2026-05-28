@@ -58,6 +58,7 @@ public:
     emitSub8Tables();
     emitReturnAddrSlot();
     emitEspDecScratch();
+    emitIndirectCalleeSlot();
   }
 
 private:
@@ -70,6 +71,7 @@ private:
   void emitSub8Tables();
   void emitReturnAddrSlot();
   void emitEspDecScratch();
+  void emitIndirectCalleeSlot();
 };
 } // namespace
 
@@ -426,6 +428,29 @@ void MovAsmPrinter::emitReturnAddrSlot() {
       ELF::SHT_NOBITS, ELF::SHF_ALLOC | ELF::SHF_WRITE);
   OutStreamer->switchSection(Sec);
   MCSymbol *Sym = OutContext.getOrCreateSymbol("__mov_return_addr_slot");
+  OutStreamer->emitLabel(Sym);
+  OutStreamer->emitZeros(/*NumBytes=*/4);
+}
+
+// CALL32r legalize — `__mov_indirect_callee_slot`: a 4-byte cell in
+// .bss used to stash the function-pointer value across the 7d3
+// byte-chain (which clobbers EAX/ECX/EDX). The save happens just
+// before the chain; the reload happens immediately before the
+// trailing JMP32r_CALL terminator. Single-shot per call site, so
+// one global slot is sufficient — recursion is safe because the
+// save→jmp sequence runs atomically before any nested call's
+// return reaches this point (same reasoning as
+// __mov_return_addr_slot).
+//
+// Lives in its own section so --gc-sections drops it from TUs that
+// don't reference the symbol (i.e. modules with no indirect calls).
+void MovAsmPrinter::emitIndirectCalleeSlot() {
+  MCSection *Sec = OutContext.getELFSection(
+      ".bss.__mov_indirect_callee_slot",
+      ELF::SHT_NOBITS, ELF::SHF_ALLOC | ELF::SHF_WRITE);
+  OutStreamer->switchSection(Sec);
+  MCSymbol *Sym =
+      OutContext.getOrCreateSymbol("__mov_indirect_callee_slot");
   OutStreamer->emitLabel(Sym);
   OutStreamer->emitZeros(/*NumBytes=*/4);
 }

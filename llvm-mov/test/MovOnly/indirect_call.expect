@@ -1,0 +1,4 @@
+# 7d3 still leaves a direct `jmp <callee>` for direct calls and an
+# indirect `jmp *%reg` for indirect calls — both render as `jmp`
+# in objdump and are mov-equivalent (no flags, no fixed target).
+jmp

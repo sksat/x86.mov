@@ -788,9 +788,12 @@ SDValue MovTargetLowering::LowerCall(CallLoweringInfo &CLI,
   if (!MemOpChains.empty())
     Chain = DAG.getNode(ISD::TokenFactor, DL, MVT::Other, MemOpChains);
 
-  // Translate the callee operand to a usable form. We only handle
-  // GlobalAddress (direct symbol) and ExternalSymbol — function pointers
-  // (indirect via register) wait for stage 6c.
+  // Translate the callee operand to a usable form.
+  //   - GlobalAddress / ExternalSymbol → Target* variant → CALL32d
+  //     (DAGToDAG picks the opcode based on the resulting SDNode kind).
+  //   - Anything else (load result, formal arg of function-pointer type,
+  //     computed pointer, …) is left as a plain register-shaped SDValue
+  //     and selected as CALL32r in DAGToDAG.
   if (auto *G = dyn_cast<GlobalAddressSDNode>(Callee)) {
     Callee = DAG.getTargetGlobalAddress(G->getGlobal(), DL,
                                         getPointerTy(DAG.getDataLayout()),
@@ -798,9 +801,6 @@ SDValue MovTargetLowering::LowerCall(CallLoweringInfo &CLI,
   } else if (auto *E = dyn_cast<ExternalSymbolSDNode>(Callee)) {
     Callee = DAG.getTargetExternalSymbol(
         E->getSymbol(), getPointerTy(DAG.getDataLayout()));
-  } else {
-    report_fatal_error(
-        "Mov: indirect calls not yet supported (stage 6c will add CALL32r)");
   }
 
   // Build the MovISD::CALL: chain, callee, regmask, [glue].

@@ -140,18 +140,31 @@ void MovDAGToDAGISel::Select(SDNode *Node) {
     return;
   }
 
-  // MovISD::CALL: emit
-  //     CALL32d <callee_symbol>     ; Uses=[ESP], Defs=[EAX/ECX/EDX/EFLAGS]
+  // MovISD::CALL: emit either
+  //     CALL32d <callee_symbol>     ; direct
+  //     CALL32r <callee_register>   ; indirect (function pointer)
+  // with the same Uses=[ESP] / Defs=[EAX/ECX/EDX/EFLAGS] envelope.
   //
   // The original SDNode operands are (Chain, Callee, RegMask[, ...InGlue]).
   // We rebuild the machine-node operand list as
   //     (Callee, RegMask, Chain[, ...InGlue])
-  // — Callee first because it's our only explicit input on CALL32d, then
-  // the regmask + the chain/glue tail as implicit attachments.
+  // — Callee first because it's our only explicit input on CALL32{d,r},
+  // then the regmask + the chain/glue tail as implicit attachments.
+  //
+  // Dispatch by Callee SDNode kind: LowerCall converts GlobalAddress /
+  // ExternalSymbol into their Target* forms but leaves register-shaped
+  // Callee SDValues (load results, formal-arg pointers, computed
+  // pointers) untouched. Anything that isn't a TargetGlobalAddress or
+  // TargetExternalSymbol selects as CALL32r.
   if (Node->getOpcode() == MovISD::CALL) {
     SDLoc DL(Node);
     SDValue Chain  = Node->getOperand(0);
     SDValue Callee = Node->getOperand(1);
+
+    unsigned Opc = Mov::CALL32d;
+    if (Callee.getOpcode() != ISD::TargetGlobalAddress &&
+        Callee.getOpcode() != ISD::TargetExternalSymbol)
+      Opc = Mov::CALL32r;
 
     SmallVector<SDValue, 8> Ops;
     Ops.push_back(Callee);
@@ -162,7 +175,7 @@ void MovDAGToDAGISel::Select(SDNode *Node) {
     Ops.push_back(Chain);
 
     SDVTList NodeTys = CurDAG->getVTList(MVT::Other, MVT::Glue);
-    SDNode *MICall = CurDAG->getMachineNode(Mov::CALL32d, DL, NodeTys, Ops);
+    SDNode *MICall = CurDAG->getMachineNode(Opc, DL, NodeTys, Ops);
     ReplaceNode(Node, MICall);
     return;
   }
