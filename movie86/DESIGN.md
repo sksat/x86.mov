@@ -334,27 +334,61 @@ dispatch-flag level:
 **Crucially**: linking `multi-add` with real libc and running it
 natively on i386 (`/usr/bin/ld ... -dynamic-linker /lib/ld-linux.so.2
 -lc -lm ...`, then exec) **also fails to terminate within 10 minutes
-of CPU time** (`user 1:10, sys 3:39` in 10:00 wall). The simpler
-fixtures (`return42-dyn`, `sum10-dyn`) exit immediately. So the long
-runtime is **inherent to movfuscator's mov-only function-call
-dispatch on this specific fixture**, not a movie86 bug.
+of CPU time** (`user 1:10, sys 3:39` in 10:00 wall).
 
-Root cause (from cross-referencing movfuscator.c):
-- Each label / call site emits an `alu_eq(target, $LABEL-0x80000000)`
-  compare block followed by `execution_on(b0)`. `MOV_OFFSET = 0x80000000`
-  is defined at the top of `movfuscator.c`.
-- For multi-add's call→return round-trip, the compare blocks chain
-  through main entry → arg setup → `&add` entry → `add` body →
-  return continuation → main continuation → `exit`. Each transition
-  is hundreds of master_loop iterations, each iteration is 1474
-  emulated mov instructions.
-- The dispatch IS technically progressing (b0 / on / target do flip
-  in the early phase), but per-iteration cost dominates.
+**Update (2026-05-29 root cause)**: an earlier draft framed this as
+"movfuscator is just slow on function calls". That was wrong. A clean
+A/B test pinned the real bug:
 
-Verdict: not a movie86 bug. **Documented as a known-slow fixture; do
-not block PR review on it.** The investigation produced the
-`--log-writes-in` tool which is independently useful for any future
-deep-dive into movfuscator-runtime questions.
+| Form | Native i386 | movie86 |
+|---|---|---|
+| `inline-add` — single .c with `add` inlined alongside `main` | **0.02s ✓** | **0.21s ✓** |
+| `multi-add` — same C content, split into `multi-add.c` (main) + `multi-add-helper.c` (add), linked together | **>10 min ✗** | **>5×10⁸ steps ✗** |
+
+Single-`.c` programs with calls / recursion work fine in both
+environments (`upstream-hanoi` 27s, `upstream-nqueens` 0.9s,
+`upstream-hello` 13ms, all native). **Only 2-`.o` linkage breaks.**
+
+The bug is in movfuscator's **call classification at compile time**
+(smart-friend GPT-5.5 traced this to `movfuscator.c`'s CALL emission
+checking `s->sclass == EXTERN`):
+
+- When compiling `multi-add.c`, the symbol `add` is unresolved (defined
+  in a different translation unit) → movfuscator emits the **external
+  call path** (`jmp_extern`, the SIGSEGV-trampoline / libc-style
+  dispatch that writes an *un-obfuscated* address to `external`).
+- When `multi-add-helper.c` is compiled separately, `add` is emitted
+  as a **normal movfuscated function**, whose prologue gates execution
+  on `target == 0x8804a298` — the **obfuscated** label form (= real
+  address `+ 0x80000000`, per `MOV_OFFSET`).
+- After link the caller uses the external protocol but the callee
+  expects the internal one. The compares never match → `b0` / `on`
+  never re-arm → permanent dispatch deadlock.
+
+Verified in `multi-add-real.elf`:
+
+```asm
+8049bfc: mov DWORD PTR ds:0x8687194, 0x804a298   ; external = &add
+                                                  ; (un-obfuscated, jmp_extern)
+0804a298 <add>:
+804a29d: mov edx, 0x8804a298                      ; expected target value
+                                                  ; (obfuscated, internal compare)
+```
+
+The byte-identical link test in `movfuscator-wasm/tests/run-multi.mjs`
+only verifies that `wasm-ld` produces the same bytes as host
+`/usr/bin/ld` — it never **runs** the linked binary, so this deadlock
+has been latent there as well.
+
+**Workaround**: amalgamate sources into a single `.c` (e.g.
+`#include "multi-add-helper.c"`). movfuscator has no `--whole-program`
+flag — separately compiled `.o` files don't compose safely when one
+movfuscated function calls another.
+
+**Verdict for movie86**: nothing to fix. The `--log-writes-in` tool
+built during the investigation is now permanent infra. multi-add is
+left in the demos table as a **known-broken movfuscator-side fixture**
+with the workaround documented.
 
 ## Library-stub generality (resolved → host-wrapper ABI)
 
