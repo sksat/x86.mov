@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-28T02:57:23Z on x86_64 (Linux).
+Generated 2026-05-28T03:15:56Z on x86_64 (Linux).
 
 ## return0
 
@@ -20,7 +20,7 @@ int main(void) { return 0; }
 | .rodata size | 524288 | 0 |
 | mov count / total | 120 / 123 (97.6%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.156 ms | 0.525 ms |
+| wall-clock runtime (hyperfine mean) | 0.165 ms | 0.621 ms |
 
 ## return42
 
@@ -35,7 +35,7 @@ int main(void) { return 42; }
 | .rodata size | 524288 | 0 |
 | mov count / total | 120 / 123 (97.6%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.158 ms | 0.613 ms |
+| wall-clock runtime (hyperfine mean) | 0.151 ms | 0.580 ms |
 
 ## eq42
 
@@ -59,7 +59,7 @@ int main(void) {
 | .rodata size | 721152 | 0 |
 | mov count / total | 282 / 289 (97.6%) | 1050 / 1052 (99.8%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.177 ms | 0.621 ms |
+| wall-clock runtime (hyperfine mean) | 0.167 ms | 0.685 ms |
 
 ## lt_unsigned
 
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 | .rodata size | 721152 | 0 |
 | mov count / total | 312 / 319 (97.8%) | 1045 / 1047 (99.8%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.168 ms | 0.577 ms |
+| wall-clock runtime (hyperfine mean) | 0.189 ms | 0.783 ms |
 
 ## bitops
 
@@ -134,7 +134,7 @@ int main(void) {
 | .rodata size | 589824 | 0 |
 | mov count / total | 164 / 167 (98.2%) | 922 / 924 (99.8%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.190 ms | 0.623 ms |
+| wall-clock runtime (hyperfine mean) | 0.159 ms | 0.603 ms |
 
 ## sum10
 
@@ -154,7 +154,7 @@ int main(void) {
 | .rodata size | 721408 | 0 |
 | mov count / total | 429 / 437 (98.2%) | 1225 / 1227 (99.8%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.171 ms | 0.539 ms |
+| wall-clock runtime (hyperfine mean) | 0.176 ms | 0.576 ms |
 
 ## fib10
 
@@ -191,7 +191,7 @@ int main(void) {
 | .rodata size | 721408 | 0 |
 | mov count / total | 434 / 442 (98.2%) | 1267 / 1269 (99.8%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.169 ms | 0.546 ms |
+| wall-clock runtime (hyperfine mean) | 0.187 ms | 0.551 ms |
 
 ## shifts
 
@@ -228,7 +228,7 @@ int main(int argc, char **argv) {
 | .rodata size | 657152 | 0 |
 | mov count / total | 458 / 461 (99.3%) | 1423 / 1425 (99.9%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.159 ms | 0.552 ms |
+| wall-clock runtime (hyperfine mean) | 0.259 ms | 0.551 ms |
 
 ## fib_rec
 
@@ -271,7 +271,7 @@ int main(void) {
 | .rodata size | 721408 | 0 |
 | mov count / total | 918 / 929 (98.8%) | 2248 / 2250 (99.9%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.257 ms | 1.479 ms |
+| wall-clock runtime (hyperfine mean) | 0.261 ms | 1.511 ms |
 
 ## multi_call
 
@@ -312,5 +312,85 @@ int main(int argc, char **argv) {
 | .rodata size | 524288 | 0 |
 | mov count / total | 704 / 711 (99.0%) | 2036 / 2038 (99.9%) |
 | non-mov mnemonics | `call int jmp` | `call` |
-| wall-clock runtime (hyperfine mean) | 1.214 ms | 0.690 ms |
+| wall-clock runtime (hyperfine mean) | 0.161 ms | 0.554 ms |
+
+## rust_main
+
+```rust
+//! Stage-6.5 trivial Rust → mov-only x86-32 ELF example.
+//!
+//! Single `extern "C"` entry point returning a scalar i32. The
+//! sibling [`../_start.s`](../_start.s) calls `rust_main` and `int
+//! 0x80`s with the return value, so the linked ELF exits with status
+//! 42.
+//!
+//! Edition 2024: `#[no_mangle]` is now an unsafe attribute.
+//! See [`Cargo.toml`](Cargo.toml) for the `panic=abort` /
+//! `overflow-checks=false` profile knobs that keep the IR within
+//! the Mov backend's supported surface.
+
+#![no_std]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_main() -> i32 {
+    42
+}
+```
+
+| metric | llvm-mov (Rust) | movfuscator |
+|---|---:|---:|
+| total ELF (bytes) | 533380 | — |
+| .text size | 794 | — |
+| .rodata size | 524288 | — |
+| mov count / total | 193 / 199 (97.0%) | — |
+| non-mov mnemonics | `call int jmp` | — |
+| wall-clock runtime (hyperfine mean) | 0.160 ms | — |
+
+## rust_fib
+
+```rust
+//! Stage-7d3 recursive Fibonacci in Rust → mov-only x86-32 ELF.
+//!
+//! Recursion stresses stage-7d1's single-slot
+//! `__mov_return_addr_slot` invariant (each `ret` writes its own
+//! return address into the global slot and immediately jumps,
+//! before any nested call can return). Stage-7d3 (`CALL32d` →
+//! `JMP32d_CALL`) sees two call sites per `fib` invocation.
+//!
+//! Build constraints (same as ../main/):
+//!   - `panic=abort`, `overflow-checks=false` so the integer
+//!     subtractions in `fib` don't lower to
+//!     `llvm.ssub.with.overflow.i32` (the returned `{i32, i1}`
+//!     aggregate would need backend work the demo doesn't pull in).
+//!
+//! `fib_main` returns `fib(10) = 55`, which the `_start.s` runner
+//! turns into the process exit code.
+
+#![no_std]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fib(n: i32) -> i32 {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fib_main() -> i32 {
+    fib(10)
+}
+```
+
+| metric | llvm-mov (Rust) | movfuscator |
+|---|---:|---:|
+| total ELF (bytes) | 730692 | — |
+| .text size | 3997 | — |
+| .rodata size | 721408 | — |
+| mov count / total | 984 / 998 (98.6%) | — |
+| non-mov mnemonics | `call int jmp` | — |
+| wall-clock runtime (hyperfine mean) | 0.261 ms | — |
 

@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# bench/run.sh — side-by-side comparison of llvm-mov-llc vs movfuscator.
+# bench/run.sh — side-by-side comparison of llvm-mov-llc vs movfuscator,
+# plus a "llvm-mov on Rust" column for the Cargo-backed examples under
+# examples/rust/{main,fib}/.
 #
-# Both back-ends consume the *same* C source from
-# movfuscator-wasm/tests/fixtures/ and produce x86-32 ELF. We measure:
+# C fixtures are built through both back-ends from the *same* source
+# under bench/fixtures/ or movfuscator-wasm/tests/fixtures/. Rust
+# fixtures only go through llvm-mov (movfuscator is C-only); their
+# movfuscator column is rendered as `—`.
 #
+# Metrics per row:
 #   - total ELF size                 (`stat -c %s`)
 #   - .text section size             (`size --format=sysv`)
 #   - .rodata section size           (--gc-sections drops llvm-mov's add
@@ -13,8 +18,13 @@
 #                                     .text — 1.0 = fully mov-only)
 #   - non-mov mnemonic counts        (which opcodes are still in the .text)
 #
-# llvm-mov pipeline:
+# llvm-mov pipeline (C):
 #   clang -m32 -emit-llvm -S → llvm-mov-llc -mtriple=mov-... → as --32 → ld
+#
+# llvm-mov pipeline (Rust):
+#   cargo rustc --release --target=i686-unknown-linux-gnu -- --emit=llvm-ir
+#       → pluck .ll from target/<triple>/release/deps/
+#       → llvm-mov-llc -mtriple=mov-... → as --32 → ld
 #
 # movfuscator pipeline:
 #   movcc <fixture.c> -o <ELF>    (statically resolved by movfuscator's
@@ -95,10 +105,19 @@ DEFAULT_FIXTURES=(
     multi_call
 )
 
+# Rust fixtures live in their own Cargo crates under examples/rust/.
+# Each entry's metadata (crate dir, expected exit code, entry symbol,
+# crate name as cargo writes it into target/.../deps/<crate>-<hash>.ll)
+# is encoded in the per-fixture build path inside the main loop.
+RUST_FIXTURES=(
+    rust_main
+    rust_fib
+)
+
 if [ $# -gt 0 ]; then
     FIXTURE_NAMES=("$@")
 else
-    FIXTURE_NAMES=("${DEFAULT_FIXTURES[@]}")
+    FIXTURE_NAMES=("${DEFAULT_FIXTURES[@]}" "${RUST_FIXTURES[@]}")
 fi
 
 # -- prerequisites -------------------------------------------------------
@@ -247,6 +266,44 @@ build_movfuscator() {
     "$MOVCC" "$src" -o "$out_dir/elf" >"$out_dir/movcc.log" 2>&1
 }
 
+# Resolve a `rust_<example>` fixture name to its Cargo metadata.
+# Echoes "crate_dir|cargo_name" on success, empty on unknown name.
+resolve_rust_fixture() {
+    case "$1" in
+        rust_main) printf '%s|rust_mov_main' "$LLVM_MOV_DIR/examples/rust/main" ;;
+        rust_fib)  printf '%s|rust_mov_fib'  "$LLVM_MOV_DIR/examples/rust/fib"  ;;
+        *) printf '' ;;
+    esac
+}
+
+# Run the llvm-mov pipeline on a Cargo crate (Rust fixture).
+# build_llvm_mov_rust <crate_dir> <cargo_name> <out_dir>
+#   → writes <out_dir>/elf and <out_dir>/elf.s
+build_llvm_mov_rust() {
+    local crate_dir="$1" cargo_name="$2" out_dir="$3"
+    mkdir -p "$out_dir"
+    local triple="i686-unknown-linux-gnu"
+    cargo rustc \
+        --manifest-path="$crate_dir/Cargo.toml" \
+        --release \
+        --target="$triple" \
+        --quiet \
+        -- --emit=llvm-ir,link >/dev/null 2>&1
+    local ll
+    ll="$(ls -t "$crate_dir/target/$triple/release/deps/${cargo_name}-"*.ll 2>/dev/null | head -1)"
+    if [ -z "$ll" ] || ! [ -f "$ll" ]; then
+        echo "build_llvm_mov_rust: .ll not found for $cargo_name under $crate_dir/target/$triple/release/deps/" >&2
+        return 1
+    fi
+    "$LLVM_MOV_LLC" -mtriple=mov-unknown-linux-gnu "$ll" -o "$out_dir/elf.s" 2>/dev/null
+    as --32 -o "$out_dir/elf.o" "$out_dir/elf.s" 2>/dev/null
+    # Each Rust crate ships its own _start.s pinning the entry symbol
+    # (rust_main vs fib_main).
+    as --32 -o "$out_dir/_start.o" "$crate_dir/_start.s" 2>/dev/null
+    ld -m elf_i386 -static --gc-sections \
+        "$out_dir/_start.o" "$out_dir/elf.o" -o "$out_dir/elf"
+}
+
 # -- main loop -----------------------------------------------------------
 
 RESULTS="${RESULTS_OUT:-$HERE/results.md}"
@@ -259,7 +316,69 @@ RESULTS="${RESULTS_OUT:-$HERE/results.md}"
     printf '%s\n\n' "Generated $(date -u +'%Y-%m-%dT%H:%M:%SZ') on $(uname -m) ($(uname -s))."
 } > "$RESULTS"
 
+# is_rust_fixture <name> → 0 (yes) or 1 (no)
+is_rust_fixture() {
+    case "$1" in
+        rust_*) return 0 ;;
+        *)      return 1 ;;
+    esac
+}
+
+# Emit the bench-row metrics for a successfully-built llvm-mov ELF.
+emit_lm_metrics() {
+    local elf="$1" rt="$2"
+    printf '| total ELF (bytes) | %s | %s |\n' "$(stat -c %s "$elf")" "$rt"
+    printf '| .text size | %s | %s |\n' "$(section_size "$elf" "[.]text")" "$rt"
+    printf '| .rodata size | %s | %s |\n' "$(section_size "$elf" "[.]rodata")" "$rt"
+    read -r movs tot ratio <<<"$(count_mov_ratio "$elf")"
+    printf '| mov count / total | %d / %d (%s) | %s |\n' "$movs" "$tot" "$ratio" "$rt"
+    local other
+    other="$(non_mov_mnemonics "$elf")"
+    printf '| non-mov mnemonics | `%s` | %s |\n' "${other:-(none)}" "$rt"
+    local lm_time
+    lm_time=$(measure_runtime "$elf")
+    printf '| wall-clock runtime (hyperfine mean) | %s | %s |\n' "$lm_time" "$rt"
+}
+
 for name in "${FIXTURE_NAMES[@]}"; do
+    if is_rust_fixture "$name"; then
+        meta="$(resolve_rust_fixture "$name")"
+        if [ -z "$meta" ]; then
+            echo "warn: unknown rust fixture '$name' (expected one of: ${RUST_FIXTURES[*]})" >&2
+            continue
+        fi
+        crate_dir="${meta%%|*}"
+        cargo_name="${meta##*|}"
+        if ! [ -d "$crate_dir" ]; then
+            echo "warn: rust fixture '$name' crate dir not found at $crate_dir" >&2
+            continue
+        fi
+        echo "$name"
+
+        lm_dir="$WORK/$name/llvm-mov"
+        lm_ok=1
+        if ! build_llvm_mov_rust "$crate_dir" "$cargo_name" "$lm_dir" \
+                2>"$WORK/$name.lm.log"; then
+            lm_ok=0
+        fi
+
+        {
+            printf '## %s\n\n' "$name"
+            printf '```rust\n%s\n```\n\n' "$(cat "$crate_dir/src/lib.rs")"
+            printf '| metric | llvm-mov (Rust) | movfuscator |\n'
+            printf '|---|---:|---:|\n'
+            if [ "$lm_ok" -eq 1 ]; then
+                # `—` (em dash) in the movfuscator column flags "not
+                # applicable: movcc is a C-only frontend".
+                emit_lm_metrics "$lm_dir/elf" "—"
+            else
+                printf '| (llvm-mov build failed; see log) |||\n'
+            fi
+            printf '\n'
+        } >> "$RESULTS"
+        continue
+    fi
+
     src="$(resolve_fixture "$name")"
     if [ -z "$src" ]; then
         echo "warn: fixture '$name.c' not found in any of:" >&2
