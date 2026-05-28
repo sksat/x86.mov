@@ -100,6 +100,26 @@ static bool moduleNeedsDivRemHelpers(Module &M) {
   return false;
 }
 
+// Stage 7g1 — does the module contain any IR-level f32 operation
+// that triggers the SDAG soft-float libcall path? The injection is
+// scoped to FAdd for now (`__addsf3`); follow-up stages add sub /
+// mul / div / cmp / conversion helpers via the same shape.
+// We check `getScalarType()` so that `<N x float>` ops the Scalarizer
+// will later flatten still trigger the injection (same lesson as
+// the stage-7f2 codex review on `udiv <N x i32>`).
+static bool moduleNeedsAddSf3Helper(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if (I.getOpcode() == Instruction::FAdd &&
+          I.getType()->getScalarType()->isFloatTy())
+        return true;
+    }
+  }
+  return false;
+}
+
 static Function *makeOrPromoteHelper(Module &M, StringRef Name,
                                      FunctionType *Ty) {
   if (Function *Existing = M.getFunction(Name)) {
@@ -256,6 +276,251 @@ static void injectDivRemHelpers(Module &M, LLVMContext &Ctx) {
   }
 }
 
+// Stage 7g1 — inject `__addsf3` (IEEE-754 single-precision add).
+//
+// SDAG's soft-float legalizer turns each `fadd float` into a libcall
+// against `__addsf3 (float, float) -> float`. We provide the body
+// here, using the same `linkonce_odr` pattern as the integer DIV/REM
+// helpers. The body is straight-line (no internal branches): every
+// "if" in the standard textbook algorithm is rewritten as an
+// `i1`-conditioned `select`, so the driver's existing SELECT →
+// bit-blend pass (around the 6d3e era) lowers them to mov-only-
+// friendly straight-line arithmetic instead of CMP+Jcc+PHI loops
+// that would otherwise pin DAG-ISel.
+//
+// Limitations of this first-cut implementation:
+//   - Inf / NaN inputs propagate as best-effort; specifically a NaN
+//     input may surface as a finite garbage output. The four
+//     fadd_*.ll fixtures stay in the normal range and don't tickle
+//     this; following stages can add the NaN / Inf paths.
+//   - Subnormal inputs are flushed to zero (exp == 0 ⇒ value == 0).
+//   - Subnormal result is flushed to zero (underflow → +0 with the
+//     surviving sign).
+//   - Rounding: round-to-nearest, ties-to-even, with one guard bit +
+//     a sticky bit synthesised from the bits shifted out during
+//     alignment. Matches the C `+` operator on x86-64 for the
+//     fixture range; differs in the LSB for edge-case rounding.
+//
+// Variable layout (all i32 unless noted, mantissas carry an extra
+// 3-bit guard region — see comments inline):
+//
+//   ai, bi          : the IEEE-754 bit patterns of the two inputs
+//   sa, sb          : sign bits   (ai >> 31)
+//   ea, eb          : biased exponents (8 bits)
+//   ma_raw, mb_raw  : mantissa fields (23 bits)
+//   ma_g, mb_g      : (mantissa | implicit-1) << 3  — bit 26 is MSB
+//   a_ge_b          : i1, ea >= eb
+//   re_init         : max(ea, eb), the "tentative" result exponent
+//   ed              : |ea - eb|, capped at 31 to keep shifts well-
+//                     defined
+//   mLarge, mSmall  : the (g)-form mantissas in (larger, smaller)
+//                     exponent order; sLarge/sSmall are the matching
+//                     signs
+//   shifted         : mSmall lshr ed, then OR'd with a 1-bit sticky
+//                     that captures whether any bit was dropped
+//   sum_same / sum_diff : straight-add and straight-sub of the two
+//                     aligned mantissas, both kept around so the
+//                     final `select i1 signs_equal` picks one
+//   mSum            : selected magnitude pre-normalise; sign comes
+//                     from `sLarge` when adding, or from the side
+//                     with the larger magnitude when subtracting
+//   lz              : ctlz(mSum). bit 26 = "normal", bit 27 = post-
+//                     add carry-out, lz > 5 = subtraction left-
+//                     normalises
+//   ... rounding / packing follow at the bottom.
+static void injectAddSf3Helper(Module &M, LLVMContext &Ctx) {
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(F32, {F32, F32}, /*isVarArg=*/false);
+
+  Function *F = makeOrPromoteHelper(M, "__addsf3", FnTy);
+  if (!F)
+    return;
+
+  F->getArg(0)->setName("a");
+  F->getArg(1)->setName("b");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+
+  auto C = [&](uint32_t V) { return B.getInt32(V); };
+
+  Value *AI = B.CreateBitCast(F->getArg(0), I32, "ai");
+  Value *BI = B.CreateBitCast(F->getArg(1), I32, "bi");
+
+  // Field extraction.
+  Value *SA = B.CreateLShr(AI, C(31), "sa");
+  Value *SB = B.CreateLShr(BI, C(31), "sb");
+  Value *EA = B.CreateAnd(B.CreateLShr(AI, C(23)), C(0xFFu), "ea");
+  Value *EB = B.CreateAnd(B.CreateLShr(BI, C(23)), C(0xFFu), "eb");
+  Value *MARaw = B.CreateAnd(AI, C(0x7FFFFFu), "ma_raw");
+  Value *MBRaw = B.CreateAnd(BI, C(0x7FFFFFu), "mb_raw");
+
+  // Implicit-1, then shift left by 3 to make room for guard+round+
+  // sticky bits at the bottom. The "normalised" mantissa now has its
+  // MSB at bit 26 (= 23 + 3).
+  Value *MAN = B.CreateOr(MARaw, C(0x800000u));
+  Value *MBN = B.CreateOr(MBRaw, C(0x800000u));
+  Value *MAG = B.CreateShl(MAN, C(3), "ma_g");
+  Value *MBG = B.CreateShl(MBN, C(3), "mb_g");
+
+  // Order by *magnitude*, not by exponent alone. When ea == eb but the
+  // signs differ, the operand with the larger mantissa is the one
+  // whose sign survives in the result; ordering by exponent only
+  // would pick whichever operand is on the left and feed an unsigned
+  // underflow into the m_large - m_small subtract (codex-review P1
+  // on inputs like `1.0 + -1.5`). Stripping the sign bit and
+  // comparing the magnitude as unsigned i32 is a single compare:
+  // when ea > eb the exponent dominates, when ea == eb the mantissas
+  // decide.
+  Value *AMag = B.CreateAnd(AI, C(0x7FFFFFFFu));
+  Value *BMag = B.CreateAnd(BI, C(0x7FFFFFFFu));
+  Value *AGeB = B.CreateICmpUGE(AMag, BMag, "a_ge_b");
+  Value *ReInit = B.CreateSelect(AGeB, EA, EB, "re_init");
+  Value *EDab = B.CreateSub(EA, EB);
+  Value *EDba = B.CreateSub(EB, EA);
+  Value *EDraw = B.CreateSelect(AGeB, EDab, EDba, "ed_raw");
+  // Cap ed to 31 so the alignment shifts stay defined; bits beyond
+  // 31 places contribute only sticky-bit, and we OR a guaranteed-
+  // non-zero sticky onto the shifted result when ed >= 24 anyway
+  // (the shifted mantissa is zero by then).
+  Value *EDtooBig = B.CreateICmpUGT(EDraw, C(31u));
+  Value *ED = B.CreateSelect(EDtooBig, C(31u), EDraw, "ed");
+
+  Value *MLarge = B.CreateSelect(AGeB, MAG, MBG, "m_large");
+  Value *MSmall = B.CreateSelect(AGeB, MBG, MAG, "m_small");
+  Value *SLarge = B.CreateSelect(AGeB, SA, SB, "s_large");
+  Value *SSmall = B.CreateSelect(AGeB, SB, SA, "s_small");
+
+  // Sticky bit = "any of the bits we are about to discard is set".
+  //   discarded = m_small - ((m_small >> ed) << ed)
+  // Both shifts use `ed` ∈ [0, 31] (UB-free). Avoids the
+  // `shl 32`-when-ed-is-zero hazard of the "shift to top" trick.
+  Value *MSmallRight = B.CreateLShr(MSmall, ED);
+  Value *MSmallBack  = B.CreateShl(MSmallRight, ED);
+  Value *Discarded   = B.CreateSub(MSmall, MSmallBack);
+  Value *StickyI1    = B.CreateICmpNE(Discarded, C(0));
+  Value *Sticky      = B.CreateZExt(StickyI1, I32, "sticky");
+  // Plus: if ed was capped to 31 from a larger original, *any* bit of
+  // the smaller mantissa contributes to sticky (it was 0 after the
+  // 31-bit lshr above, but the original m_small was non-zero by virtue
+  // of carrying an implicit 1). Catch that here too.
+  Value *MSmallNonzero = B.CreateICmpNE(MSmall, C(0));
+  Value *StickyExtra   = B.CreateAnd(B.CreateZExt(EDtooBig, I32),
+                                     B.CreateZExt(MSmallNonzero, I32));
+  Value *StickyAll     = B.CreateOr(Sticky, StickyExtra);
+
+  Value *MSmallShifted = B.CreateOr(MSmallRight, StickyAll, "m_small_shifted");
+
+  // Same-sign add, different-sign subtract.
+  Value *SignsEqual = B.CreateICmpEQ(SLarge, SSmall);
+  Value *SumAdd = B.CreateAdd(MLarge, MSmallShifted);
+  Value *SumSub = B.CreateSub(MLarge, MSmallShifted); // m_large >= shifted because exp_large > exp_small
+  Value *MSum = B.CreateSelect(SignsEqual, SumAdd, SumSub, "m_sum");
+
+  // Cancel-to-zero — opposite signs with identical magnitudes.
+  Value *CancelZero = B.CreateAnd(B.CreateNot(SignsEqual),
+                                  B.CreateICmpEQ(MSum, C(0)));
+
+  // Normalise. mSum currently has its MSB somewhere in bits 0..27:
+  //   bit 27 = add overflow  (lz == 4)
+  //   bit 26 = "normal"      (lz == 5)
+  //   bit  k < 26 = subtraction left-normalises by (5 - lz)
+  // Use ctlz to compute the shift count branchlessly.
+  Function *Ctlz = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::ctlz, {I32});
+  Value *LZ = B.CreateCall(Ctlz, {MSum, ConstantInt::getFalse(Ctx)}, "lz");
+
+  // Overflow path (lz == 4): shift right by 1 with sticky.
+  Value *LzEq4 = B.CreateICmpEQ(LZ, C(4u));
+  Value *StickyOverflow = B.CreateAnd(MSum, C(1u));
+  Value *MSumOvf = B.CreateOr(B.CreateLShr(MSum, C(1)), StickyOverflow);
+  Value *ReOvf  = B.CreateAdd(ReInit, C(1u));
+
+  // Underflow path (lz > 5): shift left by min(lz - 5, re_init - 1).
+  // The lower bound on re_init - 1 protects against generating a
+  // denormal result; if the shift would push below exp == 1 we cap
+  // and let the round-trip below flush to zero via the exponent < 1
+  // check.
+  //
+  // Belt-and-braces clamping (codex-review P1): the underflow arm is
+  // evaluated unconditionally inside the straight-line body. When the
+  // selected path is actually "lz == 4" (post-add carry-out, common
+  // for same-sign sums like `1.5 + 1.5`), `lz - 5` underflows to
+  // 0xFFFFFFFF and `re_init - 1` is whatever the larger exponent
+  // happened to be — often well above 31. The later SELECT → bit-
+  // blend rewrite evaluates *both* arms, so a `shl mSum, > 31`
+  // appears in the lowered MIR even though the bit-blend's mask
+  // discards its result. We clamp the shift count to a safe range
+  // (≤ 26, the mantissa-width-bounded normalize maximum) so the
+  // emitted shift is always well-defined regardless of which arm
+  // the final select chooses.
+  Value *LzGt5     = B.CreateICmpUGT(LZ, C(5u));
+  Value *LzMinus5Safe =
+      B.CreateSelect(LzGt5, B.CreateSub(LZ, C(5u)), C(0u));
+  Value *MaxShift  = B.CreateSub(ReInit, C(1u));
+  Value *ShiftA    = B.CreateSelect(
+      B.CreateICmpULT(LzMinus5Safe, MaxShift), LzMinus5Safe, MaxShift);
+  // Final shift-width clamp. 26 is enough to fully normalise any
+  // 27-bit mantissa we can produce; clamping here keeps the shift
+  // amount in i32-shift's defined range [0, 31] no matter what
+  // ReInit happened to be.
+  Value *ShiftCap  = B.CreateSelect(
+      B.CreateICmpULT(ShiftA, C(26u)), ShiftA, C(26u));
+  Value *MSumUnf   = B.CreateShl(MSum, ShiftCap);
+  Value *ReUnf     = B.CreateSub(ReInit, ShiftCap);
+
+  // Combine. lz == 4 → overflow; lz > 5 → underflow; else → normal.
+  Value *MSumPost = B.CreateSelect(LzEq4, MSumOvf,
+                       B.CreateSelect(LzGt5, MSumUnf, MSum));
+  Value *RePost = B.CreateSelect(LzEq4, ReOvf,
+                       B.CreateSelect(LzGt5, ReUnf, ReInit));
+
+  // Round to nearest, ties to even.
+  Value *GuardBit = B.CreateAnd(B.CreateLShr(MSumPost, C(2)), C(1u));
+  Value *RoundBit = B.CreateAnd(B.CreateLShr(MSumPost, C(1)), C(1u));
+  Value *StickyBit2 = B.CreateAnd(MSumPost, C(1u));
+  Value *MSumTrunc = B.CreateLShr(MSumPost, C(3));
+  Value *Lsb = B.CreateAnd(MSumTrunc, C(1u));
+  Value *RoundOrSticky = B.CreateOr(RoundBit, StickyBit2);
+  Value *RoundOrLsb    = B.CreateOr(RoundOrSticky, Lsb);
+  Value *NeedRoundUp   = B.CreateAnd(GuardBit, RoundOrLsb);
+  Value *MSumRounded   = B.CreateAdd(MSumTrunc, NeedRoundUp);
+
+  // Round may push mantissa to 0x1000000 → bump exponent, shift down.
+  Value *RoundedOvf = B.CreateICmpEQ(MSumRounded, C(0x1000000u));
+  Value *MSumFinal  = B.CreateSelect(RoundedOvf,
+                                     B.CreateLShr(MSumRounded, C(1)),
+                                     MSumRounded);
+  Value *ReFinalRaw = B.CreateSelect(RoundedOvf, B.CreateAdd(RePost, C(1u)),
+                                     RePost);
+
+  // Pack the IEEE-754 fields back.
+  Value *MantField  = B.CreateAnd(MSumFinal, C(0x7FFFFFu));
+  Value *ExpField   = B.CreateAnd(B.CreateShl(ReFinalRaw, C(23)),
+                                  C(0x7F800000u));
+  Value *SignField  = B.CreateShl(SLarge, C(31));
+  Value *Packed     = B.CreateOr(SignField,
+                                 B.CreateOr(ExpField, MantField));
+
+  // Exponent overflow → Inf with the result sign.
+  Value *ExpOvf = B.CreateICmpUGE(ReFinalRaw, C(255u));
+  Value *InfBits = B.CreateOr(B.CreateShl(SLarge, C(31)), C(0x7F800000u));
+  Value *PostOvf = B.CreateSelect(ExpOvf, InfBits, Packed);
+
+  // Special-case handling: zero / denormal inputs flush to "pass the
+  // other through". This also catches "0 + 0 = 0" naturally (both
+  // sides are zero, so PostOvf path could produce -0; here we end at
+  // the b-input side, which is +0 in the fixtures).
+  Value *AIsZero = B.CreateICmpEQ(EA, C(0u));
+  Value *BIsZero = B.CreateICmpEQ(EB, C(0u));
+  Value *Step1 = B.CreateSelect(AIsZero, BI, PostOvf);
+  Value *Step2 = B.CreateSelect(BIsZero, AI, Step1);
+  Value *Step3 = B.CreateSelect(CancelZero, C(0u), Step2);
+
+  Value *Result = B.CreateBitCast(Step3, F32);
+  B.CreateRet(Result);
+}
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
 
@@ -375,6 +640,11 @@ int main(int argc, char **argv) {
   // around stage 6d3e below).
   if (moduleNeedsDivRemHelpers(*M))
     injectDivRemHelpers(*M, Ctx);
+
+  // Stage 7g1 — `__addsf3` body. Same shape as the DIV/REM helpers
+  // above: scan the IR for the trigger op and inject when present.
+  if (moduleNeedsAddSf3Helper(*M))
+    injectAddSf3Helper(*M, Ctx);
 
   // Stage 6d2 — pre-Scalarizer lowering of `llvm.vector.reduce.*`.
   //

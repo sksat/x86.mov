@@ -242,6 +242,56 @@ above sidesteps all of that.
     fixtures matched but the helpers' loop-with-PHI bodies, which
     RA spills around, did not.
 
+### 7g — single-precision floating-point
+
+- **7g1** `f32 fadd` via SDAG soft-float legalization →
+  `call __addsf3 (float, float) -> float`, with the helper body
+  injected by `llvm-mov-llc` (same `linkonce_odr` shape as the
+  stage-7f2 integer DIV/REM helpers). The body is an IEEE-754
+  single-precision add written entirely as straight-line `i1`-
+  conditioned `select`s over the bit pattern; the driver's pre-
+  existing SELECT → bit-blend rewrite (around stage 6d3e)
+  removes every internal branch before SDAG sees it, so the
+  helper does not introduce CMP+Jcc+PHI control flow.
+
+  Why driver IR injection again (vs. a `FADD32rr` byte-chain
+  pseudo): the per-call-site cost in `.text` is dominated by the
+  call's mov-only frame manipulation either way. Letting the
+  helper body amortise across all `fadd` callers keeps the per-
+  fixture `.text` linear in call-count rather than in the count
+  of fadd operations.
+
+  Backend plumbing for f32 is intentionally minimal: f32 is **not**
+  given a register class, so the SDAG type legalizer's soft-float
+  path takes over and converts every f32 SDAG node into i32 +
+  libcall before ISel sees it. Every existing TableGen pattern
+  stays i32-only. The only change in `MovISelLowering` is
+  `setOperationAction(ISD::FADD, MVT::f32, LibCall)` plus the
+  `setLibcallImpl(RTLIB::ADD_F32, RTLIB::impl___addsf3)` binding.
+
+  Algorithm (round-to-nearest, ties-to-even; bit-pattern operations
+  detailed inline in `tools/llvm-mov-llc/main.cpp`):
+
+  ```
+  ai, bi          = bitcast a, b to i32
+  sign, exp, mant = unpack
+  align mantissa with smaller exponent → sticky bit
+  add (same sign) | sub (diff sign)
+  ctlz → normalize shift (overflow / underflow / in-place)
+  round-to-nearest, ties-to-even with guard/round/sticky
+  repack → bitcast i32 to f32
+  ```
+
+  Limitations of the first cut (deferred to follow-ups in this
+  stage 7g series):
+    - Inf / NaN inputs are best-effort; specifically a NaN input
+      may produce a finite garbage output. The execution fixtures
+      stay in the normal range so this does not surface.
+    - Subnormal inputs flush to zero; the result also flushes to
+      zero on underflow.
+    - `fsub` / `fmul` / `fdiv` / `fcmp` and `i32 ↔ f32` / `f32 ↔
+      f64` conversions are not yet wired up.
+
 ### Stage 7 gates
 
 [`test/MovOnly/run.sh`](test/MovOnly/run.sh) is the objdump gate.

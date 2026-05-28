@@ -26,6 +26,15 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
                                      const MovSubtarget &STI)
     : TargetLowering(TM, STI) {
   addRegisterClass(MVT::i32, &Mov::GPR32RegClass);
+  // Stage 7g0 — f32 is intentionally NOT given a register class. The
+  // type legalizer sees f32 as illegal and soft-promotes it to i32
+  // before ISel runs: every fadd/fsub/etc. SDAG node becomes a libcall
+  // taking i32 bit-patterns. The compiler-rt-named helpers
+  // (`__addsf3`, etc.) are injected as IR by `llvm-mov-llc` (stage 7g1
+  // — see the helper definitions in tools/llvm-mov-llc/main.cpp).
+  // This is the standard soft-float lowering pattern other backends
+  // (RISC-V soft-float, MSP430, …) use and keeps every TableGen
+  // pattern operating purely on i32.
   computeRegisterProperties(STI.getRegisterInfo());
 
   setStackPointerRegisterToSaveRestore(Mov::ESP);
@@ -173,6 +182,18 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setLibcallImpl(RTLIB::SDIV_I32,  RTLIB::impl___divsi3);
   setLibcallImpl(RTLIB::UREM_I32,  RTLIB::impl___umodsi3);
   setLibcallImpl(RTLIB::SREM_I32,  RTLIB::impl___modsi3);
+
+  // Stage 7g1 — single-precision floating-point ops. No FPU exists
+  // in mov-only land, so every FP op routes through compiler-rt-
+  // named libcalls. ADD_F32 lands first (this PR); the helper body
+  // for `__addsf3` is injected as IR by `llvm-mov-llc` along the
+  // same path that 7f2 used for the integer DIV/REM helpers.
+  // SUB / MUL / DIV / CMP / conversions are deferred to follow-up
+  // stage-7g rounds. The action mark below is LibCall so that the
+  // SDAG legalizer emits `call __addsf3` without trying to find a
+  // native FADD instruction first.
+  setOperationAction(ISD::FADD, MVT::f32, LibCall);
+  setLibcallImpl(RTLIB::ADD_F32, RTLIB::impl___addsf3);
 
   // No `bswap` opcode either. Rust idioms like `u32::from_be(x)` or
   // `x.swap_bytes()` lower to ISD::BSWAP. Expand re-spells it as
