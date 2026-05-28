@@ -330,6 +330,26 @@ def SHR32rCL : ShiftRCL<"shr">;
 def SAR32rCL : ShiftRCL<"sar">;
 
 //===----------------------------------------------------------------------===//
+// Stage 7e — count-set-bits pseudo. Codegen-only: never reaches the
+// AsmPrinter; MovOnlyLegalize::legalizeCTPOP32r rewrites it before
+// emission into the byte-table mov-only sequence (per-byte
+// `__mov_popcount8_table` lookup × 4 + 3-step byte-add accumulation
+// via the existing `__mov_add8_sum_table`). The print string is a
+// comment so that if a future bug leaks one through, `as` parses it
+// rather than choking on a fictional `ctpop32` mnemonic.
+//
+// Untied operands — input and output are independent: the rewrite
+// reads the src value once (spilled to `srcdst`), runs the byte
+// chain in scratch, then loads the accumulated popcount into dst.
+// Setting `mayLoad = 1` because the byte-table lookups read rodata;
+// this stops late MachineCSE / scheduler from reordering across
+// table re-emission boundaries.
+let isCodeGenOnly = 1, mayLoad = 1 in
+def CTPOP32r : MovInst<(outs GPR32:$dst), (ins GPR32:$src),
+                       "# ctpop32 $dst, $src",
+                       [(set GPR32:$dst, (ctpop GPR32:$src))]>;
+
+//===----------------------------------------------------------------------===//
 // PUSH / POP — used by emitPrologue/emitEpilogue (stage 4a) to save and
 // restore EBP for the frame pointer. No DAG patterns: these are
 // target-only, emitted directly via BuildMI from FrameLowering. The

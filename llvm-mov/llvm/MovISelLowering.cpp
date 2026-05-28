@@ -189,13 +189,21 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
 
   // Bit-count intrinsics (count leading zeros, count trailing zeros,
   // popcount, parity). No `bsf` / `bsr` / `popcnt` in mov-only land.
-  // The qoi / png decoders touch these via integer hashing in their
-  // hot path; Expand makes the legalizer synthesise them as long
-  // shift + add / and chains, which all stay in the legal i32 op
-  // set + byte-chain. CTPOP / CTLZ / CTTZ + the *_ZERO_UNDEF
-  // variants are kept Expand for the same reason — the alternative
-  // would be a libcall to compiler-rt which our runtime can't link.
-  for (auto Op : {ISD::CTPOP, ISD::CTLZ, ISD::CTLZ_ZERO_UNDEF,
+  //
+  // Stage 7e — CTPOP gets a dedicated `CTPOP32r` pseudo + byte-table
+  // lowering in MovOnlyLegalize. The TableGen pattern on the pseudo
+  // matches `(ctpop GPR32)` directly; this `Legal` action lets DAG-ISel
+  // dispatch to it instead of synthesising the SWAR Hamming-weight
+  // expansion (which left a `sub eax, ecx` un-lowered and bloated
+  // `.text` by ~13×).
+  setOperationAction(ISD::CTPOP, MVT::i32, Legal);
+
+  // CTLZ / CTTZ + the *_ZERO_UNDEF variants still Expand. The shift-
+  // chain expansion stays in legal-op territory (every step is a
+  // shift/and/add the byte-chain handles), so they keep working; the
+  // future-work `__mov_clz8_table` / `__mov_ctz8_table` byte-table
+  // lowering will turn them Legal once landed (see [[llvm-mov]] memo).
+  for (auto Op : {ISD::CTLZ, ISD::CTLZ_ZERO_UNDEF,
                   ISD::CTTZ, ISD::CTTZ_ZERO_UNDEF})
     setOperationAction(Op, MVT::i32, Expand);
 

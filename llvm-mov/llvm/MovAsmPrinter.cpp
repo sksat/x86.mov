@@ -56,6 +56,7 @@ public:
     emitBitwise8Tables();
     emitShift8Tables();
     emitSub8Tables();
+    emitPopcount8Table();
     emitReturnAddrSlot();
     emitEspDecScratch();
     emitIndirectCalleeSlot();
@@ -69,6 +70,7 @@ private:
   void emitShift8Tables();
   void emitUnaryByteTable(StringRef Name, uint8_t (*Op)(uint8_t));
   void emitSub8Tables();
+  void emitPopcount8Table();
   void emitReturnAddrSlot();
   void emitEspDecScratch();
   void emitIndirectCalleeSlot();
@@ -378,6 +380,32 @@ void MovAsmPrinter::emitSub8Tables() {
   };
   emitTable("__mov_sub8_diff_table", Diff);
   emitTable("__mov_sub8_borrow_table", Borrow);
+}
+
+// Stage 7e — `__mov_popcount8_table[a] = popcount(a)` for a ∈ 0..255.
+// Each entry fits in 4 bits (max value 8), so 1 byte / entry is plenty.
+// Indexed by `mov dl, byte ptr [__mov_popcount8_table + ecx]` after the
+// caller has packed the source byte into ECX via the standard idx-slot
+// dance (idx[0] = src_byte, idx[1..3] = 0 → ecx = src_byte). Lives in
+// its own ELF section so `ld --gc-sections` drops the 256 bytes from
+// TUs that contain no `llvm.ctpop.i32`.
+void MovAsmPrinter::emitPopcount8Table() {
+  SmallVector<uint8_t, 256> Data;
+  Data.reserve(256);
+  for (unsigned a = 0; a < 256; ++a) {
+    uint8_t pc = 0;
+    for (unsigned b = a; b; b &= b - 1)
+      ++pc;
+    Data.push_back(pc);
+  }
+
+  MCSection *Sec = OutContext.getELFSection(
+      ".rodata.__mov_popcount8_table", ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
+  OutStreamer->switchSection(Sec);
+  MCSymbol *Sym = OutContext.getOrCreateSymbol("__mov_popcount8_table");
+  OutStreamer->emitLabel(Sym);
+  OutStreamer->emitBytes(StringRef(
+      reinterpret_cast<const char *>(Data.data()), Data.size()));
 }
 
 // Stage 7d2 — `__mov_esp_dec_scratch`: a 16-byte cell in .bss used

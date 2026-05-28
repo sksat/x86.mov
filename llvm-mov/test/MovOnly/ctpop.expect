@@ -1,0 +1,4 @@
+# Opcodes this fixture acknowledges as not-yet-legalised. `jmp` is the
+# 7c1 dispatcher's indirect jump (mov-equivalent). Everything else
+# under stage 7e is rewritten to mov-only via the popcount byte-table.
+jmp

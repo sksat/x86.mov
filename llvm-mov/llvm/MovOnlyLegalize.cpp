@@ -237,6 +237,9 @@ public:
         case Mov::SAR32rCL:
           Changed |= legalizeShift32rCL(MI, MBB, TII, ShiftDir::SAR);
           break;
+        case Mov::CTPOP32r:
+          Changed |= legalizeCTPOP32r(MI, MBB, TII);
+          break;
         // SUB rr/ri, CMP+Jcc, CALL32d + CALLSEQ, RET, and the
         // prologue/epilogue PUSH/POP/SUB/MOV sequence light up
         // across stages 7c → 7d.
@@ -2298,6 +2301,134 @@ private:
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
         .addReg(Mov::EBP)
         .addImm(Addr->SrcDstDisp);
+
+    MI.eraseFromParent();
+    return true;
+  }
+
+  // Stage 7e — lower a single `CTPOP32r DST, SRC` into a mov-only
+  // sequence using the popcount8 byte table + the existing add8
+  // accumulator. Two phases:
+  //
+  //   Phase 1 (in-place per-byte popcount8 lookup) — for each byte
+  //     i ∈ 0..3 of the spilled source, replace srcdst[i] with
+  //     `__mov_popcount8_table[srcdst[i]]` (a value in 0..8).
+  //
+  //   Phase 2 (byte-add accumulator) — collapse srcdst[0..3] into
+  //     srcdst[0] via 3 single-stage byte adds against
+  //     `__mov_add8_sum_table`. Each intermediate is ≤ 32 (= 4×8), so
+  //     it fits in one byte and the carry-out path is never read.
+  //     idx[2] is left at 0 by emitIdxZero (= zero carry-in), so we
+  //     just reuse the existing add8 sum table without touching the
+  //     carry chain.
+  //
+  // After Phase 2 the popcount value is in srcdst[0] as a byte; we
+  // zero srcdst[1..3] with three MOV8mi so the final
+  // `mov DST32, [srcdst]` loads it as a plain u32.
+  //
+  // CTPOP is untied (dst ≠ src is allowed) — the rewrite spills src
+  // before any clobber and loads dst at the very end, so dst ∈
+  // {src, ECX, EDX} all work without special-casing.
+  bool legalizeCTPOP32r(MachineInstr &MI, MachineBasicBlock &MBB,
+                        const TargetInstrInfo &TII) const {
+    const MachineFunction &MF = *MBB.getParent();
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr)
+      return false;
+
+    assert(MI.getOperand(0).isReg() && "CTPOP32r op 0 must be reg");
+    assert(MI.getOperand(1).isReg() && "CTPOP32r op 1 must be reg");
+    const Register Dst = MI.getOperand(0).getReg();
+    const Register Src = MI.getOperand(1).getReg();
+
+    auto Insert = MachineBasicBlock::iterator(&MI);
+    const DebugLoc DL = MI.getDebugLoc();
+
+    // PROLOGUE — save ECX/EDX (clobbered by the chain's table
+    // lookups) and spill the source to srcdst. Spilling Src last
+    // captures its actual value (the ECX/EDX saves don't touch it).
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Src);
+
+    // PHASE 1 — in-place per-byte popcount8 lookup. Each stage is the
+    // standard idx-pack + table-load + store-back: idx zeroed, idx[0]
+    // = srcdst[i] (idx[1..3] stay 0), load `__mov_popcount8_table[ecx]`
+    // into DL, write DL into srcdst[i]. No carry chain — popcount is
+    // a pure per-byte function.
+    for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx) {
+      emitIdxZero(MBB, Insert, DL, TII, *Addr);
+      // mov dl, byte ptr [srcdst + i]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP)
+          .addImm(Addr->SrcDstDisp + static_cast<int64_t>(ByteIdx));
+      // mov byte ptr [idx + 0], dl
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+      // mov ecx, dword ptr [idx]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+      // mov dl, byte ptr [__mov_popcount8_table + ecx]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_popcount8_table").addReg(Mov::ECX);
+      // mov byte ptr [srcdst + i], dl
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP)
+          .addImm(Addr->SrcDstDisp + static_cast<int64_t>(ByteIdx))
+          .addReg(Mov::DL);
+    }
+
+    // PHASE 2 — accumulate srcdst[0] += srcdst[i] for i = 1..3 via
+    // the add8 sum table. cin is 0 throughout (emitIdxZero takes care
+    // of idx[2] = 0), and intermediate sums stay ≤ 32 so we never
+    // need the carry-out byte. Each step is one idx-pack + lookup +
+    // store-back into srcdst[0].
+    for (unsigned i = 1; i < 4; ++i) {
+      emitIdxZero(MBB, Insert, DL, TII, *Addr);
+      // idx[1] = srcdst[0]   ; running accumulator
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+      // idx[0] = srcdst[i]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP)
+          .addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+      // mov ecx, dword ptr [idx]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+      // mov dl, byte ptr [__mov_add8_sum_table + ecx]
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_add8_sum_table").addReg(Mov::ECX);
+      // mov byte ptr [srcdst], dl
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Mov::DL);
+    }
+
+    // Zero srcdst[1..3] so the trailing MOV32rm picks up only the
+    // accumulated popcount byte (max value 32 ⊆ 1 byte).
+    for (unsigned i = 1; i < 4; ++i) {
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+          .addReg(Mov::EBP)
+          .addImm(Addr->SrcDstDisp + static_cast<int64_t>(i))
+          .addImm(0);
+    }
+
+    // EPILOGUE — restore ECX/EDX, then load result into Dst. Same
+    // ordering rationale as legalizeADD32ri: if Dst ∈ {ECX, EDX}
+    // the restore writes the saved value and the result-load
+    // immediately overwrites it with the popcount.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
 
     MI.eraseFromParent();
     return true;

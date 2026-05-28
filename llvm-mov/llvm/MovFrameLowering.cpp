@@ -176,6 +176,15 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
         // so the trigger doesn't depend on that incidental signal.
         NeedsByteOpScratch = true;
         break;
+      case Mov::CTPOP32r:
+        // Stage 7e — count-set-bits pseudo. Rewrite uses the base 4
+        // byte-op scratch slots: srcdst holds the spilled input (then
+        // accumulates the popcount via the add8 byte chain), idx is
+        // the table-lookup index slot, save_ecx/save_edx preserve the
+        // chain's clobber-set across the rewrite. No rhs_buf needed
+        // (CTPOP is unary) and no sign/var-shift slots.
+        NeedsByteOpScratch = true;
+        break;
       default:
         break;
       }
