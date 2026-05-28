@@ -37,8 +37,23 @@ C-only frontend).
 | `shifts`         | `bench/fixtures/`                       | 7b2 imm shifts |
 | `fib_rec`        | `bench/fixtures/`                       | 7d1 + 7d3 recursion (`fib(24)` — compute-bound, the only fixture whose runtime row carries meaningful signal) |
 | `multi_call`     | `bench/fixtures/`                       | 7d3 multiple sequential CALLs |
-| `rust_main`      | `examples/rust/main/`                   | Rust trivial through `llvm-mov-llc` |
-| `rust_fib`       | `examples/rust/fib/`                    | Rust recursion (`fib(24)`) through `llvm-mov-llc` |
+| `rust_main`         | `examples/rust/main/`          | Rust trivial through `llvm-mov-llc` (no deps) |
+| `rust_fib`          | `examples/rust/fib/`           | Rust recursion (`fib(24)`) through `llvm-mov-llc` (no deps) |
+| `rust_png_header`   | `examples/rust/png_header/`    | PNG signature + IHDR parse via `read_unaligned::<u32>` (no deps) |
+| `rust_jpeg_header`  | `examples/rust/jpeg_header/`   | JPEG SOI/SOF0 marker walk (no deps) |
+| `rust_bmp_decode`   | `examples/rust/bmp_decode/`    | Full 32bpp BMP decode (no deps) |
+| `rust_base64_decode`| `examples/rust/base64_decode/` | `base64 = "0.22"` decode "Hello, World!" — **hybrid** (user mov + crate native) |
+| `rust_qoi_decode`   | `examples/rust/qoi_decode/`    | `qoi = "0.4"` 2x2 RGBA decode — **hybrid** |
+
+The "hybrid" rows are the honest baseline for how much of a
+deps-using Rust ELF the backend currently mov-ifies: user-crate
+`.text` (`*_main`, panic shim, and any decoder logic written *in*
+this crate) goes through `llvm-mov-llc`, but each crates.io dep's
+code is pulled in as the native i686 `.o` rustc compiled it to. The
+mov ratio for those rows is therefore strictly below 100 % even when
+the user code is fully mov-only — see
+[issue #11](https://github.com/sksat/x86.mov/issues/11) for the
+roadmap on getting deps through `llvm-mov-llc` too.
 
 Fixtures live in either `bench/fixtures/` (llvm-mov-specific) or the
 shared `../movfuscator-wasm/tests/fixtures/`. The runner searches

@@ -8,8 +8,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "rust-mov-jpeg-header"
+path = "src/main.rs"
+
 [lib]
 crate-type = ["staticlib"]
+path = "src/main.rs"
 
 [profile.release]
 panic = "abort"

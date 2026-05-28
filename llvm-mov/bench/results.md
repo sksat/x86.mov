@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-28T21:10:21Z on x86_64 (Linux).
+Generated 2026-05-28T23:43:43Z on x86_64 (Linux).
 
 ## return0
 
@@ -20,7 +20,7 @@ int main(void) { return 0; }
 | .rodata size | 524288 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 120 / 123 (97.6%) | 775 / 777 (99.7%) | 4 / 13 (30.8%) | 2 / 7 (28.6%) | 2 / 7 (28.6%) | 2 / 7 (28.6%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call int pop push ret xchg xor` | `call int ret xchg xor` | `call int ret xchg xor` | `call int ret xchg xor` |
-| wall-clock runtime (hyperfine mean) | 1.656 ms | 3.611 ms | 1.478 ms | 0.473 ms | 2.874 ms | 1.203 ms |
+| wall-clock runtime (hyperfine mean) | 2.795 ms | 2.875 ms | 2.439 ms | 1.473 ms | 1.112 ms | 1.197 ms |
 
 ## return42
 
@@ -35,7 +35,7 @@ int main(void) { return 42; }
 | .rodata size | 524288 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 120 / 123 (97.6%) | 775 / 777 (99.7%) | 5 / 13 (38.5%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call int pop push ret xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.410 ms | 1.536 ms | 0.789 ms | 0.818 ms | 0.629 ms | 0.360 ms |
+| wall-clock runtime (hyperfine mean) | 0.176 ms | 3.771 ms | 1.626 ms | 2.958 ms | 2.787 ms | 3.311 ms |
 
 ## eq42
 
@@ -59,7 +59,7 @@ int main(void) {
 | .rodata size | 721152 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 274 / 281 (97.5%) | 1050 / 1052 (99.8%) | 8 / 19 (42.1%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jmp jne pop push ret sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.672 ms | 1.050 ms | 0.384 ms | 0.715 ms | 0.410 ms | 1.188 ms |
+| wall-clock runtime (hyperfine mean) | 2.423 ms | 1.511 ms | 2.276 ms | 1.219 ms | 0.979 ms | 1.053 ms |
 
 ## lt_unsigned
 
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 | .rodata size | 721152 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 304 / 311 (97.7%) | 1045 / 1047 (99.8%) | 9 / 20 (45.0%) | 2 / 9 (22.2%) | 2 / 9 (22.2%) | 2 / 9 (22.2%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jae jmp pop push ret xchg` | `call cmp int ret setb xchg xor` | `call cmp int ret setb xchg xor` | `call cmp int ret setb xchg xor` |
-| wall-clock runtime (hyperfine mean) | 1.539 ms | 2.772 ms | 0.856 ms | 2.431 ms | 1.432 ms | 1.832 ms |
+| wall-clock runtime (hyperfine mean) | 1.522 ms | 2.370 ms | 3.490 ms | 1.643 ms | 3.511 ms | 2.631 ms |
 
 ## bitops
 
@@ -134,7 +134,7 @@ int main(void) {
 | .rodata size | 589824 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 164 / 167 (98.2%) | 922 / 924 (99.8%) | 8 / 19 (42.1%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add and call int or pop push ret sub xchg xor` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 1.609 ms | 1.891 ms | 1.446 ms | 0.740 ms | 2.298 ms | 1.207 ms |
+| wall-clock runtime (hyperfine mean) | 2.508 ms | 4.328 ms | 2.942 ms | 1.831 ms | 1.109 ms | 1.582 ms |
 
 ## sum10
 
@@ -154,7 +154,7 @@ int main(void) {
 | .rodata size | 721408 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 421 / 429 (98.1%) | 1225 / 1227 (99.8%) | 11 / 24 (45.8%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jg jmp pop push ret sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.633 ms | 2.071 ms | 0.500 ms | 0.402 ms | 0.304 ms | 0.343 ms |
+| wall-clock runtime (hyperfine mean) | 0.387 ms | 2.383 ms | 1.121 ms | 0.559 ms | 0.854 ms | 1.586 ms |
 
 ## fib10
 
@@ -191,7 +191,7 @@ int main(void) {
 | .rodata size | 721408 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 426 / 434 (98.2%) | 1267 / 1269 (99.8%) | 16 / 29 (55.2%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jge jmp pop push ret sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 2.614 ms | 2.436 ms | 0.604 ms | 1.133 ms | 3.164 ms | 2.340 ms |
+| wall-clock runtime (hyperfine mean) | 0.990 ms | 3.139 ms | 2.698 ms | 0.820 ms | 0.725 ms | 1.552 ms |
 
 ## shifts
 
@@ -228,7 +228,7 @@ int main(int argc, char **argv) {
 | .rodata size | 657152 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 458 / 461 (99.3%) | 1423 / 1425 (99.9%) | 14 / 28 (50.0%) | 3 / 9 (33.3%) | 3 / 9 (33.3%) | 3 / 9 (33.3%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add and call int or pop push ret sar shl sub xchg` | `call int or ret shl xchg` | `call int or ret shl xchg` | `call int or ret shl xchg` |
-| wall-clock runtime (hyperfine mean) | 1.319 ms | 1.788 ms | 0.670 ms | 0.598 ms | 1.771 ms | 0.998 ms |
+| wall-clock runtime (hyperfine mean) | 0.503 ms | 3.138 ms | 1.731 ms | 1.879 ms | 1.195 ms | 1.721 ms |
 
 ## shift_reg
 
@@ -278,7 +278,7 @@ int main(int argc, char **argv) {
 | .rodata size | 723968 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 2378 / 2381 (99.9%) | 1542 / 1544 (99.9%) | 21 / 37 (56.8%) | 7 / 20 (35.0%) | 7 / 20 (35.0%) | 7 / 20 (35.0%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add and call int or pop push ret sar shl shr sub xchg xor` | `and call int or pop push ret sar shl shr xchg xor` | `and call int or pop push ret sar shl shr xchg xor` | `and call int or pop push ret sar shl shr xchg xor` |
-| wall-clock runtime (hyperfine mean) | 3.895 ms | 2.224 ms | 0.659 ms | 1.466 ms | 1.585 ms | 0.925 ms |
+| wall-clock runtime (hyperfine mean) | 0.753 ms | 4.494 ms | 2.417 ms | 2.992 ms | 0.709 ms | 0.527 ms |
 
 ## fib_rec
 
@@ -325,7 +325,7 @@ int main(void) {
 | .rodata size | 721408 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 873 / 884 (98.8%) | 2248 / 2250 (99.9%) | 21 / 54 (38.9%) | 6 / 43 (14.0%) | 7 / 57 (12.3%) | 7 / 57 (12.3%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jge jmp nop pop push ret sub xchg` | `add call cmp int jge jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` |
-| wall-clock runtime (hyperfine mean) | 432.875 ms | 3450.920 ms | 4.580 ms | 1.966 ms | 1.832 ms | 1.377 ms |
+| wall-clock runtime (hyperfine mean) | 176.172 ms | 2369.006 ms | 3.012 ms | 2.092 ms | 0.876 ms | 0.865 ms |
 
 ## multi_call
 
@@ -366,27 +366,29 @@ int main(int argc, char **argv) {
 | .rodata size | 524288 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 704 / 711 (99.0%) | 2036 / 2038 (99.9%) | 22 / 46 (47.8%) | 4 / 22 (18.2%) | 4 / 22 (18.2%) | 4 / 22 (18.2%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call int nop pop push ret sub xchg` | `add call inc int lea nop ret xchg` | `add call inc int lea nop ret xchg` | `add call inc int lea nop ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.201 ms | 1.338 ms | 0.919 ms | 1.412 ms | 1.716 ms | 0.605 ms |
+| wall-clock runtime (hyperfine mean) | 0.604 ms | 2.405 ms | 1.033 ms | 2.193 ms | 2.154 ms | 0.995 ms |
 
 ## rust_main
 
 ```rust
 //! Stage-6.5 trivial Rust → mov-only x86-32 ELF example.
 //!
-//! Single `extern "C"` entry point returning a scalar i32. The
-//! sibling [`../_start.s`](../_start.s) calls `rust_main` and `int
-//! 0x80`s with the return value, so the linked ELF exits with status
-//! 42.
+//! Bin crate, `#![no_main]`: rustc does not emit any entry symbol;
+//! the real ELF entry is `_start` in [`../_start.s`](../_start.s),
+//! which calls `rust_main` and `int 0x80`s with the return value.
 //!
-//! Edition 2024: `#[no_mangle]` is now an unsafe attribute.
-//! See [`Cargo.toml`](Cargo.toml) for the `panic=abort` /
+//! Edition 2024: `#[no_mangle]` is now an unsafe attribute. See
+//! [`Cargo.toml`](Cargo.toml) for the `panic=abort` /
 //! `overflow-checks=false` profile knobs that keep the IR within
 //! the Mov backend's supported surface.
 
 #![no_std]
+#![no_main]
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main() -> i32 {
@@ -396,12 +398,12 @@ pub extern "C" fn rust_main() -> i32 {
 
 | metric | llvm-mov (Rust) | movfuscator | rustc -O0 | rustc -O1 | rustc -O2 | rustc -O3 |
 |---|---:|---:|---:|---:|---:|---:|
-| total ELF (bytes) | 533380 | — | 1220856 | 1220856 | 1220856 | 1220856 |
+| total ELF (bytes) | 1745488 | — | 1220856 | 1220856 | 1220856 | 1220856 |
 | .text size | 794 | — | 22 | 22 | 22 | 22 |
 | .rodata size | 524288 | — | 0 | 0 | 0 | 0 |
 | mov count / total | 193 / 199 (97.0%) | — | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | — | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.783 ms | — | 0.396 ms | 0.801 ms | 0.556 ms | 0.717 ms |
+| wall-clock runtime (hyperfine mean) | 0.784 ms | — | 0.219 ms | 0.844 ms | 0.374 ms | 0.606 ms |
 
 ## rust_fib
 
@@ -430,6 +432,7 @@ pub extern "C" fn rust_main() -> i32 {
 //! doesn't check it.
 
 #![no_std]
+#![no_main]
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
@@ -447,10 +450,520 @@ pub extern "C" fn fib_main() -> i32 {
 
 | metric | llvm-mov (Rust) | movfuscator | rustc -O0 | rustc -O1 | rustc -O2 | rustc -O3 |
 |---|---:|---:|---:|---:|---:|---:|
-| total ELF (bytes) | 730692 | — | 1225028 | 1225028 | 1225028 | 1225028 |
+| total ELF (bytes) | 1942800 | — | 1225028 | 1225028 | 1225028 | 1225028 |
 | .text size | 3790 | — | 161 | 113 | 129 | 129 |
 | .rodata size | 721408 | — | 0 | 0 | 0 | 0 |
 | mov count / total | 939 / 953 (98.5%) | — | 20 / 50 (40.0%) | 6 / 41 (14.6%) | 7 / 50 (14.0%) | 7 / 50 (14.0%) |
 | non-mov mnemonics | `call int jmp` | — | `add call cmp int jl jmp pop push ret sub xchg` | `add call cmp int jge jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` |
-| wall-clock runtime (hyperfine mean) | 257.238 ms | — | 1.540 ms | 1.810 ms | 2.621 ms | 2.763 ms |
+| wall-clock runtime (hyperfine mean) | 242.903 ms | — | 1.625 ms | 2.580 ms | 2.541 ms | 2.603 ms |
+
+## rust_png_header
+
+```rust
+//! Tiny PNG-header parser. Pure no_std, no_alloc, no byte-by-byte
+//! reads — everything is `read_unaligned::<u32>` so the generated IR
+//! is `load i32, align 1` + bitshift/mask only. With stage 6d3a
+//! (`allowsMisalignedMemoryAccesses` returning true) these compile
+//! through llvm-mov-llc as plain MOV32rm + AND32ri / SHR32ri.
+//!
+//! Layout we care about:
+//!   * 8-byte PNG signature: `89 50 4e 47  0d 0a 1a 0a`
+//!   * IHDR chunk: 4-byte length (=13), 4-byte type ("IHDR"),
+//!     13-byte payload (width u32 BE, height u32 BE, depth u8,
+//!     colour-type u8, compression u8, filter u8, interlace u8),
+//!     4-byte CRC.
+//!
+//! `png_header_main` returns the parsed IHDR width modulo 256 if the
+//! signature / IHDR-type match the spec, otherwise 0. The fixture
+//! is a 8x8 image so the expected exit code is 8.
+
+#![no_std]
+#![no_main]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+use core::ptr;
+
+// Hand-built 33-byte prefix of a real 8x8 grayscale PNG file:
+// signature (8) + IHDR length+type (8) + IHDR data (13) + CRC (4).
+// Byte values are the spec — width=8, height=8, depth=8, colour=0
+// (grayscale), compression=0, filter=0, interlace=0.
+#[unsafe(no_mangle)]
+pub static PNG_FIXTURE: [u8; 33] = [
+    // PNG signature
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    // IHDR length (13 BE) + chunk type "IHDR"
+    0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    // Width (8 BE), height (8 BE)
+    0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08,
+    // depth, colour-type, compression, filter, interlace
+    0x08, 0x00, 0x00, 0x00, 0x00,
+    // CRC (placeholder)
+    0xa1, 0xa3, 0x40, 0x67,
+];
+
+#[inline(always)]
+fn read_u32_le(p: *const u8, off: usize) -> u32 {
+    unsafe { ptr::read_unaligned(p.add(off) as *const u32) }
+}
+
+#[inline(always)]
+fn bswap32(x: u32) -> u32 {
+    // Manual byte-swap. `u32::swap_bytes` works too but lowers to the
+    // same shift/or chain at -O0; spell it out so the IR stays
+    // predictable for the bench reader.
+    let a = (x >> 24) & 0xff;
+    let b = (x >> 8)  & 0xff_00;
+    let c = (x << 8)  & 0xff_0000;
+    let d = (x << 24) & 0xff_00_0000;
+    a | b | c | d
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn png_header_main() -> i32 {
+    let p = (&raw const PNG_FIXTURE) as *const u8;
+
+    // Word 0/1 of the signature, compared as little-endian native.
+    let sig0 = read_u32_le(p, 0);   // 47 4e 50 89  (LE)
+    let sig1 = read_u32_le(p, 4);   // 0a 1a 0a 0d  (LE)
+    if sig0 != 0x474e5089 || sig1 != 0x0a1a0a0d {
+        return 0;
+    }
+
+    // IHDR chunk type, offset 12. "IHDR" as LE u32 = 0x52444849.
+    let chunk_type = read_u32_le(p, 12);
+    if chunk_type != 0x52444849 {
+        return 0;
+    }
+
+    // Width is at offset 16, big-endian. Read as LE u32 then byteswap.
+    let width_be_raw = read_u32_le(p, 16);
+    let width = bswap32(width_be_raw);
+
+    (width & 0xff) as i32
+}
+```
+
+| metric | llvm-mov (Rust) | movfuscator | rustc -O0 | rustc -O1 | rustc -O2 | rustc -O3 |
+|---|---:|---:|---:|---:|---:|---:|
+| total ELF (bytes) | 1946772 | — | 1225260 | 1220868 | 1220868 | 1220868 |
+| .text size | 4262 | — | 318 | 22 | 22 | 22 |
+| .rodata size | 721232 | — | 45 | 0 | 0 | 0 |
+| mov count / total | 1077 / 1094 (98.4%) | — | 39 / 91 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
+| non-mov mnemonics | `call int jmp` | — | `add and call cmp int je jmp jne lea nop or pop push ret shl shr sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
+| wall-clock runtime (hyperfine mean) | 1.872 ms | — | 1.481 ms | 3.388 ms | 0.495 ms | 3.199 ms |
+
+## rust_jpeg_header
+
+```rust
+//! Tiny JPEG header parser, no_std/no_alloc. Same shape as
+//! `png_header/`: read 32-bit words via `ptr::read_unaligned::<u32>`,
+//! extract bytes via shift/mask. The whole point is that the
+//! resulting IR stays in i32-land — no individual `load i8` ops —
+//! so it round-trips through llvm-mov-llc once stage 6d3a's
+//! `allowsMisalignedMemoryAccesses` lets unaligned 32-bit loads
+//! survive.
+//!
+//! JPEG layout we look at:
+//!   * 2-byte SOI marker `FF D8`
+//!   * marker stream: each marker is `FF xx`; length-bearing markers
+//!     are followed by 2-byte big-endian length (incl. the length
+//!     itself), then the payload.
+//!   * SOF0 (Start Of Frame, baseline) is `FF C0`; payload begins
+//!     with `precision (1B) height (2B BE) width (2B BE) ...`.
+//!
+//! `jpeg_header_main` walks the marker chain, finds SOF0, and
+//! returns the height & 0xff. The embedded fixture is a 16-tall
+//! image, so expected exit code is 16.
+
+#![no_std]
+#![no_main]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+use core::ptr;
+
+// Hand-built JPEG prefix: SOI + JFIF APP0 (18 bytes) + SOF0 (17 bytes).
+// Just enough that the parser can find the SOF0 marker and read the
+// frame dimensions. Image is 24 wide × 16 tall (arbitrary).
+//
+// SOI:  ff d8
+// APP0: ff e0  00 10  4a 46 49 46 00  01 01 00  00 01 00 01  00 00
+//       (marker, length=16, "JFIF\0", version, density, x/y, thumbnail)
+// SOF0: ff c0  00 11  08  00 10  00 18  03  01 22 00  02 11 01  03 11 01
+//       (marker, length=17, precision=8, height=16, width=24,
+//        components=3, then 3 × (id, sampling, qtbl))
+#[unsafe(no_mangle)]
+pub static JPEG_FIXTURE: [u8; 39] = [
+    0xff, 0xd8,
+    0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00,
+    0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x18,
+    0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
+];
+
+#[inline(always)]
+fn read_u32_le(p: *const u8, off: usize) -> u32 {
+    unsafe { ptr::read_unaligned(p.add(off) as *const u32) }
+}
+
+#[inline(always)]
+fn byte_at(w: u32, lane: u32) -> u32 {
+    (w >> (lane * 8)) & 0xff
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn jpeg_header_main() -> i32 {
+    let p = (&raw const JPEG_FIXTURE) as *const u8;
+
+    // Word 0 contains bytes [0..4] (little-endian native).
+    // Bytes 0/1 should be ff d8 (SOI).
+    let w0 = read_u32_le(p, 0);
+    if byte_at(w0, 0) != 0xff || byte_at(w0, 1) != 0xd8 {
+        return 0;
+    }
+
+    // Walk markers. Each marker is ff <code>; if `code` is
+    // 0xC0..=0xFE (excluding standalone markers like 0xD8/0xD9)
+    // it carries a 2-byte BE length follow.
+    //
+    // The fixture's layout makes this a one-iteration walk — APP0 at
+    // offset 2 (length 16 → next at 2+2+16 = 20), then SOF0 at 20.
+    let mut off: usize = 2;
+    // Cap the loop so a malformed input can't run forever; 16 markers
+    // is plenty for SOF0 to appear in a real header. The bound here
+    // doubles as the loop's upper iteration count for the byte-chain
+    // legalize cost estimate.
+    let mut iter: u32 = 0;
+    while iter < 16 {
+        // Read the marker (4 bytes starting at off): ff, code, len_hi, len_lo
+        let mw = read_u32_le(p, off);
+        let marker_ff = byte_at(mw, 0);
+        let code      = byte_at(mw, 1);
+        if marker_ff != 0xff {
+            return 0;
+        }
+        if code == 0xc0 {
+            // SOF0 found. Length is at off+2..off+4 (BE); height at
+            // off+5..off+7 (BE). The whole 8-byte block fits in two
+            // u32 reads starting at off and off+4.
+            let payload_w = read_u32_le(p, off + 4);
+            // payload bytes in payload_w (LE-ordered native):
+            //   lane 0 = precision
+            //   lane 1 = height hi
+            //   lane 2 = height lo
+            //   lane 3 = width hi
+            let height_hi = byte_at(payload_w, 1);
+            let height_lo = byte_at(payload_w, 2);
+            let height = (height_hi << 8) | height_lo;
+            return (height & 0xff) as i32;
+        }
+        // Length-bearing marker (everything in C0..=FE except the
+        // standalone 0xD0..=0xD9 set). Read 2-byte BE length at off+2.
+        let lw = mw >> 16;            // top half of mw = bytes [off+2, off+3]
+        let len_be_hi = lw & 0xff;
+        let len_be_lo = (lw >> 8) & 0xff;
+        let len = (len_be_hi << 8) | len_be_lo;
+        off = off + 2 + len as usize;
+        iter = iter + 1;
+    }
+    0
+}
+```
+
+| metric | llvm-mov (Rust) | movfuscator | rustc -O0 | rustc -O1 | rustc -O2 | rustc -O3 |
+|---|---:|---:|---:|---:|---:|---:|
+| total ELF (bytes) | 1946776 | — | 1225264 | 1220872 | 1220872 | 1220872 |
+| .text size | 7349 | — | 419 | 22 | 22 | 22 |
+| .rodata size | 721236 | — | 51 | 0 | 0 | 0 |
+| mov count / total | 1888 / 1908 (99.0%) | — | 45 / 114 (39.5%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
+| non-mov mnemonics | `call int jmp` | — | `add and call cmp int jb je jmp jne lea nop or pop push ret shl shr sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
+| wall-clock runtime (hyperfine mean) | 2.420 ms | — | 2.571 ms | 1.395 ms | 0.618 ms | 2.051 ms |
+
+## rust_bmp_decode
+
+```rust
+//! Full no_std BMP decoder for the 32bpp / uncompressed / BITMAPINFOHEADER
+//! subset. Reads every pixel of the embedded fixture and returns a
+//! 32-bit digest so we can prove the bytes were genuinely consumed
+//! (vs the header-only `png_header/` / `jpeg_header/` examples).
+//!
+//! What "full decode" means here:
+//!   * Parse the 14-byte BITMAPFILEHEADER (signature, file size,
+//!     pixel-array offset).
+//!   * Parse the 40-byte BITMAPINFOHEADER (width, height, planes,
+//!     bpp=32, compression=0).
+//!   * Iterate over `width * abs(height)` pixels, reading each as a
+//!     u32 (BGRA in little-endian byte order).
+//!   * Reduce the pixel stream to a single u32 digest (XOR + rotate)
+//!     so the output depends on every pixel's value.
+//!
+//! Why 32bpp & not 24bpp: 32bpp aligns each pixel to a 4-byte
+//! boundary, so iterating with `ptr::read_unaligned::<u32>` produces
+//! `load i32` IR with no per-byte access. The DIB header is 14+40
+//! = 54 bytes before pixel data, which *is* misaligned, but the
+//! stage 6d3a `allowsMisalignedMemoryAccesses` fix lets the
+//! resulting `load i32, align 1` pass straight through.
+//!
+//! 24bpp BMP would force a per-byte read at every pixel boundary
+//! (3 bytes/pixel, never aligned to 4); supporting that path needs
+//! stage 6d3b.
+
+#![no_std]
+#![no_main]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+use core::ptr;
+
+// Hand-built 2x2 32bpp BMP. File header (14B) + DIB header (40B) +
+// 4 pixels (16B) = 70 bytes total. Pixels in BGRA order, bottom-up:
+//   row 1 (bottom): 0x000000FF (red), 0x0000FF00 (green)
+//   row 0 (top):    0x00FF0000 (blue), 0x00FFFFFF (white)
+//
+// The exit-code oracle below digests these into a deterministic u32,
+// and its low byte is what `bmp_decode_main` returns. Running the
+// same XOR+rotl-13 chain in Python over the embedded pixels gives
+// `digest = 0x6bea7f68`, mod 256 = 104.
+#[unsafe(no_mangle)]
+pub static BMP_FIXTURE: [u8; 70] = [
+    // BITMAPFILEHEADER (14 bytes)
+    0x42, 0x4d,                         // "BM"
+    0x46, 0x00, 0x00, 0x00,             // file size = 70
+    0x00, 0x00, 0x00, 0x00,             // reserved
+    0x36, 0x00, 0x00, 0x00,             // pixel data offset = 54
+    // BITMAPINFOHEADER (40 bytes)
+    0x28, 0x00, 0x00, 0x00,             // header size = 40
+    0x02, 0x00, 0x00, 0x00,             // width = 2
+    0x02, 0x00, 0x00, 0x00,             // height = 2 (bottom-up)
+    0x01, 0x00,                         // planes = 1
+    0x20, 0x00,                         // bpp = 32
+    0x00, 0x00, 0x00, 0x00,             // compression = BI_RGB (0)
+    0x10, 0x00, 0x00, 0x00,             // image size = 16
+    0x13, 0x0b, 0x00, 0x00,             // x ppm
+    0x13, 0x0b, 0x00, 0x00,             // y ppm
+    0x00, 0x00, 0x00, 0x00,             // palette colours
+    0x00, 0x00, 0x00, 0x00,             // important colours
+    // Pixel data (16 bytes, BGRA bottom-up)
+    0xff, 0x00, 0x00, 0x00,             // (0,1) red
+    0x00, 0xff, 0x00, 0x00,             // (1,1) green
+    0x00, 0x00, 0xff, 0x00,             // (0,0) blue
+    0xff, 0xff, 0xff, 0x00,             // (1,0) white
+];
+
+#[inline(always)]
+fn read_u32_le(p: *const u8, off: usize) -> u32 {
+    unsafe { ptr::read_unaligned(p.add(off) as *const u32) }
+}
+
+#[inline(always)]
+fn read_u16_le(p: *const u8, off: usize) -> u32 {
+    // Read u16 as the low 16 bits of an unaligned u32 read.
+    let w = unsafe { ptr::read_unaligned(p.add(off) as *const u32) };
+    w & 0xffff
+}
+
+#[inline(always)]
+fn rotl32_13(x: u32) -> u32 {
+    // Hand-spelled rotate-left-13 to keep the IR off the `rotl`
+    // intrinsic — the backend has no ROL/ROR opcode (and no
+    // pattern to lower `ISD::ROTL`); shifting + OR-ing the two
+    // halves is the same value and stays inside the legal i32 op
+    // set (SHL32ri / SHR32ri / OR32rr).
+    (x << 13) | (x >> 19)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bmp_decode_main() -> i32 {
+    let p = (&raw const BMP_FIXTURE) as *const u8;
+
+    // BITMAPFILEHEADER: signature must be "BM" (0x4d42 LE).
+    let bm = read_u16_le(p, 0);
+    if bm != 0x4d42 {
+        return 0;
+    }
+    let pixel_offset = read_u32_le(p, 10) as usize;
+
+    // BITMAPINFOHEADER: validate planes=1, bpp=32, compression=0.
+    let width  = read_u32_le(p, 18);
+    let height = read_u32_le(p, 22);
+    let planes_bpp = read_u32_le(p, 26);    // planes (low 16) + bpp (high 16)
+    let compression = read_u32_le(p, 30);
+    if planes_bpp != ((32u32 << 16) | 1u32) || compression != 0 {
+        return 0;
+    }
+
+    // Decode every pixel. `read_unaligned::<u32>` on the pixel base
+    // is fine — BITMAPFILEHEADER + BITMAPINFOHEADER is 54 bytes
+    // (offset 54 = 0x36 = mod 4 = 2, misaligned), but the
+    // unaligned-load lowering at stage 6d3a accepts that.
+    //
+    // We deliberately do NOT compute `width * height` for the loop
+    // bound — `i32 mul` is unsupported in the backend today (no
+    // MUL32rr/ri yet). Instead we walk byte offsets directly with
+    // the image-size field (DIB header offset 34, in bytes) as the
+    // termination cap, which is a plain u32 comparison.
+    let image_size = read_u32_le(p, 34) as usize;
+    let end = pixel_offset + image_size;
+    let mut digest: u32 = 0x9e3779b9; // golden ratio sentinel
+    let mut off = pixel_offset;
+    while off < end {
+        let px = read_u32_le(p, off);
+        // Mix every pixel into the digest. XOR + rotate gives a
+        // function where each pixel's value affects every digest
+        // byte after a couple of rounds — enough that flipping any
+        // single byte in the fixture changes the exit code.
+        digest = rotl32_13(digest ^ px);
+        off = off + 4;
+    }
+    // Silence "unused" on width/height — they're still parsed and
+    // validated structurally; the digest loop just doesn't multiply
+    // them because the backend lacks MUL32.
+    let _ = width;
+    let _ = height;
+
+    (digest & 0xff) as i32
+}
+```
+
+| metric | llvm-mov (Rust) | movfuscator | rustc -O0 | rustc -O1 | rustc -O2 | rustc -O3 |
+|---|---:|---:|---:|---:|---:|---:|
+| total ELF (bytes) | 1947416 | — | 1225264 | 1220868 | 1220868 | 1220868 |
+| .text size | 7953 | — | 497 | 22 | 22 | 22 |
+| .rodata size | 721812 | — | 82 | 0 | 0 | 0 |
+| mov count / total | 2004 / 2028 (98.8%) | — | 65 / 130 (50.0%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
+| non-mov mnemonics | `call int jmp` | — | `add and call cmp int jb je jmp jne lea nop or pop push ret shl shr sub xchg xor` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
+| wall-clock runtime (hyperfine mean) | 2.343 ms | — | 2.126 ms | 2.090 ms | 1.191 ms | 1.618 ms |
+
+## rust_base64_decode
+
+```rust
+#![no_std]
+#![no_main]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+
+// compiler-rt stubs are no longer required: MUL32{rr,ri} (stage 7f1)
+// covers `__mulsi3`, and stage 7f2's llvm-mov-llc driver injects
+// `__udivsi3 / __umodsi3 / __divsi3 / __modsi3` bodies into any module
+// whose IR uses udiv/sdiv/urem/srem. Only memset/memcpy stay here
+// because the backend's libcall set still routes through them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut i: usize = 0;
+    while i < n { unsafe { *dst.add(i) = c as u8; } i = i + 1; }
+    dst
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i: usize = 0;
+    while i < n { unsafe { *dst.add(i) = *src.add(i); } i = i + 1; }
+    dst
+}
+
+#[unsafe(no_mangle)]
+pub static BASE64_INPUT: &[u8] = b"SGVsbG8sIFdvcmxkIQ==";
+
+#[unsafe(no_mangle)]
+pub extern "C" fn base64_decode_main() -> i32 {
+    let mut out = [0u8; 16];
+    let n = match STANDARD.decode_slice(BASE64_INPUT, &mut out) {
+        Ok(n) => n,
+        Err(_) => return -1,
+    };
+    let mut sum: u32 = 0;
+    let mut i: usize = 0;
+    while i < n { sum = sum + out[i] as u32; i = i + 1; }
+    (sum & 0xff) as i32
+}
+```
+
+| metric | llvm-mov (Rust) | movfuscator | rustc -O0 | rustc -O1 | rustc -O2 | rustc -O3 |
+|---|---:|---:|---:|---:|---:|---:|
+| total ELF (bytes) | 1988948 | — | — | 1234400 | 1234400 | 1234400 |
+| .text size | 34747 | — | — | 6219 | 6347 | 6347 |
+| .rodata size | 729144 | — | — | 4888 | 4888 | 4888 |
+| mov count / total | 8299 / 9451 (87.8%) | — | — | 669 / 1862 (35.9%) | 671 / 1893 (35.4%) | 671 / 1893 (35.4%) |
+| non-mov mnemonics | `add and bswap call cmovae cmovb cmove cmovne cmp dec imul inc int ja jae jb jbe je jmp jne lea movd movdqa movdqu mul neg nop not or paddd pand pcmpeqd pcmpgtb pinsrw pop por pshufd psrld punpckhdq punpckhqdq punpcklbw punpckldq punpcklqdq punpcklwd push pxor ret setae setb sete setge setne shl shld shr sub test xchg xor` | — | — | `add and bswap call cmovae cmovb cmove cmovne cmp dec imul inc int ja jae jb jbe je jmp jne lea movaps movd movdqa movdqu mul neg nop not or paddd pand pcmpeqd pcmpgtb pinsrw pop por pshufd psrld punpckhdq punpckhqdq punpcklbw punpckldq punpcklqdq punpcklwd push pxor ret setae setb sete setge setne shl shld shr sub test xchg xor xorps` | `add and bswap call cmovae cmovb cmove cmovne cmp dec imul inc int ja jae jb jbe je jmp jne lea movd movdqa movdqu mul neg nop not or paddd pand pcmpeqd pcmpgtb pinsrw pop por pshufd psrld punpckhdq punpckhqdq punpcklbw punpckldq punpcklqdq punpcklwd push pxor ret setae setb sete setge setne shl shld shr sub test xchg xor` | `add and bswap call cmovae cmovb cmove cmovne cmp dec imul inc int ja jae jb jbe je jmp jne lea movd movdqa movdqu mul neg nop not or paddd pand pcmpeqd pcmpgtb pinsrw pop por pshufd psrld punpckhdq punpckhqdq punpcklbw punpckldq punpcklqdq punpcklwd push pxor ret setae setb sete setge setne shl shld shr sub test xchg xor` |
+| wall-clock runtime (hyperfine mean) | 2.082 ms | — | — | 0.849 ms | 1.716 ms | 0.691 ms |
+
+## rust_qoi_decode
+
+```rust
+//! Full no_std QOI decode via the `qoi = "0.4", default-features = false"`
+//! crate. Embeds a hand-built 2x2 RGBA fixture (4 pixels via
+//! QOI_OP_RGBA chunks), runs `Decoder::decode_to_buf` into a stack
+//! `[u8; 16]`, and returns the byte sum mod 256.
+//!
+//! Pixel sum = (10+20+30+255) + (40+50+60+255) + (70+80+90+255)
+//!           + (100+110+120+255) = 1800.
+//! 1800 mod 256 = 8.
+
+#![no_std]
+#![no_main]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+// compiler-rt stubs are no longer required: MUL32{rr,ri} (stage 7f1)
+// covers `__mulsi3`, and stage 7f2's llvm-mov-llc driver injects
+// `__udivsi3 / __umodsi3 / __divsi3 / __modsi3` bodies into any module
+// whose IR uses udiv/sdiv/urem/srem. Only memset/memcpy stay here
+// because the backend's libcall set still routes through them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut i: usize = 0;
+    while i < n { unsafe { *dst.add(i) = c as u8; } i = i + 1; }
+    dst
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i: usize = 0;
+    while i < n { unsafe { *dst.add(i) = *src.add(i); } i = i + 1; }
+    dst
+}
+
+#[unsafe(no_mangle)]
+pub static QOI_FIXTURE: [u8; 42] = [
+    // header: "qoif", width=2, height=2, channels=4, colorspace=0
+    0x71, 0x6f, 0x69, 0x66, 0x00, 0x00, 0x00, 0x02,
+    0x00, 0x00, 0x00, 0x02, 0x04, 0x00,
+    // 4 × QOI_OP_RGBA (1+4=5 bytes each)
+    0xff, 0x0a, 0x14, 0x1e, 0xff, 0xff, 0x28, 0x32,
+    0x3c, 0xff, 0xff, 0x46, 0x50, 0x5a, 0xff, 0xff,
+    0x64, 0x6e, 0x78, 0xff,
+    // end marker
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+];
+
+#[unsafe(no_mangle)]
+pub extern "C" fn qoi_decode_main() -> i32 {
+    let mut buf = [0u8; 16];
+    let mut decoder = match qoi::Decoder::new(&QOI_FIXTURE[..]) {
+        Ok(d) => d,
+        Err(_) => return -1,
+    };
+    if decoder.decode_to_buf(&mut buf).is_err() { return -2; }
+    let mut sum: u32 = 0;
+    let mut i: usize = 0;
+    while i < 16 { sum = sum + buf[i] as u32; i = i + 1; }
+    (sum & 0xff) as i32
+}
+```
+
+| metric | llvm-mov (Rust) | movfuscator | rustc -O0 | rustc -O1 | rustc -O2 | rustc -O3 |
+|---|---:|---:|---:|---:|---:|---:|
+| total ELF (bytes) | 2208596 | — | — | 1225168 | 1225168 | 1225168 |
+| .text size | 132917 | — | — | 821 | 1126 | 1088 |
+| .rodata size | 855594 | — | — | 42 | 42 | 42 |
+| mov count / total | 23365 / 23412 (99.8%) | — | — | 78 / 246 (31.7%) | 111 / 342 (32.5%) | 111 / 334 (33.2%) |
+| non-mov mnemonics | `call int jmp` | — | — | `add and call cmovb cmp dec imul inc int jae jb jbe je jmp jne js lea movaps mul nop or pop push ret shl shr sub test xchg xor xorps` | `add and call cmovb cmp dec imul inc int ja jae jb jbe je jmp jne js lea movd movdqa movdqu mul nop or pop pshufd pshuflw punpcklbw push pxor ret shl shr sub test xchg xor` | `add and call cmovb cmp dec imul inc int ja jae jb jbe je jmp jne js lea movd movdqa movdqu mul nop or paddb pop psadbw pshufd pshuflw punpcklbw push pxor ret shl shr sub test xchg xor` |
+| wall-clock runtime (hyperfine mean) | 3.054 ms | — | — | 2.340 ms | 0.166 ms | 0.349 ms |
 

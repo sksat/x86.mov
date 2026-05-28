@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "rust-mov-base64-decode"
+path = "src/main.rs"
+
 [lib]
 crate-type = ["staticlib"]
+path = "src/main.rs"
 
 [dependencies]
 base64 = { version = "0.22", default-features = false }

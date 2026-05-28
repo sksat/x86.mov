@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "rust-mov-qoi-decode"
+path = "src/main.rs"
+
 [lib]
 crate-type = ["staticlib"]
+path = "src/main.rs"
 
 [dependencies]
 qoi = { version = "0.4", default-features = false }

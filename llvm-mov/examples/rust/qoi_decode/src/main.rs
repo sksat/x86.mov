@@ -8,6 +8,7 @@
 //! 1800 mod 256 = 8.
 
 #![no_std]
+#![no_main]
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }

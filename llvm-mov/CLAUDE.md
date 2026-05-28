@@ -28,7 +28,7 @@ layout, the staged stage-7 plan — see [`DESIGN.md`](DESIGN.md).
 | `make build` | `llvm-mov-llc` compiles against `libLLVM-22` | LLVM 22.1.x (apt.llvm.org) |
 | `make test` | 39 [`test/Execution/`](test/Execution/) fixtures exit with their expected codes | binutils `as --32`, `ld -m elf_i386` |
 | `make test-mov-only` | every [`test/MovOnly/`](test/MovOnly/) fixture's `.text` contains only mov-family mnemonics (plus per-fixture `.expect` allowlist) | (same) |
-| `make test-rust-example` | both Cargo-backed examples under [`examples/rust/{main,fib}/`](examples/rust/) link + run | rustc + cargo + `rustup target add i686-unknown-linux-gnu` |
+| `make test-rust-example` | plain `cargo build --release` in every crate under [`examples/rust/*/`](examples/rust/) produces a runnable mov-only ELF (alias: `make test-cargo-build`; harness at [`test/CargoBuild/run.sh`](test/CargoBuild/run.sh)) | rustc + cargo + `rustup target add i686-unknown-linux-gnu` |
 | `make bench` | regenerates [`bench/results.md`](bench/results.md) (side-by-side vs movfuscator + Rust rows) | clang-22, hyperfine, movfuscator |
 | `make bench-check` | committed `results.md` deterministic numbers still match a fresh run | (same) |
 
