@@ -79,6 +79,12 @@ case "$EXAMPLE" in
     # decode_to_buf produces 16 output bytes whose sum is 1800,
     # mod 256 = 8.
     qoi_decode) ENTRY="qoi_decode_main"; EXPECTED=8; CRATE="rust_mov_qoi_decode" ;;
+    # Stage-6e indirect-call demo: `apply(add25, 17)` routes through
+    # `apply`'s function-pointer formal arg, so `apply`'s body lowers
+    # to a real CALL32r (mov-only legalised at stage 7d3 via the
+    # `__mov_indirect_callee_slot` save/reload). Expected exit code
+    # = add25(17) = 42.
+    indirect_call) ENTRY="indirect_call_main"; EXPECTED=42; CRATE="rust_mov_indirect_call" ;;
     # AES-128 ECB encrypt of NIST's AES-128 test vector, iterated
     # N_ROUNDS times (see aes/src/lib.rs). The example does NOT
     # currently round-trip through llvm-mov-llc: rustc emits
@@ -88,7 +94,7 @@ case "$EXAMPLE" in
     # 256 once the encrypt path can be compiled (placeholder value
     # until a real run produces it).
     aes)  ENTRY="aes_main";  EXPECTED=0;   CRATE="rust_mov_aes" ;;
-    *) echo "error: unknown --example=$EXAMPLE (try main, fib, png_header, jpeg_header, bmp_decode, base64_decode, qoi_decode, aes)" 1>&2; exit 2 ;;
+    *) echo "error: unknown --example=$EXAMPLE (try main, fib, png_header, jpeg_header, bmp_decode, base64_decode, qoi_decode, indirect_call, aes)" 1>&2; exit 2 ;;
 esac
 
 CRATE_DIR="$HERE/$EXAMPLE"
