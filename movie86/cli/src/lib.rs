@@ -15,6 +15,11 @@ use movie86_core::{Cpu, Fault, Memory, Reg32, Signal};
 /// already-large segment range.
 const DEFAULT_STACK_SIZE: u32 = 64 * 1024;
 
+pub mod diff;
+pub mod snapshot;
+
+pub use diff::diff_snapshots;
+
 #[cfg(test)]
 mod tests;
 
@@ -397,6 +402,17 @@ pub struct DebugConfig {
     /// Dump the current `u32` values at these guest addresses whenever
     /// execution stops at `break_at`.
     pub dump_u32: Vec<u32>,
+    /// Capture a [`Snapshot`] right after the Nth step completes and
+    /// write it to the given path. Pair with `snapshot_on_stop` to
+    /// compare progress between a specific step and the eventual halt.
+    ///
+    /// [`Snapshot`]: snapshot::Snapshot
+    pub snapshot_at_step: Option<(u64, std::path::PathBuf)>,
+    /// Capture a snapshot when the run halts (exit, fault, break-at,
+    /// max-steps). The snapshot's `kind` field records *why* it
+    /// stopped so a later `movie86 diff` can label the comparison
+    /// honestly.
+    pub snapshot_on_stop: Option<std::path::PathBuf>,
 }
 
 /// Reason the debug-driven run stopped *short* of the guest exiting on
@@ -411,6 +427,7 @@ pub enum DebugStop {
 
 /// Like [`run_elf_with_host`] but also accepts a `DebugConfig`. This
 /// is the entry the `movie86 --watch ...` CLI uses, exposed for tests.
+#[allow(clippy::too_many_lines)] // single-narrative run loop — splitting just spreads the state-machine across helpers
 pub fn run_elf_with_debug<H: SysHost + LibcHost>(
     bytes: &[u8],
     host: &mut H,
@@ -472,6 +489,14 @@ pub fn run_elf_with_debug<H: SysHost + LibcHost>(
                     Err(f) => eprintln!("movie86: dump {addr:#010x} faulted: {f:?}"),
                 }
             }
+            write_stop_snapshot(
+                cfg,
+                snapshot::SnapshotKind::Break,
+                cpu.eip,
+                step_count,
+                &cpu,
+                &mem,
+            );
             return RunOutcome::DebugStop(DebugStop::Break(cpu.eip));
         }
         if let Some(max) = cfg.max_steps {
@@ -479,6 +504,14 @@ pub fn run_elf_with_debug<H: SysHost + LibcHost>(
                 eprintln!(
                     "movie86: --max-steps {max} reached at eip={:#010x}",
                     cpu.eip
+                );
+                write_stop_snapshot(
+                    cfg,
+                    snapshot::SnapshotKind::MaxSteps,
+                    u32::try_from(max).unwrap_or(u32::MAX),
+                    step_count,
+                    &cpu,
+                    &mem,
                 );
                 return RunOutcome::DebugStop(DebugStop::MaxSteps(max));
             }
@@ -508,9 +541,126 @@ pub fn run_elf_with_debug<H: SysHost + LibcHost>(
             }
         }
         match outcome {
-            Ok(()) => step_count += 1,
-            Err(Fault::Exit(status)) => return RunOutcome::Exit(status),
-            Err(e) => return RunOutcome::Fault(e),
+            Ok(()) => {
+                step_count += 1;
+                // `--snapshot-at-step N` captures right after step N
+                // completed (step_count is now N+1, but the user said
+                // "step N", which is what we just finished).
+                if let Some((target, path)) = &cfg.snapshot_at_step {
+                    if step_count == *target {
+                        write_step_snapshot(path, step_count, &cpu, &mem);
+                    }
+                }
+            }
+            Err(Fault::Exit(status)) => {
+                write_stop_snapshot(
+                    cfg,
+                    snapshot::SnapshotKind::Exit,
+                    status,
+                    step_count,
+                    &cpu,
+                    &mem,
+                );
+                return RunOutcome::Exit(status);
+            }
+            Err(e) => {
+                write_stop_snapshot(
+                    cfg,
+                    snapshot::SnapshotKind::Fault,
+                    fault_detail(e),
+                    step_count,
+                    &cpu,
+                    &mem,
+                );
+                return RunOutcome::Fault(e);
+            }
         }
+    }
+}
+
+/// Encode a [`Fault`]'s primary u32 payload for the snapshot `detail`
+/// field. 0 when the variant carries none.
+fn fault_detail(f: Fault) -> u32 {
+    match f {
+        Fault::Unmapped(a) => a,
+        // Exit, UnknownSyscall, SignalHandlerUnregistered all carry
+        // one u32 scalar that maps to detail directly.
+        Fault::Exit(s) | Fault::UnknownSyscall(s) | Fault::SignalHandlerUnregistered(s) => s,
+        Fault::UnknownOpcode(b) | Fault::UnsupportedInterrupt(b) => u32::from(b),
+        Fault::DecodeTruncated | Fault::UnimplementedMov => 0,
+    }
+}
+
+/// Snapshot the whole `FlatMemory`. Used by both --snapshot-at-step
+/// (with kind `AfterStep`) and the stop-time captures.
+fn write_step_snapshot(
+    path: &std::path::Path,
+    step_count: u64,
+    cpu: &Cpu,
+    mem: &movie86_core::FlatMemory,
+) {
+    write_snapshot(
+        path,
+        snapshot::SnapshotKind::AfterStep,
+        0,
+        step_count,
+        cpu,
+        mem,
+    );
+}
+
+/// Take the snapshot for whatever caused the run to stop. No-op when
+/// the user didn't pass `--snapshot-on-stop`.
+fn write_stop_snapshot(
+    cfg: &DebugConfig,
+    kind: snapshot::SnapshotKind,
+    detail: u32,
+    step_count: u64,
+    cpu: &Cpu,
+    mem: &movie86_core::FlatMemory,
+) {
+    let Some(path) = &cfg.snapshot_on_stop else {
+        return;
+    };
+    write_snapshot(path, kind, detail, step_count, cpu, mem);
+}
+
+fn write_snapshot(
+    path: &std::path::Path,
+    kind: snapshot::SnapshotKind,
+    detail: u32,
+    step_count: u64,
+    cpu: &Cpu,
+    mem: &movie86_core::FlatMemory,
+) {
+    // u32 cast: FlatMemory's construction already rejects regions
+    // larger than 4 GiB, so this can't truncate.
+    let mem_len = u32::try_from(mem.len()).unwrap_or(u32::MAX);
+    let snap = match snapshot::Snapshot::capture(
+        kind,
+        step_count,
+        cpu.regs,
+        cpu.eip,
+        cpu.signal_handler(Signal::Segv),
+        cpu.signal_handler(Signal::Ill),
+        detail,
+        mem,
+        mem.base(),
+        mem_len,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("movie86: snapshot capture failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = snap.write_to_path(path) {
+        eprintln!("movie86: snapshot write to {} failed: {e}", path.display());
+    } else {
+        eprintln!(
+            "movie86: snapshot ({}) written to {} at step {step_count}",
+            kind.label(),
+            path.display()
+        );
     }
 }

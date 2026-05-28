@@ -1,12 +1,17 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use movie86_cli::{run_elf_with_debug, DebugConfig, RunOutcome, StdHost};
+use movie86_cli::{diff_snapshots, run_elf_with_debug, DebugConfig, RunOutcome, StdHost};
 
 fn print_usage(arg0: &str) {
     eprintln!(
         "usage: {arg0} [--trace] [--break-at HEX] [--max-steps N] \
-         [--watch HEX]... [--dump-u32 HEX]... <elf-file>"
+         [--watch HEX]... [--dump-u32 HEX]... \
+         [--snapshot-at-step N PATH] [--snapshot-on-stop PATH] <elf-file>"
     );
+    eprintln!();
+    eprintln!("subcommands:");
+    eprintln!("  {arg0} diff <a.snap> <b.snap>    compare two snapshots");
 }
 
 fn parse_u32_hex(s: &str) -> Option<u32> {
@@ -20,6 +25,13 @@ fn parse_u32_hex(s: &str) -> Option<u32> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let progname = args.first().map_or("movie86", String::as_str).to_string();
+
+    // The first positional argument selects the subcommand. `diff` is
+    // the only non-default one for now; everything else is treated as
+    // a path to an ELF.
+    if args.get(1).is_some_and(|s| s == "diff") {
+        return run_diff_subcommand(&args, &progname);
+    }
 
     let mut cfg = DebugConfig::default();
     let mut path: Option<String> = None;
@@ -54,6 +66,24 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 };
                 cfg.dump_u32.push(v);
+            }
+            "--snapshot-at-step" => {
+                let Some(n) = it.next().and_then(|s| s.parse::<u64>().ok()) else {
+                    eprintln!("movie86: --snapshot-at-step needs a decimal step count");
+                    return ExitCode::from(2);
+                };
+                let Some(p) = it.next() else {
+                    eprintln!("movie86: --snapshot-at-step needs a path after the step count");
+                    return ExitCode::from(2);
+                };
+                cfg.snapshot_at_step = Some((n, PathBuf::from(p)));
+            }
+            "--snapshot-on-stop" => {
+                let Some(p) = it.next() else {
+                    eprintln!("movie86: --snapshot-on-stop needs a path");
+                    return ExitCode::from(2);
+                };
+                cfg.snapshot_on_stop = Some(PathBuf::from(p));
             }
             "-h" | "--help" => {
                 print_usage(&progname);
@@ -99,4 +129,36 @@ fn main() -> ExitCode {
     // run loop; no extra message needed here.
     let code = u8::try_from(outcome.process_exit_code() & 0xff).unwrap_or(1);
     ExitCode::from(code)
+}
+
+/// `movie86 diff <a.snap> <b.snap>` — load two snapshots and print the
+/// register / step-count / memory deltas. Exits 0 if they match (no
+/// changes), 1 if they differ, 2 on bad arguments / load failure.
+fn run_diff_subcommand(args: &[String], progname: &str) -> ExitCode {
+    // args[0] = progname, args[1] = "diff", args[2..] = paths
+    if args.len() != 4 {
+        eprintln!("usage: {progname} diff <a.snap> <b.snap>");
+        return ExitCode::from(2);
+    }
+    let a = match movie86_cli::snapshot::Snapshot::read_from_path(args[2].as_ref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("movie86: failed to read {}: {e}", args[2]);
+            return ExitCode::from(2);
+        }
+    };
+    let b = match movie86_cli::snapshot::Snapshot::read_from_path(args[3].as_ref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("movie86: failed to read {}: {e}", args[3]);
+            return ExitCode::from(2);
+        }
+    };
+    let report = diff_snapshots(&a, &b);
+    print!("{report}");
+    if report.contains("no differences") {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
