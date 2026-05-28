@@ -11,6 +11,7 @@ fn print_usage(arg0: &str) {
     eprintln!(
         "usage: {arg0} [--trace] [--break-at HEX] [--max-steps N] \
          [--watch HEX]... [--dump-u32 HEX]... \
+         [--log-writes-in START:END]... \
          [--snapshot-at-step N PATH] [--snapshot-on-stop PATH] \
          [--gdb-listen ADDR] <elf-file>"
     );
@@ -29,6 +30,19 @@ fn parse_u32_hex(s: &str) -> Option<u32> {
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s);
     u32::from_str_radix(trimmed, 16).ok()
+}
+
+/// Parse `START:END` into a half-open `Range<u32>` (both hex, with
+/// or without `0x` prefix). `END` is exclusive — match Rust's `..`
+/// range convention.
+fn parse_range(s: &str) -> Option<std::ops::Range<u32>> {
+    let (a, b) = s.split_once(':')?;
+    let start = parse_u32_hex(a)?;
+    let end = parse_u32_hex(b)?;
+    if end <= start {
+        return None;
+    }
+    Some(start..end)
 }
 
 #[allow(clippy::too_many_lines)] // monolithic arg-parse; clarity beats fragmentation here
@@ -88,6 +102,19 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 };
                 cfg.snapshot_at_step = Some((n, PathBuf::from(p)));
+            }
+            "--log-writes-in" => {
+                let Some(arg) = it.next() else {
+                    eprintln!("movie86: --log-writes-in needs START:END (hex)");
+                    return ExitCode::from(2);
+                };
+                let Some(r) = parse_range(&arg) else {
+                    eprintln!(
+                        "movie86: bad --log-writes-in range {arg:?} (expected START:END, both hex, END > START)"
+                    );
+                    return ExitCode::from(2);
+                };
+                cfg.log_writes_in.push(r);
             }
             "--snapshot-on-stop" => {
                 let Some(p) = it.next() else {

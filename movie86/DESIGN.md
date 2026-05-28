@@ -408,6 +408,48 @@ gdb -ex 'target remote :1234' -ex 'set arch i386'
 (gdb) c
 ```
 
+## Memory-write log (`--log-writes-in START:END`)
+
+`cli/src/logging_memory.rs`. Per-write tracer for a caller-supplied
+address range. Answers the question snapshot+diff *couldn't*: "which
+instruction wrote to this dispatch cell, in what temporal order?".
+
+Built as a memory adapter (smart-friend's option B), not a trait
+change: `LoggingMemory<M: Memory>` wraps any `Memory` impl, intercepts
+writes, and captures `(addr, width, old, new)` into a per-step pending
+buffer. The run loop drains the buffer after each `cpu.step()` and
+prepends `(step_count, eip)`.
+
+- **Range matching is inclusive-start, exclusive-end** (`START..END`,
+  Rust's `..` convention).
+- **Empty `log_ranges` ⇒ zero-cost pass-through** — one `is_empty`
+  check per write, no allocations.
+- **`write_bytes` (loader) explodes into per-byte entries** in-range —
+  rare in practice (the adapter sits on top of an already-loaded
+  memory) but kept correct for completeness.
+- **Multiple ranges** via repeating `--log-writes-in`.
+
+Applied to `multi-add` against the 3 pages the snapshot diff revealed
+(0x08286xxx / 0x08487xxx / 0x08687xxx), the log immediately surfaced
+movfuscator's function-call dispatch machinery:
+
+```
+[     0] write u32@0x08487100: 0x00000000 -> 0x088976d0  (eip=0x08049012)
+[    25] write u32@0x08487118: 0x00000000 -> 0x00000001  (eip=0x0804909f)
+[    26] write u32@0x0848711c: 0x00000001 -> 0x00000000  (eip=0x080490a9)
+[    33] write u32@0x08286fc0: 0x00000000 -> 0x00000000  (eip=0x080490d2)
+...
+[   102] write u32@0x082870c0: 0x00000000 -> 0x8804958a  (eip=0x08049238)
+[   108] write u32@0x08487134: 0x08687134 -> 0x08687150  (eip=0x0804925c)
+[   118] write u32@0x08487134: 0x08687150 -> 0x08687160  (eip=0x08049290)
+[   126] write u32@0x08487134: 0x08687160 -> 0x0868716c  (eip=0x080492bb)
+```
+
+`0x8804958a` is `&add` (the callee), `0x08487134` is movfuscator's
+`sel_target` slot ping-ponging through stack frames as the shadow
+stack pushes — exactly the dispatch dance multi-add is slow on. With
+this tool the per-iteration cost is visible, not hidden.
+
 ## Snapshot / diff
 
 `cli/src/snapshot.rs` + `cli/src/diff.rs`. Memory + register state

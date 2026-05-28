@@ -17,10 +17,12 @@ const DEFAULT_STACK_SIZE: u32 = 64 * 1024;
 
 pub mod diff;
 pub mod gdb_target;
+pub mod logging_memory;
 pub mod snapshot;
 
 pub use diff::diff_snapshots;
 pub use gdb_target::{run_elf_with_gdb, GdbRunError};
+pub use logging_memory::{LoggedWrite, LoggingMemory};
 
 #[cfg(test)]
 mod tests;
@@ -415,6 +417,12 @@ pub struct DebugConfig {
     /// stopped so a later `movie86 diff` can label the comparison
     /// honestly.
     pub snapshot_on_stop: Option<std::path::PathBuf>,
+    /// Log every guest memory write that falls inside any of these
+    /// ranges, prefixed with `(step, eip)`. Built for tracing the
+    /// movfuscator dispatch state in fixtures like multi-add where
+    /// PC cycling alone hides logical progress — see
+    /// [`logging_memory`] for the per-write capture mechanism.
+    pub log_writes_in: Vec<std::ops::Range<u32>>,
 }
 
 /// Reason the debug-driven run stopped *short* of the guest exiting on
@@ -439,10 +447,15 @@ pub fn run_elf_with_debug<H: SysHost + LibcHost>(
         Ok(e) => e,
         Err(e) => return RunOutcome::LoadError(e),
     };
-    let (mut mem, esp_initial) = match flatten_with_stack(&elf, DEFAULT_STACK_SIZE) {
+    let (inner_mem, esp_initial) = match flatten_with_stack(&elf, DEFAULT_STACK_SIZE) {
         Ok(pair) => pair,
         Err(e) => return RunOutcome::LoadError(e),
     };
+    // Always wrap the flat memory in a logging adapter — `log_writes_in`
+    // empty ⇒ zero-cost pass-through (one Vec::is_empty check per write).
+    // Putting the wrap unconditionally on the run path keeps the trait
+    // bound stable and avoids enum-dispatch downstream.
+    let mut mem = LoggingMemory::new(inner_mem, cfg.log_writes_in.clone());
     let mut cpu = Cpu::new(elf.entry);
     cpu.set_reg(Reg32::Esp, esp_initial);
     // movfuscator's runtime installs `dispatch` (SIGSEGV) and
@@ -552,6 +565,20 @@ pub fn run_elf_with_debug<H: SysHost + LibcHost>(
                 watch_state[i] = new_v;
             }
         }
+        // Drain any writes that landed in a `--log-writes-in` range
+        // during this step. `eip` is *after* the step here (control
+        // already advanced); that's the convention the existing
+        // --watch path uses too. `step_count` is still pre-increment.
+        for w in mem.drain_pending() {
+            eprintln!(
+                "[{step_count:>6}] write u{}@{:#010x}: {:#010x} -> {:#010x}  (eip={:#010x})",
+                w.width * 8,
+                w.addr,
+                w.old,
+                w.new,
+                cpu.eip,
+            );
+        }
         match outcome {
             Ok(()) => {
                 step_count += 1;
@@ -609,7 +636,7 @@ fn write_step_snapshot(
     path: &std::path::Path,
     step_count: u64,
     cpu: &Cpu,
-    mem: &movie86::FlatMemory,
+    mem: &LoggingMemory<movie86::FlatMemory>,
 ) {
     write_snapshot(
         path,
@@ -629,7 +656,7 @@ fn write_stop_snapshot(
     detail: u32,
     step_count: u64,
     cpu: &Cpu,
-    mem: &movie86::FlatMemory,
+    mem: &LoggingMemory<movie86::FlatMemory>,
 ) {
     let Some(path) = &cfg.snapshot_on_stop else {
         return;
@@ -643,7 +670,7 @@ fn write_snapshot(
     detail: u32,
     step_count: u64,
     cpu: &Cpu,
-    mem: &movie86::FlatMemory,
+    mem: &LoggingMemory<movie86::FlatMemory>,
 ) {
     // u32 cast: FlatMemory's construction already rejects regions
     // larger than 4 GiB, so this can't truncate.
