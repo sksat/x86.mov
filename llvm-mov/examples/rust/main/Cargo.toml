@@ -1,5 +1,10 @@
-# Stage-6.5 trivial Rust example. Crate-type=staticlib, edition 2024.
-# See ../README.md for the build invariants.
+# Stage-6.5 trivial Rust example.
+#
+# Binary crate: `cargo build --release` produces a runnable mov-only
+# ELF at target/i686-unknown-linux-gnu/release/rust-mov-main via the
+# custom linker driver wired in ../.cargo/config.toml. The actual
+# entry symbol is `_start` from ../_start.s; rustc's own libstd /
+# main wrapper is sidestepped by `#![no_main]` in src/main.rs.
 
 [package]
 name = "rust-mov-main"
@@ -7,8 +12,9 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-[lib]
-crate-type = ["staticlib"]
+[[bin]]
+name = "rust-mov-main"
+path = "src/main.rs"
 
 [profile.release]
 panic = "abort"

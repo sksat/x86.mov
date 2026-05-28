@@ -1,0 +1,25 @@
+# `cargo build` inside any examples/rust/<crate>/ directory is rewired
+# here so the link step goes through llvm-mov-llc instead of the host's
+# native linker. The driver lives one level up (../cargo-link.sh
+# resolved from each crate dir) and takes the rustc-emitted LLVM IR
+# (via `--emit=llvm-ir`) as its actual input — the .o that rustc also
+# emits and passes through is discarded.
+#
+# Result: `cd examples/rust/<name> && cargo build --release` produces
+# a runnable mov-only ELF at
+# `target/i686-unknown-linux-gnu/release/rust-mov-<name>`, no run.sh
+# wrapper required.
+
+[build]
+target = "i686-unknown-linux-gnu"
+
+[target.i686-unknown-linux-gnu]
+linker = "./cargo-link.sh"
+# --emit=llvm-ir,obj,link makes rustc drop the .ll alongside the .o,
+# which the linker driver picks up by mtime under target/<triple>/release/deps/.
+# codegen-units=1 keeps it a single .ll per crate so the most-recent
+# pick is unambiguous.
+rustflags = [
+    "--emit=llvm-ir,obj,link",
+    "-Ccodegen-units=1",
+]

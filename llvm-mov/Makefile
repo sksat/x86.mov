@@ -12,7 +12,7 @@ BUILD_TYPE   ?= Release
 LLVM_CMAKE_DIR := $(shell $(LLVM_CONFIG) --cmakedir 2>/dev/null)
 
 .PHONY: all build configure test test-exec test-codegen test-mov-only \
-        test-rust-example bench bench-check clean distclean help
+        test-rust-example test-cargo-build bench bench-check clean distclean help
 
 all: build
 
@@ -24,8 +24,9 @@ help:
 	@echo "  test-codegen       — lit + FileCheck only  (test/CodeGen)"
 	@echo "  test-mov-only      — objdump gate: every fixture under test/MovOnly/"
 	@echo "                       must disassemble to mov-only opcodes (stage 7+)"
-	@echo "  test-rust-example  — rustc → llvm-mov-llc → ELF round-trip (stage 6.5;"
-	@echo "                       needs 'rustup target add i686-unknown-linux-gnu')"
+	@echo "  test-rust-example  — plain 'cargo build' per examples/rust/<crate>"
+	@echo "                       (alias: test-cargo-build); stage 6.5; needs"
+	@echo "                       'rustup target add i686-unknown-linux-gnu'"
 	@echo "  bench              — side-by-side ELF comparison vs movfuscator on the"
 	@echo "                       shared .c fixtures; writes bench/results.md"
 	@echo "                       (needs 'make -C ../movfuscator-wasm setup build-native')"
@@ -69,21 +70,18 @@ test-codegen: build
 		echo "test-codegen: lit not installed or no CodeGen suite yet — skipping"; \
 	fi
 
-# Stage-6.5 / 7d3 demo: cargo (rustc) → llvm-mov-llc → as → ld → run.
-# Opt-in — not in the default `test` target because it pulls in a Rust
-# toolchain dependency. The script itself surfaces a clear message if
-# the i686 rust-std rlibs aren't installed.
+# Stage-6.5 / 7d3 demo: plain `cd examples/rust/<crate> && cargo
+# build --release` produces a runnable mov-only ELF for every Cargo-
+# backed example. The custom linker driver wired in
+# examples/rust/.cargo/config.toml does the llvm-mov-llc + as + ld
+# pipeline; cargo itself sees the build as a normal `bin` crate
+# compile.
 #
-# Runs every Cargo-backed example under examples/rust/.
-test-rust-example: build
-	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=main --run
-	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=fib --run
-	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=png_header --run
-	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=jpeg_header --run
-	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=bmp_decode --run
-	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=base64_decode --run
-	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=qoi_decode --run
-	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=indirect_call --run
+# Opt-in — not in the default `test` target because it pulls in a
+# Rust toolchain dependency. The harness surfaces a clear message
+# if the i686 rust-std rlibs aren't installed.
+test-rust-example test-cargo-build: build
+	@./test/CargoBuild/run.sh $(BUILD_DIR)
 
 # Stage-7+ gate. `test/MovOnly/run.sh` builds every fixture under
 # test/MovOnly/ and asserts the disassembly contains only mov-family

@@ -1,21 +1,39 @@
 # examples/rust — Rust → mov-only x86-32
 
-End-to-end pipeline:
+End-to-end pipeline, invoked by a plain `cargo build --release`:
 
 ```
-src/lib.rs ──cargo rustc --emit=llvm-ir──> .ll ──llvm-mov-llc──> .s ──as --32──> .o ──ld -m elf_i386──> ELF32
+src/main.rs ──rustc --emit=llvm-ir──> .ll ──llvm-mov-llc──> .s ──as --32──> .o ──ld -m elf_i386──> ELF32
+                                                              (linker driver: cargo-link.sh)
 ```
 
-Two independent Cargo crates live under this directory:
+[`./.cargo/config.toml`](.cargo/config.toml) rewires every crate under
+this directory to go through [`cargo-link.sh`](cargo-link.sh) at the
+link step. Rustc emits the LLVM IR (via `--emit=llvm-ir`) instead of a
+native binary; the driver picks the `.ll` up, runs `llvm-mov-llc`, and
+calls `as --32` + `ld -m elf_i386 -static` to produce the final mov-only
+ELF where cargo expects its binary output.
+
+Result: `cd <crate> && cargo build --release` is the whole command —
+no `run.sh` wrapper required. Each crate is an independent Cargo
+project with its own deps:
 
 | crate | entry | stage exercised | expected exit |
 |---|---|---|---:|
 | [`main/`](main/) | `rust_main` | 6.5 (trivial scalar return) | 42 |
-| [`fib/`](fib/) | `fib_main` | 7d1 + 7d3 (recursion through global return-addr slot) | 55 |
+| [`fib/`](fib/) | `fib_main` | 7d1 + 7d3 (recursion through global return-addr slot) | 32 |
+| [`png_header/`](png_header/) | `png_header_main` | 6d3a (`load i32, align 1`) | 8 |
+| [`jpeg_header/`](jpeg_header/) | `jpeg_header_main` | 6d3a + marker walk | 16 |
+| [`bmp_decode/`](bmp_decode/) | `bmp_decode_main` | 6d3a full 32bpp decode | 104 |
+| [`base64_decode/`](base64_decode/) | `base64_decode_main` | 6d3c crates.io ecosystem (base64) | 105 |
+| [`qoi_decode/`](qoi_decode/) | `qoi_decode_main` | 6d3e crates.io ecosystem (qoi) | 8 |
+| [`aes/`](aes/) | `aes_main` | stage 8+ blocker (vector.reduce.xor) | n/a |
 
-Both crates are edition **2024** (`#[no_mangle]` → `#[unsafe(no_mangle)]`)
-and target `i686-unknown-linux-gnu`. The shared
-[`run.sh`](run.sh) driver picks one via `--example={main,fib}`.
+All crates are edition **2024** (`#[no_mangle]` → `#[unsafe(no_mangle)]`),
+`#![no_std]` + `#![no_main]`, and target `i686-unknown-linux-gnu`.
+The shared [`run.sh`](run.sh) driver is a thin dev wrapper around
+`cargo build`; pick a crate via `--example=<dir>` for a quick build +
+asm dump or `--run` to also execute the binary and check its exit code.
 
 ## Build invariants
 
@@ -33,10 +51,15 @@ and target `i686-unknown-linux-gnu`. The shared
    return an `{i32, i1}` aggregate the Mov backend doesn't yet handle.
 3. **Tight surface.** `no_std`, no panic message formatting, no atomics,
    no aggregates, no FP. The Cargo profile knobs (above) plus the
-   `#![no_std]` attribute in each `lib.rs` enforce this.
+   `#![no_std]` + `#![no_main]` attributes in each `src/main.rs`
+   enforce this.
 4. **Static link, no libc.** Each crate's `_start.s` invokes `int 0x80`
    directly, sidestepping the host's 32-bit dynamic loader and crt0
-   entirely (same approach as `test/Execution/`).
+   entirely (same approach as `test/Execution/`). `cargo-link.sh`
+   ignores rustc's native `.o` and the runtime libs it would normally
+   pull in — only the crate's `.ll` (run through `llvm-mov-llc`),
+   `_start.s`, and any dependency `.o` extracted from rlibs end up in
+   the final ELF.
 
 ## Running
 
@@ -47,15 +70,21 @@ rustup target add i686-unknown-linux-gnu
 # From the llvm-mov/ root:
 make build                              # builds llvm-mov-llc
 
-# Trivial example:
-bash examples/rust/run.sh --example=main --run    # → PASS  rust_main  (exit 42)
+# Plain cargo build per example:
+cd examples/rust/main && cargo build --release
+./target/i686-unknown-linux-gnu/release/rust-mov-main; echo $?    # → 42
 
-# Recursive example:
-bash examples/rust/run.sh --example=fib --run     # → PASS  fib_main   (exit 32)
+# Or, dev wrapper (build + run + exit-code check, one of the 7 crates):
+bash examples/rust/run.sh --example=fib --run     # → PASS  fib_main  (exit 32)
+
+# Full CI gate — `cargo build` every example, check every exit code:
+make test-rust-example   # alias: make test-cargo-build
 ```
 
-Omit `--run` to dump the generated asm + `file` output of the linked
-ELF without executing it.
+Omit `--run` in the dev wrapper to dump the generated asm + `file`
+output of the linked ELF without executing it. The asm lives under
+`<crate>/target/i686-unknown-linux-gnu/release/deps/<crate>-<hash>.s`
+since the linker driver writes it next to its `-o` target.
 
 ## What it shows
 

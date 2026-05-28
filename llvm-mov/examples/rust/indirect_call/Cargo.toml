@@ -1,4 +1,4 @@
-# Stage-6e indirect-call Rust example. Crate-type=staticlib, edition 2024.
+# Stage-6e indirect-call Rust example.
 # Mirror of ../main/Cargo.toml — same panic=abort / opt-level=0 /
 # overflow-checks=false profile shape.
 
@@ -8,8 +8,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "rust-mov-indirect-call"
+path = "src/main.rs"
+
 [lib]
 crate-type = ["staticlib"]
+path = "src/main.rs"
 
 [profile.release]
 panic = "abort"
