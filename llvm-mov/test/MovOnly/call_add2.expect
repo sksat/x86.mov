@@ -1,0 +1,5 @@
+# Stage 7d3 — the trailing `jmp <callee>` (JMP32d_CALL) of the call
+# rewrite is the only non-mov mnemonic. The objdump gate already
+# accepts `jmp` (dispatcher + 7d1 indirect return), so the same line
+# covers this case.
+jmp

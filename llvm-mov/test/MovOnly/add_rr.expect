@@ -1,0 +1,6 @@
+# After stage 7d the only non-mov opcode left in this fixture's `.text`
+# is `jmp` — the indirect branch through the 7c1 dispatcher slot (and,
+# for fixtures with calls, the 7d3 `JMP32d_CALL` terminator). Both are
+# mov-equivalent (one memory operand, no flag use), so the gate
+# accepts them.
+jmp

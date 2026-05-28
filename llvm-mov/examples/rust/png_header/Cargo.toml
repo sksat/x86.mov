@@ -1,0 +1,27 @@
+# Stage-6d demonstrator: parse a PNG file header (signature + IHDR
+# chunk) entirely in pure-i32 territory — `core::ptr::read_unaligned::<u32>`
+# instead of byte-by-byte reads, so the resulting IR is `load i32, align 1`
+# + bit-shift/mask only. With stage 6d3a (allowsMisalignedMemoryAccesses)
+# this round-trips through llvm-mov-llc; per-byte parsing of the same
+# fixture would hit the unresolved i8 ext-load path.
+
+[package]
+name = "rust-mov-png-header"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+opt-level = 0
+overflow-checks = false
+debug = false
+strip = false
+lto = false
+
+[profile.dev]
+panic = "abort"
+overflow-checks = false

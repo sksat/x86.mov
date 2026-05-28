@@ -1,0 +1,48 @@
+//===-- MovInstPrinter.h ----------------------------------------*- C++ -*-===//
+#pragma once
+
+#include "llvm/MC/MCInstPrinter.h"
+
+namespace llvm {
+// TableGen produces `MovGenAsmWriter.inc` from the AsmString fields in
+// MovInstrInfo.td; this thin subclass plugs it into the MCInstPrinter
+// machinery the streamer expects.
+class MovInstPrinter : public MCInstPrinter {
+public:
+  MovInstPrinter(const MCAsmInfo &MAI, const MCInstrInfo &MII,
+                 const MCRegisterInfo &MRI)
+      : MCInstPrinter(MAI, MII, MRI) {}
+
+  void printInst(const MCInst *MI, uint64_t Address, StringRef Annot,
+                 const MCSubtargetInfo &STI, raw_ostream &O) override;
+
+  // Generated entry points from MovGenAsmWriter.inc:
+  void printInstruction(const MCInst *MI, uint64_t Address, raw_ostream &O);
+  std::pair<const char *, uint64_t> getMnemonic(const MCInst &MI) const override;
+  bool printAliasInstr(const MCInst *MI, uint64_t Address, raw_ostream &OS);
+  static const char *getRegisterName(MCRegister Reg);
+
+  void printRegName(raw_ostream &O, MCRegister Reg) override;
+  void printOperand(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+
+  // 4-arg overload for PC-relative operands (branch targets in JMP / Jcc).
+  // The generated AsmWriter passes the instruction address; we don't use
+  // it for Intel asm (the symbol expression is self-describing), but the
+  // signature must match what TableGen emits.
+  void printOperand(const MCInst *MI, uint64_t /*Address*/, unsigned OpNo,
+                    raw_ostream &O) {
+    printOperand(MI, OpNo, O);
+  }
+
+  // Two-operand printer for MovMemOperand: emits `[base + disp]` in Intel
+  // syntax. Called from the TableGen-generated printInstruction whenever
+  // it encounters an operand whose `let PrintMethod = "printMemOperand"`.
+  void printMemOperand(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+
+  // Two-operand printer for MovIdxMemOperand (stage 7-prep-2b): emits
+  // `[<symbol-expr> + <index_reg>]` in Intel syntax. The base slot must
+  // be an MCExpr (table symbol); the index slot must be a non-zero
+  // register. Strictly (expr, reg) — generic shapes are not accepted.
+  void printIdxMemOperand(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+};
+} // namespace llvm

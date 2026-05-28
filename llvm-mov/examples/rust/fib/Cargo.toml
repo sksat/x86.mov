@@ -1,0 +1,25 @@
+# Stage-7d3 recursive Rust example. Crate-type=staticlib, edition 2024.
+# Mirror of ../main/Cargo.toml but a separate crate so its compiled
+# .o (and bench metrics) only contain `fib` + `fib_main` — not the
+# trivial `rust_main` from the sibling crate.
+
+[package]
+name = "rust-mov-fib"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+opt-level = 0
+overflow-checks = false
+debug = false
+strip = false
+lto = false
+
+[profile.dev]
+panic = "abort"
+overflow-checks = false

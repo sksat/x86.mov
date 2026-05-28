@@ -1,0 +1,23 @@
+# Stage-6.5 trivial Rust example. Crate-type=staticlib, edition 2024.
+# See ../README.md for the build invariants.
+
+[package]
+name = "rust-mov-main"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+opt-level = 0
+overflow-checks = false
+debug = false
+strip = false
+lto = false
+
+[profile.dev]
+panic = "abort"
+overflow-checks = false
