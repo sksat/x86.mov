@@ -1,2 +1,3 @@
 # Output of `make stage-deploy` (Cloudflare Pages upload tree).
 dist/
+/.codex

@@ -1,0 +1,47 @@
+name: movie86
+
+on:
+  push:
+    branches: [mov]
+  pull_request:
+    branches: [mov]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: movie86
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      # Pinned to the exact version; bumps must be deliberate and read
+      # the release notes (the toolchain action installs and caches).
+      - name: setup rust (stable + wasm32 target)
+        uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          # wasm32-unknown-unknown is what the eventual browser front
+          # will build against; we verify the core builds for it on
+          # every change so wasm portability doesn't bit-rot.
+          target: wasm32-unknown-unknown
+          cache-workspaces: movie86
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
+      # The library crate is `no_std` and must build for wasm32. CLI is
+      # std and not part of the wasm build.
+      - name: cargo build movie86 for wasm32-unknown-unknown
+        run: cargo build -p movie86 --target wasm32-unknown-unknown
