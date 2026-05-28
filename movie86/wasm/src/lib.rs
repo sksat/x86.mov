@@ -468,6 +468,32 @@ impl Vm {
         core::mem::take(&mut self.host.stderr)
     }
 
+    /// EFLAGS stub. movie86 doesn't model EFLAGS — there's no
+    /// arithmetic and no cmp/jcc to consume the flags, so tracking
+    /// them would just be dead state. We expose the Linux i386
+    /// process-startup value (`IF=1`, reserved bit 1 set) so the
+    /// register pane has something honest to show; the demo labels
+    /// this as a stub so it's not read as live state.
+    #[wasm_bindgen(getter)]
+    pub fn eflags(&self) -> u32 {
+        0x0000_0202
+    }
+
+    /// Address of the registered SIGSEGV handler (movfuscator's
+    /// `dispatch`), or `None` if the loader didn't find the symbol.
+    /// Real, non-stubbed state — kept distinct from `eflags` above.
+    #[wasm_bindgen(getter, js_name = sigsegvHandler)]
+    pub fn sigsegv_handler(&self) -> Option<u32> {
+        self.cpu.signal_handler(Signal::Segv)
+    }
+
+    /// Address of the registered SIGILL handler (movfuscator's
+    /// `master_loop`), or `None`.
+    #[wasm_bindgen(getter, js_name = sigillHandler)]
+    pub fn sigill_handler(&self) -> Option<u32> {
+        self.cpu.signal_handler(Signal::Ill)
+    }
+
     #[wasm_bindgen(getter, js_name = memBase)]
     pub fn mem_base(&self) -> u32 {
         self.mem.base()
