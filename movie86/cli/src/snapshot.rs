@@ -40,7 +40,7 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use movie86_core::{Memory, Signal};
+use movie86::{Memory, Signal};
 
 const MAGIC: &[u8; 4] = b"M86S";
 const VERSION: u16 = 1;
@@ -301,7 +301,7 @@ pub fn signal_name(sig: Signal) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use movie86_core::FlatMemory;
+    use movie86::FlatMemory;
 
     fn make_snapshot() -> Snapshot {
         let mut mem = FlatMemory::new_zeroed(0x1000, 0x100);

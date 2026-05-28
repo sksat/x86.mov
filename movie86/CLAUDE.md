@@ -21,4 +21,4 @@ is shaped the way it is.
 
 ## CI
 
-`.github/workflows/movie86.yaml` at the repo root. Runs on push/PR to `mov`: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test --workspace --all-targets`, and a `wasm32-unknown-unknown` build of `movie86-core`. Actions pinned to `vMAJOR.MINOR.PATCH` per project convention.
+`.github/workflows/movie86.yaml` at the repo root. Runs on push/PR to `mov`: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test --workspace --all-targets`, and a `wasm32-unknown-unknown` build of the `movie86` library crate. Actions pinned to `vMAJOR.MINOR.PATCH` per project convention.

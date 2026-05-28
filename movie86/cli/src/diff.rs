@@ -17,7 +17,7 @@
 use std::fmt::Write as _;
 
 use crate::snapshot::{reg_name, signal_name, Snapshot};
-use movie86_core::Signal;
+use movie86::Signal;
 
 /// Treat two changed byte spans as one when they're within this many
 /// equal bytes of each other. Tunable trade-off: small gap → more
@@ -329,7 +329,7 @@ pub fn diff_snapshots(a: &Snapshot, b: &Snapshot) -> String {
 mod tests {
     use super::*;
     use crate::snapshot::SnapshotKind;
-    use movie86_core::FlatMemory;
+    use movie86::FlatMemory;
 
     fn snap_with(regs: [u32; 8], eip: u32, mem_bytes: Vec<u8>, kind: SnapshotKind) -> Snapshot {
         Snapshot {

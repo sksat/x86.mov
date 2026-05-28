@@ -2,10 +2,10 @@
 //! the CLI library, and assert the outcome. Mirrors the byte-identical
 //! TDD style the rest of the repo uses.
 
+use movie86::libc_host::LibcHost;
+use movie86::syscall::{SysHost, SyscallArgs, SyscallResult};
+use movie86::{decode, Fault, Memory};
 use movie86_cli::{run_elf, run_elf_with_host, RunOutcome};
-use movie86_core::libc_host::LibcHost;
-use movie86_core::syscall::{SysHost, SyscallArgs, SyscallResult};
-use movie86_core::{decode, Fault, Memory};
 
 /// Build a minimal ELF32-LE-i386 `ET_EXEC` whose entry runs `program`.
 /// One `PT_LOAD` segment covering exactly the program bytes.
@@ -275,7 +275,7 @@ fn investigate_decoder_coverage() {
     let mut pos = 0;
     let mut insns = 0;
     while pos < text.len() {
-        match movie86_core::decode(&text[pos..]) {
+        match movie86::decode(&text[pos..]) {
             Ok((insn, len)) => {
                 assert!(len > 0);
                 pos += usize::from(len);
@@ -360,7 +360,7 @@ fn fault_on_unsupported_syscall() {
     ];
     let elf = build_elf(0x0804_8000, program);
     match run_elf(&elf) {
-        RunOutcome::Fault(movie86_core::Fault::UnknownSyscall(999)) => {}
+        RunOutcome::Fault(movie86::Fault::UnknownSyscall(999)) => {}
         other => panic!("expected UnknownSyscall(999), got {other:?}"),
     }
 }

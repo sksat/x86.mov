@@ -1,8 +1,8 @@
 //! Unit tests for the host-side syscall translation.
 
 use super::{errno_to_eax, write_syscall, LibcFn, StdHost, SyscallArgs, SyscallResult};
-use movie86_core::libc_host::{LibcCall, LibcHost};
-use movie86_core::{Fault, FlatMemory, Memory, Reg32};
+use movie86::libc_host::{LibcCall, LibcHost};
+use movie86::{Fault, FlatMemory, Memory, Reg32};
 
 #[test]
 fn errno_to_eax_matches_two_complement() {

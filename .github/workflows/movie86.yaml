@@ -41,7 +41,7 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets
 
-      # The core crate is `no_std` and must build for wasm32. CLI is std
-      # and not part of the wasm build.
-      - name: cargo build core for wasm32-unknown-unknown
-        run: cargo build -p movie86-core --target wasm32-unknown-unknown
+      # The library crate is `no_std` and must build for wasm32. CLI is
+      # std and not part of the wasm build.
+      - name: cargo build movie86 for wasm32-unknown-unknown
+        run: cargo build -p movie86 --target wasm32-unknown-unknown

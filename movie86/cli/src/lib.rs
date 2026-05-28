@@ -4,10 +4,10 @@
 
 use std::io::{self, Write};
 
-use movie86_core::elf::{flatten_with_stack, parse, ElfError, LoadedElf};
-use movie86_core::libc_host::{LibcCall, LibcHost, LibcResult};
-use movie86_core::syscall::{SysHost, SyscallArgs, SyscallResult};
-use movie86_core::{Cpu, Fault, Memory, Reg32, Signal};
+use movie86::elf::{flatten_with_stack, parse, ElfError, LoadedElf};
+use movie86::libc_host::{LibcCall, LibcHost, LibcResult};
+use movie86::syscall::{SysHost, SyscallArgs, SyscallResult};
+use movie86::{Cpu, Fault, Memory, Reg32, Signal};
 
 /// Stack size reserved by the CLI for every program. 64 KiB is enough
 /// for any hand-assembled fixture we run today and well within the
@@ -128,7 +128,7 @@ impl LibcHost for StdHost {
         }
     }
 
-    fn scan_libc_stubs(&mut self, elf: &LoadedElf<'_>, mem: &dyn movie86_core::Memory) {
+    fn scan_libc_stubs(&mut self, elf: &LoadedElf<'_>, mem: &dyn movie86::Memory) {
         // Auto-detect: for each known function name we have a wrapper
         // for, look up its symbol in the ELF. If the first two bytes
         // are our sentinel `CD 81` (int 0x81), register the address.
@@ -607,7 +607,7 @@ fn write_step_snapshot(
     path: &std::path::Path,
     step_count: u64,
     cpu: &Cpu,
-    mem: &movie86_core::FlatMemory,
+    mem: &movie86::FlatMemory,
 ) {
     write_snapshot(
         path,
@@ -627,7 +627,7 @@ fn write_stop_snapshot(
     detail: u32,
     step_count: u64,
     cpu: &Cpu,
-    mem: &movie86_core::FlatMemory,
+    mem: &movie86::FlatMemory,
 ) {
     let Some(path) = &cfg.snapshot_on_stop else {
         return;
@@ -641,7 +641,7 @@ fn write_snapshot(
     detail: u32,
     step_count: u64,
     cpu: &Cpu,
-    mem: &movie86_core::FlatMemory,
+    mem: &movie86::FlatMemory,
 ) {
     // u32 cast: FlatMemory's construction already rejects regions
     // larger than 4 GiB, so this can't truncate.

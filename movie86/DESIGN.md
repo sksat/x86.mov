@@ -14,8 +14,8 @@ name is mov + ie: watching a mov-only binary execute is the joke.
 
 Two-crate Cargo workspace at this directory.
 
-- [`core/`](core/) — `movie86-core`, `no_std` + `alloc`. Library only. Decoder, CPU, memory abstraction, syscall trait, ELF loader. This is the artifact that will eventually build to `wasm32-unknown-unknown` and run in a browser.
-- [`cli/`](cli/) — `movie86-cli`, `std`. Provides `lib.rs` (the `run_elf` entry point + `StdHost` that wires Linux i386 syscalls to the surrounding process) **and** a thin `bin` target at [`cli/src/main.rs`](cli/src/main.rs). The library half exists specifically so end-to-end tests in [`cli/tests/`](cli/tests/) can drive the same code path the binary uses without spawning a subprocess.
+- [`core/`](core/) — crate `movie86`, `no_std` + `alloc`. Library only. Decoder, CPU, memory abstraction, syscall trait, ELF loader. This is the artifact that will eventually build to `wasm32-unknown-unknown` and run in a browser. (Path is `core/`; the crate name dropped the `-core` suffix to match the `movie86` brand.)
+- [`cli/`](cli/) — crate `movie86-cli`, `std`. Provides `lib.rs` (the `run_elf` entry point + `StdHost` that wires Linux i386 syscalls to the surrounding process) **and** a thin `bin` target at [`cli/src/main.rs`](cli/src/main.rs). The library half exists specifically so end-to-end tests in [`cli/tests/`](cli/tests/) can drive the same code path the binary uses without spawning a subprocess.
 
 Run the bin with `cargo run -p movie86-cli -- path/to/file.elf`; exit status is the guest's `exit(2)` status, low 8 bits, with `1` for any fault.
 
