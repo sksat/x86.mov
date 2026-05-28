@@ -86,6 +86,69 @@ for (const c of cases) {
     }
 }
 
+// --- Vm introspection API surface ---
+//
+// The runElf↔Vm parity loop above exercises stepN / regs / haltReason /
+// exitCode / drainStdout, but the demo also depends on disasmAt,
+// readMem, sigsegvHandler / sigillHandler, memBase / memLen. Verify
+// those on a known-shape fixture (return42: entry 0x1000, first insn
+// is `mov ebx, 42` = BB 2A 00 00 00, no signal handlers).
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/return42.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        // EIP must fall inside the mapped region the loader handed us.
+        assert.ok(
+            vm.memBase <= vm.eip && vm.eip < vm.memBase + vm.memLen,
+            `eip ${vm.eip.toString(16)} not inside [${vm.memBase.toString(16)}, ${(vm.memBase + vm.memLen).toString(16)})`,
+        );
+
+        // disasmAt at entry: the first instruction of return42 is
+        // `mov ebx, 42` encoded as BB 2A 00 00 00 (5 bytes).
+        const d = vm.disasmAt(vm.eip);
+        assert.ok(d != null, 'disasmAt(entry) returned null');
+        try {
+            assert.equal(d.len, 5, `mov ebx, imm32 should be 5 bytes, got ${d.len}`);
+            assert.deepEqual(
+                Array.from(d.bytes),
+                [0xbb, 0x2a, 0x00, 0x00, 0x00],
+                `disasmAt bytes mismatch: got ${Array.from(d.bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}`,
+            );
+            assert.ok(d.text.includes('Mov'), `disasmAt text should mention Mov, got ${d.text}`);
+        } finally {
+            d.free();
+        }
+
+        // readMem in-range: same 5 bytes as disasmAt
+        const inRange = vm.readMem(vm.eip, 5);
+        assert.deepEqual(
+            Array.from(inRange),
+            [0xbb, 0x2a, 0x00, 0x00, 0x00],
+            'readMem(eip, 5) disagrees with disasmAt bytes',
+        );
+
+        // readMem out-of-range: address well past the mapped region.
+        // Pick something high enough to be safe across loader layouts.
+        const farAway = 0xfff0_0000 >>> 0;
+        assert.equal(
+            vm.readMem(farAway, 16).length, 0,
+            'readMem past mapped region should return an empty array',
+        );
+
+        // Signal handlers: return42 doesn't define `dispatch` or
+        // `master_loop`, so both getters surface undefined.
+        assert.equal(vm.sigsegvHandler, undefined, `sigsegvHandler expected undefined, got ${vm.sigsegvHandler}`);
+        assert.equal(vm.sigillHandler,  undefined, `sigillHandler expected undefined, got ${vm.sigillHandler}`);
+
+        console.log('ok  Vm introspection (return42)');
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL Vm introspection: ${e.message}`);
+    failed++;
+}
+
 if (failed > 0) {
     console.error(`${failed} smoke test(s) failed`);
     process.exit(1);
