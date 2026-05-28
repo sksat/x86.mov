@@ -74,6 +74,11 @@ case "$EXAMPLE" in
     # back to "Hello, World!" — exit = sum of those 13 ASCII bytes
     # (1129) mod 256 = 105.
     base64_decode) ENTRY="base64_decode_main"; EXPECTED=105; CRATE="rust_mov_base64_decode" ;;
+    # Full QOI image decode via the `qoi` crate (no_std + no_alloc
+    # with default-features = false). Hand-built 2x2 RGBA fixture;
+    # decode_to_buf produces 16 output bytes whose sum is 1800,
+    # mod 256 = 8.
+    qoi_decode) ENTRY="qoi_decode_main"; EXPECTED=8; CRATE="rust_mov_qoi_decode" ;;
     # AES-128 ECB encrypt of NIST's AES-128 test vector, iterated
     # N_ROUNDS times (see aes/src/lib.rs). The example does NOT
     # currently round-trip through llvm-mov-llc: rustc emits
@@ -83,7 +88,7 @@ case "$EXAMPLE" in
     # 256 once the encrypt path can be compiled (placeholder value
     # until a real run produces it).
     aes)  ENTRY="aes_main";  EXPECTED=0;   CRATE="rust_mov_aes" ;;
-    *) echo "error: unknown --example=$EXAMPLE (try main, fib, png_header, jpeg_header, bmp_decode, base64_decode, aes)" 1>&2; exit 2 ;;
+    *) echo "error: unknown --example=$EXAMPLE (try main, fib, png_header, jpeg_header, bmp_decode, base64_decode, qoi_decode, aes)" 1>&2; exit 2 ;;
 esac
 
 CRATE_DIR="$HERE/$EXAMPLE"
@@ -171,7 +176,7 @@ as --32 -o "$START_O" "$START_S"
 # gate fire on `.text` belonging to user code.
 EXTRA_LINK=""
 case "$EXAMPLE" in
-    aes|base64_decode)
+    aes|base64_decode|qoi_decode)
         # Crates with crates.io dependencies. Pull the Cargo
         # staticlib for the precompiled deps; our mov-only `.o`
         # defines the `*_main` first so the linker picks the
