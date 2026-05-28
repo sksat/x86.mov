@@ -1,0 +1,36 @@
+[package]
+name = "movie86-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sksat/x86.mov"
+publish = false
+description = "Browser bindings for the movie86 mov-only i386 emulator"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+movie86 = { path = "../core" }
+# Exact pin (not caret): the wasm-bindgen crate must match the
+# wasm-bindgen CLI version byte-for-byte — they share a schema that
+# bumps on every patch release. Cargo.lock is gitignored here (matching
+# the rest of the repo's Rust subprojects), so a caret `"0.2.122"` would
+# let CI silently resolve to `0.2.123` while the CLI install step is
+# still pinned to 0.2.122, and the build would fail with a schema
+# mismatch. Bumping is a three-place change: this `=`, the
+# wasm-bindgen-cli install in `.github/workflows/movie86-wasm.yaml`,
+# and the same install step in `.github/workflows/deploy.yaml`.
+wasm-bindgen = "=0.2.122"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+
+# Standalone workspace — the `movie86` crate next door is no_std + alloc
+# and lives in its own workspace; we depend on it via path. Keeping this
+# crate out of that workspace lets `cargo build -p movie86 --target
+# wasm32-unknown-unknown` on the movie86 side stay strictly no_std,
+# while this crate is free to pull in std-flavoured deps (wasm-bindgen).
+[workspace]
