@@ -68,15 +68,21 @@ if [ -z "$OUTPUT" ]; then
 fi
 
 # ---- locate the rustc-emitted .ll ------------------------------------
-TARGET_TRIPLE="i686-unknown-linux-gnu"
-DEPS_DIR="$CRATE_DIR/target/$TARGET_TRIPLE/release/deps"
-if ! [ -d "$DEPS_DIR" ]; then
-    # cargo build --profile=dev lands under .../debug/deps instead.
-    DEPS_DIR="$CRATE_DIR/target/$TARGET_TRIPLE/debug/deps"
+# Rustc emits .ll alongside the .o it hands cargo to link, in the
+# `--out-dir` cargo configured (= target/<triple>/{release,debug}/deps).
+# Same basename as our OUTPUT, just .ll extension — robust even when
+# the crate also produces a sibling staticlib that drops a .ll for the
+# bench's rustc-native reference column.
+LL="$OUTPUT.ll"
+if ! [ -f "$LL" ]; then
+    # Fallback: pick the freshest .ll in the same dir. Keeps the
+    # driver working if a future rustc layout change moves the .ll
+    # next to the bin output instead of next to the rcgu .o.
+    DEPS_DIR="$(dirname "$OUTPUT")"
+    LL="$(ls -t "$DEPS_DIR"/*.ll 2>/dev/null | head -1 || true)"
 fi
-LL="$(ls -t "$DEPS_DIR"/*.ll 2>/dev/null | head -1 || true)"
 if [ -z "$LL" ] || ! [ -f "$LL" ]; then
-    echo "cargo-link.sh: no .ll found under $DEPS_DIR" 1>&2
+    echo "cargo-link.sh: no .ll found at $OUTPUT.ll or under $(dirname "$OUTPUT")" 1>&2
     echo "  (check that .cargo/config.toml passes --emit=llvm-ir to rustc)" 1>&2
     exit 2
 fi

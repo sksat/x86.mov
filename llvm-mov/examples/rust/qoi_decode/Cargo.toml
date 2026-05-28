@@ -8,6 +8,10 @@ publish = false
 name = "rust-mov-qoi-decode"
 path = "src/main.rs"
 
+[lib]
+crate-type = ["staticlib"]
+path = "src/main.rs"
+
 [dependencies]
 qoi = { version = "0.4", default-features = false }
 

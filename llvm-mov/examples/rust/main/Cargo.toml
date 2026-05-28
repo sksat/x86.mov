@@ -16,6 +16,15 @@ publish = false
 name = "rust-mov-main"
 path = "src/main.rs"
 
+# Bench's rustc-native reference column links a sibling staticlib of
+# the same source to produce a "what would rustc emit if llvm-mov-llc
+# weren't here" ELF. Sharing `path = "src/main.rs"` keeps the lib and
+# bin compiling the same source tree (`#![no_main]` is a no-op for the
+# lib build).
+[lib]
+crate-type = ["staticlib"]
+path = "src/main.rs"
+
 [profile.release]
 panic = "abort"
 opt-level = 0

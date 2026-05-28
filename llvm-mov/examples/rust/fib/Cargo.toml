@@ -14,6 +14,10 @@ publish = false
 name = "rust-mov-fib"
 path = "src/main.rs"
 
+[lib]
+crate-type = ["staticlib"]
+path = "src/main.rs"
+
 [profile.release]
 panic = "abort"
 opt-level = 0
