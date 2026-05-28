@@ -148,6 +148,30 @@ func (r *Runner) writeMem(addr uint32, data []byte) error {
 	return r.mem.WriteAt(addr, data)
 }
 
+// sniffHostSigaction peeks at the act struct of a host-mode rt_sigaction
+// passthrough call so r.handlers stays in sync with what the kernel will
+// be doing — purely advisory, used by the signal-stop branch to skip the
+// memory snapshot when a handler is registered (the kernel will run it,
+// the child won't die, the snapshot would be discarded). Failure to read
+// guest memory is non-fatal: we just leave r.handlers as-is and pay the
+// snapshot cost.
+func (r *Runner) sniffHostSigaction(regs *regs32) {
+	if regs.Ecx == 0 {
+		return // pure-query call; disposition unchanged
+	}
+	signum := uint8(regs.Ebx)
+	var buf [4]byte
+	if err := r.mem.ReadAt(regs.Ecx, buf[:]); err != nil {
+		return
+	}
+	handler := uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24
+	if handler <= 1 {
+		delete(r.handlers, signum)
+	} else {
+		r.handlers[signum] = handler
+	}
+}
+
 // memfdCreate is a thin wrapper around the memfd_create(2) syscall.
 // flags is the bitmask of MFD_* flags (MFD_CLOEXEC = 1).
 func memfdCreate(name string, flags uint) (int, error) {
@@ -459,8 +483,14 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 	if r.mode == "" {
 		r.mode = proto.ModeHost
 	}
+	// r.handlers is used in both modes: trap mode reads it to dispatch
+	// signals locally; host mode reads it to decide whether to take a
+	// (potentially expensive) memory snapshot before forwarding a
+	// signal — known-handled signals don't need one because the
+	// kernel will dispatch into the guest's handler and the child
+	// stays alive.
+	r.handlers = make(map[uint8]uint32)
 	if r.mode == proto.ModeTrap {
-		r.handlers = make(map[uint8]uint32)
 		if err := r.mem.WriteAt(trapTrampolineAddr, trapTrampolineBytes); err != nil {
 			r.emitFault(fmt.Sprintf("write trap-mode restorer trampoline: %v", err))
 			return
@@ -533,8 +563,17 @@ func (r *Runner) bootstrap(stubBytes []byte) error {
 	if !ws.Stopped() {
 		return fmt.Errorf("expected initial execve stop, got status %v", ws)
 	}
-	if err := syscall.PtraceSetOptions(r.pid, syscall.PTRACE_O_TRACESYSGOOD); err != nil {
-		return fmt.Errorf("set TRACESYSGOOD: %w", err)
+	// TRACESYSGOOD: syscall stops use SIGTRAP|0x80 so we can distinguish
+	//   them from real SIGTRAPs (which are reserved for tracer-owned
+	//   int3 breakpoints).
+	// EXITKILL: if this tracer dies, the kernel sends SIGKILL to the
+	//   tracee. Without it, a crashed turbo86 host would orphan the
+	//   guest as a normal process — and the guest is executing
+	//   untrusted bytes, so anything it runs would no longer be
+	//   filtered by the bridge.
+	const ptraceOExitkill = 0x00100000
+	if err := syscall.PtraceSetOptions(r.pid, syscall.PTRACE_O_TRACESYSGOOD|ptraceOExitkill); err != nil {
+		return fmt.Errorf("set ptrace options: %w", err)
 	}
 
 	// Let the stub run its setup (mmap RWX region + stack, then
@@ -738,13 +777,20 @@ func (r *Runner) syscallLoop(regs *regs32) {
 					}
 					return
 				}
-				// Host mode: snapshot then forward to kernel.
-				snap, err := r.capturePausedSnapshot(sig)
-				if err != nil {
-					r.emitFault(fmt.Sprintf("snapshot at signal forward: %v", err))
-					return
+				// Host mode: only snapshot when the kernel will probably
+				// kill the child for lack of a handler — otherwise the
+				// handler runs to completion and the snapshot is just
+				// wasted I/O. For movfuscator-style guests that fire
+				// SIGILL on every dispatch this is the difference
+				// between ~18 MiB/signal and nothing/signal.
+				if _, hasHandler := r.handlers[uint8(sig)]; !hasHandler {
+					snap, err := r.capturePausedSnapshot(sig)
+					if err != nil {
+						r.emitFault(fmt.Sprintf("snapshot at signal forward: %v", err))
+						return
+					}
+					heldSnapshot = &snap
 				}
-				heldSnapshot = &snap
 				nextSignal = int(sig)
 				continue
 			}
@@ -807,6 +853,16 @@ func (r *Runner) syscallLoop(regs *regs32) {
 				pending = syscallPending{expectingExit: true, overwriteEax: true, returnValue: retVal}
 				continue
 			}
+		}
+
+		// Host mode: rt_sigaction passes through to the kernel, but we
+		// still want to know which signals have a guest handler so the
+		// signal-stop branch can skip the 18 MiB memory snapshot when
+		// the kernel will dispatch into a registered handler (snapshot
+		// is only needed if the child is about to die because no
+		// handler is installed).
+		if r.mode == proto.ModeHost && regs.OrigEax == sysRtSigaction {
+			r.sniffHostSigaction(regs)
 		}
 
 		args := bridge.SyscallArgs{
@@ -873,15 +929,22 @@ func (r *Runner) handleTrapModeSyscall(regs *regs32) (bool, uint32, error) {
 		// old one even when also setting a new one).
 		prevHandler, prevSet := r.handlers[signum]
 
-		// If act is non-NULL, install a new handler from
-		// userspace struct sigaction's sa_handler (offset 0).
+		// If act is non-NULL, install a new handler from sa_handler
+		// (offset 0 in both kernel k_sigaction and userspace struct
+		// sigaction). SIG_DFL (0) and SIG_IGN (1) mean "no handler" —
+		// drop the entry so r.handlers reflects "is a real handler
+		// registered" rather than "did the guest ever call sigaction".
 		if regs.Ecx != 0 {
 			var buf [4]byte
 			if err := r.mem.ReadAt(regs.Ecx, buf[:]); err != nil {
 				return true, 0, fmt.Errorf("read sa_handler at 0x%x: %w", regs.Ecx, err)
 			}
 			handler := uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24
-			r.handlers[signum] = handler
+			if handler <= 1 {
+				delete(r.handlers, signum)
+			} else {
+				r.handlers[signum] = handler
+			}
 		}
 
 		// If oldact is non-NULL, fill the *kernel* struct k_sigaction
