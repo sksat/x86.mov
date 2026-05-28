@@ -13,6 +13,10 @@
 
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/CommandFlags.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -162,6 +166,54 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Stage 6d2 — pre-Scalarizer lowering of `llvm.vector.reduce.*`.
+  //
+  // LLVM's `expand-reductions` codegen pass would otherwise rewrite
+  // these into a shufflevector + vector-binop tree, re-introducing
+  // `<N x ty>` ops *after* our driver-level Scalarizer (6d1) ran.
+  // Lowering the reductions to a balanced scalar tree up front lets
+  // both Scalarizer (6d1) and the codegen pipeline see scalar-only
+  // shapes.
+  //
+  // Only `xor` is handled today (the only kind the AES example
+  // emits); extending to add / and / or / smin / smax etc. is a
+  // 4-line addition each.
+  for (Function &F : *M) {
+    SmallVector<IntrinsicInst *, 4> Worklist;
+    for (Instruction &I : instructions(F)) {
+      if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+        if (II->getIntrinsicID() == Intrinsic::vector_reduce_xor)
+          Worklist.push_back(II);
+      }
+    }
+    for (IntrinsicInst *II : Worklist) {
+      Value *Vec = II->getArgOperand(0);
+      auto *VecTy = cast<FixedVectorType>(Vec->getType());
+      const unsigned N = VecTy->getNumElements();
+      IRBuilder<> B(II);
+      // Extract every element to a scalar, then XOR-reduce as a
+      // balanced binary tree. A linear chain would also be correct
+      // but a tree halves the dependency depth (matters once each
+      // i8 XOR expands to ~50 movs via the byte-chain mov-only
+      // legalize at stage 7).
+      SmallVector<Value *, 16> Lanes;
+      Lanes.reserve(N);
+      for (unsigned i = 0; i < N; ++i)
+        Lanes.push_back(B.CreateExtractElement(Vec, B.getInt32(i)));
+      while (Lanes.size() > 1) {
+        SmallVector<Value *, 16> Next;
+        Next.reserve((Lanes.size() + 1) / 2);
+        for (unsigned i = 0; i + 1 < Lanes.size(); i += 2)
+          Next.push_back(B.CreateXor(Lanes[i], Lanes[i + 1]));
+        if (Lanes.size() % 2)
+          Next.push_back(Lanes.back());
+        Lanes.swap(Next);
+      }
+      II->replaceAllUsesWith(Lanes[0]);
+      II->eraseFromParent();
+    }
+  }
+
   // Stage 6d1 — pre-codegen IR scalarization.
   //
   // Rust crate IR ships `<N x ty>` vector ops (the `aes` crate's
@@ -177,10 +229,9 @@ int main(int argc, char **argv) {
   // *before* `addPassesToEmitFile` adds the codegen pipeline.
   // Running it inside MovPassConfig::addIRPasses would technically
   // also work, but the LegacyPM TargetPassConfig already runs a
-  // long fixed-order chain there and Scalarizer's results would
-  // not survive the subsequent `expand-reductions` (which can
-  // synthesise new vector shuffles + XORs from `vector.reduce.*`).
-  // Stage 6d2 deals with that follow-up.
+  // long fixed-order chain there. With reductions already lowered
+  // above, the codegen-pipeline `expand-reductions` is a no-op so
+  // running Scalarizer once here is enough.
   {
     legacy::PassManager IRPM;
     ScalarizerPassOptions Opts;
