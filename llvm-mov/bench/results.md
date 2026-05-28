@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-27T23:42:17Z on x86_64 (Linux).
+Generated 2026-05-28T00:17:10Z on x86_64 (Linux).
 
 ## return0
 
@@ -20,7 +20,7 @@ int main(void) { return 0; }
 | .rodata size | 0 | 0 |
 | mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.135 ms | 0.527 ms |
+| wall-clock runtime (hyperfine mean) | 0.150 ms | 0.536 ms |
 
 ## return42
 
@@ -35,7 +35,7 @@ int main(void) { return 42; }
 | .rodata size | 0 | 0 |
 | mov count / total | 7 / 13 (53.8%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.139 ms | 0.527 ms |
+| wall-clock runtime (hyperfine mean) | 0.137 ms | 0.526 ms |
 
 ## eq42
 
@@ -59,7 +59,7 @@ int main(void) {
 | .rodata size | 196864 | 0 |
 | mov count / total | 170 / 180 (94.4%) | 1050 / 1052 (99.8%) |
 | non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.146 ms | 0.536 ms |
+| wall-clock runtime (hyperfine mean) | 0.142 ms | 0.518 ms |
 
 ## lt_unsigned
 
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 | .rodata size | 459008 | 0 |
 | mov count / total | 202 / 212 (95.3%) | 1045 / 1047 (99.8%) |
 | non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.148 ms | 0.520 ms |
+| wall-clock runtime (hyperfine mean) | 0.169 ms | 0.607 ms |
 
 ## bitops
 
@@ -134,7 +134,7 @@ int main(void) {
 | .rodata size | 65536 | 0 |
 | mov count / total | 51 / 57 (89.5%) | 922 / 924 (99.8%) |
 | non-mov mnemonics | `call int pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.153 ms | 0.528 ms |
+| wall-clock runtime (hyperfine mean) | 0.141 ms | 0.530 ms |
 
 ## sum10
 
@@ -149,30 +149,29 @@ int main(void) {
 
 | metric | llvm-mov | movfuscator |
 |---|---:|---:|
-| total ELF (bytes) | 270980 | 10221108 |
-| .text size | 443 | 6706 |
-| .rodata size | 262144 | 0 |
-| mov count / total | 103 / 116 (88.8%) | 1225 / 1227 (99.8%) |
-| non-mov mnemonics | `call cmp int jg jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.139 ms | 0.615 ms |
+| total ELF (bytes) | 730496 | 10221108 |
+| .text size | 1287 | 6706 |
+| .rodata size | 721408 | 0 |
+| mov count / total | 320 / 331 (96.7%) | 1225 / 1227 (99.8%) |
+| non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.154 ms | 0.555 ms |
 
 ## fib10
 
 ```c
-/* Stage 7a + 7c1 visibility — a small Fibonacci loop.
+/* Stage 7a + 7c1 + 7c4 visibility — a small Fibonacci loop.
  *
  * The loop body has 3 add operations and the loop header has a signed
- * compare (cmp + jl), so this fixture exercises:
+ * compare (cmp + jl). After 7c4 this fixture exercises:
  *
  *   - 7a1 ADD32rr legalize (the t/a/b updates)
  *   - 7c1 CFG dispatcher (every BB ends with `mov [next_pc], target;
  *     jmp .Ldispatcher`)
+ *   - 7c4 signed-predicate legalize (cmp + jl on the loop bound is
+ *     rewritten via the byte-SUB chain + SF/OF/ZF flag math)
  *
- * The signed compare on the loop bound stays as native `cmp + jl` —
- * stage 7c4 (signed predicates) hasn't landed yet, so this fixture
- * surfaces "cmp / jl" in the non-mov mnemonic column. When 7c4 lands
- * the bench-check diff will show those mnemonics dropping out and
- * the mov ratio rising. main returns fib(10) = 55. */
+ * After 7c4 the `.text` shows no `cmp` / `jl` — only the dispatcher's
+ * `jmp`. main returns fib(10) = 55. */
 int main(void) {
     int a = 0, b = 1, t;
     int i;
@@ -187,10 +186,10 @@ int main(void) {
 
 | metric | llvm-mov | movfuscator |
 |---|---:|---:|
-| total ELF (bytes) | 270980 | 10221108 |
-| .text size | 458 | 6943 |
-| .rodata size | 262144 | 0 |
-| mov count / total | 108 / 121 (89.3%) | 1267 / 1269 (99.8%) |
-| non-mov mnemonics | `call cmp int jg jmp pop push ret sub` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.136 ms | 0.546 ms |
+| total ELF (bytes) | 730496 | 10221108 |
+| .text size | 1302 | 6943 |
+| .rodata size | 721408 | 0 |
+| mov count / total | 325 / 336 (96.7%) | 1267 / 1269 (99.8%) |
+| non-mov mnemonics | `call int jmp pop push ret sub` | `call` |
+| wall-clock runtime (hyperfine mean) | 0.165 ms | 0.574 ms |
 
