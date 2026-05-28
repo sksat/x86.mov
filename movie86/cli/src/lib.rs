@@ -18,8 +18,10 @@ const DEFAULT_STACK_SIZE: u32 = 64 * 1024;
 pub mod context_json;
 pub mod diff;
 pub mod gdb_target;
+pub mod handover;
 pub mod logging_memory;
 pub mod snapshot;
+pub mod turbo86_wire;
 
 pub use diff::diff_snapshots;
 pub use gdb_target::{run_elf_with_gdb, GdbRunError};
