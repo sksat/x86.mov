@@ -47,6 +47,27 @@ public:
     return getTM<MovTargetMachine>();
   }
 
+  // Stage 6d3b — IR-level i8/i16 promotion.
+  //
+  // The DAG-ISel path cannot handle i8 SSA values: a bare
+  // `load i8` + `zext i8 to i32` legalises into an unsupported
+  // `extload (s8) anyext` SDNode, and chained i8 binops balloon
+  // DAG-ISel into multi-minute compile times. LLVM's TypePromotion
+  // pass clusters i8/i16 ops and their consumers, promotes the
+  // cluster to a wider legal type (i32 here), and inserts trunc
+  // at boundaries — so the post-pass IR stays in pure i32-land
+  // and selects against the existing MOV32rm + AND32ri / SHR32ri
+  // patterns.
+  //
+  // ARM / AArch64 hook this up via their own pass config; we run
+  // it as the first thing in addIRPasses so the rest of the
+  // pre-codegen chain (Scalarizer runs in the driver before us)
+  // sees the already-promoted IR.
+  void addIRPasses() override {
+    addPass(createTypePromotionLegacyPass());
+    TargetPassConfig::addIRPasses();
+  }
+
   bool addInstSelector() override {
     addPass(createMovISelDag(getMovTargetMachine(), getOptLevel()));
     return false;

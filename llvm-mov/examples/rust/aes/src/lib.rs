@@ -44,6 +44,31 @@
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
 
+// The `aes::soft::fixslice` code that Cargo pulls in as a precompiled
+// rlib references `memset` / `memcpy` from libc. Our standalone
+// runtime doesn't link a libc, so provide trivial Rust implementations
+// here. They get compiled through llvm-mov-llc the same as the rest
+// of the user crate (byte loop + i8 store, both lower fine thanks to
+// stage 6d3b).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *dst.add(i) = c as u8; }
+        i = i + 1;
+    }
+    dst
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *dst.add(i) = *src.add(i); }
+        i = i + 1;
+    }
+    dst
+}
+
 use aes::Aes128;
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::cipher::generic_array::GenericArray;

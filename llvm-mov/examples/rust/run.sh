@@ -152,7 +152,26 @@ ELF="$WORK/$EXAMPLE.elf"
 
 as --32 -o "$O" "$S"
 as --32 -o "$START_O" "$START_S"
-ld -m elf_i386 -static --gc-sections -e _start -o "$ELF" "$START_O" "$O"
+
+# Link. For most examples our single mov-only `.o` is enough. The
+# `aes` example calls into RustCrypto crates (aes::soft::*,
+# cipher::*) that rustc precompiled as native i686 code into the
+# Cargo staticlib — we pull those symbols in as a fallback so the
+# binary actually runs. The mov-only `.o` is listed first so the
+# linker picks up its `aes_main` (and not the native `aes_main` that
+# Cargo also archived); the staticlib only contributes the
+# externally-referenced dependency symbols. The result is "user
+# code = mov-only, AES core = native x86" — a hybrid that still
+# round-trips the encrypt path end-to-end, and lets the mov-only
+# gate fire on `.text` belonging to user code.
+EXTRA_LINK=""
+if [ "$EXAMPLE" = "aes" ]; then
+    STATICLIB="$CRATE_DIR/target/$TARGET_TRIPLE/release/librust_mov_aes.a"
+    if [ -f "$STATICLIB" ]; then
+        EXTRA_LINK="$STATICLIB"
+    fi
+fi
+ld -m elf_i386 -static --gc-sections -e _start -o "$ELF" "$START_O" "$O" $EXTRA_LINK
 
 # -- run or print --------------------------------------------------------
 

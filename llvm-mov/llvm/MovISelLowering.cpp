@@ -33,27 +33,35 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
 
   // Narrow ext-load policy.
   //
-  // Stage 3 ran with everything Expand: real Rust code didn't have i8
-  // load/store sites because i8 ABI values were promoted through i32
-  // slots (no narrow memory). DAGCombine then couldn't fold `(and (load
-  // i32), 255)` into ZEXTLOAD-i8, which would have hit "Cannot select".
+  // i8 ZEXTLOAD/EXTLOAD/SEXTLOAD are Custom — see LowerExtLoadI8 below.
+  // Each lowers in the SDAG to an aligned-down 4-byte load plus a
+  // shift-and-mask sequence, so the backend never has to synthesise
+  // GR8 vregs for byte-stream reads (an earlier attempt at GR8-based
+  // patterns tripped the post-isel scheduler — codex review on
+  // 825044a). The aligned-down read is always within the enclosing
+  // i32 word of the original i8 pointer, so it can never page-fault
+  // past the surrounding object. SEXTLOAD adds a `(x << 24) >>a 24`
+  // tail to sign-extend the extracted byte to i32.
   //
-  // Narrow ext-loads stay Expand: byte-loads route through DAGCombine's
-  // `(load i32) + (and 0xff)` fold which selects against the existing
-  // MOV32rm + AND32ri patterns. The Pat-based path through MOV8rm +
-  // INSERT_SUBREG (tried in an earlier 6c iteration) had two issues:
-  //  (1) for the `truncstorei8` companion the sub_8bit operand needs a
-  //      COPY_TO_REGCLASS to GPR32_ABCD that TableGen wouldn't emit,
-  //      and (2) the resulting MIR tripped the post-isel scheduler on
-  //      a number of common loop shapes (phi i8 + load i8).
-  // Keeping the load/store-i8 path going through i32 mem ops + masks
-  // is correct, scheduler-clean, and what the existing 39 fixtures
-  // already exercise.
-  for (MVT MemVT : {MVT::i1, MVT::i8, MVT::i16}) {
+  // i16 / i1 stays Expand for now: rare in Rust IR, and adding the
+  // same Custom path is mechanical when the time comes.
+  setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MVT::i8, Custom);
+  setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MVT::i8, Custom);
+  setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MVT::i8, Custom);
+  for (MVT MemVT : {MVT::i1, MVT::i16}) {
     setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MemVT, Expand);
     setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MemVT, Expand);
     setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MemVT, Expand);
   }
+
+  // Stage 6d3b — truncating stores. `store i8` (trunc-from-i32 in IR)
+  // lowers in LowerTruncStoreI8 to a read-modify-write on the
+  // enclosing i32 word. Same alignment-safety story as the load
+  // path: writing the aligned-down i32 word means we never touch
+  // bytes outside the original object.
+  setTruncStoreAction(MVT::i32, MVT::i8, Custom);
+  setTruncStoreAction(MVT::i32, MVT::i16, Expand);
+  setTruncStoreAction(MVT::i32, MVT::i1,  Expand);
 
   // x86 normally lowers `sign_extend_inreg` to `movsx`, which we don't
   // have. Without an action, signed narrow consumers — `sext i8 to i32`,
@@ -128,9 +136,164 @@ SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerBRCOND(Op, DAG);
   case ISD::BR_CC:
     return LowerBR_CC(Op, DAG);
+  case ISD::LOAD:
+    return LowerExtLoadI8(Op, DAG);
+  case ISD::STORE:
+    return LowerTruncStoreI8(Op, DAG);
   default:
     llvm_unreachable("Mov: LowerOperation called on unhandled opcode");
   }
+}
+
+SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
+  // Stage 6d3b — custom expansion of (ext)load (s8) into a single
+  // aligned-down 4-byte load + a shift+mask sequence:
+  //
+  //   aligned_ptr  = ptr & ~3
+  //   byte_off     = ptr &  3                ; 0..3
+  //   bit_shift    = byte_off << 3            ; 0, 8, 16, or 24
+  //   word         = load i32, [aligned_ptr]  ; always within object
+  //   raw_byte     = (word >> bit_shift) & 0xff
+  //   result       = raw_byte                       (zext / anyext)
+  //              or = (raw_byte << 24) >>a 24       (sext)
+  //
+  // The aligned-down read trick is what keeps the lowering safe at
+  // object boundaries: a byte at offset 13 of a 16-byte alloca
+  // belongs to the i32 word at [12..16) which is always inside the
+  // alloca. A naive read at the byte's address could step into the
+  // next page if the byte happened to sit at a page boundary.
+  //
+  // The full op sequence (shift right by variable + mask + optional
+  // sext shifts) is heavy for an 8-bit load, but it is what
+  // "scalar-only mov-only" buys us: the byte-chain mov-only legalize
+  // at stage 7 already handles every op in this expansion, and the
+  // resulting `.text` stays mov-only without any GR8 plumbing.
+  auto *LD = cast<LoadSDNode>(Op);
+  if (LD->getMemoryVT() != MVT::i8)
+    return SDValue(); // Only i8 ext-loads are custom-handled here.
+
+  SDLoc DL(Op);
+  SDValue Chain = LD->getChain();
+  SDValue Ptr   = LD->getBasePtr();
+  EVT PtrTy     = Ptr.getValueType();
+  EVT ResTy     = Op.getValueType();
+
+  // aligned_ptr = ptr & ~3, byte_off = ptr & 3.
+  SDValue Three     = DAG.getConstant(3, DL, PtrTy);
+  SDValue InvThree  = DAG.getConstant(~3u, DL, PtrTy);
+  SDValue AlignedPt = DAG.getNode(ISD::AND, DL, PtrTy, Ptr, InvThree);
+  SDValue ByteOff   = DAG.getNode(ISD::AND, DL, PtrTy, Ptr, Three);
+  SDValue BitShift  = DAG.getNode(ISD::SHL, DL, PtrTy, ByteOff,
+                                  DAG.getConstant(3, DL, PtrTy));
+
+  // Word load. PointerInfo is conservative — the aligned-down ptr
+  // still points into the same underlying object as the original
+  // i8 pointer, so the original MMO's alias info applies.
+  MachineMemOperand *MMO = LD->getMemOperand();
+  SDValue Word = DAG.getLoad(MVT::i32, DL, Chain, AlignedPt,
+                             MachinePointerInfo(MMO->getPointerInfo()),
+                             Align(4), MMO->getFlags());
+
+  // Extract the requested byte.
+  SDValue Shifted = DAG.getNode(ISD::SRL, DL, MVT::i32, Word, BitShift);
+  SDValue ByteVal = DAG.getNode(ISD::AND, DL, MVT::i32, Shifted,
+                                DAG.getConstant(0xff, DL, MVT::i32));
+
+  // For SEXTLOAD, sign-extend the byte from 8 to 32 bits via
+  // `(x << 24) >>a 24`. Both shifts are by a compile-time constant
+  // 24, so they select to SHL32ri / SAR32ri (and survive byte-chain).
+  SDValue Result;
+  if (LD->getExtensionType() == ISD::SEXTLOAD) {
+    SDValue Sh = DAG.getConstant(24, DL, MVT::i32);
+    SDValue Up = DAG.getNode(ISD::SHL, DL, MVT::i32, ByteVal, Sh);
+    Result     = DAG.getNode(ISD::SRA, DL, MVT::i32, Up, Sh);
+  } else {
+    // EXTLOAD and ZEXTLOAD: the AND 0xff already produced a
+    // zero-extended i32, which is exactly what the consumer wants.
+    Result = ByteVal;
+  }
+
+  // Result type might be smaller than i32 if the consumer truncates
+  // it later; for ZEXTLOAD / EXTLOAD the source ext is from i8 to
+  // the natural promote type i32, so ResTy == i32 in practice.
+  if (Result.getValueType() != ResTy)
+    Result = DAG.getNode(ISD::TRUNCATE, DL, ResTy, Result);
+
+  return DAG.getMergeValues({Result, Word.getValue(1)}, DL);
+}
+
+SDValue MovTargetLowering::LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) const {
+  // Stage 6d3b — truncating store of i8 → read-modify-write on the
+  // enclosing aligned i32 word:
+  //
+  //   aligned_ptr  = ptr & ~3
+  //   byte_off     = ptr &  3
+  //   bit_shift    = byte_off << 3
+  //   word         = load  i32, [aligned_ptr]
+  //   cleared      = word & ~(0xff << bit_shift)
+  //   new_byte     = (val & 0xff) << bit_shift
+  //   store i32 (cleared | new_byte), [aligned_ptr]
+  //
+  // Same alignment-safety argument as LowerExtLoadI8: the i32 word
+  // we read+write straddles the original i8 byte, but always sits
+  // inside the same underlying object, so we never page-fault past
+  // its end. The op chain is heavy (load, two masks, two shifts,
+  // OR, store) but every op is i32 and selects against the existing
+  // MOV32rm / AND32ri / SHL32ri / OR32rr / MOV32mr patterns —
+  // mov-only legalize at stage 7 picks them all up.
+  auto *ST = cast<StoreSDNode>(Op);
+  if (ST->getMemoryVT() != MVT::i8 || !ST->isTruncatingStore())
+    return SDValue();
+
+  SDLoc DL(Op);
+  SDValue Chain = ST->getChain();
+  SDValue Val   = ST->getValue();
+  SDValue Ptr   = ST->getBasePtr();
+  EVT PtrTy     = Ptr.getValueType();
+
+  SDValue Three     = DAG.getConstant(3, DL, PtrTy);
+  SDValue InvThree  = DAG.getConstant(~3u, DL, PtrTy);
+  SDValue AlignedPt = DAG.getNode(ISD::AND, DL, PtrTy, Ptr, InvThree);
+  SDValue ByteOff   = DAG.getNode(ISD::AND, DL, PtrTy, Ptr, Three);
+  SDValue BitShift  = DAG.getNode(ISD::SHL, DL, PtrTy, ByteOff,
+                                  DAG.getConstant(3, DL, PtrTy));
+
+  // Two separate MachineMemOperands — the original store's MMO has
+  // store flags set, but we now need a load-only MMO for the
+  // pre-load and a store-only MMO for the back-store. Sharing the
+  // original would have MOV32rm carrying a store-flagged MMO and
+  // the verifier rejects it ("Missing mayStore flag").
+  MachineFunction &MF = DAG.getMachineFunction();
+  MachineMemOperand *OrigMMO = ST->getMemOperand();
+  MachineMemOperand *LoadMMO = MF.getMachineMemOperand(
+      OrigMMO->getPointerInfo(),
+      MachineMemOperand::MOLoad,
+      /*size=*/4, Align(4), OrigMMO->getAAInfo(),
+      OrigMMO->getRanges(), OrigMMO->getSyncScopeID(),
+      OrigMMO->getSuccessOrdering(), OrigMMO->getFailureOrdering());
+  MachineMemOperand *StoreMMO = MF.getMachineMemOperand(
+      OrigMMO->getPointerInfo(),
+      MachineMemOperand::MOStore,
+      /*size=*/4, Align(4), OrigMMO->getAAInfo(),
+      OrigMMO->getRanges(), OrigMMO->getSyncScopeID(),
+      OrigMMO->getSuccessOrdering(), OrigMMO->getFailureOrdering());
+
+  SDValue Word = DAG.getLoad(MVT::i32, DL, Chain, AlignedPt, LoadMMO);
+
+  // ~(0xff << bit_shift) — we have no NOT opcode, so XOR with ~0.
+  SDValue ByteMask = DAG.getNode(ISD::SHL, DL, MVT::i32,
+                                 DAG.getConstant(0xff, DL, MVT::i32),
+                                 BitShift);
+  SDValue AllOnes  = DAG.getConstant(0xFFFFFFFFu, DL, MVT::i32);
+  SDValue InvMask  = DAG.getNode(ISD::XOR, DL, MVT::i32, ByteMask, AllOnes);
+  SDValue Cleared  = DAG.getNode(ISD::AND, DL, MVT::i32, Word, InvMask);
+
+  SDValue NewByte = DAG.getNode(ISD::AND, DL, MVT::i32, Val,
+                                DAG.getConstant(0xff, DL, MVT::i32));
+  SDValue Shifted = DAG.getNode(ISD::SHL, DL, MVT::i32, NewByte, BitShift);
+  SDValue Merged  = DAG.getNode(ISD::OR, DL, MVT::i32, Cleared, Shifted);
+
+  return DAG.getStore(Word.getValue(1), DL, Merged, AlignedPt, StoreMMO);
 }
 
 SDValue MovTargetLowering::LowerBRCOND(SDValue Op, SelectionDAG &DAG) const {

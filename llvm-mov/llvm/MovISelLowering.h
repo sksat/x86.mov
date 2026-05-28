@@ -56,9 +56,14 @@ public:
 
   // Custom-lowered operations: ISD::BRCOND and ISD::BR_CC both fold
   // into MovISD::BR_CC; the selector then emits a CMP + Jcc pair.
+  // ISD::LOAD with extload-i8 lowers to an aligned-down i32 load +
+  // shift-mask sequence (stage 6d3b) so the backend never has to
+  // synthesise GR8 vregs for byte-stream reads.
   SDValue LowerOperation(SDValue Op, SelectionDAG &DAG) const override;
   SDValue LowerBRCOND(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) const;
 
   // Stop DAGCombiner from rewriting `(and (load i32), 0xFF)` or
   // `(lshr (load i32), 16)` into a narrow ext-load — our backend has no
