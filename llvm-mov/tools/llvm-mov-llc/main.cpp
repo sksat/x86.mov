@@ -182,29 +182,48 @@ int main(int argc, char **argv) {
     SmallVector<IntrinsicInst *, 4> Worklist;
     for (Instruction &I : instructions(F)) {
       if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
-        if (II->getIntrinsicID() == Intrinsic::vector_reduce_xor)
+        switch (II->getIntrinsicID()) {
+        case Intrinsic::vector_reduce_xor:
+        case Intrinsic::vector_reduce_add:
+        case Intrinsic::vector_reduce_and:
+        case Intrinsic::vector_reduce_or:
           Worklist.push_back(II);
+          break;
+        default:
+          break;
+        }
       }
     }
     for (IntrinsicInst *II : Worklist) {
       Value *Vec = II->getArgOperand(0);
       auto *VecTy = cast<FixedVectorType>(Vec->getType());
       const unsigned N = VecTy->getNumElements();
+      const Intrinsic::ID ID = II->getIntrinsicID();
       IRBuilder<> B(II);
-      // Extract every element to a scalar, then XOR-reduce as a
-      // balanced binary tree. A linear chain would also be correct
-      // but a tree halves the dependency depth (matters once each
-      // i8 XOR expands to ~50 movs via the byte-chain mov-only
-      // legalize at stage 7).
-      SmallVector<Value *, 16> Lanes;
+      // Extract every element to a scalar, then fold to scalar as a
+      // balanced binary tree. The fold op is chosen by intrinsic
+      // kind. A linear chain would also be correct but a tree halves
+      // the dependency depth (matters once each binop expands to
+      // ~50 movs via the byte-chain mov-only legalize at stage 7).
+      SmallVector<Value *, 32> Lanes;
       Lanes.reserve(N);
       for (unsigned i = 0; i < N; ++i)
         Lanes.push_back(B.CreateExtractElement(Vec, B.getInt32(i)));
       while (Lanes.size() > 1) {
-        SmallVector<Value *, 16> Next;
+        SmallVector<Value *, 32> Next;
         Next.reserve((Lanes.size() + 1) / 2);
-        for (unsigned i = 0; i + 1 < Lanes.size(); i += 2)
-          Next.push_back(B.CreateXor(Lanes[i], Lanes[i + 1]));
+        for (unsigned i = 0; i + 1 < Lanes.size(); i += 2) {
+          Value *L = Lanes[i], *R = Lanes[i + 1];
+          Value *Folded = nullptr;
+          switch (ID) {
+          case Intrinsic::vector_reduce_xor: Folded = B.CreateXor(L, R); break;
+          case Intrinsic::vector_reduce_add: Folded = B.CreateAdd(L, R); break;
+          case Intrinsic::vector_reduce_and: Folded = B.CreateAnd(L, R); break;
+          case Intrinsic::vector_reduce_or:  Folded = B.CreateOr (L, R); break;
+          default: llvm_unreachable("unreachable: kind filtered above");
+          }
+          Next.push_back(Folded);
+        }
         if (Lanes.size() % 2)
           Next.push_back(Lanes.back());
         Lanes.swap(Next);

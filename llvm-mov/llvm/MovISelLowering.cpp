@@ -116,6 +116,74 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // get folded by rustc's own const-eval before we ever see the
   // IR; runtime mul is a "do this later" hold).
   setOperationAction(ISD::MUL, MVT::i32, Expand);
+  // No 64-bit-result multiply either. UMUL_LOHI / SMUL_LOHI / MULH*
+  // arise from i32 multiplications whose high half escapes (hashing,
+  // 32x32→64 fixed-point, the modulo-by-constant fast path that
+  // LLVM emits in place of an actual UDIV). Expand spells them as
+  // narrow MUL + manual carry, which then re-expands via the MUL
+  // Expand above into a libcall. The libcall still doesn't link
+  // (no compiler-rt) but it stops crashing in ISel; runtime
+  // multiplication is genuinely future-work for this backend.
+  setOperationAction(ISD::UMUL_LOHI, MVT::i32, Expand);
+  setOperationAction(ISD::SMUL_LOHI, MVT::i32, Expand);
+  setOperationAction(ISD::MULHU,     MVT::i32, Expand);
+  setOperationAction(ISD::MULHS,     MVT::i32, Expand);
+  // DIV / REM round out the "we don't have a 32-bit multiplier"
+  // story — same Expand→libcall path. Real code that wants these
+  // must wait until the byte-chain mul/div stage lands.
+  setOperationAction(ISD::UDIV, MVT::i32, Expand);
+  setOperationAction(ISD::SDIV, MVT::i32, Expand);
+  setOperationAction(ISD::UREM, MVT::i32, Expand);
+  setOperationAction(ISD::SREM, MVT::i32, Expand);
+  setOperationAction(ISD::UDIVREM, MVT::i32, Expand);
+  setOperationAction(ISD::SDIVREM, MVT::i32, Expand);
+
+  // Min / max / abs intrinsics. No CMOV-equivalent so each expands
+  // into a CMP + Jcc + branch + PHI sequence (which the existing
+  // 7c2 mov-only CMP+Jcc legalize then turns into a mov-only
+  // dispatcher mask). Same Expand pattern as SELECT above —
+  // arrives via DAGCombine from `core::cmp::min / max / Ord` and
+  // from `llvm.abs.i32` / `llvm.umin.i32` etc. intrinsics in opt'd
+  // Rust crates (qoi's index hash uses umin).
+  for (auto Op : {ISD::SMIN, ISD::SMAX, ISD::UMIN, ISD::UMAX, ISD::ABS})
+    setOperationAction(Op, MVT::i32, Expand);
+
+  // Register the compiler-rt libcall names for the multiply/divide
+  // family. The Expand actions above synthesise calls to these
+  // symbols at SDAG time; without the explicit binding the
+  // legalizer errors out with "no libcall available for mul". The
+  // actual implementations are provided as small shift-and-add
+  // Rust stubs in the example crates that need them
+  // (examples/rust/qoi_decode/src/lib.rs etc.); when a future
+  // stage adds a real byte-chain MUL legalize, these can move
+  // back to MovOnlyLegalize and the libcall fall back goes away.
+  setLibcallImpl(RTLIB::MUL_I32,   RTLIB::impl___mulsi3);
+  setLibcallImpl(RTLIB::UDIV_I32,  RTLIB::impl___udivsi3);
+  setLibcallImpl(RTLIB::SDIV_I32,  RTLIB::impl___divsi3);
+  setLibcallImpl(RTLIB::UREM_I32,  RTLIB::impl___umodsi3);
+  setLibcallImpl(RTLIB::SREM_I32,  RTLIB::impl___modsi3);
+
+  // No `bswap` opcode either. Rust idioms like `u32::from_be(x)` or
+  // `x.swap_bytes()` lower to ISD::BSWAP. Expand re-spells it as
+  // the standard four-byte shuffle (`(x << 24) | ((x & 0xff00) << 8)
+  // | ((x >> 8) & 0xff00) | (x >> 24)`), which our SHL32ri /
+  // SHR32ri / OR32rr / AND32ri patterns handle and the byte-chain
+  // mov-only legalize at stage 7 lowers further. Same shape as the
+  // hand-spelled `bswap32` in examples/rust/bmp_decode but applied
+  // automatically to any IR that arrives with a real ISD::BSWAP.
+  setOperationAction(ISD::BSWAP, MVT::i32, Expand);
+
+  // Bit-count intrinsics (count leading zeros, count trailing zeros,
+  // popcount, parity). No `bsf` / `bsr` / `popcnt` in mov-only land.
+  // The qoi / png decoders touch these via integer hashing in their
+  // hot path; Expand makes the legalizer synthesise them as long
+  // shift + add / and chains, which all stay in the legal i32 op
+  // set + byte-chain. CTPOP / CTLZ / CTTZ + the *_ZERO_UNDEF
+  // variants are kept Expand for the same reason — the alternative
+  // would be a libcall to compiler-rt which our runtime can't link.
+  for (auto Op : {ISD::CTPOP, ISD::CTLZ, ISD::CTLZ_ZERO_UNDEF,
+                  ISD::CTTZ, ISD::CTTZ_ZERO_UNDEF})
+    setOperationAction(Op, MVT::i32, Expand);
 
   // Stage 6c — inline llvm.memset / llvm.memcpy / llvm.memmove
   // rather than emitting libcalls. Our standalone runtime doesn't
