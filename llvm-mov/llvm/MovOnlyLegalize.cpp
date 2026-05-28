@@ -2799,8 +2799,12 @@ private:
   //      the result back to srcdst[ByteIdx].
   //
   // After this returns, srcdst[ByteIdx] holds the final result byte.
-  // ECX/DL/CL are trashed. idx is left in a clobbered state (the
-  // caller's next byte-stage zero pass resets it).
+  // ECX/DL/CL are trashed. idx[0..1] is left in a clobbered state
+  // (the caller writes idx[0..1] before its next table lookup).
+  // idx[2..3] is preserved as 0 throughout — this helper never
+  // writes them, so callers that established the invariant up
+  // front (e.g. opt 6 / opt 6 follow-up hoists) keep it across
+  // repeated invocations.
   static void emitOrByteAndStore(MachineBasicBlock &MBB,
                                  MachineBasicBlock::iterator I,
                                  const DebugLoc &DL,
@@ -2817,9 +2821,11 @@ private:
     // mov byte ptr [idx + 1], cl       ; idx[1] = low_contrib
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
         .addReg(Mov::EBP).addImm(A.IdxDisp + 1).addReg(Mov::CL);
-    // idx[2..3] are 0 from the previous lookup's `mov [idx], ecx`
-    // zero pass (the last write to idx[2..3] before this point is
-    // the one in emitUnaryByteLookup, which set them to 0).
+    // idx[2..3] are 0 — guaranteed by the caller's hoisted
+    // emitIdxZero (opt 6 / opt 6 follow-up) plus the fact that
+    // nothing on the path to here writes them (emitUnaryByteLookup
+    // re-establishes the zero internally, emitOrByteAndStore only
+    // touches idx[0..1]).
     // mov ecx, dword ptr [idx]
     BuildMI(MBB, I, DL, TII.get(Mov::MOV32rm), Mov::ECX)
         .addReg(Mov::EBP).addImm(A.IdxDisp);
@@ -3127,6 +3133,23 @@ private:
         "__mov_shr_byte_7",
     };
 
+    // opt 6 follow-up — Phase 5 idx-zero hoist for shift32rCL (smart-friend
+    // follow-up to opt 6, see PR #6 Future work). The previous shape
+    // emitted 50 emitIdxZero calls per shift32rCL site: 2 in each
+    // stage's mask compute (Phase B) and 8 in each stage's per-byte
+    // select (Phase C1+C2), times 5 stages. All but the very first
+    // are redundant — every helper inside the loop writes only
+    // idx[0..1] (or pre-zeros idx[0..3] internally via
+    // emitUnaryByteLookup before its own table lookup), so idx[2..3]
+    // stay 0 across the entire 5-stage unroll. One hoisted
+    // emitIdxZero here is enough to establish the invariant.
+    //
+    // The SAR sign-byte block above runs emitUnaryByteLookup, which
+    // already does its own internal MOV32mi 0 — but that fires only
+    // on SAR, so the unconditional hoist below covers SHL/SHR/SAR
+    // uniformly. Saves 49 movs per shift32rCL site.
+    emitIdxZero(MBB, Insert, DL, TII, *Addr);
+
     // ===== 5-stage unroll =====
     for (unsigned k = 0; k < 5; ++k) {
       const unsigned ShiftAmount = 1u << k; // 1, 2, 4, 8, 16
@@ -3186,7 +3209,8 @@ private:
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
           .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp);
       // 2. Pack (amount, 1<<k) into idx[1..0] and look up __mov_and8_table.
-      emitIdxZero(MBB, Insert, DL, TII, *Addr);
+      // (opt 6 follow-up: idx[2..3] are already 0 from the hoisted emitIdxZero
+      // before the for-loop, and no MI in this loop writes them.)
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
@@ -3207,7 +3231,8 @@ private:
           .addReg(Mov::DL);
       // 5. Compute inv_mask = mask XOR 0xFF (using __mov_xor8_table)
       //    and stash at amount_buf[2].
-      emitIdxZero(MBB, Insert, DL, TII, *Addr);
+      // (opt 6 follow-up: emitUnaryByteLookup above leaves idx[2..3] = 0; the
+      // writes to idx[0..1] below are full overwrites.)
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
@@ -3230,7 +3255,8 @@ private:
       // in DL).
       for (unsigned i = 0; i < 4; ++i) {
         // (C1) Compute (~mask & srcdst[i]) → DL, stash to srcdst[i].
-        emitIdxZero(MBB, Insert, DL, TII, *Addr);
+        // (opt 6 follow-up: prior xor8 lookup left idx[2..3] = 0; the writes
+        // below fully overwrite idx[0..1].)
         // idx[1] = inv_mask
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
             .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp + 2);
@@ -3253,7 +3279,8 @@ private:
             .addReg(Mov::DL);
 
         // (C2) Compute (mask & shifted_buf[i]) → DL.
-        emitIdxZero(MBB, Insert, DL, TII, *Addr);
+        // (opt 6 follow-up: C1's and8 lookup left idx[2..3] = 0; the writes
+        // below fully overwrite idx[0..1].)
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
             .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp + 1);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))

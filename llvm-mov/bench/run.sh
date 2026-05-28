@@ -92,6 +92,14 @@ CLANG="${CLANG:-clang-22}"
 #   fib10             — small Fibonacci loop. ADD32rr chain + signed
 #                       compare; same story as sum10 but with an extra
 #                       loop carried dependency (a/b/t).
+#   shifts            — `<<`/`>>` with constant amounts. Exercises stage
+#                       7b2 (SHL32ri / SHR32ri byte-table rewrite).
+#   shift_reg         — `<<`/`>>` with a runtime amount, covering
+#                       SHL32rCL, SAR32rCL and SHR32rCL in one fixture.
+#                       Surfaces the opt-6-follow-up "Phase 5 idx-zero
+#                       hoist for shift32rCL": each shift site historically
+#                       paid 50 redundant `mov dword [idx], 0` stores;
+#                       with the hoist, 1.
 DEFAULT_FIXTURES=(
     return0
     return42
@@ -101,6 +109,7 @@ DEFAULT_FIXTURES=(
     sum10
     fib10
     shifts
+    shift_reg
     fib_rec
     multi_call
 )
