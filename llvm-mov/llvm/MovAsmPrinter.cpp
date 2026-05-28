@@ -57,6 +57,7 @@ public:
     emitShift8Tables();
     emitSub8Tables();
     emitReturnAddrSlot();
+    emitPrologueScratch();
   }
 
 private:
@@ -68,6 +69,7 @@ private:
   void emitUnaryByteTable(StringRef Name, uint8_t (*Op)(uint8_t));
   void emitSub8Tables();
   void emitReturnAddrSlot();
+  void emitPrologueScratch();
 };
 } // namespace
 
@@ -369,6 +371,32 @@ void MovAsmPrinter::emitSub8Tables() {
   };
   emitTable("__mov_sub8_diff_table", Diff);
   emitTable("__mov_sub8_borrow_table", Borrow);
+}
+
+// Stage 7d2 — `__mov_prologue_scratch`: a 16-byte cell in .bss used
+// by the prologue-head rewrite (PUSH32r EBP → mov-only sequence).
+// At the entry MI EBP still holds the caller's value, so the usual
+// [ebp + scratch_disp] addressing isn't available. The earlier draft
+// used [esp - 12]..[esp - 16] as scratch, but writes below ESP can
+// fault on a guard page (codex P1 review on 7d2). A .bss slot is
+// always mapped, so the rewrite stays correctness-safe across any
+// caller stack shape.
+//
+// Layout:
+//   [0..3]   srcdst — current ESP value, decremented in place
+//   [4..7]   idx    — (K, a_byte, borrow_in, 0) pack for sub8 lookup
+//   [8..15]  unused (reserved for future expansion)
+//
+// Lives in its own section so --gc-sections drops it from TUs that
+// don't reference the symbol.
+void MovAsmPrinter::emitPrologueScratch() {
+  MCSection *Sec = OutContext.getELFSection(
+      ".bss.__mov_prologue_scratch",
+      ELF::SHT_NOBITS, ELF::SHF_ALLOC | ELF::SHF_WRITE);
+  OutStreamer->switchSection(Sec);
+  MCSymbol *Sym = OutContext.getOrCreateSymbol("__mov_prologue_scratch");
+  OutStreamer->emitLabel(Sym);
+  OutStreamer->emitZeros(/*NumBytes=*/16);
 }
 
 // Stage 7d1 — `__mov_return_addr_slot`: a 4-byte cell in .bss that the
