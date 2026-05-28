@@ -315,6 +315,47 @@ because both rely on `main`'s return value, which the crt0 always
 overrides with `exit(0)`. That is a movfuscator convention, not a
 movie86 limitation, and is the same reason `return42` exits 0.
 
+**Update (2026-05-28 deep dive)**: `--log-writes-in` lets us trace
+the dispatch chain. `multi-add` is genuinely deadlocked at the
+dispatch-flag level:
+
+- `on` (0x08487118) flips to 1 twice (steps 25, 350), to 0 twice
+  (steps 142, 1154), then **stuck at 0 forever**.
+- `b0` (0x08286fa0) — the `alu_eq` result that re-arms `on` via
+  `execution_on(b0)` — flips to 1 at step 268, 0 at step 579, then
+  **stuck at 0**.
+- `target` (0x08487128) only ever holds `0x8804958a` (= `&main`
+  encoded, set at step 106) and `0x08049c14` (the post-call
+  continuation, set at step 1118 via the `alu_add16` table chain
+  `0x88049c14 + 0x80000000 mod 2^32`).
+- `branch_temp` (0x082870c0) then oscillates 0x14 ↔ 0x8804958a
+  forever (period ~710 steps).
+
+**Crucially**: linking `multi-add` with real libc and running it
+natively on i386 (`/usr/bin/ld ... -dynamic-linker /lib/ld-linux.so.2
+-lc -lm ...`, then exec) **also fails to terminate within 10 minutes
+of CPU time** (`user 1:10, sys 3:39` in 10:00 wall). The simpler
+fixtures (`return42-dyn`, `sum10-dyn`) exit immediately. So the long
+runtime is **inherent to movfuscator's mov-only function-call
+dispatch on this specific fixture**, not a movie86 bug.
+
+Root cause (from cross-referencing movfuscator.c):
+- Each label / call site emits an `alu_eq(target, $LABEL-0x80000000)`
+  compare block followed by `execution_on(b0)`. `MOV_OFFSET = 0x80000000`
+  is defined at the top of `movfuscator.c`.
+- For multi-add's call→return round-trip, the compare blocks chain
+  through main entry → arg setup → `&add` entry → `add` body →
+  return continuation → main continuation → `exit`. Each transition
+  is hundreds of master_loop iterations, each iteration is 1474
+  emulated mov instructions.
+- The dispatch IS technically progressing (b0 / on / target do flip
+  in the early phase), but per-iteration cost dominates.
+
+Verdict: not a movie86 bug. **Documented as a known-slow fixture; do
+not block PR review on it.** The investigation produced the
+`--log-writes-in` tool which is independently useful for any future
+deep-dive into movfuscator-runtime questions.
+
 ## Library-stub generality (resolved → host-wrapper ABI)
 
 The original hello demo's `printf` stub hardcoded a 6-byte write
