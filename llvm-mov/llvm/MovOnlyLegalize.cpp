@@ -246,6 +246,12 @@ public:
         case Mov::CTTZ32r:
           Changed |= legalizeBitScan32r(MI, MBB, TII, /*IsCTTZ=*/true);
           break;
+        case Mov::MUL32rr:
+          Changed |= legalizeMUL32(MI, MBB, TII, /*IsRR=*/true);
+          break;
+        case Mov::MUL32ri:
+          Changed |= legalizeMUL32(MI, MBB, TII, /*IsRR=*/false);
+          break;
         // SUB rr/ri, CMP+Jcc, CALL32d + CALLSEQ, RET, and the
         // prologue/epilogue PUSH/POP/SUB/MOV sequence light up
         // across stages 7c → 7d.
@@ -290,6 +296,8 @@ private:
     std::optional<int64_t> AmountBufDisp;
     std::optional<int64_t> ShiftedBufDisp;
     std::optional<int64_t> CmpMaskBufDisp;
+    std::optional<int64_t> MulTempDisp;
+    std::optional<int64_t> MulRhs2Disp;
   };
 
   // Stage 7c1: resolve just the dispatcher's `next_pc` slot. CFG
@@ -1830,6 +1838,9 @@ private:
               std::nullopt,
               std::nullopt,
               std::nullopt,
+              std::nullopt,
+              std::nullopt,
+              std::nullopt,
               std::nullopt};
     const int FI_Rhs = MovMFI->getAddRewriteRhsFI();
     if (FI_Rhs != -1)
@@ -1846,6 +1857,12 @@ private:
     const int FI_CmpMask = MovMFI->getCmpMaskBufFI();
     if (FI_CmpMask != -1)
       A.CmpMaskBufDisp = MFI.getObjectOffset(FI_CmpMask);
+    const int FI_MulTemp = MovMFI->getMulTempBufFI();
+    if (FI_MulTemp != -1)
+      A.MulTempDisp = MFI.getObjectOffset(FI_MulTemp);
+    const int FI_MulRhs2 = MovMFI->getMulRhs2BufFI();
+    if (FI_MulRhs2 != -1)
+      A.MulRhs2Disp = MFI.getObjectOffset(FI_MulRhs2);
     return A;
   }
 
@@ -2607,6 +2624,214 @@ private:
 
     // EPILOGUE — restore ECX/EDX, then load result into Dst (same
     // ordering rationale as CTPOP32r / ADD32ri).
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
+
+    MI.eraseFromParent();
+    return true;
+  }
+
+  // Stage 7f — lower MUL32rr / MUL32ri into a mov-only schoolbook
+  // multiplication of two 32-bit operands using the new
+  // `__mov_mul8_{lo,hi}_table` byte tables + the existing add8 byte
+  // chain for accumulation.
+  //
+  // Operand layout post-RA:
+  //   - MUL32rr: $dst, $src1 (= A), $src2 (= B, GPR32)
+  //   - MUL32ri: $dst, $src1 (= A), imm (= B, baked into MI)
+  //
+  // Scratch layout (already reserved by FrameLowering):
+  //   - srcdst         : 4-byte result accumulator, initially 0
+  //   - rhs_buf        : 4-byte spill of A (== src1)
+  //   - mul_rhs2_buf   : 4-byte spill of B (MUL32rr only)
+  //   - mul_temp_buf   : 4 bytes; legalize uses [0] to stash the
+  //                      per-pair high byte across the low cascade
+  //   - idx            : 4-byte pack slot for table lookups
+  //
+  // Algorithm — schoolbook on bytes:
+  //   for each (i, j) with i + j < 4:
+  //     idx = a[i] * 256 + b[j]
+  //     lo  = __mov_mul8_lo_table[idx]
+  //     hi  = __mov_mul8_hi_table[idx]
+  //     add lo at byte position i+j   with carry into i+j+1..3
+  //     if i+j+1 < 4:
+  //       add hi at byte position i+j+1 with carry into i+j+2..3
+  //
+  // The low cascade uses the add8 sum/carry tables (same primitives
+  // as ADD32rr), but the first byte add reads `b` directly from DL
+  // (the just-loaded low table result) instead of paying the temp-
+  // memory round-trip. The high lookup result is stashed in
+  // mul_temp_buf[0] before the low cascade starts because the cascade
+  // clobbers ECX (= mul idx) on its first add8 lookup.
+  //
+  // For (i, j) with i + j == 3 the high contribution would land at
+  // byte 4 of the result, which falls off the 32-bit boundary — those
+  // pairs do not need a high lookup at all.
+  //
+  // Per-site cost (counted on `multiply(0x01020304, 0x05060708)`):
+  // 1 pair × full cascade (4+3 bytes) + 2 × 3+2 + 3 × 2+1 + 4 × 1
+  // ≈ 290 byte moves; the old `__mulsi3` libcall path through the
+  // user-stub shift-and-add loop produced ~6400 movs per call site
+  // (32-iteration loop × ~200 movs per iteration), so this is a
+  // ~20× reduction in `.text` size for any TU that performs a 32-bit
+  // multiplication.
+  bool legalizeMUL32(MachineInstr &MI, MachineBasicBlock &MBB,
+                     const TargetInstrInfo &TII, bool IsRR) const {
+    const MachineFunction &MF = *MBB.getParent();
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr || !Addr->RhsDisp || !Addr->MulTempDisp)
+      return false;
+    if (IsRR && !Addr->MulRhs2Disp)
+      return false;
+
+    assert(MI.getOperand(0).isReg() && "MUL32 op 0 must be reg");
+    assert(MI.getOperand(1).isReg() && "MUL32 op 1 must be reg");
+    const Register Dst = MI.getOperand(0).getReg();
+    const Register Src1 = MI.getOperand(1).getReg();
+    Register Src2;
+    std::array<uint8_t, 4> ImmBytes = {0, 0, 0, 0};
+    if (IsRR) {
+      assert(MI.getOperand(2).isReg() && "MUL32rr op 2 must be reg");
+      Src2 = MI.getOperand(2).getReg();
+    } else {
+      assert(MI.getOperand(2).isImm() && "MUL32ri op 2 must be imm");
+      const uint32_t Imm = static_cast<uint32_t>(MI.getOperand(2).getImm());
+      ImmBytes = {static_cast<uint8_t>(Imm & 0xFFu),
+                  static_cast<uint8_t>((Imm >> 8) & 0xFFu),
+                  static_cast<uint8_t>((Imm >> 16) & 0xFFu),
+                  static_cast<uint8_t>((Imm >> 24) & 0xFFu)};
+    }
+
+    auto Insert = MachineBasicBlock::iterator(&MI);
+    const DebugLoc DL = MI.getDebugLoc();
+    const int64_t ADisp = *Addr->RhsDisp;            // src1 spill
+    const int64_t BDisp = IsRR ? *Addr->MulRhs2Disp  // src2 spill
+                               : int64_t{0};         // (unused for ri)
+    const int64_t TempDisp = *Addr->MulTempDisp;     // hi byte stash
+
+    // PROLOGUE — save ECX/EDX, spill operand(s), zero accumulator.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(ADisp).addReg(Src1);
+    if (IsRR) {
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+          .addReg(Mov::EBP).addImm(BDisp).addReg(Src2);
+    }
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addImm(0);
+
+    // Helper: cascade-add a single byte (held in DL on entry) at
+    // result position `p`, propagating carry through `p+1..3`.
+    // For p == 3 we still write the byte at srcdst[3] but skip the
+    // carry-out load (it would feed byte 4 which is discarded).
+    auto cascadeAddDLAtPos = [&](unsigned p) {
+      // First step: srcdst[p] += DL, no cin. DL still holds the
+      // byte value coming from the just-completed lookup. Pack
+      // (idx[1] = srcdst[p], idx[0] = DL), idx[2..3] = 0.
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(p));
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          .addExternalSymbol("__mov_add8_sum_table").addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(p)).addReg(Mov::DL);
+      if (p < 3) {
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
+            .addExternalSymbol("__mov_add8_carry_table").addReg(Mov::ECX);
+      }
+      // Carry-only continuations for k = p+1 .. 3.
+      for (unsigned k = p + 1; k < 4; ++k) {
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 2).addReg(Mov::CL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+            .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(k));
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+            .addExternalSymbol("__mov_add8_sum_table").addReg(Mov::ECX);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(k)).addReg(Mov::DL);
+        if (k < 3) {
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
+              .addExternalSymbol("__mov_add8_carry_table").addReg(Mov::ECX);
+        }
+      }
+    };
+
+    // CHAIN — for each (i, j) with i + j < 4 visit the byte pair,
+    // look up partial product, cascade-add into srcdst.
+    for (unsigned i = 0; i < 4; ++i) {
+      for (unsigned j = 0; j < 4; ++j) {
+        const unsigned p = i + j;
+        if (p >= 4)
+          continue;
+
+        // Build mul lookup idx: idx[2..3] = 0, idx[1] = a[i] (from
+        // rhs_buf+i), idx[0] = b[j] (from mul_rhs2_buf+j or imm).
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+            .addReg(Mov::EBP).addImm(ADisp + static_cast<int64_t>(i));
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
+        if (IsRR) {
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(BDisp + static_cast<int64_t>(j));
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+        } else {
+          // MUL32ri: write the imm byte directly into idx[0].
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(ImmBytes[j]);
+        }
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
+
+        // If a high contribution exists (p + 1 < 4), look it up
+        // now and stash in mul_temp_buf[0]. ECX is still valid
+        // (table loads don't mutate it) so we can do the lo
+        // lookup right after.
+        const bool HiNeeded = (p + 1 < 4);
+        if (HiNeeded) {
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+              .addExternalSymbol("__mov_mul8_hi_table").addReg(Mov::ECX);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
+              .addReg(Mov::EBP).addImm(TempDisp).addReg(Mov::DL);
+        }
+        // Low lookup — DL now carries the lo partial product, ready
+        // for direct use by the cascade's first step.
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+            .addExternalSymbol("__mov_mul8_lo_table").addReg(Mov::ECX);
+        cascadeAddDLAtPos(p);
+
+        if (HiNeeded) {
+          // Reload hi into DL from the stash, cascade at p + 1.
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+              .addReg(Mov::EBP).addImm(TempDisp);
+          cascadeAddDLAtPos(p + 1);
+        }
+      }
+    }
+
+    // EPILOGUE — restore ECX/EDX, then load result into Dst.
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
         .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)

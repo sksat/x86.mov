@@ -6,24 +6,12 @@ fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
-// Compiler-rt stubs (mul/div/rem). The backend Expand-s these to
-// libcalls; this crate provides the implementations themselves
-// compiled through llvm-mov-llc into mov-only `.text`. Inline so
-// they don't cross-call each other (which would otherwise feed
-// SDAG legalisation back through the libcall-name pattern and
-// blow up combine work — see codex review).
-#[inline(always)]
-fn umul(mut a: u32, mut b: u32) -> u32 {
-    let mut r: u32 = 0;
-    let mut i = 0u32;
-    while i < 32 {
-        if (b & 1) != 0 { r = r.wrapping_add(a); }
-        a = a << 1;
-        b = b >> 1;
-        i = i + 1;
-    }
-    r
-}
+// Compiler-rt stubs (div/rem only). The backend selects 32-bit MUL
+// to MUL32{rr,ri} pseudos with byte-table lowering at stage 7f, so
+// `__mulsi3` is no longer needed — every `q * d` here lowers
+// directly into the mov-only schoolbook chain. The DIV/REM stubs
+// still go through their libcall names because the byte-chain
+// legalize for them hasn't landed yet (see future work).
 #[inline(always)]
 fn udiv(n: u32, d: u32) -> u32 {
     if d == 0 { return 0; }
@@ -37,10 +25,9 @@ fn udiv(n: u32, d: u32) -> u32 {
     }
     q
 }
-#[unsafe(no_mangle)] pub extern "C" fn __mulsi3(a: i32, b: i32) -> i32 { umul(a as u32, b as u32) as i32 }
 #[unsafe(no_mangle)] pub extern "C" fn __udivsi3(n: u32, d: u32) -> u32 { udiv(n, d) }
 #[unsafe(no_mangle)] pub extern "C" fn __umodsi3(n: u32, d: u32) -> u32 {
-    let q = udiv(n, d); n.wrapping_sub(umul(q, d))
+    let q = udiv(n, d); n.wrapping_sub(q.wrapping_mul(d))
 }
 #[unsafe(no_mangle)] pub extern "C" fn __divsi3(a: i32, b: i32) -> i32 {
     let neg = (a < 0) ^ (b < 0);
@@ -53,7 +40,7 @@ fn udiv(n: u32, d: u32) -> u32 {
     let abs_a = if a < 0 { (a as u32).wrapping_neg() } else { a as u32 };
     let abs_b = if b < 0 { (b as u32).wrapping_neg() } else { b as u32 };
     let q = udiv(abs_a, abs_b);
-    let r = abs_a.wrapping_sub(umul(q, abs_b)) as i32;
+    let r = abs_a.wrapping_sub(q.wrapping_mul(abs_b)) as i32;
     if a < 0 { r.wrapping_neg() } else { r }
 }
 #[unsafe(no_mangle)]

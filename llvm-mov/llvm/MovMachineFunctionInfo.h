@@ -126,6 +126,22 @@ public:
   int getCmpMaskBufFI() const { return CmpMaskBufFI; }
   void setCmpMaskBufFI(int FI) { CmpMaskBufFI = FI; }
 
+  // Stage 7f — `mul_rhs2_buf` is the 4-byte spill of the second
+  // operand for MUL32rr (rhs_buf holds the first operand). MUL32ri
+  // gets the rhs bytes from the immediate slice, so this slot is
+  // only allocated when the function contains MUL32rr.
+  int getMulRhs2BufFI() const { return MulRhs2BufFI; }
+  void setMulRhs2BufFI(int FI) { MulRhs2BufFI = FI; }
+
+  // Stage 7f — `mul_temp_buf` is a 4-byte scratch slot. The byte
+  // legalize uses [0] to stash the per-pair high byte
+  // (`__mov_mul8_hi_table[a*256+b]`) before running the low-byte
+  // cascade — the cascade clobbers ECX, so the high lookup result
+  // has to live in memory until the low cascade is done. Reserved
+  // whenever the function contains any MUL32{rr,ri}.
+  int getMulTempBufFI() const { return MulTempBufFI; }
+  void setMulTempBufFI(int FI) { MulTempBufFI = FI; }
+
 private:
   // Keyed on the *parent* (full-width) physreg, e.g. Mov::ECX for the
   // slot that backs CL-uses. We don't key by the byte subreg because
@@ -142,6 +158,8 @@ private:
   int ShiftShiftedBufFI = -1;
   int DispatcherNextPCBufFI = -1;
   int CmpMaskBufFI = -1;
+  int MulRhs2BufFI = -1;
+  int MulTempBufFI = -1;
 };
 
 } // namespace llvm

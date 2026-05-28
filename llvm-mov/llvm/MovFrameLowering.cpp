@@ -112,6 +112,8 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
   bool NeedsShiftSignScratch = false;
   bool NeedsShiftVarScratch = false;
   bool NeedsCmpMaskScratch = false;
+  bool NeedsMulScratch = false;
+  bool NeedsMulRhs2Scratch = false;
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
       switch (MI.getOpcode()) {
@@ -184,6 +186,25 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
         // chain's clobber-set across the rewrite. No rhs_buf needed
         // (CTPOP is unary) and no sign/var-shift slots.
         NeedsByteOpScratch = true;
+        break;
+      case Mov::MUL32rr:
+        // Stage 7f — `mul reg, reg` pseudo. Spill src1 to rhs_buf
+        // and src2 to mul_rhs2_buf; result accumulates in srcdst.
+        // mul_temp_buf holds the per-pair `__mov_mul8_hi_table`
+        // result across the low-byte cascade (which clobbers ECX).
+        NeedsByteOpScratch = true;
+        NeedsRhsScratch = true;
+        NeedsMulScratch = true;
+        NeedsMulRhs2Scratch = true;
+        break;
+      case Mov::MUL32ri:
+        // Stage 7f — `mul reg, imm32`. RHS bytes come from the
+        // immediate slice (written into idx via MOV8mi during the
+        // mul-idx pack), so no rhs2 buffer needed. rhs_buf still
+        // spills src1.
+        NeedsByteOpScratch = true;
+        NeedsRhsScratch = true;
+        NeedsMulScratch = true;
         break;
       case Mov::CTLZ32r:
       case Mov::CTTZ32r:
@@ -278,4 +299,14 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
   // ECX/DL/CL on every step).
   if (NeedsCmpMaskScratch)
     MovMFI->setCmpMaskBufFI(Make());
+
+  // Stage 7f slots — MUL byte-chain buffers.
+  //   mul_temp_buf: scratch for the per-pair high byte across the
+  //                 low cascade (clobber-safe across the ADD lookups).
+  //   mul_rhs2_buf: src2 spill for MUL32rr (MUL32ri's rhs is the
+  //                 immediate slice, no memory needed).
+  if (NeedsMulScratch)
+    MovMFI->setMulTempBufFI(Make());
+  if (NeedsMulRhs2Scratch)
+    MovMFI->setMulRhs2BufFI(Make());
 }

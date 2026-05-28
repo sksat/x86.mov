@@ -379,6 +379,30 @@ def : Pat<(ctlz_zero_undef GPR32:$src), (CTLZ32r GPR32:$src)>;
 def : Pat<(cttz_zero_undef GPR32:$src), (CTTZ32r GPR32:$src)>;
 
 //===----------------------------------------------------------------------===//
+// Stage 7f — 32-bit integer multiply pseudos. Codegen-only;
+// MovOnlyLegalize rewrites each into a mov-only schoolbook
+// multiplication that walks every byte pair (a_i, b_j) with i+j<4,
+// looks up the per-pair partial in `__mov_mul8_{lo,hi}_table`, and
+// accumulates into a 4-byte result with carry propagation through
+// the existing `__mov_add8_{sum,carry}_table` chain.
+//
+// Untied operands — `(mul a, b)` is commutative so RA can place dst
+// anywhere; the rewrite spills both operands before any byte borrow.
+// `mayLoad = 1` for the table reads (same rationale as the bit-count
+// pseudos in stage 7e). Marked `isCommutable` so DAGCombine can swap
+// operands to expose the immediate form when one operand is constant.
+let isCodeGenOnly = 1, mayLoad = 1 in {
+let isCommutable = 1 in
+def MUL32rr : MovInst<(outs GPR32:$dst), (ins GPR32:$src1, GPR32:$src2),
+                      "# mul32 $dst, $src1, $src2",
+                      [(set GPR32:$dst, (mul GPR32:$src1, GPR32:$src2))]>;
+
+def MUL32ri : MovInst<(outs GPR32:$dst), (ins GPR32:$src1, i32imm_op:$src2),
+                      "# mul32 $dst, $src1, $src2",
+                      [(set GPR32:$dst, (mul GPR32:$src1, imm:$src2))]>;
+}
+
+//===----------------------------------------------------------------------===//
 // PUSH / POP — used by emitPrologue/emitEpilogue (stage 4a) to save and
 // restore EBP for the frame pointer. No DAG patterns: these are
 // target-only, emitted directly via BuildMI from FrameLowering. The

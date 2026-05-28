@@ -120,16 +120,13 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::ROTL, MVT::i32, Expand);
   setOperationAction(ISD::ROTR, MVT::i32, Expand);
 
-  // No MUL32 opcode yet. The byte-chain mov-only legalize for a
-  // generic 32x32 multiply is a separate stage (4-stage Karatsuba
-  // / shift-and-add chain). Mark as Expand so the legalizer
-  // synthesises a __mulsi3 libcall — which still fails at link
-  // time (no libc), but at least at ISel it stops crashing.
-  // Real Rust code that wants to compile through here today must
-  // avoid `i32 * i32` in user code (constant multiplications
-  // get folded by rustc's own const-eval before we ever see the
-  // IR; runtime mul is a "do this later" hold).
-  setOperationAction(ISD::MUL, MVT::i32, Expand);
+  // Stage 7f — 32-bit MUL has a dedicated MUL32{rr,ri} pseudo +
+  // byte-table lowering in MovOnlyLegalize. The TableGen patterns
+  // match `(mul …)` directly; this `Legal` action stops the
+  // legalizer from synthesising a `__mulsi3` libcall (the previous
+  // Expand path needed Rust user-crate stubs for the libcall to
+  // resolve at link time — they're no longer required).
+  setOperationAction(ISD::MUL, MVT::i32, Legal);
   // No 64-bit-result multiply either. UMUL_LOHI / SMUL_LOHI / MULH*
   // arise from i32 multiplications whose high half escapes (hashing,
   // 32x32→64 fixed-point, the modulo-by-constant fast path that
