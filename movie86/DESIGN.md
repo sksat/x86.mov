@@ -345,6 +345,69 @@ control-flow needs (movfuscator only avoids them via the master_loop
 trick; a future mov-only LLVM backend may want them honestly), but
 they are no longer load-bearing for libc-using fixtures.
 
+## GDB attach (`--gdb-listen ADDR`)
+
+`cli/src/gdb_target.rs`. movie86 speaks the gdb Remote Serial Protocol
+(RSP) so the user can attach gdb and drive interactively — registers,
+memory, `c` / `s` / `b *0x...` / Ctrl-C — instead of inventing one-off
+`--watch` flags every time.
+
+Built on the [`gdbstub`](https://crates.io/crates/gdbstub) crate (cli
+only — the `movie86` library crate stays dep-free + no_std). Rolling
+our own RSP would be much more than the obvious 400 LOC once you
+handle ACK / partial reads / Ctrl-C / `target.xml` / GDB quirks
+(smart-friend's review).
+
+**Design decisions:**
+
+- **Separate `run_elf_with_gdb` entry.** Gdb owns the run/stop state
+  machine — folding it into the existing tight `loop { cpu.step() }`
+  in `run_elf_with_debug` would couple transport to execution.
+  Bootstrap (ELF load, esp, signal handlers, libc-stub scan) is the
+  only thing shared.
+
+- **i386 target description**: we ship `gdbstub_arch::x86::X86_SSE`
+  so the user doesn't need `set arch i386` — `target remote :1234`
+  is enough.
+
+- **EFLAGS = 0**. movie86 has no flags register today. Returning 0
+  keeps the register-file shape stable for gdb; writes via
+  `set $eflags = X` are silently dropped (unmodeled).
+
+- **Breakpoints**: stub-side tracking, **not** int3 byte-rewrites.
+  Behaves as "execution breakpoint at this eip" — fine for movie86
+  since we don't decode `int3`. The breakpoint set lives on
+  `GdbTarget` and is checked before each step in `ExecMode::Continue`.
+
+- **Fault → signal mapping:**
+
+  | Fault | gdb signal |
+  |---|---|
+  | `Unmapped` | `SIGSEGV` |
+  | `UnknownOpcode` / `UnsupportedInterrupt` / `DecodeTruncated` | `SIGILL` |
+  | `UnimplementedMov` / `UnknownSyscall` | `SIGSYS` |
+  | `SignalHandlerUnregistered` | `SIGTRAP` |
+  | `Exit(n)` | gdb `W` packet with `n & 0xff` |
+
+- **`c` is interruptible.** `wait_for_stop_reason` checks `conn.peek()`
+  between steps so Ctrl-C from gdb arrives within one instruction —
+  no blind tight-loop.
+
+**Usage:**
+
+```sh
+# Terminal 1:
+movie86 --gdb-listen 127.0.0.1:1234 prog.elf
+# movie86: waiting for gdb on 127.0.0.1:1234
+
+# Terminal 2:
+gdb -ex 'target remote :1234' -ex 'set arch i386'
+(gdb) info registers
+(gdb) x/5i $eip
+(gdb) b *0x08049092
+(gdb) c
+```
+
 ## Snapshot / diff
 
 `cli/src/snapshot.rs` + `cli/src/diff.rs`. Memory + register state

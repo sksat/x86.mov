@@ -1,17 +1,25 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use movie86_cli::{diff_snapshots, run_elf_with_debug, DebugConfig, RunOutcome, StdHost};
+use movie86_cli::{
+    diff_snapshots, run_elf_with_debug, run_elf_with_gdb, DebugConfig, GdbRunError, RunOutcome,
+    StdHost,
+};
 
 fn print_usage(arg0: &str) {
     eprintln!(
         "usage: {arg0} [--trace] [--break-at HEX] [--max-steps N] \
          [--watch HEX]... [--dump-u32 HEX]... \
-         [--snapshot-at-step N PATH] [--snapshot-on-stop PATH] <elf-file>"
+         [--snapshot-at-step N PATH] [--snapshot-on-stop PATH] \
+         [--gdb-listen ADDR] <elf-file>"
     );
     eprintln!();
     eprintln!("subcommands:");
     eprintln!("  {arg0} diff <a.snap> <b.snap>    compare two snapshots");
+    eprintln!();
+    eprintln!("gdb usage:");
+    eprintln!("  {arg0} --gdb-listen 127.0.0.1:1234 prog.elf");
+    eprintln!("  $ gdb -ex 'target remote :1234' -ex 'set arch i386'");
 }
 
 fn parse_u32_hex(s: &str) -> Option<u32> {
@@ -22,6 +30,7 @@ fn parse_u32_hex(s: &str) -> Option<u32> {
     u32::from_str_radix(trimmed, 16).ok()
 }
 
+#[allow(clippy::too_many_lines)] // monolithic arg-parse; clarity beats fragmentation here
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let progname = args.first().map_or("movie86", String::as_str).to_string();
@@ -35,6 +44,7 @@ fn main() -> ExitCode {
 
     let mut cfg = DebugConfig::default();
     let mut path: Option<String> = None;
+    let mut gdb_listen: Option<std::net::SocketAddr> = None;
     let mut it = args.into_iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -85,6 +95,19 @@ fn main() -> ExitCode {
                 };
                 cfg.snapshot_on_stop = Some(PathBuf::from(p));
             }
+            "--gdb-listen" => {
+                let Some(addr) = it.next() else {
+                    eprintln!("movie86: --gdb-listen needs an ADDR like 127.0.0.1:1234");
+                    return ExitCode::from(2);
+                };
+                match addr.parse::<std::net::SocketAddr>() {
+                    Ok(s) => gdb_listen = Some(s),
+                    Err(e) => {
+                        eprintln!("movie86: bad --gdb-listen address {addr:?}: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "-h" | "--help" => {
                 print_usage(&progname);
                 return ExitCode::SUCCESS;
@@ -117,6 +140,12 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(addr) = gdb_listen {
+        // gdb attach path is mutually exclusive with the debugger CLI
+        // flags — gdb owns the run/stop state machine.
+        return run_gdb_path(&bytes, addr);
+    }
+
     let mut host = StdHost::default();
     let outcome = run_elf_with_debug(&bytes, &mut host, &cfg);
     if let RunOutcome::Fault(f) = &outcome {
@@ -129,6 +158,29 @@ fn main() -> ExitCode {
     // run loop; no extra message needed here.
     let code = u8::try_from(outcome.process_exit_code() & 0xff).unwrap_or(1);
     ExitCode::from(code)
+}
+
+/// `--gdb-listen` execution path. Returns 0 on a clean disconnect /
+/// target exit, 1 on a stub error / fatal fault.
+fn run_gdb_path(bytes: &[u8], addr: std::net::SocketAddr) -> ExitCode {
+    match run_elf_with_gdb(bytes, addr) {
+        Ok(reason) => {
+            eprintln!("movie86: gdb session ended: {reason:?}");
+            ExitCode::SUCCESS
+        }
+        Err(GdbRunError::Load(e)) => {
+            eprintln!("movie86: load error: {e:?}");
+            ExitCode::from(2)
+        }
+        Err(GdbRunError::Io(e)) => {
+            eprintln!("movie86: gdb-listen io error: {e}");
+            ExitCode::from(2)
+        }
+        Err(GdbRunError::Stub(msg)) => {
+            eprintln!("movie86: gdbstub error: {msg}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// `movie86 diff <a.snap> <b.snap>` — load two snapshots and print the

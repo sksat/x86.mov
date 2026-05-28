@@ -16,9 +16,11 @@ use movie86::{Cpu, Fault, Memory, Reg32, Signal};
 const DEFAULT_STACK_SIZE: u32 = 64 * 1024;
 
 pub mod diff;
+pub mod gdb_target;
 pub mod snapshot;
 
 pub use diff::diff_snapshots;
+pub use gdb_target::{run_elf_with_gdb, GdbRunError};
 
 #[cfg(test)]
 mod tests;

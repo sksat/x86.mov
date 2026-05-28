@@ -13,6 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 movie86 = { path = "../core" }
+# gdb Remote Serial Protocol server. movie86-cli only — the `movie86`
+# library crate stays dep-free + no_std. Smart-friend's review pinned
+# the trade-off: rolling our own RSP would be much more than the
+# obvious 400 LOC once you handle ACK / partial reads / Ctrl-C /
+# target.xml / etc.
+gdbstub = "0.7.10"
+gdbstub_arch = "0.3.3"
 
 [lints]
 workspace = true
