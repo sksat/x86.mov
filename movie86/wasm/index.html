@@ -133,6 +133,7 @@
       <option value="return42" selected>return42 — exit 42 via int 0x80</option>
       <option value="hello">hello — write(1, "Hello\n") + exit</option>
       <option value="call_greet">call_greet — direct CALL/RET</option>
+      <option value="cycle">cycle — print "1 2 3 4 5" forever (CALL/RET loop)</option>
       <option value="upload">(upload your own ELF)</option>
     </select>
   </label>
@@ -197,6 +198,7 @@ const EXAMPLES = {
     return42:   './examples/return42.elf',
     hello:      './examples/hello.elf',
     call_greet: './examples/call_greet.elf',
+    cycle:      './examples/cycle.elf',
 };
 
 // Register file order matches movie86's `Reg32`: EAX, ECX, EDX, EBX,
