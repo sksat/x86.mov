@@ -805,11 +805,23 @@ private:
 
         // === PHASE 5: per-byte mask-based select into next_pc ===
         // next_pc[i] = (mask & T[i]) | (~mask & F[i])
+        //
+        // opt 6 — Phase 5 idx-zero hoist: idx[2..3]=0 is the only
+        // invariant the byte-table lookups depend on (the and8 /
+        // or8 tables are indexed by `a*256 + b`, so the top two
+        // bytes of `idx` MUST stay zero). idx[0] and idx[1] get
+        // overwritten by every iteration's pack-and-store before
+        // the table read. Phase 3 above already emitted at least
+        // one emitIdxZero so idx[2..3] start at zero entering this
+        // loop, and no MI in the loop writes those bytes — they
+        // ride through all 4 iterations and the
+        // emitOrByteAndStore tail (which also touches only idx[0]
+        // and idx[1]). So the 8 per-iteration `emitIdxZero` calls
+        // the previous shape emitted are 100% redundant; drop them.
         for (unsigned i = 0; i < 4; ++i) {
           const int64_t NextPCByteDisp = NextPCDisp + static_cast<int64_t>(i);
 
           // (~mask & F[i]) → DL; stash to next_pc[i].
-          emitIdxZero(MBB, Insert, DL, TII, *Addr);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
               .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 1);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
@@ -826,7 +838,6 @@ private:
               .addReg(Mov::EBP).addImm(NextPCByteDisp).addReg(Mov::DL);
 
           // (mask & T[i]) → DL.
-          emitIdxZero(MBB, Insert, DL, TII, *Addr);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
               .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
