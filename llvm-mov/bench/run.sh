@@ -269,6 +269,35 @@ build_movfuscator() {
     "$MOVCC" "$src" -o "$out_dir/elf" >"$out_dir/movcc.log" 2>&1
 }
 
+# Build the same C source as a "normal" 32-bit native binary at a
+# given clang optimisation level. Used as a reference column in the
+# bench so the mov-only `.text` / runtime numbers from llvm-mov and
+# movfuscator can be compared against what an ordinary compiler
+# would have produced from the same source.
+#
+# Same `_start.s` runtime as the llvm-mov pipeline (`int 0x80` exit,
+# no glibc / no dynamic loader), so the only thing differing between
+# the columns is the body of `main`. We link with -nostdlib +
+# -static + -e _start to get a self-contained ELF for measurement.
+build_clang_native() {
+    local opt_level="$1" src="$2" out_dir="$3"
+    mkdir -p "$out_dir"
+    "$CLANG" -m32 "$opt_level" -c "$src" -o "$out_dir/elf.o" 2>/dev/null
+    cat > "$out_dir/_start.s" <<'STARTEOF'
+.intel_syntax noprefix
+.section .text
+.globl _start
+_start:
+    call main
+    mov ebx, eax
+    mov eax, 1
+    int 0x80
+STARTEOF
+    as --32 -o "$out_dir/_start.o" "$out_dir/_start.s" 2>/dev/null
+    ld -m elf_i386 -static --gc-sections \
+        "$out_dir/_start.o" "$out_dir/elf.o" -o "$out_dir/elf"
+}
+
 # Resolve a `rust_<example>` fixture name to its Cargo metadata.
 # Echoes "crate_dir|cargo_name" on success, empty on unknown name.
 resolve_rust_fixture() {
@@ -306,6 +335,34 @@ build_llvm_mov_rust() {
     as --32 -o "$out_dir/_start.o" "$crate_dir/_start.s" 2>/dev/null
     ld -m elf_i386 -static --gc-sections \
         "$out_dir/_start.o" "$out_dir/elf.o" -o "$out_dir/elf"
+}
+
+# Build a Cargo crate as a "normal" 32-bit native ELF at a given
+# opt-level. Reference column counterpart to build_clang_native for
+# C fixtures. We bypass the crate's `[profile.release]` (which pins
+# `opt-level = 0` so the IR shapes stay simple for the Mov backend)
+# and use `cargo rustc ... -- -C opt-level=N` to override per-build.
+# The same hand-written `_start.s` + `int 0x80` exit shape is used,
+# so this is comparable to the llvm-mov column of the same crate.
+build_rustc_native() {
+    local opt_level="$1" crate_dir="$2" cargo_name="$3" out_dir="$4"
+    mkdir -p "$out_dir"
+    local triple="i686-unknown-linux-gnu"
+    cargo rustc \
+        --manifest-path="$crate_dir/Cargo.toml" \
+        --release \
+        --target="$triple" \
+        --quiet \
+        -- -C opt-level="$opt_level" --emit=link >/dev/null 2>&1
+    local lib
+    lib="$(ls -t "$crate_dir/target/$triple/release/lib${cargo_name}.a" 2>/dev/null | head -1)"
+    if [ -z "$lib" ] || ! [ -f "$lib" ]; then
+        return 1
+    fi
+    as --32 -o "$out_dir/_start.o" "$crate_dir/_start.s" 2>/dev/null
+    ld -m elf_i386 -static --gc-sections \
+        "$out_dir/_start.o" --whole-archive "$lib" --no-whole-archive \
+        -o "$out_dir/elf"
 }
 
 # -- main loop -----------------------------------------------------------
@@ -366,20 +423,91 @@ for name in "${FIXTURE_NAMES[@]}"; do
             lm_ok=0
         fi
 
+        # Native rustc reference per opt level — counterpart to the
+        # clang -O0..-O3 columns for C fixtures.
+        declare -A r_dir r_ok
+        for lvl in 0 1 2 3; do
+            r_dir[$lvl]="$WORK/$name/rustc-O$lvl"
+            r_ok[$lvl]=1
+            if ! build_rustc_native "$lvl" "$crate_dir" "$cargo_name" \
+                    "${r_dir[$lvl]}" 2>"$WORK/$name.rustc-O$lvl.log"; then
+                r_ok[$lvl]=0
+            fi
+        done
+
+        # Per-cell formatter helpers (same as the C branch's).
+        size_cell() {  # $1=ok, $2=elf
+            if [ "$1" -eq 1 ]; then printf '%s' "$(stat -c %s "$2")"; else printf '—'; fi
+        }
+        sec_cell() {
+            if [ "$1" -eq 1 ]; then printf '%s' "$(section_size "$2" "$3")"; else printf '—'; fi
+        }
+        mov_cell() {
+            if [ "$1" -eq 1 ]; then
+                read -r m t r <<<"$(count_mov_ratio "$2")"
+                printf '%d / %d (%s)' "$m" "$t" "$r"
+            else printf '—'; fi
+        }
+        nonmov_cell() {
+            if [ "$1" -eq 1 ]; then printf '`%s`' "$(non_mov_mnemonics "$2" || printf '(none)')"; else printf '—'; fi
+        }
+        rt_cell() {
+            if [ "$1" -eq 1 ]; then printf '%s' "$(measure_runtime "$2")"; else printf '—'; fi
+        }
+
         {
             printf '## %s\n\n' "$name"
             printf '```rust\n%s\n```\n\n' "$(cat "$crate_dir/src/lib.rs")"
-            printf '| metric | llvm-mov (Rust) | movfuscator |\n'
-            printf '|---|---:|---:|\n'
-            if [ "$lm_ok" -eq 1 ]; then
-                # `—` (em dash) in the movfuscator column flags "not
-                # applicable: movcc is a C-only frontend".
-                emit_lm_metrics "$lm_dir/elf" "—"
-            else
-                printf '| (llvm-mov build failed; see log) |||\n'
-            fi
+            printf '| metric | llvm-mov (Rust) | movfuscator | rustc -O0 | rustc -O1 | rustc -O2 | rustc -O3 |\n'
+            printf '|---|---:|---:|---:|---:|---:|---:|\n'
+
+            # `—` (em dash) in the movfuscator column flags "not
+            # applicable: movcc is a C-only frontend".
+            printf '| total ELF (bytes) | %s | — | %s | %s | %s | %s |\n' \
+                "$(size_cell $lm_ok "$lm_dir/elf")" \
+                "$(size_cell ${r_ok[0]} "${r_dir[0]}/elf")" \
+                "$(size_cell ${r_ok[1]} "${r_dir[1]}/elf")" \
+                "$(size_cell ${r_ok[2]} "${r_dir[2]}/elf")" \
+                "$(size_cell ${r_ok[3]} "${r_dir[3]}/elf")"
+
+            printf '| .text size | %s | — | %s | %s | %s | %s |\n' \
+                "$(sec_cell $lm_ok "$lm_dir/elf" "[.]text")" \
+                "$(sec_cell ${r_ok[0]} "${r_dir[0]}/elf" "[.]text")" \
+                "$(sec_cell ${r_ok[1]} "${r_dir[1]}/elf" "[.]text")" \
+                "$(sec_cell ${r_ok[2]} "${r_dir[2]}/elf" "[.]text")" \
+                "$(sec_cell ${r_ok[3]} "${r_dir[3]}/elf" "[.]text")"
+
+            printf '| .rodata size | %s | — | %s | %s | %s | %s |\n' \
+                "$(sec_cell $lm_ok "$lm_dir/elf" "[.]rodata")" \
+                "$(sec_cell ${r_ok[0]} "${r_dir[0]}/elf" "[.]rodata")" \
+                "$(sec_cell ${r_ok[1]} "${r_dir[1]}/elf" "[.]rodata")" \
+                "$(sec_cell ${r_ok[2]} "${r_dir[2]}/elf" "[.]rodata")" \
+                "$(sec_cell ${r_ok[3]} "${r_dir[3]}/elf" "[.]rodata")"
+
+            printf '| mov count / total | %s | — | %s | %s | %s | %s |\n' \
+                "$(mov_cell $lm_ok "$lm_dir/elf")" \
+                "$(mov_cell ${r_ok[0]} "${r_dir[0]}/elf")" \
+                "$(mov_cell ${r_ok[1]} "${r_dir[1]}/elf")" \
+                "$(mov_cell ${r_ok[2]} "${r_dir[2]}/elf")" \
+                "$(mov_cell ${r_ok[3]} "${r_dir[3]}/elf")"
+
+            printf '| non-mov mnemonics | %s | — | %s | %s | %s | %s |\n' \
+                "$(nonmov_cell $lm_ok "$lm_dir/elf")" \
+                "$(nonmov_cell ${r_ok[0]} "${r_dir[0]}/elf")" \
+                "$(nonmov_cell ${r_ok[1]} "${r_dir[1]}/elf")" \
+                "$(nonmov_cell ${r_ok[2]} "${r_dir[2]}/elf")" \
+                "$(nonmov_cell ${r_ok[3]} "${r_dir[3]}/elf")"
+
+            printf '| wall-clock runtime (hyperfine mean) | %s | — | %s | %s | %s | %s |\n' \
+                "$(rt_cell $lm_ok "$lm_dir/elf")" \
+                "$(rt_cell ${r_ok[0]} "${r_dir[0]}/elf")" \
+                "$(rt_cell ${r_ok[1]} "${r_dir[1]}/elf")" \
+                "$(rt_cell ${r_ok[2]} "${r_dir[2]}/elf")" \
+                "$(rt_cell ${r_ok[3]} "${r_dir[3]}/elf")"
+
             printf '\n'
         } >> "$RESULTS"
+        unset r_dir r_ok
         continue
     fi
 
@@ -405,53 +533,98 @@ for name in "${FIXTURE_NAMES[@]}"; do
         mf_ok=0
     fi
 
+    # Clang native reference build per optimisation level. The
+    # `_start`/`int 0x80` runtime is the same as the llvm-mov pipeline,
+    # so the only thing differing between these columns and the
+    # mov-only columns is what `main`'s body looks like.
+    declare -A c_dir c_ok
+    for lvl in O0 O1 O2 O3; do
+        c_dir[$lvl]="$WORK/$name/clang-$lvl"
+        c_ok[$lvl]=1
+        if ! build_clang_native "-$lvl" "$src" "${c_dir[$lvl]}" \
+                2>"$WORK/$name.clang-$lvl.log"; then
+            c_ok[$lvl]=0
+        fi
+    done
+
     {
         printf '## %s\n\n' "$name"
         printf '```c\n%s\n```\n\n' "$(cat "$src")"
-        printf '| metric | llvm-mov | movfuscator |\n'
-        printf '|---|---:|---:|\n'
+        printf '| metric | llvm-mov | movfuscator | clang -O0 | clang -O1 | clang -O2 | clang -O3 |\n'
+        printf '|---|---:|---:|---:|---:|---:|---:|\n'
 
-        if [ "$lm_ok" -eq 1 ] && [ "$mf_ok" -eq 1 ]; then
-            lm_elf="$lm_dir/elf"
-            mf_elf="$mf_dir/elf"
+        # Helper closures for per-cell formatting. `cell <ok> <elf> <kind>`
+        # echoes the right thing for the column.
+        size_cell() {  # $1=ok, $2=elf
+            if [ "$1" -eq 1 ]; then printf '%s' "$(stat -c %s "$2")"; else printf '—'; fi
+        }
+        sec_cell() {   # $1=ok, $2=elf, $3=section regex
+            if [ "$1" -eq 1 ]; then printf '%s' "$(section_size "$2" "$3")"; else printf '—'; fi
+        }
+        mov_cell() {   # $1=ok, $2=elf
+            if [ "$1" -eq 1 ]; then
+                read -r m t r <<<"$(count_mov_ratio "$2")"
+                printf '%d / %d (%s)' "$m" "$t" "$r"
+            else printf '—'; fi
+        }
+        nonmov_cell() {  # $1=ok, $2=elf
+            if [ "$1" -eq 1 ]; then printf '`%s`' "$(non_mov_mnemonics "$2" || printf '(none)')"; else printf '—'; fi
+        }
+        rt_cell() {    # $1=ok, $2=elf
+            if [ "$1" -eq 1 ]; then printf '%s' "$(measure_runtime "$2")"; else printf '—'; fi
+        }
 
-            lm_total=$(stat -c %s "$lm_elf")
-            mf_total=$(stat -c %s "$mf_elf")
-            printf '| total ELF (bytes) | %s | %s |\n' \
-                "$(printf '%d' "$lm_total")" "$(printf '%d' "$mf_total")"
+        printf '| total ELF (bytes) | %s | %s | %s | %s | %s | %s |\n' \
+            "$(size_cell $lm_ok "$lm_dir/elf")" \
+            "$(size_cell $mf_ok "$mf_dir/elf")" \
+            "$(size_cell ${c_ok[O0]} "${c_dir[O0]}/elf")" \
+            "$(size_cell ${c_ok[O1]} "${c_dir[O1]}/elf")" \
+            "$(size_cell ${c_ok[O2]} "${c_dir[O2]}/elf")" \
+            "$(size_cell ${c_ok[O3]} "${c_dir[O3]}/elf")"
 
-            # Patterns use `[.]` for the leading literal dot rather than
-            # `\.` to keep mawk/gawk quiet (gawk warns "escape sequence
-            # \. treated as plain ." for the latter shape).
-            lm_text=$(section_size "$lm_elf" "[.]text")
-            mf_text=$(section_size "$mf_elf" "[.]text")
-            printf '| .text size | %s | %s |\n' "${lm_text:-0}" "${mf_text:-0}"
+        printf '| .text size | %s | %s | %s | %s | %s | %s |\n' \
+            "$(sec_cell $lm_ok "$lm_dir/elf" "[.]text")" \
+            "$(sec_cell $mf_ok "$mf_dir/elf" "[.]text")" \
+            "$(sec_cell ${c_ok[O0]} "${c_dir[O0]}/elf" "[.]text")" \
+            "$(sec_cell ${c_ok[O1]} "${c_dir[O1]}/elf" "[.]text")" \
+            "$(sec_cell ${c_ok[O2]} "${c_dir[O2]}/elf" "[.]text")" \
+            "$(sec_cell ${c_ok[O3]} "${c_dir[O3]}/elf" "[.]text")"
 
-            lm_rodata=$(section_size "$lm_elf" "[.]rodata")
-            mf_rodata=$(section_size "$mf_elf" "[.]rodata")
-            printf '| .rodata size | %s | %s |\n' "${lm_rodata:-0}" "${mf_rodata:-0}"
+        printf '| .rodata size | %s | %s | %s | %s | %s | %s |\n' \
+            "$(sec_cell $lm_ok "$lm_dir/elf" "[.]rodata")" \
+            "$(sec_cell $mf_ok "$mf_dir/elf" "[.]rodata")" \
+            "$(sec_cell ${c_ok[O0]} "${c_dir[O0]}/elf" "[.]rodata")" \
+            "$(sec_cell ${c_ok[O1]} "${c_dir[O1]}/elf" "[.]rodata")" \
+            "$(sec_cell ${c_ok[O2]} "${c_dir[O2]}/elf" "[.]rodata")" \
+            "$(sec_cell ${c_ok[O3]} "${c_dir[O3]}/elf" "[.]rodata")"
 
-            read -r lm_movs lm_tot lm_ratio <<<"$(count_mov_ratio "$lm_elf")"
-            read -r mf_movs mf_tot mf_ratio <<<"$(count_mov_ratio "$mf_elf")"
-            printf '| mov count / total | %d / %d (%s) | %d / %d (%s) |\n' \
-                "$lm_movs" "$lm_tot" "$lm_ratio" \
-                "$mf_movs" "$mf_tot" "$mf_ratio"
+        printf '| mov count / total | %s | %s | %s | %s | %s | %s |\n' \
+            "$(mov_cell $lm_ok "$lm_dir/elf")" \
+            "$(mov_cell $mf_ok "$mf_dir/elf")" \
+            "$(mov_cell ${c_ok[O0]} "${c_dir[O0]}/elf")" \
+            "$(mov_cell ${c_ok[O1]} "${c_dir[O1]}/elf")" \
+            "$(mov_cell ${c_ok[O2]} "${c_dir[O2]}/elf")" \
+            "$(mov_cell ${c_ok[O3]} "${c_dir[O3]}/elf")"
 
-            lm_other=$(non_mov_mnemonics "$lm_elf")
-            mf_other=$(non_mov_mnemonics "$mf_elf")
-            printf '| non-mov mnemonics | `%s` | `%s` |\n' \
-                "${lm_other:-(none)}" "${mf_other:-(none)}"
+        printf '| non-mov mnemonics | %s | %s | %s | %s | %s | %s |\n' \
+            "$(nonmov_cell $lm_ok "$lm_dir/elf")" \
+            "$(nonmov_cell $mf_ok "$mf_dir/elf")" \
+            "$(nonmov_cell ${c_ok[O0]} "${c_dir[O0]}/elf")" \
+            "$(nonmov_cell ${c_ok[O1]} "${c_dir[O1]}/elf")" \
+            "$(nonmov_cell ${c_ok[O2]} "${c_dir[O2]}/elf")" \
+            "$(nonmov_cell ${c_ok[O3]} "${c_dir[O3]}/elf")"
 
-            lm_time=$(measure_runtime "$lm_elf")
-            mf_time=$(measure_runtime "$mf_elf")
-            printf '| wall-clock runtime (hyperfine mean) | %s | %s |\n' \
-                "$lm_time" "$mf_time"
-        else
-            [ "$lm_ok" -eq 0 ] && printf '| (llvm-mov build failed; see log) |||\n'
-            [ "$mf_ok" -eq 0 ] && printf '| (movfuscator build failed; see log) |||\n'
-        fi
+        printf '| wall-clock runtime (hyperfine mean) | %s | %s | %s | %s | %s | %s |\n' \
+            "$(rt_cell $lm_ok "$lm_dir/elf")" \
+            "$(rt_cell $mf_ok "$mf_dir/elf")" \
+            "$(rt_cell ${c_ok[O0]} "${c_dir[O0]}/elf")" \
+            "$(rt_cell ${c_ok[O1]} "${c_dir[O1]}/elf")" \
+            "$(rt_cell ${c_ok[O2]} "${c_dir[O2]}/elf")" \
+            "$(rt_cell ${c_ok[O3]} "${c_dir[O3]}/elf")"
+
         printf '\n'
     } >> "$RESULTS"
+    unset c_dir c_ok
 done
 
 echo

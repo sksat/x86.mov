@@ -12,8 +12,14 @@
 //!     `llvm.ssub.with.overflow.i32` (the returned `{i32, i1}`
 //!     aggregate would need backend work the demo doesn't pull in).
 //!
-//! `fib_main` returns `fib(10) = 55`, which the `_start.s` runner
-//! turns into the process exit code.
+//! `fib_main` returns `fib(24) = 46368`. We pick n=24 (rather than
+//! the smaller n=10 the earlier shape used) so the wall-clock
+//! benchmark stays well above the bare process-exit overhead —
+//! the recursion depth itself is what stresses the return-addr
+//! invariant, but the runtime number only becomes meaningful when
+//! the compute dominates exec()'s ~150 µs startup. The `_start.s`
+//! runner takes the i32 modulo 256 for the exit code; the bench
+//! doesn't check it.
 
 #![no_std]
 
@@ -27,5 +33,5 @@ pub extern "C" fn fib(n: i32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fib_main() -> i32 {
-    fib(10)
+    fib(24)
 }

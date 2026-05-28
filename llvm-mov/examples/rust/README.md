@@ -51,7 +51,7 @@ make build                              # builds llvm-mov-llc
 bash examples/rust/run.sh --example=main --run    # → PASS  rust_main  (exit 42)
 
 # Recursive example:
-bash examples/rust/run.sh --example=fib --run     # → PASS  fib_main   (exit 55)
+bash examples/rust/run.sh --example=fib --run     # → PASS  fib_main   (exit 32)
 ```
 
 Omit `--run` to dump the generated asm + `file` output of the linked

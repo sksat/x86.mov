@@ -14,10 +14,14 @@
  *   - 7c4 (signed predicate `n < 2`)
  *   - 7a1 (ADD32rr on the return-value sum)
  *
- * fib(10) = 55. The runner doesn't pass argc/argv to main so the
- * computed exit code is non-deterministic; the bench measures static
- * shape + average runtime, neither of which depends on the exact
- * result.
+ * fib(24) = 46368 — chosen so the wall-clock runtime stays well
+ * above the bare process-exit overhead (~150 µs) on both back-ends.
+ * fib(10), which earlier versions of this fixture used, finished in
+ * sub-millisecond and made the runtime column dominated by exec()
+ * cost rather than the mov-only computation it's meant to compare.
+ * The exit code wraps the i32 to a byte (46368 mod 256 = 224), but
+ * the bench doesn't check it — only static shape + average runtime
+ * matter here.
  */
 int fib(int n) {
     if (n < 2) return n;
@@ -25,5 +29,5 @@ int fib(int n) {
 }
 
 int main(void) {
-    return fib(10);
+    return fib(24);
 }

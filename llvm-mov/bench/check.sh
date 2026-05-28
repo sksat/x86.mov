@@ -54,13 +54,18 @@ RESULTS_OUT="$FRESH" "$HERE/run.sh" "$@" >/dev/null
 #     that isn't anything llvm-mov did). We DO care about the
 #     llvm-mov column, which our backend fully controls.
 #
-# The sed picks out 4-piped table rows (`| col1 | col2 | col3 |`) and
-# replaces col3 (the movfuscator value) with `<movfuscator>`. Header
-# and separator rows get the same treatment, so before/after still
-# match exactly when only movfuscator drifts.
+# The sed picks out 7-column table rows
+# `| metric | llvm-mov | movfuscator | clang -O0 | -O1 | -O2 | -O3 |`
+# and replaces the movfuscator column (3rd cell) with `<movfuscator>`.
+# Header and separator rows get the same treatment, so before/after
+# still match exactly when only movfuscator drifts.
+#
+# The clang -O0..-O3 columns are deterministic in CI (clang version
+# is pinned to apt.llvm.org clang-22) and are included in the diff,
+# so opt-level shape changes will surface as bench drift.
 strip_volatile() {
     grep -vE '^Generated [0-9]|^\| wall-clock runtime' "$1" \
-        | sed -E 's/^(\|[^|]*\|[^|]*\|)[^|]*\|$/\1 <movfuscator> |/'
+        | sed -E 's/^(\|[^|]*\|[^|]*\|)[^|]*(\|.*)$/\1 <movfuscator> \2/'
 }
 
 diff_out="$(diff -u \

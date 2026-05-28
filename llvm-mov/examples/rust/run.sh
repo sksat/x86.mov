@@ -5,7 +5,8 @@
 #   run.sh                    # build main, show asm
 #   run.sh --run              # build main, run; expect exit 42
 #   run.sh --example=fib      # build fib, show asm
-#   run.sh --example=fib --run    # build fib, run; expect exit 55
+#   run.sh --example=fib --run    # build fib, run; expect exit 32
+#                                  # (fib(24)=46368, mod 256)
 #
 # The two examples are independent Cargo crates under `main/` and
 # `fib/` so each linked ELF only contains the entry point that fixture
@@ -45,7 +46,7 @@ done
 
 case "$EXAMPLE" in
     main) ENTRY="rust_main"; EXPECTED=42; CRATE="rust_mov_main" ;;
-    fib)  ENTRY="fib_main";  EXPECTED=55; CRATE="rust_mov_fib" ;;
+    fib)  ENTRY="fib_main";  EXPECTED=32; CRATE="rust_mov_fib" ;;
     *) echo "error: unknown --example=$EXAMPLE (try main, fib)" 1>&2; exit 2 ;;
 esac
 
