@@ -180,6 +180,11 @@ int main(int argc, char **argv) {
   // 4-line addition each.
   for (Function &F : *M) {
     SmallVector<IntrinsicInst *, 4> Worklist;
+    SmallVector<IntrinsicInst *, 4> AbsList;
+    SmallVector<IntrinsicInst *, 4> UMinList;
+    SmallVector<IntrinsicInst *, 4> UMaxList;
+    SmallVector<IntrinsicInst *, 4> SMinList;
+    SmallVector<IntrinsicInst *, 4> SMaxList;
     for (Instruction &I : instructions(F)) {
       if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
         switch (II->getIntrinsicID()) {
@@ -189,10 +194,112 @@ int main(int argc, char **argv) {
         case Intrinsic::vector_reduce_or:
           Worklist.push_back(II);
           break;
+        case Intrinsic::abs:
+          if (II->getType()->isIntegerTy(32))
+            AbsList.push_back(II);
+          break;
+        case Intrinsic::umin:
+          if (II->getType()->isIntegerTy(32))
+            UMinList.push_back(II);
+          break;
+        case Intrinsic::umax:
+          if (II->getType()->isIntegerTy(32))
+            UMaxList.push_back(II);
+          break;
+        case Intrinsic::smin:
+          if (II->getType()->isIntegerTy(32))
+            SMinList.push_back(II);
+          break;
+        case Intrinsic::smax:
+          if (II->getType()->isIntegerTy(32))
+            SMaxList.push_back(II);
+          break;
         default:
           break;
         }
       }
+    }
+    // Branchless replacements for min / max / abs i32. Going
+    // through the default Expand path turns each into a SELECT,
+    // and SELECT is Expand too — that cascade lands in CMP +
+    // Jcc + branch + PHI and feeds back into DAGCombine
+    // combinatorically. Spelling out the branchless integer
+    // tricks here keeps the IR in pure shift / and / or / add /
+    // sub form which our SDAG path lowers in linear time.
+    auto AddMask = [](IRBuilder<> &B, Value *X) {
+      // sign = X >> 31 arithmetic-right; -1 if X<0 else 0.
+      return B.CreateAShr(X, 31);
+    };
+    for (IntrinsicInst *II : AbsList) {
+      IRBuilder<> B(II);
+      Value *X    = II->getArgOperand(0);
+      Value *Sign = AddMask(B, X);
+      // (x ^ sign) - sign  -- branchless abs.
+      Value *Xor  = B.CreateXor(X, Sign);
+      Value *R    = B.CreateSub(Xor, Sign);
+      II->replaceAllUsesWith(R);
+      II->eraseFromParent();
+    }
+    auto BlendOnCmp = [](IRBuilder<> &B, Value *Cond, Value *T, Value *F) {
+      // Branchless 2-way select on i1: m = sext(cond)
+      // result = (t & m) | (f & ~m).
+      Value *M    = B.CreateSExt(Cond, T->getType());
+      Value *NotM = B.CreateNot(M);
+      return B.CreateOr(B.CreateAnd(T, M), B.CreateAnd(F, NotM));
+    };
+    for (IntrinsicInst *II : UMinList) {
+      IRBuilder<> B(II);
+      Value *A = II->getArgOperand(0), *C = II->getArgOperand(1);
+      II->replaceAllUsesWith(BlendOnCmp(B, B.CreateICmpULT(A, C), A, C));
+      II->eraseFromParent();
+    }
+    for (IntrinsicInst *II : UMaxList) {
+      IRBuilder<> B(II);
+      Value *A = II->getArgOperand(0), *C = II->getArgOperand(1);
+      II->replaceAllUsesWith(BlendOnCmp(B, B.CreateICmpUGT(A, C), A, C));
+      II->eraseFromParent();
+    }
+    for (IntrinsicInst *II : SMinList) {
+      IRBuilder<> B(II);
+      Value *A = II->getArgOperand(0), *C = II->getArgOperand(1);
+      II->replaceAllUsesWith(BlendOnCmp(B, B.CreateICmpSLT(A, C), A, C));
+      II->eraseFromParent();
+    }
+    for (IntrinsicInst *II : SMaxList) {
+      IRBuilder<> B(II);
+      Value *A = II->getArgOperand(0), *C = II->getArgOperand(1);
+      II->replaceAllUsesWith(BlendOnCmp(B, B.CreateICmpSGT(A, C), A, C));
+      II->eraseFromParent();
+    }
+
+    // Branchless rewrite of all i32 SelectInsts. The default SELECT
+    // Expand action emits a CMP + branch + PHI scaffold whose
+    // multiplied basic blocks on tight inner loops (e.g. the udiv
+    // 32-iteration loop in our libcall stub) push DAG-ISel into
+    // multi-minute compile times. Replacing each SELECT with the
+    // bit-blend `(a & sext(c)) | (b & ~sext(c))` is functionally
+    // identical, four extra i32 ops per site, and the resulting
+    // graph is straight-line — DAG-ISel handles it in
+    // milliseconds.
+    //
+    // Only i32 SELECTs are rewritten; i1 / pointer / aggregate
+    // SELECTs (e.g. ones SROA leaves around for control flow
+    // synthesis) keep going through the default Expand path.
+    SmallVector<SelectInst *, 32> SelectList;
+    for (Instruction &I : instructions(F))
+      if (auto *S = dyn_cast<SelectInst>(&I))
+        if (S->getType()->isIntegerTy(32))
+          SelectList.push_back(S);
+    for (SelectInst *S : SelectList) {
+      IRBuilder<> B(S);
+      Value *Cond = S->getCondition();
+      Value *T    = S->getTrueValue();
+      Value *Fa   = S->getFalseValue();
+      Value *M    = B.CreateSExt(Cond, T->getType());
+      Value *NotM = B.CreateNot(M);
+      Value *R    = B.CreateOr(B.CreateAnd(T, M), B.CreateAnd(Fa, NotM));
+      S->replaceAllUsesWith(R);
+      S->eraseFromParent();
     }
     for (IntrinsicInst *II : Worklist) {
       Value *Vec = II->getArgOperand(0);

@@ -165,12 +165,17 @@ as --32 -o "$START_O" "$START_S"
 # round-trips the encrypt path end-to-end, and lets the mov-only
 # gate fire on `.text` belonging to user code.
 EXTRA_LINK=""
-if [ "$EXAMPLE" = "aes" ]; then
-    STATICLIB="$CRATE_DIR/target/$TARGET_TRIPLE/release/librust_mov_aes.a"
-    if [ -f "$STATICLIB" ]; then
-        EXTRA_LINK="$STATICLIB"
-    fi
-fi
+case "$EXAMPLE" in
+    aes)
+        # The aes example calls into RustCrypto crates that rustc
+        # precompiled as native i686 code into the Cargo staticlib;
+        # we pull those symbols in as a fallback so the binary runs.
+        STATICLIB="$CRATE_DIR/target/$TARGET_TRIPLE/release/lib${CRATE}.a"
+        if [ -f "$STATICLIB" ]; then
+            EXTRA_LINK="$STATICLIB"
+        fi
+        ;;
+esac
 ld -m elf_i386 -static --gc-sections -e _start -o "$ELF" "$START_O" "$O" $EXTRA_LINK
 
 # -- run or print --------------------------------------------------------
