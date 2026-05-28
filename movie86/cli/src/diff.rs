@@ -304,7 +304,14 @@ pub fn diff_snapshots(a: &Snapshot, b: &Snapshot) -> String {
     }
 
     // Tail line that the CLI subcommand uses to choose exit code.
+    // `kind` and `detail` participate in the equality check — the report
+    // header already shows them, so a diff between (e.g.) an
+    // `--snapshot-at-step` capture and a `--snapshot-on-stop` break
+    // capture that happen to land on the same eip/regs/mem must NOT
+    // claim "no differences".
     if ranges.is_empty()
+        && a.kind == b.kind
+        && a.detail == b.detail
         && a.step_count == b.step_count
         && a.eip == b.eip
         && a.regs == b.regs
@@ -421,6 +428,30 @@ mod tests {
         assert!(
             report.contains("result: differences detected"),
             "report:\n{report}"
+        );
+    }
+
+    #[test]
+    fn diff_treats_kind_or_detail_mismatch_as_a_difference() {
+        // Regression for codex P2-1: a `--snapshot-at-step N` capture
+        // and a `--snapshot-on-stop` break capture can land on the
+        // same eip/regs/mem (e.g. user broke right at step N). They
+        // are NOT the same snapshot — header surfaces `kind`/`detail`,
+        // so the equality check has to include them too.
+        let a = snap_with(
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            0x0804_8000,
+            vec![0u8; 32],
+            SnapshotKind::AfterStep,
+        );
+        // Same regs + mem + eip, but a Break with the eip-as-detail.
+        let mut b = a.clone();
+        b.kind = SnapshotKind::Break;
+        b.detail = 0x0804_8000;
+        let report = diff_snapshots(&a, &b);
+        assert!(
+            report.contains("result: differences detected"),
+            "kind/detail diff must NOT be reported as identical; report:\n{report}",
         );
     }
 

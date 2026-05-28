@@ -305,6 +305,53 @@ fn investigate_decoder_coverage() {
 }
 
 #[test]
+fn snapshot_at_step_zero_captures_initial_state_before_any_step() {
+    // Regression for codex P2-2: --snapshot-at-step 0 used to silently
+    // never fire because the loop-body capture only ran after
+    // step_count was incremented. The fix captures once before
+    // entering the loop, so step 0 = "the initial state".
+
+    use movie86_cli::snapshot::{Snapshot, SnapshotKind};
+    use movie86_cli::{run_elf_with_debug, DebugConfig, StdHost};
+
+    let program: &[u8] = &[
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1   (SYS_exit)
+        0xbb, 0x07, 0x00, 0x00, 0x00, // mov ebx, 7
+        0xcd, 0x80, // int 0x80
+    ];
+    let entry: u32 = 0x0804_8000;
+    let elf = build_elf(entry, program);
+
+    // Pick a tmp path that doesn't clash with parallel test runs.
+    let path = std::env::temp_dir().join(format!("movie86-snap-step0-{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let cfg = DebugConfig {
+        snapshot_at_step: Some((0, path.clone())),
+        ..DebugConfig::default()
+    };
+    let mut host = StdHost::default();
+    let outcome = run_elf_with_debug(&elf, &mut host, &cfg);
+    matches!(outcome, RunOutcome::Exit(7))
+        .then_some(())
+        .expect("program runs to exit(7)");
+
+    // The snapshot file must exist and reflect the pre-step state:
+    // step_count = 0, eip = entry, all GPRs zero (no `mov` has run
+    // yet).
+    let snap = Snapshot::read_from_path(&path).expect("snapshot file should exist");
+    assert_eq!(snap.kind, SnapshotKind::AfterStep);
+    assert_eq!(snap.step_count, 0);
+    assert_eq!(snap.eip, entry, "eip should be the ELF entry point");
+    assert_eq!(
+        snap.regs[0], 0,
+        "EAX should be 0 — the program hasn't run yet"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn fault_on_unsupported_syscall() {
     // mov eax, 999 ; int 0x80  → syscall 999 is unimplemented
     let program: &[u8] = &[

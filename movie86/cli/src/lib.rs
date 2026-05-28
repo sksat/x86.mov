@@ -469,6 +469,16 @@ pub fn run_elf_with_debug<H: SysHost + LibcHost>(
         .map(|&a| mem.read_u32(a).unwrap_or(0))
         .collect();
     let mut step_count: u64 = 0;
+    // `--snapshot-at-step 0` means "the initial state, before any step
+    // has run". The loop-body capture only fires after step_count is
+    // incremented, so it can never match 0 — capture once here before
+    // entering the loop instead. Documented as the baseline capture
+    // case in DESIGN.md.
+    if let Some((target, path)) = &cfg.snapshot_at_step {
+        if *target == 0 {
+            write_step_snapshot(path, 0, &cpu, &mem);
+        }
+    }
     loop {
         if cfg.break_at == Some(cpu.eip) {
             eprintln!(
