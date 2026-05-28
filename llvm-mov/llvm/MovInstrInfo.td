@@ -189,6 +189,15 @@ let mayStore = 1 in
 def MOV8mr : MovInst<(outs), (ins MovMemOperand:$dst, GR8:$src),
                      "mov\tbyte ptr $dst, $src", []>;
 
+// opt 4 — store an i8 immediate to memory in one instruction.
+// Replaces the `mov dl, K; mov [m], dl` pair the byte-chain
+// legalizer emits for writing K_byte / b_byte / 0xFF constants
+// into the idx pack slot. Saves one mov per non-zero byte write
+// (and indirectly enables collapsing the carry-clear path too).
+let mayStore = 1, isCodeGenOnly = 1 in
+def MOV8mi : MovInst<(outs), (ins MovMemOperand:$dst, i8imm_op:$src),
+                     "mov\tbyte ptr $dst, $src", []>;
+
 let isMoveReg = 1 in
 def MOV8rr : MovInst<(outs GR8:$dst), (ins GR8:$src),
                      "mov\t$dst, $src", []>;

@@ -1131,13 +1131,14 @@ private:
       BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EAX).addImm(IdxBase + 1).addReg(Mov::DL);
 
-      // mov dl, K_byte_i            ; b_byte
+      // opt 4 — store K_byte_i directly to idx[0] via MOV8mi
+      // (skipping if it's 0, since the MOV32mi above already
+      // zeroed idx[0..3]).
       const uint8_t KByte = static_cast<uint8_t>((K >> (8u * i)) & 0xFFu);
-      BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
-          .addImm(KByte);
-      // mov [eax + idx + 0], dl     ; idx[0] = b_byte
-      BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EAX).addImm(IdxBase).addReg(Mov::DL);
+      if (KByte != 0) {
+        BuildMI(EntryMBB, Insert, DL, TII.get(Mov::MOV8mi))
+            .addReg(Mov::EAX).addImm(IdxBase).addImm(KByte);
+      }
 
       // if i > 0: mov [eax + idx + 2], cl  ; idx[2] = borrow_in
       if (i > 0) {
@@ -1306,12 +1307,14 @@ private:
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
             .addReg(Mov::EAX).addImm(IdxBase + 1).addReg(Mov::DL);
 
+        // opt 4 — direct MOV8mi for K_byte (skip if 0, idx already
+        // zeroed by the MOV32mi above).
         const uint8_t KByte =
             static_cast<uint8_t>((K >> (8u * i)) & 0xFFu);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
-            .addImm(KByte);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-            .addReg(Mov::EAX).addImm(IdxBase).addReg(Mov::DL);
+        if (KByte != 0) {
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+              .addReg(Mov::EAX).addImm(IdxBase).addImm(KByte);
+        }
 
         if (i > 0) {
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
@@ -1639,21 +1642,28 @@ private:
     if (BSrc.K == ByteSource::Kind::Imm && BSrc.Imm == 0)
       return;
 
-    // Load b_byte:
+    // Load b_byte and store to idx[0]:
     if (BSrc.K == ByteSource::Kind::Imm) {
-      // mov dl, IMM8                  ; compile-time immediate slice
-      BuildMI(MBB, I, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(BSrc.Imm);
+      // opt 4 — single MOV8mi (mem-imm 8) instead of the
+      // `mov dl, IMM; mov [idx+0], dl` pair. Saves 1 mov per
+      // non-zero immediate K_byte slice (= 1 mov per ADD/SUB/AND/
+      // OR/XOR ri site with a non-zero high byte). Zero K_byte
+      // was already short-circuited by the early return above.
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8mi))
+          .addReg(Mov::EBP)
+          .addImm(A.IdxDisp)
+          .addImm(BSrc.Imm);
     } else {
       // mov dl, byte ptr [rhs_buf + i] ; rr-form RHS spill byte
       BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::DL)
           .addReg(Mov::EBP)
           .addImm(BSrc.MemDisp + static_cast<int64_t>(ByteIdx));
+      // mov byte ptr [idx + 0], dl
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
+          .addReg(Mov::EBP)
+          .addImm(A.IdxDisp)
+          .addReg(Mov::DL);
     }
-    // mov byte ptr [idx + 0], dl
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
-        .addReg(Mov::EBP)
-        .addImm(A.IdxDisp)
-        .addReg(Mov::DL);
   }
 
   // Helper: load the packed index from idx into ECX, look up the
