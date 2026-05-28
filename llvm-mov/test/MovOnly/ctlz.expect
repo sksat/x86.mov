@@ -1,0 +1,4 @@
+# Opcodes this fixture acknowledges as not-yet-legalised. `jmp` is the
+# 7c1 dispatcher's indirect jump (mov-equivalent). Stage 7e drives
+# every other opcode out of the CTLZ lowering.
+jmp

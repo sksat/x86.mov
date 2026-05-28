@@ -57,6 +57,7 @@ public:
     emitShift8Tables();
     emitSub8Tables();
     emitPopcount8Table();
+    emitBitscan8Tables();
     emitReturnAddrSlot();
     emitEspDecScratch();
     emitIndirectCalleeSlot();
@@ -71,6 +72,7 @@ private:
   void emitUnaryByteTable(StringRef Name, uint8_t (*Op)(uint8_t));
   void emitSub8Tables();
   void emitPopcount8Table();
+  void emitBitscan8Tables();
   void emitReturnAddrSlot();
   void emitEspDecScratch();
   void emitIndirectCalleeSlot();
@@ -406,6 +408,59 @@ void MovAsmPrinter::emitPopcount8Table() {
   OutStreamer->emitLabel(Sym);
   OutStreamer->emitBytes(StringRef(
       reinterpret_cast<const char *>(Data.data()), Data.size()));
+}
+
+// Stage 7e — byte tables consumed by the CTLZ32r / CTTZ32r legalize.
+//
+//   __mov_zero_mask_table[a]  = (a == 0) ? 0xFF : 0x00
+//     Used to update the per-iteration `alive` mask: alive_next =
+//     alive AND zero_mask[b]. So once a non-zero byte is crossed,
+//     alive flips to 0x00 and stays there for the rest of the scan.
+//
+//   __mov_clz_or_8_table[a]   = (a == 0) ? 8 : (count of leading
+//                                                zeros in `a` as
+//                                                an 8-bit value)
+//   __mov_ctz_or_8_table[a]   = (a == 0) ? 8 : (count of trailing
+//                                                zeros in `a` as
+//                                                an 8-bit value)
+//     Each per-byte iteration looks one of these up to get the
+//     "contribution if this is the first non-zero byte (CLZ/CTZ of
+//     this byte) or otherwise add 8 to advance past a zero byte"
+//     choice. The choice is then AND-masked by `alive` and added
+//     into the running total via `__mov_add8_sum_table`.
+//
+// Each table is 256 bytes and lives in its own `.rodata.<sym>`
+// section so `ld --gc-sections` drops the unreferenced ones per-TU.
+void MovAsmPrinter::emitBitscan8Tables() {
+  emitUnaryByteTable(
+      "__mov_zero_mask_table",
+      [](uint8_t a) -> uint8_t {
+        return a == 0 ? static_cast<uint8_t>(0xFFu) : static_cast<uint8_t>(0);
+      });
+  emitUnaryByteTable(
+      "__mov_clz_or_8_table",
+      [](uint8_t a) -> uint8_t {
+        if (a == 0)
+          return 8;
+        uint8_t c = 0;
+        while ((a & 0x80u) == 0) {
+          ++c;
+          a = static_cast<uint8_t>(a << 1);
+        }
+        return c;
+      });
+  emitUnaryByteTable(
+      "__mov_ctz_or_8_table",
+      [](uint8_t a) -> uint8_t {
+        if (a == 0)
+          return 8;
+        uint8_t c = 0;
+        while ((a & 0x01u) == 0) {
+          ++c;
+          a = static_cast<uint8_t>(a >> 1);
+        }
+        return c;
+      });
 }
 
 // Stage 7d2 — `__mov_esp_dec_scratch`: a 16-byte cell in .bss used
