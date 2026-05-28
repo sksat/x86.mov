@@ -157,6 +157,15 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
         NeedsRhsScratch = true;
         NeedsCmpMaskScratch = true;
         break;
+      case Mov::RET:
+        // Stage 7d1 — `pop ebp + ret` legalize uses the base 4 byte-op
+        // scratch slots for the inline `add esp, 8` byte chain. Every
+        // function has at least one RET, so this effectively makes the
+        // base scratch unconditional — which is fine: the 16 bytes of
+        // frame per function are a small cost for landing the epilogue
+        // tail mov-only across all shapes.
+        NeedsByteOpScratch = true;
+        break;
       default:
         break;
       }

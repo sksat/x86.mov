@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-28T00:58:19Z on x86_64 (Linux).
+Generated 2026-05-28T01:03:33Z on x86_64 (Linux).
 
 ## return0
 
@@ -20,7 +20,7 @@ int main(void) { return 0; }
 | .rodata size | 524288 | 0 |
 | mov count / total | 87 / 91 (95.6%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int jmp push` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.163 ms | 0.537 ms |
+| wall-clock runtime (hyperfine mean) | 0.149 ms | 0.516 ms |
 
 ## return42
 
@@ -35,7 +35,7 @@ int main(void) { return 42; }
 | .rodata size | 524288 | 0 |
 | mov count / total | 87 / 91 (95.6%) | 775 / 777 (99.7%) |
 | non-mov mnemonics | `call int jmp push` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.147 ms | 0.525 ms |
+| wall-clock runtime (hyperfine mean) | 0.150 ms | 0.541 ms |
 
 ## eq42
 
@@ -59,7 +59,7 @@ int main(void) {
 | .rodata size | 721152 | 0 |
 | mov count / total | 250 / 258 (96.9%) | 1050 / 1052 (99.8%) |
 | non-mov mnemonics | `call int jmp push` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.162 ms | 0.525 ms |
+| wall-clock runtime (hyperfine mean) | 0.170 ms | 0.511 ms |
 
 ## lt_unsigned
 
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 | .rodata size | 721152 | 0 |
 | mov count / total | 282 / 290 (97.2%) | 1045 / 1047 (99.8%) |
 | non-mov mnemonics | `call int jmp push` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.157 ms | 0.532 ms |
+| wall-clock runtime (hyperfine mean) | 0.169 ms | 0.542 ms |
 
 ## bitops
 
@@ -134,7 +134,7 @@ int main(void) {
 | .rodata size | 589824 | 0 |
 | mov count / total | 131 / 135 (97.0%) | 922 / 924 (99.8%) |
 | non-mov mnemonics | `call int jmp push` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.160 ms | 0.568 ms |
+| wall-clock runtime (hyperfine mean) | 0.163 ms | 0.527 ms |
 
 ## sum10
 
@@ -154,7 +154,7 @@ int main(void) {
 | .rodata size | 721408 | 0 |
 | mov count / total | 400 / 409 (97.8%) | 1225 / 1227 (99.8%) |
 | non-mov mnemonics | `call int jmp push` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.170 ms | 0.558 ms |
+| wall-clock runtime (hyperfine mean) | 0.170 ms | 0.553 ms |
 
 ## fib10
 
@@ -191,5 +191,5 @@ int main(void) {
 | .rodata size | 721408 | 0 |
 | mov count / total | 405 / 414 (97.8%) | 1267 / 1269 (99.8%) |
 | non-mov mnemonics | `call int jmp push` | `call` |
-| wall-clock runtime (hyperfine mean) | 0.172 ms | 0.551 ms |
+| wall-clock runtime (hyperfine mean) | 0.198 ms | 0.549 ms |
 
