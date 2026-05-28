@@ -196,6 +196,52 @@ above sidesteps all of that.
   the new JMP32d_CALL so late liveness analysis still sees the call's
   clobber semantics — critical for `call_live_across` shapes.
 
+### 7e / 7f — bit-twiddling + multiply/divide
+
+- **7e** CTPOP / CTLZ / CTTZ via 256-entry byte tables
+  (`__mov_popcount8_table`, `__mov_ctlz8_table`, `__mov_cttz8_table`)
+  + the existing add8 accumulator for popcount.
+- **7f1** 32-bit MUL via `MUL32{rr,ri}` pseudos + byte-pair schoolbook
+  multiplication using `__mov_mul8_{lo,hi}_table` (two 64 KiB tables
+  in `.rodata.__mov_mul8_tables`). ~437 mov / call site.
+- **7f2** 32-bit UDIV / SDIV / UREM / SREM via SDAG Expand → libcall,
+  with `llvm-mov-llc` injecting the four compiler-rt-named helper
+  bodies (`__udivsi3 / __umodsi3 / __divsi3 / __modsi3`) as IR when
+  the input module contains any div/rem instruction. The helpers
+  are emitted with `linkonce_odr` linkage so multiple TUs each
+  carrying them don't conflict; the linker keeps one definition.
+  `__udivsi3` is a 32-iter restoring long division with a single
+  branchless body; the signed helpers do an abs-then-udiv-then-fixup
+  dance. Per-site cost in `.text` is one `call` (already mov-only
+  via 7d3) + the helper body amortised across all div/rem callers
+  in the ELF.
+
+  Why driver IR injection and not a `DIV32rr` byte-chain pseudo (the
+  shape 7f1 used for MUL): bit-by-bit long division would emit
+  ~16000 movs per call site (32 iters × ~500 movs each), the same
+  cost as the libcall path's body. With no compaction win, injection
+  keeps `.text` linear in user-call count and removes the user-crate
+  compiler-rt stubs that base64_decode / qoi_decode previously
+  shipped. The injection runs before the driver-level i32 SELECT →
+  bit-blend rewrite so the helper's `r >= d ? r - d : r` shape is
+  rewritten to straight-line ops instead of branching (the SELECT
+  → branch shape is what historically forced DAG-ISel into the
+  multi-minute legalize loop the SELECT-rewrite was introduced to
+  avoid).
+
+  Side fixes that 7f2 required:
+  - **SUB32rr** mov-only legalize (`legalizeSUB32rr`) — same shape
+    as `legalizeADD32rr` but indexing `__mov_sub8_{diff,borrow}_table`.
+    The helper bodies need `r - d` and several abs / sign-fixup
+    subs; before 7f2 only SUB32ri was covered.
+  - **CMP+Jcc matcher** in `legalizeCmpJccPairs` relaxed to skip
+    any EFLAGS-preserving instruction (in particular, register-
+    allocator-inserted COPYs around PHI lowering) between the CMP
+    and the Jcc, instead of bailing out the moment a non-MOV32mi
+    appears. The pattern was tight enough that hand-written
+    fixtures matched but the helpers' loop-with-PHI bodies, which
+    RA spills around, did not.
+
 ### Stage 7 gates
 
 [`test/MovOnly/run.sh`](test/MovOnly/run.sh) is the objdump gate.

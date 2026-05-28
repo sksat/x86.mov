@@ -118,6 +118,7 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
     for (const MachineInstr &MI : MBB) {
       switch (MI.getOpcode()) {
       case Mov::ADD32rr:
+      case Mov::SUB32rr:
       case Mov::AND32rr:
       case Mov::OR32rr:
       case Mov::XOR32rr:

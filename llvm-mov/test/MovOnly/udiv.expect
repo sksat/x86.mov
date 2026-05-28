@@ -1,0 +1,5 @@
+# Opcodes this fixture acknowledges as not-yet-legalised. `jmp` is the
+# 7c1 dispatcher's indirect jump (mov-equivalent) and the 7d3 call
+# rewrite's continuation jump. Stage 7f2 drives the `call __udivsi3`
+# libcall site through the dispatcher rewrite — no `call` remains.
+jmp

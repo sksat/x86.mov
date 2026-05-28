@@ -163,6 +163,14 @@ public:
           }
           Changed |= legalizeSUB32ri(MI, MBB, TII);
           break;
+        case Mov::SUB32rr:
+          // Stage 7f2 — `sub reg, reg`. Same byte-chain shape as
+          // ADD32rr but indexes the sub8 tables. Required so the
+          // injected __udivsi3 / __umodsi3 / __divsi3 / __modsi3
+          // bodies (which compute `r - d` and sign-fixups via subs)
+          // legalize cleanly without `sub` leaking to `.text`.
+          Changed |= legalizeSUB32rr(MI, MBB, TII);
+          break;
         case Mov::AND32ri:
           // opt 3 — `and reg, 0` zeroes Dst; `and reg, ~0` is a no-op.
           if (MI.getOperand(2).getImm() == 0) {
@@ -353,10 +361,18 @@ private:
         // Look forward (skipping debug instrs) for:
         //   - an optional MOV32mi to [EBP + NextPCDisp] (the F-store
         //     that 7c1 inserted before the Jcc)
-        //   - immediately followed by JE or JNE
-        // Anything else aborts the pattern match.
+        //   - followed by JE / JNE / JL / JGE / JLE / JG / JB / JAE
+        //     / JBE / JA
+        // Between the CMP and the Jcc the matcher tolerates any
+        // EFLAGS-preserving instruction (register-allocator-inserted
+        // COPY / spill MOV, the 7c1 F-store itself, etc.). Any
+        // EFLAGS-clobbering instruction in that window means the Jcc
+        // would consume the wrong flags — abort the rewrite so the
+        // raw CMP+Jcc is left for a later pass to handle.
         MachineInstr *FStore = nullptr;
         MachineInstr *Jcc = nullptr;
+        const TargetRegisterInfo *TRI =
+            MF.getSubtarget().getRegisterInfo();
         auto Probe = std::next(It);
         for (; Probe != MBB.end(); ++Probe) {
           if (Probe->isDebugInstr())
@@ -372,7 +388,9 @@ private:
               FStore = &*Probe;
               continue;
             }
-            break;
+            // A MOV32mi that doesn't target next_pc is still
+            // EFLAGS-preserving — fall through to the EFLAGS check
+            // below.
           }
           if (POp == Mov::JE || POp == Mov::JNE || POp == Mov::JB ||
               POp == Mov::JAE || POp == Mov::JBE || POp == Mov::JA ||
@@ -381,8 +399,12 @@ private:
             Jcc = &*Probe;
             break;
           }
-          // Anything else (other Jcc, RET, JMP, ...) breaks the pattern.
-          break;
+          // EFLAGS-preserving instructions (MOV32rr COPYs inserted
+          // by RA around PHI lowering, byte MOVs, etc.) are allowed
+          // to live between the CMP and the Jcc. Anything that
+          // modifies EFLAGS would corrupt the Jcc's predicate input.
+          if (Probe->modifiesRegister(Mov::EFLAGS, TRI))
+            break;
         }
 
         if (!Jcc) {
@@ -2324,6 +2346,61 @@ private:
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
         .addReg(Mov::EBP)
         .addImm(Addr->SrcDstDisp);
+
+    MI.eraseFromParent();
+    return true;
+  }
+
+  // Stage 7f2 — `sub DST32, DST32, RHS32` legalisation. Same byte
+  // chain as legalizeSUB32ri but the RHS bytes come from a per-
+  // function spill buffer (`rhs_buf`) reserved by FrameLowering when
+  // SUB32rr is present, instead of being compile-time immediate
+  // slices. Mirrors legalizeADD32rr structurally; the only differences
+  // are the byte stage helper (Sub vs Add) and the SUB32rr opcode
+  // assertion on operand 2.
+  //
+  // No ESP-prologue guard needed here: SUB32rr ESP is not how
+  // FrameLowering reserves stack — the prologue uses SUB32ri.
+  bool legalizeSUB32rr(MachineInstr &MI, MachineBasicBlock &MBB,
+                       const TargetInstrInfo &TII) const {
+    const MachineFunction &MF = *MBB.getParent();
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr || !Addr->RhsDisp)
+      return false;
+
+    assert(MI.getOperand(0).isReg() && "SUB32rr op 0 must be reg");
+    assert(MI.getOperand(2).isReg() && "SUB32rr op 2 must be reg");
+    const Register Dst = MI.getOperand(0).getReg();
+    const Register Rhs = MI.getOperand(2).getReg();
+
+    auto Insert = MachineBasicBlock::iterator(&MI);
+    const DebugLoc DL = MI.getDebugLoc();
+    const int64_t RhsDisp = *Addr->RhsDisp;
+
+    // PROLOGUE — save ECX, EDX, spill Dst (= LHS) then Rhs. Same
+    // ordering rationale as legalizeADD32rr: Dst == Rhs is fine
+    // (both spills capture the same value).
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Dst);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+        .addReg(Mov::EBP).addImm(RhsDisp).addReg(Rhs);
+
+    // CHAIN — four byte SUB stages, RHS bytes read from rhs_buf.
+    for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
+      emitByteStageSub(MBB, Insert, DL, TII, *Addr, ByteIdx,
+                       ByteSource::fromMem(RhsDisp));
+
+    // EPILOGUE — restore ECX/EDX, then load Dst from srcdst.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
+        .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
 
     MI.eraseFromParent();
     return true;
