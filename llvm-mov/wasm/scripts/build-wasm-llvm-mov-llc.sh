@@ -6,14 +6,14 @@
 # Output:
 #   build/llvm-mov-wasm/bin/llvm-mov-llc.{js,wasm}
 #
-# We point cmake at ../llvm-mov/CMakeLists.txt so the wasm and native
-# builds share the same backend source tree — every backend edit lands
-# in ../llvm-mov/ and is picked up here automatically.
+# We point cmake at ../CMakeLists.txt (the parent llvm-mov subproject)
+# so the wasm and native builds share the same backend source tree —
+# every backend edit lands in `../` and is picked up here automatically.
 
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
-backend_src="$(cd "$here/../llvm-mov" && pwd)"
+backend_src="$(cd "$here/.." && pwd)"
 llvm_build="$here/build/llvm-wasm"
 build="$here/build/llvm-mov-wasm"
 out="$here/build"
@@ -88,7 +88,7 @@ fi
 ninja -C "$build" llvm-mov-llc 2>&1 | tee "$build/build.log"
 
 # Stage the artifacts under build/ alongside the wrapper, mirroring
-# movfuscator-wasm's layout (build/cpp.{js,wasm} etc.).
+# ../../movfuscator-wasm's layout (build/cpp.{js,wasm} etc.).
 # Emcmake-built executables land at `bin/<target>.js` (+ `.wasm`)
 # directly — there's no separate extensionless launcher like a native
 # build would have.
@@ -106,7 +106,7 @@ echo '{"type":"module"}' > "$out/package.json"
 # Emscripten bakes the wasm filename into the .js (matches the .wasm
 # basename produced by emcc). Since we kept the basename
 # (llvm-mov-llc.wasm) end-to-end, no rename sed is needed (unlike
-# binutils' as-new.wasm/ld-new.wasm in movfuscator-wasm).
+# binutils' as-new.wasm/ld-new.wasm in ../../movfuscator-wasm).
 
 echo "wasm llvm-mov-llc build complete:"
 ls -la "$out"/llvm-mov-llc.{js,wasm}

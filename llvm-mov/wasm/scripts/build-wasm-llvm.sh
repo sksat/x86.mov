@@ -1,27 +1,32 @@
 #!/usr/bin/env bash
-# Build LLVM 22.1.x as Emscripten static libs.
+# Build LLVM 22.1.x as Emscripten static libs, plus clang's static
+# libs and headers (for the C-input demo path).
 #
 # Output:
-#   build/llvm-wasm/  — Ninja build dir with libLLVM*.a, lib/cmake/llvm/
-#                       (the artifact our backend build's
-#                       find_package(LLVM REQUIRED CONFIG) points at)
+#   build/llvm-wasm/                — Ninja build dir
+#     lib/libLLVM*.a + libclang*.a  — wasm static libraries
+#     lib/cmake/llvm/               — what our backend's find_package(LLVM) points at
+#     lib/cmake/clang/              — likewise for the clang frontend wasm
+#     lib/clang/<ver>/include/      — clang resource-dir headers (stdarg.h etc.)
 #
-# This is the slow step (~30–90 minutes on a 4-core machine). The
-# subsequent backend build is fast in comparison.
+# This is the slow step (~45–120 minutes on a 4-core machine). The
+# subsequent backend + clang driver link steps are fast in comparison.
 #
 # Quirks worth knowing:
 # - LLVM_TARGETS_TO_BUILD is intentionally empty. The Mov target is the
 #   only one we use and it's registered out-of-tree by the backend libs.
 #   Building X86 / AArch64 / etc. in-tree would balloon the wasm by
-#   tens of MB for code that's never reached.
+#   tens of MB for code that's never reached. Clang's frontend doesn't
+#   need a backend either — it emits LLVM IR via `-emit-llvm`, with
+#   target info coming from clang's own driver tables, not LLVM CodeGen.
 # - LLVM_TABLEGEN points at the system llvm-tblgen so TableGen
 #   invocations don't have to round-trip through Node + wasm. Same
 #   pattern movfuscator-wasm uses for binutils' chew.
 # - LLVM_INCLUDE_{TESTS,EXAMPLES,BENCHMARKS} are all OFF to skip the
 #   gtest/google-benchmark builds Emscripten would otherwise drag in.
 # - LLVM_BUILD_TOOLS=OFF / LLVM_BUILD_UTILS=OFF — we don't need llc,
-#   opt, etc. as wasm; our llvm-mov-llc driver is the only tool that
-#   gets emcc-linked.
+#   opt, etc. as wasm; our llvm-mov-llc + clang drivers are the only
+#   tools that get emcc-linked.
 
 set -euo pipefail
 
@@ -63,7 +68,12 @@ if [ ! -f "$build/build.ninja" ]; then
         -DCMAKE_BUILD_TYPE=Release \
         -DLLVM_TARGETS_TO_BUILD="" \
         -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD="" \
-        -DLLVM_ENABLE_PROJECTS="" \
+        -DLLVM_ENABLE_PROJECTS="clang" \
+        -DCLANG_ENABLE_ARCMT=OFF \
+        -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+        -DCLANG_INCLUDE_DOCS=OFF \
+        -DCLANG_INCLUDE_TESTS=OFF \
+        -DCLANG_BUILD_TOOLS=OFF \
         -DLLVM_INCLUDE_TESTS=OFF \
         -DLLVM_INCLUDE_EXAMPLES=OFF \
         -DLLVM_INCLUDE_BENCHMARKS=OFF \
@@ -88,8 +98,15 @@ fi
 # llvm-config etc.; we don't need them and they need extra emcc
 # linker flags to succeed.
 #
-# Set deduced from llvm/CMakeLists.txt + tools/llvm-mov-llc/CMakeLists.txt
-# LINK_COMPONENTS lists in ../llvm-mov/.
+# LLVM_* components deduced from llvm/CMakeLists.txt +
+# tools/llvm-mov-llc/CMakeLists.txt LINK_COMPONENTS lists in ../llvm-mov/.
+# clang* components are clangDriver + clangFrontend + their transitive
+# deps — covered by the convenience target `clang-cpp` which links
+# everything the standalone clang driver needs.
+#
+# The `clang-resource-headers` target stages the resource-dir headers
+# (stdarg.h etc.) under build/llvm-wasm/lib/clang/<ver>/include/ so
+# scripts/build-wasm-clang.sh can `--embed-file` them into clang.wasm.
 COMPONENTS=(
     LLVMAnalysis
     LLVMAsmPrinter
@@ -111,8 +128,20 @@ COMPONENTS=(
     LLVMTarget
     LLVMTextAPI
     LLVMTransformUtils
+    # clang static libs needed by the standalone driver. clangDriver +
+    # clangFrontend pull the rest transitively via cmake's link graph.
+    clangDriver
+    clangFrontend
+    clangFrontendTool
+    clangCodeGen
+    clangSerialization
+    clangSema
+    clangParse
+    clangLex
+    clangBasic
+    clang-resource-headers
 )
 
 ninja -C "$build" "${COMPONENTS[@]}" 2>&1 | tee "$build/build.log"
 
-echo "wasm-LLVM build complete: $build"
+echo "wasm-LLVM + clang static libs built: $build"

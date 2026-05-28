@@ -1,0 +1,124 @@
+name: llvm-mov-wasm
+
+on:
+  push:
+    branches: [mov]
+  pull_request:
+    branches: [mov]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: llvm-mov/wasm
+
+# Per-ref concurrency so a new push to a PR/branch supersedes its
+# in-flight run but production (mov) and per-PR previews don't fight.
+concurrency:
+  group: llvm-mov-wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180   # cold LLVM+clang emcc build is ~90 min on the runner
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      # llvm-22-dev gives us:
+      #   - the native llvm-mov-llc reference (built by the parent ../ subproject)
+      #   - llvm-tblgen-22, used by the emcmake LLVM build
+      #   - clang-22, used as the native-side reference in the C-parity test
+      - name: install LLVM 22 from apt.llvm.org
+        working-directory: .
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
+          sudo apt-get install -y --no-install-recommends \
+              llvm-22-dev clang-22 lld-22 \
+              ninja-build cmake \
+              gcc-multilib libc6-dev-i386
+
+      - name: cache emsdk
+        uses: actions/cache@v5.0.5
+        id: emsdk-cache
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ runner.os }}-v1-latest
+
+      - name: install emsdk
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        working-directory: .
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git $HOME/emsdk
+          $HOME/emsdk/emsdk install latest
+          $HOME/emsdk/emsdk activate latest
+
+      # Vendor cache: the llvm-project clone is ~2.7 GB and a determinis-
+      # tic function of fetch.sh's pinned tag, so we cache the whole
+      # thing keyed on that script. Bumping LLVM_TAG cycles the key.
+      - name: cache vendor/llvm-project
+        uses: actions/cache@v5.0.5
+        id: vendor-cache
+        with:
+          path: llvm-mov/wasm/vendor
+          key: llvm-mov-wasm-vendor-${{ runner.os }}-${{ hashFiles('llvm-mov/wasm/scripts/fetch.sh') }}-v1
+
+      - name: setup (fetch llvm-project)
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        run: make setup
+
+      # Build cache: the emcmake LLVM+clang build tree. Multi-GB —
+      # GitHub Actions per-cache cap is 10 GB so we deliberately scope
+      # the cache down to the artefacts that are expensive to rebuild
+      # (the static libs + cmake config dir + clang resource headers)
+      # rather than the whole ninja work tree. On a hit, ninja's dep
+      # walk recognises the .a files as fresh and skips the compile
+      # stage entirely. On a miss, we rebuild from cold.
+      - name: cache build/llvm-wasm
+        uses: actions/cache@v5.0.5
+        id: llvm-build-cache
+        with:
+          path: |
+            llvm-mov/wasm/build/llvm-wasm/lib
+            llvm-mov/wasm/build/llvm-wasm/bin
+            llvm-mov/wasm/build/llvm-wasm/include
+            llvm-mov/wasm/build/llvm-wasm/tools
+            llvm-mov/wasm/build/llvm-wasm/CMakeCache.txt
+            llvm-mov/wasm/build/llvm-wasm/build.ninja
+            llvm-mov/wasm/build/llvm-wasm/rules.ninja
+            llvm-mov/wasm/build/llvm-wasm/.ninja_log
+            llvm-mov/wasm/build/llvm-wasm/.ninja_deps
+          key: llvm-mov-wasm-llvm-${{ runner.os }}-${{ hashFiles('llvm-mov/wasm/scripts/build-wasm-llvm.sh', 'llvm-mov/wasm/scripts/fetch.sh') }}-v1
+
+      - name: build wasm LLVM + clang static libs
+        run: make build-wasm-llvm
+
+      - name: build wasm clang driver
+        run: make build-wasm-clang
+
+      # The native reference for parity tests. The parent llvm-mov
+      # subproject's Makefile takes care of its own cmake invocation
+      # using the apt LLVM-22 we installed above.
+      - name: build native llvm-mov-llc (parity reference)
+        run: make build-native-llvm-mov-llc
+
+      - name: build wasm Mov backend + llvm-mov-llc driver
+        run: make build-wasm-llvm-mov-llc
+
+      - name: test (node-mode parity)
+        run: make test
+
+      # Playwright E2E — drives the demo index.html through a real
+      # headless Chromium and diffs the rendered .s against native.
+      # Playwright's `playwright install` step downloads ~120 MB of
+      # Chromium; caching that under ~/.cache/ms-playwright keeps PR
+      # iterations fast.
+      - name: cache playwright browsers
+        uses: actions/cache@v5.0.5
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-v1
+
+      - name: test-e2e (playwright + headless Chromium)
+        run: make test-e2e

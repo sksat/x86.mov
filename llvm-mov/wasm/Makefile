@@ -1,26 +1,29 @@
 # Single entry point for the llvm-mov wasm port.
-# Mirrors the make-driven convention used by sibling subproject
-# movfuscator-wasm.
+# Lives at llvm-mov/wasm/ — the parent llvm-mov/ subproject owns the
+# backend sources we link against, and the deploy artefact lands under
+# the same `/llvm-mov/` URL subpath as the demo. Same Makefile-driven
+# convention as ../../movfuscator-wasm/.
 
 LLVM_VERSION  ?= 22
 LLVM_TAG      ?= llvmorg-22.1.6
 BUILD_DIR     ?= build
 
-.PHONY: help setup build build-wasm-llvm build-wasm-llvm-mov-llc \
-        build-native-llvm-mov-llc test test-e2e stage-deploy serve \
-        clean distclean
+.PHONY: help setup build build-wasm-llvm build-wasm-clang \
+        build-wasm-llvm-mov-llc build-native-llvm-mov-llc \
+        test test-e2e stage-deploy serve clean distclean
 
 help:
 	@echo "Targets:"
 	@echo "  setup                       fetch upstream LLVM source at pinned tag"
 	@echo "  build                       build everything needed for test"
-	@echo "  build-wasm-llvm             emcmake LLVM static libs (long; tag bump only)"
+	@echo "  build-wasm-llvm             emcmake LLVM + clang static libs (long; tag bump only)"
+	@echo "  build-wasm-clang            link the standalone clang driver to clang.wasm"
 	@echo "  build-wasm-llvm-mov-llc     emcmake the Mov backend + llvm-mov-llc.wasm"
-	@echo "  build-native-llvm-mov-llc   ensure ../llvm-mov/build/bin/llvm-mov-llc exists"
+	@echo "  build-native-llvm-mov-llc   ensure ../build/bin/llvm-mov-llc exists"
 	@echo "  test                        parity test: wasm .s vs native .s (per fixture)"
 	@echo "  test-e2e                    playwright: drive the demo page in a headless browser"
 	@echo "                              and diff the rendered .s against native (needs npm + browsers)"
-	@echo "  stage-deploy                stage ../dist/llvm-mov-wasm/ for Cloudflare Pages"
+	@echo "  stage-deploy                stage ../../dist/llvm-mov/ for Cloudflare Pages"
 	@echo "  serve                       static-serve the demo on \$$PORT (default 8087)"
 	@echo "  clean                       remove $(BUILD_DIR)"
 	@echo "  distclean                   also remove vendor/"
@@ -33,10 +36,18 @@ help:
 setup:
 	./scripts/fetch.sh
 
-build: build-native-llvm-mov-llc build-wasm-llvm-mov-llc
+build: build-native-llvm-mov-llc build-wasm-llvm-mov-llc build-wasm-clang
 
 build-wasm-llvm:
 	./scripts/build-wasm-llvm.sh
+
+# Standalone clang driver — depends on build-wasm-llvm's clang+LLVM
+# static libs in build/llvm-wasm/lib/. Same parenthetical as
+# build-wasm-llvm-mov-llc below: the dependency isn't expressed as a
+# Make prerequisite because the underlying script's idempotency is
+# cheaper than Ninja's dep walk.
+build-wasm-clang:
+	./scripts/build-wasm-clang.sh
 
 # The wasm backend build links against the wasm LLVM static libs, so it
 # implicitly depends on build-wasm-llvm. We don't list it as a Make
@@ -48,10 +59,10 @@ build-wasm-llvm-mov-llc:
 	./scripts/build-wasm-llvm-mov-llc.sh
 
 # Native llvm-mov-llc is the reference for parity tests. Defer to the
-# sibling subproject's Makefile so a single source of truth governs how
-# it's built.
+# parent subproject's Makefile so a single source of truth governs how
+# it's built (we live at llvm-mov/wasm/, parent is ../).
 build-native-llvm-mov-llc:
-	$(MAKE) -C ../llvm-mov build
+	$(MAKE) -C .. build
 
 test: build
 	./tests/run.sh
@@ -71,10 +82,12 @@ test-e2e: build
 	@npx playwright install chromium >/dev/null 2>&1 || true
 	npx playwright test
 
-# Same shape as movfuscator-wasm/scripts/stage-deploy.sh — copies the
-# browser-loadable artifacts + the demo index.html into ../dist/llvm-mov-wasm/
-# so Cloudflare Pages picks them up at the same URL subpath as the source
-# tree.
+# Same shape as ../../movfuscator-wasm/scripts/stage-deploy.sh — copies
+# the browser-loadable artifacts + the demo index.html into
+# ../../dist/llvm-mov/ so Cloudflare Pages serves them at /llvm-mov/.
+# (The URL subpath stays as `llvm-mov`, even though the source tree
+# moved to llvm-mov/wasm/, because the deploy is the front door for the
+# subproject.)
 stage-deploy: build
 	./scripts/stage-deploy.sh
 

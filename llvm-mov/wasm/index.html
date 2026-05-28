@@ -12,6 +12,7 @@
   p.intro a { color: #06c; }
   .controls { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; flex-wrap: wrap; }
   button, select { font: inherit; padding: 0.35rem 0.7rem; }
+  label { font-size: 0.85rem; color: #555; }
   button.primary { background: #1d6; border: 1px solid #0a5; color: white; cursor: pointer; }
   button.primary:disabled { background: #aaa; border-color: #888; cursor: wait; }
   textarea.in, pre.out {
@@ -32,74 +33,83 @@
   pre.out { background: #f7f7f7; }
   .status { font-size: 0.85rem; color: #666; }
   .status.err { color: #b00; }
-  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
-  @media (max-width: 800px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 700px)  { .grid { grid-template-columns: minmax(0, 1fr); } }
   h2 { font-size: 0.95rem; margin: 0.5rem 0 0.25rem; color: #333; }
 </style>
 </head>
 <body>
-<h1>llvm-mov-wasm</h1>
+<h1>llvm-mov / wasm</h1>
 <p class="intro">
-  An out-of-tree LLVM backend (the sibling
-  <a href="https://github.com/sksat/x86.mov/tree/mov/llvm-mov">llvm-mov</a>)
-  ported to WebAssembly. Pastes LLVM IR on the left, emits mov-target
-  x86-32 assembly on the right — entirely in the browser.
-  See also <a href="../movfuscator-wasm/">movfuscator-wasm</a> (the
+  An out-of-tree LLVM backend
+  (<a href="https://github.com/sksat/x86.mov/tree/mov/llvm-mov">llvm-mov</a>)
+  ported to WebAssembly. Paste C on the left, see the LLVM IR clang
+  produces in the middle, and the mov-target x86-32 assembly
+  llvm-mov-llc emits on the right — all running in your browser. See
+  also <a href="../movfuscator-wasm/">movfuscator-wasm</a> (the
   LCC-based sibling).
 </p>
 
 <div class="controls">
-  <button id="run" class="primary">Compile (.ll → .s)</button>
+  <button id="run" class="primary">Compile (.c → .ll → .s)</button>
   <select id="example">
     <option value="ret_42">ret 42</option>
-    <option value="add_one">add_one(i32)</option>
-    <option value="bitand">bitand(i32, i32)</option>
+    <option value="add_one">add_one(int)</option>
+    <option value="bitand">bitand(int, int)</option>
+  </select>
+  <label for="optLevel">opt:</label>
+  <select id="optLevel">
+    <option value="0">-O0</option>
+    <option value="1">-O1</option>
+    <option value="2" selected>-O2</option>
+    <option value="3">-O3</option>
+    <option value="s">-Os</option>
+    <option value="z">-Oz</option>
   </select>
   <span class="status" id="status"></span>
 </div>
 
 <div class="grid">
   <div>
-    <h2>LLVM IR (input)</h2>
+    <h2>C source (input)</h2>
     <textarea id="in" class="in" spellcheck="false"></textarea>
   </div>
   <div>
-    <h2>mov-target x86-32 assembly (output)</h2>
+    <h2>LLVM IR (clang)</h2>
+    <pre id="ll" class="out"></pre>
+  </div>
+  <div>
+    <h2>mov-target x86-32 assembly (llvm-mov-llc)</h2>
     <pre id="out" class="out"></pre>
   </div>
 </div>
 
 <script type="module">
-import { compile } from './llvm-mov.mjs';
+import { cToIR, compile } from './llvm-mov.mjs';
 
 const EXAMPLES = {
-    ret_42: `target triple = "mov-unknown-linux-gnu"
-
-define i32 @main() {
-  ret i32 42
+    ret_42: `int main(void) {
+    return 42;
 }
 `,
-    add_one: `target triple = "mov-unknown-linux-gnu"
-
-define i32 @add_one(i32 %x) {
-  %r = add i32 %x, 1
-  ret i32 %r
+    add_one: `int add_one(int x) {
+    return x + 1;
 }
 `,
-    bitand: `target triple = "mov-unknown-linux-gnu"
-
-define i32 @bitand(i32 %a, i32 %b) {
-  %r = and i32 %a, %b
-  ret i32 %r
+    bitand: `int bitand(int a, int b) {
+    return a & b;
 }
 `,
 };
 
 const $in     = document.getElementById('in');
+const $ll     = document.getElementById('ll');
 const $out    = document.getElementById('out');
 const $run    = document.getElementById('run');
 const $status = document.getElementById('status');
 const $ex     = document.getElementById('example');
+const $opt    = document.getElementById('optLevel');
 
 function loadExample() {
     $in.value = EXAMPLES[$ex.value] ?? '';
@@ -113,12 +123,21 @@ $run.addEventListener('click', async () => {
     $status.textContent = 'compiling…';
     const t0 = performance.now();
     try {
-        const asm = await compile($in.value);
+        // Two stages so the IR appears in its own pane: cToIR runs the
+        // wasm clang, compile runs the wasm llvm-mov-llc on its output.
+        const ir = await cToIR($in.value, { optLevel: $opt.value });
+        $ll.textContent = ir;
+        const asm = await compile(ir, {
+            name: 'in.ll',
+            // clang IR carries an i386 triple; force-retarget to mov.
+            mtriple: 'mov-unknown-linux-gnu',
+        });
         $out.textContent = asm;
         const dt = (performance.now() - t0).toFixed(0);
-        $status.textContent = `compiled in ${dt} ms`;
+        $status.textContent = `compiled in ${dt} ms (-O${$opt.value})`;
     } catch (e) {
         $out.textContent = '';
+        $ll.textContent = '';
         $status.className = 'status err';
         $status.textContent = String(e.message || e);
     } finally {
