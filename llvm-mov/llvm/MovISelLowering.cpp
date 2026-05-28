@@ -85,7 +85,21 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // sides means either shape ends up in MovISD::BR_CC.
   setOperationAction(ISD::BRCOND, MVT::Other, Custom);
   setOperationAction(ISD::BR_CC,  MVT::i32,   Custom);
-  setOperationAction(ISD::SETCC,  MVT::i32,   Expand);
+  // SETCC i32 — Custom-lowered. The default Expand path eventually
+  // calls SELECT_CC → BR_CC → SETCC again on certain shapes (the
+  // legalizer iterates trying to find a target-acceptable form),
+  // which loops forever in this backend because BR_CC is Custom
+  // and SELECT_CC is Expand but they're effectively mutually
+  // recursive. Lowering manually here breaks the cycle: we
+  // emit pure SUB / XOR / LSHR / SRL combinations that produce
+  // the 0/1 ZeroOrOneBooleanContent result the legalizer expects.
+  setOperationAction(ISD::SETCC,  MVT::i32,   Custom);
+  // Note: no Custom action for SIGN_EXTEND / ZERO_EXTEND / ANY_EXTEND.
+  // The IR-rewrite pass in tools/llvm-mov-llc/main.cpp materialises
+  // all branchless 0/1 → 0/-1 masks via `(0 - zext)` rather than
+  // emitting `sext i1`, so an SDAG SIGN_EXTEND of a SETCC result
+  // never reaches the legalizer here. Leaving these to their
+  // defaults keeps the legalizer's i1-promotion path in charge.
 
   // No CMOVcc — Expand SELECT / SELECT_CC into the standard
   // branch + PHI shape (BRCOND target_bb, fallthrough). The
@@ -208,9 +222,105 @@ SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerExtLoadI8(Op, DAG);
   case ISD::STORE:
     return LowerTruncStoreI8(Op, DAG);
+  case ISD::SETCC:
+    return LowerSETCC(Op, DAG);
   default:
     llvm_unreachable("Mov: LowerOperation called on unhandled opcode");
   }
+}
+
+SDValue MovTargetLowering::LowerSETCC(SDValue Op, SelectionDAG &DAG) const {
+  // Stage 6d3e — Custom-lower `setcc i32` to a branchless integer
+  // expression that produces 0/1 (matching `ZeroOrOneBooleanContent`).
+  // The default Expand path generates SELECT_CC, which the legalizer
+  // would expand again via BR_CC → SETCC → SELECT_CC ... — a loop
+  // that hangs DAG-ISel indefinitely on a fixture as small as
+  // `define i1 @f(i32, i32) { %c = icmp uge i32 ...; ret i1 %c }`.
+  //
+  // Per-predicate primitives, all bottoming out in SUB / XOR / OR /
+  // AND / SRL (no signed shift, no overflow-sensitive arithmetic):
+  //
+  //   SLT(a, b) — Hacker's Delight 2.12 "overflow-safe sign of
+  //               difference". `((a-b) ^ ((a^b) & ((a-b) ^ a))) >> 31`
+  //               is true (1) iff a < b in signed arithmetic, even
+  //               when a-b overflows. Verified against
+  //               a = INT_MIN, b = 1 (true) and
+  //               a = INT_MAX, b = -1 (false).
+  //
+  //   ULT(a, b) — bias both by 0x80000000 (XOR), then SLT. After the
+  //               bias unsigned ordering becomes signed ordering on
+  //               the same bit pattern; the safe SLT then handles
+  //               it without overflow.
+  //
+  //   EQ(a, b)  — `((x|-x) >> 31) == 0` where x = a^b. NE inverts.
+  //
+  // All other predicates derive from these via not / swap of
+  // operands.
+  SDLoc DL(Op);
+  SDValue LHS = Op.getOperand(0);
+  SDValue RHS = Op.getOperand(1);
+  ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(2))->get();
+  EVT VT = Op.getValueType();
+
+  // `(x >> 31)` via SRL — 1 iff x has its top bit set, 0 otherwise.
+  // Using SRL (not SRA) keeps the result in the 0/1 boolean domain.
+  auto SignBit = [&](SDValue X) {
+    return DAG.getNode(ISD::SRL, DL, MVT::i32, X,
+                       DAG.getConstant(31, DL, MVT::i32));
+  };
+  // Signed less-than (overflow-safe).
+  auto Slt = [&](SDValue A, SDValue B) {
+    SDValue Sub = DAG.getNode(ISD::SUB, DL, MVT::i32, A, B);
+    SDValue Xab = DAG.getNode(ISD::XOR, DL, MVT::i32, A, B);
+    SDValue Xsa = DAG.getNode(ISD::XOR, DL, MVT::i32, Sub, A);
+    SDValue And = DAG.getNode(ISD::AND, DL, MVT::i32, Xab, Xsa);
+    SDValue Mix = DAG.getNode(ISD::XOR, DL, MVT::i32, Sub, And);
+    return SignBit(Mix);
+  };
+  // Unsigned less-than via bias + signed compare.
+  auto Ult = [&](SDValue A, SDValue B) {
+    SDValue M  = DAG.getConstant(0x80000000u, DL, MVT::i32);
+    SDValue Ap = DAG.getNode(ISD::XOR, DL, MVT::i32, A, M);
+    SDValue Bp = DAG.getNode(ISD::XOR, DL, MVT::i32, B, M);
+    return Slt(Ap, Bp);
+  };
+  // (x | -x) has its sign bit set iff x != 0.
+  auto NeZ = [&](SDValue X) {
+    SDValue Neg = DAG.getNode(ISD::SUB, DL, MVT::i32,
+                              DAG.getConstant(0, DL, MVT::i32), X);
+    SDValue Or  = DAG.getNode(ISD::OR, DL, MVT::i32, X, Neg);
+    return SignBit(Or);
+  };
+  auto Eq = [&](SDValue A, SDValue B) {
+    SDValue Xor = DAG.getNode(ISD::XOR, DL, MVT::i32, A, B);
+    SDValue Nez = NeZ(Xor);
+    return DAG.getNode(ISD::XOR, DL, MVT::i32, Nez,
+                       DAG.getConstant(1, DL, MVT::i32));
+  };
+  auto Not = [&](SDValue X) {
+    return DAG.getNode(ISD::XOR, DL, MVT::i32, X,
+                       DAG.getConstant(1, DL, MVT::i32));
+  };
+
+  SDValue R;
+  switch (CC) {
+  case ISD::SETLT:  R = Slt(LHS, RHS);            break;
+  case ISD::SETGT:  R = Slt(RHS, LHS);            break;
+  case ISD::SETLE:  R = Not(Slt(RHS, LHS));       break;
+  case ISD::SETGE:  R = Not(Slt(LHS, RHS));       break;
+  case ISD::SETULT: R = Ult(LHS, RHS);            break;
+  case ISD::SETUGT: R = Ult(RHS, LHS);            break;
+  case ISD::SETULE: R = Not(Ult(RHS, LHS));       break;
+  case ISD::SETUGE: R = Not(Ult(LHS, RHS));       break;
+  case ISD::SETEQ:  R = Eq(LHS, RHS);             break;
+  case ISD::SETNE:  R = Not(Eq(LHS, RHS));        break;
+  default:
+    report_fatal_error("Mov: unsupported SETCC predicate");
+  }
+  // R is i32 0/1; if the SDAG node wants a narrower type, truncate.
+  if (VT != MVT::i32)
+    R = DAG.getNode(ISD::TRUNCATE, DL, VT, R);
+  return R;
 }
 
 SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {

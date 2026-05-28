@@ -241,9 +241,18 @@ int main(int argc, char **argv) {
       II->eraseFromParent();
     }
     auto BlendOnCmp = [](IRBuilder<> &B, Value *Cond, Value *T, Value *F) {
-      // Branchless 2-way select on i1: m = sext(cond)
-      // result = (t & m) | (f & ~m).
-      Value *M    = B.CreateSExt(Cond, T->getType());
+      // Branchless 2-way select on i1, written so the backend never
+      // sees `sext i1 -> i32`. The target sets
+      // ZeroOrOneBooleanContent, so we zext the condition to 0/1
+      // first, then `0 - zext` to materialize the 0/-1 mask via
+      // legal i32 arithmetic. Equivalent value to `sext(cond)` but
+      // synthesised purely with SUB / AND / OR / XOR — codex review:
+      // marking SIGN_EXTEND of an i1 SetCC result as anything
+      // other than the target-canonical Expand routes through a
+      // legalizer path that loops on this backend.
+      Value *Z01  = B.CreateZExt(Cond, T->getType());
+      Value *Zero = ConstantInt::get(T->getType(), 0);
+      Value *M    = B.CreateSub(Zero, Z01);
       Value *NotM = B.CreateNot(M);
       return B.CreateOr(B.CreateAnd(T, M), B.CreateAnd(F, NotM));
     };
@@ -295,11 +304,40 @@ int main(int argc, char **argv) {
       Value *Cond = S->getCondition();
       Value *T    = S->getTrueValue();
       Value *Fa   = S->getFalseValue();
-      Value *M    = B.CreateSExt(Cond, T->getType());
+      // Same blend shape as BlendOnCmp above — zext + sub to avoid
+      // emitting `sext i1` (which dragged DAG-ISel into the
+      // SETCC/SELECT_CC loop on the SDAG side).
+      Value *Z01  = B.CreateZExt(Cond, T->getType());
+      Value *Zero = ConstantInt::get(T->getType(), 0);
+      Value *M    = B.CreateSub(Zero, Z01);
       Value *NotM = B.CreateNot(M);
       Value *R    = B.CreateOr(B.CreateAnd(T, M), B.CreateAnd(Fa, NotM));
       S->replaceAllUsesWith(R);
       S->eraseFromParent();
+    }
+
+    // Any remaining `sext i1 -> i32` instruction (e.g. from user IR
+    // that wasn't routed through our SELECT rewrite) is rewritten
+    // to `(0 - zext i1 cond to i32)`. The two are mathematically
+    // identical — both produce -1 if cond is true, 0 otherwise — but
+    // the zext+sub form keeps the backend on the i1→0/1 path the
+    // legalizer / our Custom SETCC already handles. With sext-i1 the
+    // SDAG legalizer goes through a sign-extending-SETCC path that
+    // loops indefinitely with our SETCC/SELECT_CC actions.
+    SmallVector<SExtInst *, 8> SExtList;
+    for (Instruction &I : instructions(F))
+      if (auto *SE = dyn_cast<SExtInst>(&I))
+        if (SE->getSrcTy()->isIntegerTy(1) &&
+            SE->getDestTy()->isIntegerTy(32))
+          SExtList.push_back(SE);
+    for (SExtInst *SE : SExtList) {
+      IRBuilder<> B(SE);
+      Value *Cond = SE->getOperand(0);
+      Value *Z01  = B.CreateZExt(Cond, SE->getDestTy());
+      Value *Zero = ConstantInt::get(SE->getDestTy(), 0);
+      Value *R    = B.CreateSub(Zero, Z01);
+      SE->replaceAllUsesWith(R);
+      SE->eraseFromParent();
     }
     for (IntrinsicInst *II : Worklist) {
       Value *Vec = II->getArgOperand(0);

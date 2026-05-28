@@ -81,6 +81,7 @@ test-rust-example: build
 	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=png_header --run
 	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=jpeg_header --run
 	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=bmp_decode --run
+	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=base64_decode --run
 
 # Stage-7+ gate. `test/MovOnly/run.sh` builds every fixture under
 # test/MovOnly/ and asserts the disassembly contains only mov-family

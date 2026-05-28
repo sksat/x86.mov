@@ -69,6 +69,11 @@ case "$EXAMPLE" in
     # PNG / JPEG full decode would need byte-stream ops blocked
     # on stage 6d3b. Digest oracle = 0x6bea7f68; exit = 104.
     bmp_decode) ENTRY="bmp_decode_main"; EXPECTED=104; CRATE="rust_mov_bmp_decode" ;;
+    # First crates.io ecosystem decoder hooked end-to-end through
+    # llvm-mov-llc: the `base64` crate decodes "SGVsbG8sIFdvcmxkIQ=="
+    # back to "Hello, World!" — exit = sum of those 13 ASCII bytes
+    # (1129) mod 256 = 105.
+    base64_decode) ENTRY="base64_decode_main"; EXPECTED=105; CRATE="rust_mov_base64_decode" ;;
     # AES-128 ECB encrypt of NIST's AES-128 test vector, iterated
     # N_ROUNDS times (see aes/src/lib.rs). The example does NOT
     # currently round-trip through llvm-mov-llc: rustc emits
@@ -78,7 +83,7 @@ case "$EXAMPLE" in
     # 256 once the encrypt path can be compiled (placeholder value
     # until a real run produces it).
     aes)  ENTRY="aes_main";  EXPECTED=0;   CRATE="rust_mov_aes" ;;
-    *) echo "error: unknown --example=$EXAMPLE (try main, fib, png_header, jpeg_header, bmp_decode, aes)" 1>&2; exit 2 ;;
+    *) echo "error: unknown --example=$EXAMPLE (try main, fib, png_header, jpeg_header, bmp_decode, base64_decode, aes)" 1>&2; exit 2 ;;
 esac
 
 CRATE_DIR="$HERE/$EXAMPLE"
@@ -166,10 +171,12 @@ as --32 -o "$START_O" "$START_S"
 # gate fire on `.text` belonging to user code.
 EXTRA_LINK=""
 case "$EXAMPLE" in
-    aes)
-        # The aes example calls into RustCrypto crates that rustc
-        # precompiled as native i686 code into the Cargo staticlib;
-        # we pull those symbols in as a fallback so the binary runs.
+    aes|base64_decode)
+        # Crates with crates.io dependencies. Pull the Cargo
+        # staticlib for the precompiled deps; our mov-only `.o`
+        # defines the `*_main` first so the linker picks the
+        # mov-only entry, the staticlib only contributes the
+        # external references.
         STATICLIB="$CRATE_DIR/target/$TARGET_TRIPLE/release/lib${CRATE}.a"
         if [ -f "$STATICLIB" ]; then
             EXTRA_LINK="$STATICLIB"
