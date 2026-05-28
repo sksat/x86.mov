@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use gdbstub::stub::DisconnectReason;
 use movie86_cli::{
     diff_snapshots, run_elf_with_debug, run_elf_with_gdb, DebugConfig, GdbRunError, RunOutcome,
     StdHost,
@@ -160,13 +161,31 @@ fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
-/// `--gdb-listen` execution path. Returns 0 on a clean disconnect /
-/// target exit, 1 on a stub error / fatal fault.
+/// `--gdb-listen` execution path. Preserves the inferior's
+/// termination status so scripts can distinguish clean exit from
+/// crash, same as the non-gdb path does for `int 0x80` exits.
+///
+/// - `TargetExited(code)`     → ExitCode(code)  (guest's syscall arg)
+/// - `TargetTerminated(sig)`  → ExitCode(128+sig) (Unix convention)
+/// - `Kill`                   → ExitCode(1) (debugger killed it)
+/// - `Disconnect`             → ExitCode(0) (user detached cleanly)
+/// - load / io / stub errors  → 2 / 2 / 1
 fn run_gdb_path(bytes: &[u8], addr: std::net::SocketAddr) -> ExitCode {
     match run_elf_with_gdb(bytes, addr) {
         Ok(reason) => {
             eprintln!("movie86: gdb session ended: {reason:?}");
-            ExitCode::SUCCESS
+            match reason {
+                DisconnectReason::Disconnect => ExitCode::SUCCESS,
+                DisconnectReason::TargetExited(code) => ExitCode::from(code),
+                DisconnectReason::TargetTerminated(sig) => {
+                    // Unix shells convention: signal-killed exit
+                    // status is 128 + signum. `Signal` is a
+                    // newtype around u8; `sig.0` is the raw number.
+                    let raw = u32::from(sig.0).saturating_add(128);
+                    ExitCode::from(u8::try_from(raw & 0xff).unwrap_or(1))
+                }
+                DisconnectReason::Kill => ExitCode::from(1),
+            }
         }
         Err(GdbRunError::Load(e)) => {
             eprintln!("movie86: load error: {e:?}");

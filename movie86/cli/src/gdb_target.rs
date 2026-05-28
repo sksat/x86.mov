@@ -273,7 +273,16 @@ fn fault_to_signal(f: Fault) -> GdbSignal {
             GdbSignal::SIGILL
         }
         Fault::UnimplementedMov | Fault::UnknownSyscall(_) => GdbSignal::SIGSYS,
-        Fault::SignalHandlerUnregistered(_) => GdbSignal::SIGTRAP,
+        // The signum payload carries the actual guest signal that
+        // fired without a handler — preserve it so gdb shows the
+        // right reason. `Signal::Segv` (11) → SIGSEGV, `Signal::Ill`
+        // (4) → SIGILL. Anything else falls back to SIGTRAP (we
+        // shouldn't be raising other signal numbers today).
+        Fault::SignalHandlerUnregistered(n) => match n {
+            n if n == Signal::Segv as u32 => GdbSignal::SIGSEGV,
+            n if n == Signal::Ill as u32 => GdbSignal::SIGILL,
+            _ => GdbSignal::SIGTRAP,
+        },
         // Exit is handled before we get here — but be defensive.
         Fault::Exit(_) => GdbSignal::SIGTERM,
     }
@@ -586,6 +595,29 @@ mod tests {
         assert_eq!(
             fault_to_signal(Fault::UnknownSyscall(999)),
             GdbSignal::SIGSYS
+        );
+    }
+
+    #[test]
+    fn signal_handler_unregistered_preserves_guest_signum() {
+        // Regression for codex P2-1: the signum payload was being
+        // dropped — every unregistered-handler fault reported SIGTRAP.
+        // Now we honor `Signal::Segv` (11) → SIGSEGV and `Signal::Ill`
+        // (4) → SIGILL so an ELF that lacks the dispatch / master_loop
+        // symbols still gets a faithful stop reason in gdb.
+        assert_eq!(
+            fault_to_signal(Fault::SignalHandlerUnregistered(Signal::Segv as u32)),
+            GdbSignal::SIGSEGV,
+        );
+        assert_eq!(
+            fault_to_signal(Fault::SignalHandlerUnregistered(Signal::Ill as u32)),
+            GdbSignal::SIGILL,
+        );
+        // Unknown signum → SIGTRAP (defensive default; movie86 doesn't
+        // raise other signal numbers today).
+        assert_eq!(
+            fault_to_signal(Fault::SignalHandlerUnregistered(999)),
+            GdbSignal::SIGTRAP,
         );
     }
 }
