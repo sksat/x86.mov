@@ -375,6 +375,16 @@ let isCall = 1, Defs = [EAX, ECX, EDX, EFLAGS], Uses = [ESP],
 def CALL32d : MovInst<(outs), (ins calltarget:$dst),
                       "call\t$dst", []>;
 
+// Indirect call through a register (`call <reg>` in Intel syntax).
+// Selected when LowerCall sees a Callee SDValue that is neither a
+// GlobalAddress nor an ExternalSymbol — i.e. a function pointer that
+// comes from a load, formal arg, computation, etc. (Rust dyn dispatch,
+// C function-pointer call.) Same cdecl clobber profile as CALL32d.
+let isCall = 1, Defs = [EAX, ECX, EDX, EFLAGS], Uses = [ESP],
+    mayLoad = 1, mayStore = 1, hasSideEffects = 1 in
+def CALL32r : MovInst<(outs), (ins GPR32:$dst),
+                      "call\t$dst", []>;
+
 //===----------------------------------------------------------------------===//
 // CMP — sets EFLAGS for the following Jcc. Patternless: selection (stage
 // 5b) pairs them with a glued Jcc rather than relying on TableGen
@@ -454,6 +464,15 @@ def JMP32m : MovInst<(outs), (ins MovMemOperand:$tgt),
 let isBranch = 1, isTerminator = 1, isBarrier = 1,
     isCodeGenOnly = 1, hasSideEffects = 1 in
 def JMP32d_CALL : MovInst<(outs), (ins calltarget:$dst),
+                          "jmp\t$dst", []>;
+
+// Register-indirect counterpart of JMP32d_CALL. Used by the
+// CALL32r → mov-only-call rewrite as the trailing `jmp <reg>` after
+// the rewrite has stored the return label, decremented ESP, and
+// reloaded the saved callee address into the operand register.
+let isBranch = 1, isTerminator = 1, isBarrier = 1,
+    isIndirectBranch = 1, isCodeGenOnly = 1, hasSideEffects = 1 in
+def JMP32r_CALL : MovInst<(outs), (ins GPR32:$dst),
                           "jmp\t$dst", []>;
 
 //===----------------------------------------------------------------------===//

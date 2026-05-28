@@ -1242,7 +1242,8 @@ private:
       // CALL32d sites in the same logical block (codex P2).
       MachineInstr *CallMI = nullptr;
       for (MachineInstr &MI : MBB) {
-        if (MI.getOpcode() == Mov::CALL32d) {
+        if (MI.getOpcode() == Mov::CALL32d ||
+            MI.getOpcode() == Mov::CALL32r) {
           CallMI = &MI;
           break;
         }
@@ -1255,6 +1256,16 @@ private:
       MachineFunction *MFp = MBB.getParent();
       const DebugLoc DL = CallMI->getDebugLoc();
       MachineOperand CalleeOp = CallMI->getOperand(0);
+      const bool IsIndirect = (CallMI->getOpcode() == Mov::CALL32r);
+      // For CALL32r the callee address lives in a GPR. The byte chain
+      // below clobbers EAX/ECX/EDX, so we save the callee to a global
+      // .bss slot before the chain and reload into EAX after. (Callee-
+      // saved physregs like EBX/ESI/EDI would also survive the chain,
+      // but treating all cases uniformly via the slot keeps the
+      // legalize path single-shape — a small-overhead skip optimization
+      // can land separately.)
+      const Register IndirectCalleeReg =
+          IsIndirect ? CalleeOp.getReg() : Register();
 
       // Split: continuation MBB owns everything after the CALL
       // (exclusive). The split point is the iterator just past the
@@ -1416,6 +1427,17 @@ private:
           AdjSub = nullptr;  // abort fold; fall back to standalone K=4 chain
       }
 
+      // For CALL32r the opt-5 fold is disabled in this first pass — the
+      // safety check above tracks EAX/ECX/EDX for the relocated chain,
+      // but the indirect callee also needs its last-def position
+      // verified (if CalleeReg ∈ {EAX/ECX/EDX} and gets re-defined
+      // between AdjSub and CallMI, the save would capture a stale
+      // value). Skipping the fold keeps correctness without the
+      // additional tracking; an indirect-specific safety extension can
+      // re-enable it later.
+      if (IsIndirect)
+        AdjSub = nullptr;
+
       uint32_t ExtraK = 0;
       // ChainPos = where the combined byte chain should be inserted.
       // - With fold: just before the (now-erased) ADJCALLSTACKDOWN
@@ -1443,6 +1465,21 @@ private:
 
       constexpr int64_t SrcDstBase = 0;
       constexpr int64_t IdxBase = 4;
+
+      // Step 0 (CALL32r only) — stash the callee register into the
+      // global `__mov_indirect_callee_slot` so it survives the byte
+      // chain's clobber of EAX/ECX/EDX. We pick a Tmp base register
+      // that is NOT the callee register (ECX by default, EAX when the
+      // callee happens to live in ECX). Tmp itself is freely clobbered
+      // by the byte chain in the next step.
+      if (IsIndirect) {
+        const Register TmpBase =
+            (IndirectCalleeReg == Mov::ECX) ? Mov::EAX : Mov::ECX;
+        BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV32ri), TmpBase)
+            .addExternalSymbol("__mov_indirect_callee_slot");
+        BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV32mr))
+            .addReg(TmpBase).addImm(0).addReg(IndirectCalleeReg);
+      }
 
       // Step 1 — point EAX at the global scratch and seed srcdst = ESP.
       BuildMI(MBB, ChainPos, DL, TII.get(Mov::MOV32ri), Mov::EAX)
@@ -1503,20 +1540,37 @@ private:
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
           .addReg(Mov::ESP).addImm(0).addMBB(ContMBB);
 
-      // Step 5 — emit JMP32d_CALL with the callee, carrying over the
-      // regmask + implicit defs from the original CALL32d so late
-      // liveness sees the same caller-saved clobbers.
-      auto NewJmp = BuildMI(MBB, Insert, DL, TII.get(Mov::JMP32d_CALL));
-      if (CalleeOp.isGlobal())
-        NewJmp.addGlobalAddress(CalleeOp.getGlobal(), CalleeOp.getOffset(),
-                                CalleeOp.getTargetFlags());
-      else if (CalleeOp.isSymbol())
-        NewJmp.addExternalSymbol(CalleeOp.getSymbolName(),
-                                 CalleeOp.getTargetFlags());
-      else if (CalleeOp.isMBB())
-        NewJmp.addMBB(CalleeOp.getMBB(), CalleeOp.getTargetFlags());
-      else
-        report_fatal_error("CALL32d: unexpected callee operand kind");
+      // Step 4b (CALL32r only) — reload the saved callee from the
+      // global slot into EAX. EAX was clobbered by the byte chain to
+      // hold __mov_esp_dec_scratch's address; we now re-materialize
+      // __mov_indirect_callee_slot's address into it and dereference.
+      if (IsIndirect) {
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32ri), Mov::EAX)
+            .addExternalSymbol("__mov_indirect_callee_slot");
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EAX)
+            .addReg(Mov::EAX).addImm(0);
+      }
+
+      // Step 5 — emit JMP32{d,r}_CALL with the callee, carrying over
+      // the regmask + implicit defs from the original CALL32{d,r} so
+      // late liveness sees the same caller-saved clobbers.
+      MachineInstrBuilder NewJmp;
+      if (IsIndirect) {
+        NewJmp = BuildMI(MBB, Insert, DL, TII.get(Mov::JMP32r_CALL))
+                     .addReg(Mov::EAX);
+      } else {
+        NewJmp = BuildMI(MBB, Insert, DL, TII.get(Mov::JMP32d_CALL));
+        if (CalleeOp.isGlobal())
+          NewJmp.addGlobalAddress(CalleeOp.getGlobal(), CalleeOp.getOffset(),
+                                  CalleeOp.getTargetFlags());
+        else if (CalleeOp.isSymbol())
+          NewJmp.addExternalSymbol(CalleeOp.getSymbolName(),
+                                   CalleeOp.getTargetFlags());
+        else if (CalleeOp.isMBB())
+          NewJmp.addMBB(CalleeOp.getMBB(), CalleeOp.getTargetFlags());
+        else
+          report_fatal_error("CALL32d: unexpected callee operand kind");
+      }
       // Transfer remaining operands (regmask + implicit defs/uses).
       for (unsigned i = 1, e = CallMI->getNumOperands(); i < e; ++i)
         NewJmp.add(CallMI->getOperand(i));
