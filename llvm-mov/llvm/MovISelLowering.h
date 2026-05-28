@@ -70,6 +70,26 @@ public:
     return false;
   }
 
+  // Stage 6d3 — advertise that x86 supports unaligned memory access at
+  // the hardware level. Without this, the DAG legalizer treats an
+  // `align 1` i32 load as misaligned and tries to break it into four
+  // i8 loads (which our backend doesn't yet lower cleanly — the i8
+  // extload path hits "Cannot select" and hangs the type legalizer
+  // on multi-byte fragments). With this override, the unaligned i32
+  // load survives as a single load + a MOV32rm selection — slow on
+  // real hardware but always correct, and the only path that lets
+  // byte-stream-reading Rust code (`ptr::read_unaligned::<u32>`)
+  // compile through our backend without first solving native i8
+  // ext-loads.
+  bool allowsMisalignedMemoryAccesses(EVT, unsigned AddrSpace = 0,
+                                      Align Alignment = Align(1),
+                                      MachineMemOperand::Flags = MachineMemOperand::MONone,
+                                      unsigned *Fast = nullptr) const override {
+    if (Fast)
+      *Fast = 1;
+    return true;
+  }
+
   const char *getTargetNodeName(unsigned Opcode) const override;
 };
 } // namespace llvm
