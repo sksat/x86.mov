@@ -87,6 +87,28 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::SELECT,    MVT::i32, Expand);
   setOperationAction(ISD::SELECT_CC, MVT::i32, Expand);
 
+  // No ROL/ROR opcode and no movfuscator-style rotate trick yet.
+  // DAGCombine eagerly folds `(x << k) | (x >> (32-k))` into an
+  // `ISD::ROTL` node; without an Expand action that would survive
+  // as a "Cannot select: rotl" at ISel time. Marking it Expand
+  // tells the legalizer to leave the shift+or pair alone (or to
+  // re-expand back into one), which selects against our existing
+  // SHL32ri / SHR32ri / OR32rr patterns. ROTR is handled the
+  // same way for symmetry.
+  setOperationAction(ISD::ROTL, MVT::i32, Expand);
+  setOperationAction(ISD::ROTR, MVT::i32, Expand);
+
+  // No MUL32 opcode yet. The byte-chain mov-only legalize for a
+  // generic 32x32 multiply is a separate stage (4-stage Karatsuba
+  // / shift-and-add chain). Mark as Expand so the legalizer
+  // synthesises a __mulsi3 libcall — which still fails at link
+  // time (no libc), but at least at ISel it stops crashing.
+  // Real Rust code that wants to compile through here today must
+  // avoid `i32 * i32` in user code (constant multiplications
+  // get folded by rustc's own const-eval before we ever see the
+  // IR; runtime mul is a "do this later" hold).
+  setOperationAction(ISD::MUL, MVT::i32, Expand);
+
   // Stage 6c — inline llvm.memset / llvm.memcpy / llvm.memmove
   // rather than emitting libcalls. Our standalone runtime doesn't
   // link libc, and SelectionDAG's fallback is to call

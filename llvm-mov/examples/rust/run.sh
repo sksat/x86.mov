@@ -2,12 +2,17 @@
 # Stage-6.5 / 7d3 driver: cargo (rustc) → llvm-mov-llc → as → ld → run.
 #
 # Usage:
-#   run.sh                    # build main, show asm
-#   run.sh --run              # build main, run; expect exit 42
-#   run.sh --example=fib      # build fib, show asm
-#   run.sh --example=fib --run    # build fib, run; expect exit 32
-#                                  # (fib(24)=46368, mod 256)
-#   run.sh --example=aes --run    # build aes (RustCrypto crate), run
+#   run.sh                                # build main, show asm
+#   run.sh --run                          # build main, run; expect exit 42
+#   run.sh --example=fib --run            # fib(24) mod 256 → exit 32
+#   run.sh --example=png_header --run     # parse a synthetic PNG IHDR;
+#                                          # exit = parsed width = 8
+#   run.sh --example=jpeg_header --run    # parse a synthetic JPEG SOF0;
+#                                          # exit = parsed height = 16
+#   run.sh --example=bmp_decode --run     # full 32bpp BMP decode (pixel
+#                                          # stream digest); exit = 104
+#   run.sh --example=aes --run            # AES-128 (RustCrypto); blocked
+#                                          # on stage 6d3b — see aes/src/lib.rs
 #
 # Each example is an independent Cargo crate under its own directory
 # so each linked ELF only contains the entry point that fixture
@@ -48,6 +53,22 @@ done
 case "$EXAMPLE" in
     main) ENTRY="rust_main"; EXPECTED=42; CRATE="rust_mov_main" ;;
     fib)  ENTRY="fib_main";  EXPECTED=32; CRATE="rust_mov_fib" ;;
+    # PNG signature + IHDR chunk parse, no_std/no_alloc, all
+    # `ptr::read_unaligned::<u32>` (i.e. pure i32 word reads + bit
+    # extract — sidesteps the unsolved i8 SSA path). Embedded
+    # 8x8 grayscale PNG fixture; expected exit code is the parsed
+    # IHDR width mod 256 = 8.
+    png_header) ENTRY="png_header_main"; EXPECTED=8;  CRATE="rust_mov_png_header" ;;
+    # JPEG marker walk to SOF0, returning parsed height & 0xff.
+    # Same word-read style as png_header; fixture is a 24x16 frame
+    # so expected exit code is 16.
+    jpeg_header) ENTRY="jpeg_header_main"; EXPECTED=16; CRATE="rust_mov_jpeg_header" ;;
+    # Full 32bpp BMP decode: parses the file & DIB headers and
+    # iterates every pixel as u32, returning a digest of the
+    # complete pixel stream. The unique "full decode" example —
+    # PNG / JPEG full decode would need byte-stream ops blocked
+    # on stage 6d3b. Digest oracle = 0x6bea7f68; exit = 104.
+    bmp_decode) ENTRY="bmp_decode_main"; EXPECTED=104; CRATE="rust_mov_bmp_decode" ;;
     # AES-128 ECB encrypt of NIST's AES-128 test vector, iterated
     # N_ROUNDS times (see aes/src/lib.rs). The example does NOT
     # currently round-trip through llvm-mov-llc: rustc emits
@@ -57,7 +78,7 @@ case "$EXAMPLE" in
     # 256 once the encrypt path can be compiled (placeholder value
     # until a real run produces it).
     aes)  ENTRY="aes_main";  EXPECTED=0;   CRATE="rust_mov_aes" ;;
-    *) echo "error: unknown --example=$EXAMPLE (try main, fib, aes)" 1>&2; exit 2 ;;
+    *) echo "error: unknown --example=$EXAMPLE (try main, fib, png_header, jpeg_header, bmp_decode, aes)" 1>&2; exit 2 ;;
 esac
 
 CRATE_DIR="$HERE/$EXAMPLE"

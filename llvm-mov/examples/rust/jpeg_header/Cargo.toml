@@ -1,0 +1,24 @@
+# Sibling of `png_header/` — same word-read parsing style applied to
+# JPEG marker scanning. Decodes only the SOI and SOF0 markers; no
+# entropy-coded scan, no IDCT, no colour conversion.
+
+[package]
+name = "rust-mov-jpeg-header"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+opt-level = 0
+overflow-checks = false
+debug = false
+strip = false
+lto = false
+
+[profile.dev]
+panic = "abort"
+overflow-checks = false

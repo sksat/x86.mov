@@ -1,0 +1,27 @@
+# Full-decode demo: 32bpp uncompressed BMP. Unlike `png_header/` and
+# `jpeg_header/` which stop at the header, this crate reads *every*
+# pixel of the embedded fixture and computes a digest. 32bpp BMP is
+# the largest "real" standard image format the backend can decode
+# today — PNG / JPEG full decode would need byte-stream ops that hit
+# the unsolved i8 SSA path (stage 6d3b).
+
+[package]
+name = "rust-mov-bmp-decode"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+opt-level = 0
+overflow-checks = false
+debug = false
+strip = false
+lto = false
+
+[profile.dev]
+panic = "abort"
+overflow-checks = false

@@ -74,10 +74,13 @@ test-codegen: build
 # toolchain dependency. The script itself surfaces a clear message if
 # the i686 rust-std rlibs aren't installed.
 #
-# Runs both Cargo-backed examples under examples/rust/{main,fib}/.
+# Runs every Cargo-backed example under examples/rust/.
 test-rust-example: build
 	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=main --run
 	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=fib --run
+	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=png_header --run
+	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=jpeg_header --run
+	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=bmp_decode --run
 
 # Stage-7+ gate. `test/MovOnly/run.sh` builds every fixture under
 # test/MovOnly/ and asserts the disassembly contains only mov-family
