@@ -1343,6 +1343,54 @@ private:
         }
       }
 
+      // opt-5 safety check (codex P1): the relocated byte chain
+      // clobbers EAX/ECX/EDX. If any MI between (would-be) ChainPos
+      // and CallMI reads one of those registers BEFORE it is
+      // re-defined, that read would now pick up scratch garbage
+      // instead of the original value. Walk the candidate fold
+      // region forward, tracking which scratch regs are "fresh"
+      // again. Bail out of the fold if we find a stale read.
+      if (AdjSub) {
+        auto IsScratch = [](Register R) {
+          return R == Mov::EAX || R == Mov::ECX || R == Mov::EDX;
+        };
+        bool DefinedSinceChain[3] = {false, false, false};
+        auto Idx = [](Register R) -> int {
+          if (R == Mov::EAX) return 0;
+          if (R == Mov::ECX) return 1;
+          if (R == Mov::EDX) return 2;
+          return -1;
+        };
+        bool Unsafe = false;
+        for (auto It = std::next(MachineBasicBlock::iterator(AdjSub));
+             It != MachineBasicBlock::iterator(CallMI); ++It) {
+          // Check uses first — a same-MI def of the read reg counts
+          // as a redefinition only for SUBSEQUENT MIs, not this one.
+          for (const MachineOperand &Op : It->operands()) {
+            if (!Op.isReg() || Op.isDef() || Op.isImplicit())
+              continue;
+            const Register R = Op.getReg();
+            const int i = Idx(R);
+            if (i >= 0 && !DefinedSinceChain[i]) {
+              Unsafe = true;
+              break;
+            }
+          }
+          if (Unsafe)
+            break;
+          for (const MachineOperand &Op : It->operands()) {
+            if (Op.isReg() && Op.isDef() && !Op.isImplicit()) {
+              const int i = Idx(Op.getReg());
+              if (i >= 0)
+                DefinedSinceChain[i] = true;
+            }
+          }
+          (void)IsScratch;
+        }
+        if (Unsafe)
+          AdjSub = nullptr;  // abort fold; fall back to standalone K=4 chain
+      }
+
       uint32_t ExtraK = 0;
       // ChainPos = where the combined byte chain should be inserted.
       // - With fold: just before the (now-erased) ADJCALLSTACKDOWN
