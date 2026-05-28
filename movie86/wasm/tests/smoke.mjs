@@ -149,6 +149,45 @@ try {
     failed++;
 }
 
+// --- Canvas pipeline smoke ---
+//
+// canvas_smile draws a yellow filled circle at (160, 100) in mode 13h
+// (320×200 RGBA mapped at 0xA0000). Run to completion, then verify
+// that (a) a known-yellow pixel landed where we expect, and (b) a
+// corner pixel stayed BSS-zero. This is the only test that exercises
+// the multi-PT_LOAD loader path + the demo's memory-mapped framebuffer
+// convention end-to-end.
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/canvas_smile.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        while (!vm.haltReason) vm.stepN(20000n);
+        assert.equal(vm.exitCode, 0,
+            `canvas_smile should exit 0, got ${vm.exitCode} (halt=${vm.haltReason})`);
+
+        // FB layout: mode 13h base 0xA0000, RGBA, stride = 320 * 4.
+        const FB_ADDR = 0x000A_0000;
+        const FB_W = 320;
+        const centerOffset = (100 * FB_W + 160) * 4;
+        const center = vm.readMem(FB_ADDR + centerOffset, 4);
+        // The face fill is rgba(255, 220, 60, 255).
+        assert.deepEqual(Array.from(center), [255, 220, 60, 255],
+            `canvas_smile center pixel = ${Array.from(center).join(',')} (expected 255,220,60,255)`);
+
+        // Top-left corner should still be BSS-zeroed (face doesn't reach here).
+        const corner = vm.readMem(FB_ADDR, 4);
+        assert.deepEqual(Array.from(corner), [0, 0, 0, 0],
+            `canvas_smile (0,0) = ${Array.from(corner).join(',')} (expected all-zero BSS)`);
+
+        console.log(`ok  canvas_smile  exit=0 center=yellow corner=zero`);
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL canvas_smile: ${e.message}`);
+    failed++;
+}
+
 if (failed > 0) {
     console.error(`${failed} smoke test(s) failed`);
     process.exit(1);

@@ -129,6 +129,21 @@ slider — they answer different questions ("show me each step" vs
   introspection that *does* show up: `Vm::sigsegvHandler` /
   `Vm::sigillHandler` (populated by the loader from the ELF symbol
   table at load time — static post-load, but real, not a stub).
+- **The framebuffer is purely a memory-mapped convention, no syscall.**
+  `FRAMEBUFFER_MODES` in `movie86.mjs` lists `(addr, width, height)`
+  triples; the guest draws by `mov`-ing 4-byte RGBA pixels into that
+  guest address range. The host polls each slot every render and
+  `putImageData`s the bytes. ELFs that want a canvas declare a second
+  PT_LOAD covering the slot they care about (`filesz=0, memsz=W*H*4`,
+  `p_flags=RW`) — the loader's `flatten_with_stack` already handles
+  multiple PT_LOAD segments, so no core change was needed. Addresses
+  echo real VGA (mode 13h at `0xA0000`, mode 12h at `0x100000`) but
+  the encoding is straight RGBA, not paletted 8bpp / 4bpp planar; the
+  spec is "spirit of VGA" not "exact VGA". Hand-written canvas demos
+  are kept feasible by run-length-encoding same-color pixels into one
+  `mov eax, COLOR` followed by a string of 5-byte `A3 disp32` stores
+  — see `examples/canvas_*.elf` generators in the commit history for
+  the encoding pattern.
 - **`Vm::disasmAt` exists separately from the CPU's internal decode
   path** so the demo's disassembly pane can render rows without driving
   execution. Tolerates short reads at the end of the mapped region

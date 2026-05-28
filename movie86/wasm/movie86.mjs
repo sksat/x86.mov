@@ -7,6 +7,44 @@
 
 import init, { runElf as runElfRaw, Vm as VmRaw } from './build/browser/movie86_wasm.js';
 
+/**
+ * Memory-mapped framebuffer modes — loosely styled after real-mode
+ * VGA.
+ *
+ * Each entry is a "graphics mode" with a fixed (width, height) and a
+ * dedicated guest address. The guest draws by `mov`-ing 4-byte RGBA
+ * pixels into the slot it wants to use; the host polls every slot
+ * each render and `putImageData`s the bytes onto the matching
+ * `<canvas>`. No new syscall / no new interrupt is involved — the
+ * only thing the guest needs is a writable PT_LOAD segment that
+ * covers `[addr, addr + width * height * 4)`. ELFs that don't write
+ * to a slot leave that canvas blank.
+ *
+ * The address layout deliberately echoes real x86:
+ *
+ *   - `mode 13h`  → 320×200 at **0xA0000** (the classic VGA window
+ *     start; in real mode 13h this held a 1-byte-per-pixel paletted
+ *     image, here it's straight RGBA — close in spirit, not in
+ *     encoding)
+ *   - `mode 12h`  → 640×480 at **0x100000** (the standard VGA "high
+ *     res" mode; we park it above the 1 MB boundary because real
+ *     mode 12h is planar 4bpp and the RGBA-flat equivalent doesn't
+ *     fit in the 64 KB window at A0000)
+ *
+ * Both are deliberately "famous" resolutions — `64x64`-style square
+ * sizes don't show up in real PC history and felt arbitrary; mode 13h
+ * is the iconic demoscene canvas and 640×480 is the lowest-common
+ * VGA "real" resolution.
+ */
+export const FRAMEBUFFER_MODES = Object.freeze([
+    { id: 'mode 13h', addr: 0x000A_0000, width: 320, height: 200 }, // 250 KB
+    { id: 'mode 12h', addr: 0x0010_0000, width: 640, height: 480 }, // 1.2 MB
+].map(m => Object.freeze({
+    ...m,
+    bytesPerPixel: 4,
+    byteLength: m.width * m.height * 4,
+})));
+
 let initialized = null;
 
 async function ensureInit() {

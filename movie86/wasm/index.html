@@ -126,6 +126,27 @@
   .dr.cur .db { color: #333; }
   .dr.cur .dt { font-weight: bold; }
 
+  /* Canvas row — one panel per framebuffer mode. Each canvas is
+     internally w×h but scaled up via CSS pixelated rendering so the
+     hand-encoded pixels stay crisp. */
+  .canvases {
+      display: flex; gap: 1rem; flex-wrap: wrap;
+      margin-bottom: 1rem;
+  }
+  .canvases .panel { flex: 0 1 auto; }
+  .canvases canvas {
+      display: block;
+      image-rendering: pixelated;
+      background: #000;
+      border: 1px solid #888;
+      max-width: 100%;
+  }
+  .canvases .panel-head { margin-bottom: 0.3rem; }
+  .canvases .canv-info {
+      font-size: 0.7rem; color: #777; margin-top: 0.2rem;
+      font-variant-numeric: tabular-nums;
+  }
+
   /* Console — sits full-width at the bottom so vertical content has
      room to autoscroll. Side-by-side stdout/stderr on wide screens
      uses the horizontal real estate the bottom row gets. */
@@ -180,6 +201,8 @@
       <option value="hello">hello — write(1, "Hello\n") + exit</option>
       <option value="call_greet">call_greet — direct CALL/RET</option>
       <option value="cycle">cycle — print "1 2 3 4 5" forever (CALL/RET loop)</option>
+      <option value="canvas_bars">canvas_bars — mode 13h SMPTE-ish color bars</option>
+      <option value="canvas_smile">canvas_smile — mode 13h smiley face</option>
       <option value="upload">(upload your own ELF)</option>
     </select>
   </label>
@@ -240,16 +263,20 @@
   </div>
 </div>
 
+<div class="canvases" id="canvases"></div>
+
 <script type="module">
-import { loadVm } from './movie86.mjs';
+import { loadVm, FRAMEBUFFER_MODES } from './movie86.mjs';
 
 const $ = (id) => document.getElementById(id);
 
 const EXAMPLES = {
-    return42:   './examples/return42.elf',
-    hello:      './examples/hello.elf',
-    call_greet: './examples/call_greet.elf',
-    cycle:      './examples/cycle.elf',
+    return42:     './examples/return42.elf',
+    hello:        './examples/hello.elf',
+    call_greet:   './examples/call_greet.elf',
+    cycle:        './examples/cycle.elf',
+    canvas_bars:  './examples/canvas_bars.elf',
+    canvas_smile: './examples/canvas_smile.elf',
 };
 
 // Register file order matches movie86's `Reg32`: EAX, ECX, EDX, EBX,
@@ -567,6 +594,52 @@ function pumpOutput() {
     }
 }
 
+// One <canvas> per framebuffer mode, set up at boot. Each entry caches
+// the 2D context + a reusable ImageData backed by a single
+// Uint8ClampedArray to avoid allocating per render.
+const canvasHandles = [];
+
+function setupCanvases() {
+    const host = $('canvases');
+    for (const m of FRAMEBUFFER_MODES) {
+        const wrap = document.createElement('div');
+        wrap.className = 'panel';
+        wrap.innerHTML =
+            `<div class="panel-head"><h2>canvas ${m.id}</h2></div>` +
+            `<canvas width="${m.width}" height="${m.height}"></canvas>` +
+            `<div class="canv-info">@ 0x${m.addr.toString(16).padStart(8, '0')} · ${m.byteLength.toLocaleString()} B</div>`;
+        host.appendChild(wrap);
+        const canvas = wrap.querySelector('canvas');
+        // Scale up visually so the chunky pixels read clearly. Pick a
+        // target ~240 px on the long side, but never below 1:1.
+        const scale = Math.max(1, Math.floor(240 / Math.max(m.width, m.height)));
+        canvas.style.width  = `${m.width * scale}px`;
+        canvas.style.height = `${m.height * scale}px`;
+        canvasHandles.push({
+            mode: m,
+            ctx: canvas.getContext('2d'),
+            imageData: new ImageData(m.width, m.height),
+        });
+    }
+}
+
+function renderCanvases() {
+    const vm = state.vm; if (!vm) return;
+    for (const h of canvasHandles) {
+        const bytes = vm.readMem(h.mode.addr, h.mode.byteLength);
+        if (bytes.length === h.mode.byteLength) {
+            h.imageData.data.set(bytes);
+            h.ctx.putImageData(h.imageData, 0, 0);
+        } else {
+            // Region not mapped by this ELF — paint black so the
+            // canvas doesn't keep showing a stale image from the
+            // previous program.
+            h.ctx.fillStyle = '#000';
+            h.ctx.fillRect(0, 0, h.mode.width, h.mode.height);
+        }
+    }
+}
+
 function render() {
     renderRegs();
     renderInsnPreview();
@@ -574,6 +647,7 @@ function render() {
     renderMem();
     renderMeta();
     pumpOutput();
+    renderCanvases();
 }
 
 function doStep() {
@@ -767,9 +841,11 @@ $('disasm-follow').addEventListener('change', () => {
     renderDisasm();
 });
 
-// Boot: apply URL params to the controls (so the deep-linked state
-// takes effect before the first example load), then fetch the chosen
-// preset and seed the panes.
+// Boot: build the canvas panels (one per framebuffer mode), apply
+// URL params to the controls so a deep-linked state takes effect
+// before the first example load, then fetch the chosen preset and
+// seed the panes.
+setupCanvases();
 (async () => {
     applyUrlToControls();
     const initialPreset = EXAMPLES[$('preset').value] ? $('preset').value : 'return42';
