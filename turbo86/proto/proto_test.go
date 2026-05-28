@@ -48,6 +48,7 @@ func TestInboundRoundTrip(t *testing.T) {
 				Regions: []MemRegion{},
 			}},
 		},
+		{"Stop", Stop{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

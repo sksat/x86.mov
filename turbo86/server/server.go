@@ -71,9 +71,20 @@ func handleSession(ctx context.Context, ws *websocket.Conn) error {
 				return fmt.Errorf("write code: %w", err)
 			}
 		case proto.Start:
-			events = r.Run(m.Entry, m.StackTop)
+			mode := m.Mode
+			if mode == "" {
+				mode = proto.ModeHost
+			}
+			events = r.RunWithMode(m.Entry, m.StackTop, mode)
 		case proto.LoadContext:
-			events = r.RunWithContext(m.Context)
+			mode := m.Mode
+			if mode == "" {
+				mode = proto.ModeHost
+			}
+			events = r.RunWithContextAndMode(m.Context, mode)
+		case proto.Stop:
+			// Pre-run abort: never started; just clean up.
+			return nil
 		default:
 			return fmt.Errorf("unexpected inbound %T before Start/LoadContext", msg)
 		}
@@ -102,6 +113,12 @@ func handleSession(ctx context.Context, ws *websocket.Conn) error {
 					readDone <- fmt.Errorf("write code (post-start): %w", err)
 					return
 				}
+			case proto.Stop:
+				// Caller-requested termination. The defer r.Close()
+				// above does the actual work (SIGKILL → tracer's wait4
+				// returns Signaled → Paused → events channel close).
+				readDone <- nil
+				return
 			default:
 				readDone <- fmt.Errorf("unexpected inbound %T after Start/LoadContext", msg)
 				return

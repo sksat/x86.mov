@@ -108,6 +108,17 @@ type LoadContext struct {
 
 func (LoadContext) inboundKind() string { return "load_context" }
 
+// Stop asks the runner to terminate the current session — useful for
+// "cancel" UI without dropping the WebSocket. Server-side, this sends
+// SIGKILL to the guest child (no payload needed): the kill unblocks
+// the tracer's wait4 even for guests stuck in no-syscall tight loops,
+// which is the headline use case (interrupting a runaway dispatch
+// loop like movfuscator's master_loop). The session then ends with a
+// Paused{Signal: SIGKILL} followed by normal WS closure.
+type Stop struct{}
+
+func (Stop) inboundKind() string { return "stop" }
+
 // MarshalInbound encodes an Inbound as a JSON object with a "type" field.
 func MarshalInbound(msg Inbound) ([]byte, error) {
 	switch m := msg.(type) {
@@ -126,6 +137,10 @@ func MarshalInbound(msg Inbound) ([]byte, error) {
 			Type string `json:"type"`
 			LoadContext
 		}{m.inboundKind(), m})
+	case Stop:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+		}{m.inboundKind()})
 	default:
 		return nil, fmt.Errorf("proto: unknown Inbound type %T", msg)
 	}
@@ -159,6 +174,8 @@ func UnmarshalInbound(data []byte) (Inbound, error) {
 			return nil, fmt.Errorf("proto: parsing LoadContext payload: %w", err)
 		}
 		return m, nil
+	case "stop":
+		return Stop{}, nil
 	default:
 		return nil, fmt.Errorf("proto: unknown Inbound type %q", probe.Type)
 	}

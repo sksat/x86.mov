@@ -153,6 +153,48 @@ func TestE2E_PostStartCodeStreaming(t *testing.T) {
 	}
 }
 
+// TestE2E_StopMessageInterruptsTightLoop is the graceful version of the
+// disconnect test: the client wants to cancel a runaway guest without
+// dropping the WebSocket. Sends Stop after letting the loop spin
+// briefly, then reads the resulting Paused(SIGKILL).
+func TestE2E_StopMessageInterruptsTightLoop(t *testing.T) {
+	srv := httptest.NewServer(server.Handler())
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer ws.CloseNow()
+
+	const entry uint32 = 0x08048000
+	sendInbound(t, ctx, ws, proto.Code{Offset: entry, Bytes: []byte{0xEB, 0xFE}}) // jmp $
+	sendInbound(t, ctx, ws, proto.Start{Entry: entry, StackTop: 0x701FFFF0})
+
+	// Let the guest enter the loop. Reader goroutine on the server is
+	// blocked on ws.Read at this point; tracer is blocked in wait4.
+	time.Sleep(50 * time.Millisecond)
+
+	// Graceful stop request — no disconnect.
+	sendInbound(t, ctx, ws, proto.Stop{})
+
+	got := readAllEvents(t, ctx, ws)
+	if len(got) == 0 {
+		t.Fatal("expected at least one event after Stop, got none")
+	}
+	paused, ok := got[len(got)-1].(proto.Paused)
+	if !ok {
+		t.Fatalf("final event: got %T %#v, want proto.Paused", got[len(got)-1], got[len(got)-1])
+	}
+	if paused.Signal != 9 { // SIGKILL
+		t.Errorf("Paused.Signal: got %d, want 9 (SIGKILL)", paused.Signal)
+	}
+}
+
 // TestE2E_ClientDisconnectStopsTightLoop verifies that closing the WS
 // connection while the guest is in a no-syscall tight loop tears the
 // session down. Without the reader goroutine's `defer r.Close()`, a
