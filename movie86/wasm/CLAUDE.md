@@ -13,16 +13,18 @@ printf wrapper into `Vec<u8>` instead of touching stdio.
   `cargo build -p movie86 --target wasm32-unknown-unknown` portability
   check on the movie86 side strictly no_std + alloc, while this crate
   is free to depend on wasm-bindgen (which pulls std).
-- **wasm-bindgen pinned to 0.2.122.** Both the crate dep and the
-  CLI install in CI use the same pin — the .js shim and .wasm
-  metadata only match when the versions agree, so bumping is a
-  three-place change (this `Cargo.toml`,
-  `.github/workflows/movie86-wasm.yaml`, and the wasm-bindgen-cli
-  install step in `.github/workflows/deploy.yaml`).
+- **wasm-bindgen pinned with `=0.2.122` (exact)**, not the usual caret.
+  The CLI and crate share a schema that bumps on every patch release;
+  with `Cargo.lock` gitignored, a caret `"0.2.122"` would let CI resolve
+  to a newer 0.2.x while the CLI install step stays pinned, and the
+  build would fail with a schema mismatch. Bumping is a three-place
+  change (this `Cargo.toml`, `.github/workflows/movie86-wasm.yaml`,
+  and the wasm-bindgen-cli install step in
+  `.github/workflows/deploy.yaml`).
 - **Layout matches `movfuscator-wasm/`.** Wrapper at the subproject
   root ([`movie86.mjs`](movie86.mjs)) imports
-  `./build/browser/movie86_wasm.js`; samples live under
-  [`samples/`](samples/). [`scripts/stage-deploy.sh`](scripts/stage-deploy.sh)
+  `./build/browser/movie86_wasm.js`; bundled fixtures live under
+  [`examples/`](examples/). [`scripts/stage-deploy.sh`](scripts/stage-deploy.sh)
   mirrors movfuscator-wasm's stage script, but writes into
   `../../dist/movie86/` (two levels up, since this lives at
   `movie86/wasm/`).
@@ -116,6 +118,34 @@ slider — they answer different questions ("show me each step" vs
   a small example) is below `mem.base()` — clamping on the Rust side
   means the UI doesn't have to know the loader's layout. An empty
   return is the signal "fully outside the mapped region".
+- **EFLAGS and segment registers are deliberately not surfaced**, not
+  even as stubs. None of the supported instructions touch them — `mov`
+  / `jmp` / `int` (trap gate, userspace-visible) / `push` / `pop` /
+  `call` / `ret` are all "Flags Affected: None" per the Intel SDM,
+  segment-register writes don't exist in the `Cpu` struct, and the only
+  `mov sreg` form supported is `mov cs, ax` (modelled as the
+  SIGILL-dispatch jump, not as a CS write). A stub display would just
+  invite the next reader to wire arithmetic into the wrong place. Real
+  introspection that *does* show up: `Vm::sigsegvHandler` /
+  `Vm::sigillHandler` (populated by the loader from the ELF symbol
+  table at load time — static post-load, but real, not a stub).
+- **`Vm::disasmAt` exists separately from the CPU's internal decode
+  path** so the demo's disassembly pane can render rows without driving
+  execution. Tolerates short reads at the end of the mapped region
+  (so a 1-byte `ret` at the last address still decodes) and returns
+  `None` on decode failure (e.g. EIP landed inside data) so the pane
+  can stop listing instead of throwing.
+- **Don't let panes resize as content varies during execution.** Both
+  Disassembly (decode failures truncate rows) and Memory (`readMem`
+  clipping near region edges) can return fewer rows than expected; the
+  CSS locks each row's `height` and sets a fixed pane `height` /
+  `min-height` so EIP movement doesn't visibly jitter the layout.
+- **URL query params mirror parameter controls, not action buttons.**
+  preset / follow / delay / batch / refresh / disasm-follow /
+  disasm-addr / mem-follow / mem-addr round-trip via
+  `history.replaceState`. Reset / Step / Run are imperative actions
+  and intentionally stay out of the URL — they'd just confuse the
+  shareable-state mental model.
 
 ## CI
 
