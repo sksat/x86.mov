@@ -51,14 +51,6 @@ def GPR32 : RegisterClass<"Mov", [i32], 32,
 def GPR32_NOSP : RegisterClass<"Mov", [i32], 32,
   (add EAX, ECX, EDX, EBX, ESI, EDI)>;
 
-// Stage 6c — i8 narrow memory ops. Only EAX/ECX/EDX/EBX have a
-// sub_8bit subregister in 32-bit mode (ESI/EDI/EBP/ESP do not). The
-// `truncstorei8` pattern in MovInstrInfo.td uses COPY_TO_REGCLASS
-// to land its source in one of these four before extracting the
-// low byte via sub_8bit — without that constraint, RA could pick
-// ESI/EDI for the i8 source and EXTRACT_SUBREG would crash.
-def GPR32_ABCD : RegisterClass<"Mov", [i32], 32,
-  (add EAX, ECX, EDX, EBX)>;
 
 // 8-bit register class. Stage 7-prep introduces it for the MovOnlyLegalize
 // pass to address byte-wide loads/stores into lookup tables. RA never sees

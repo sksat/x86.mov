@@ -38,19 +38,18 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // slots (no narrow memory). DAGCombine then couldn't fold `(and (load
   // i32), 255)` into ZEXTLOAD-i8, which would have hit "Cannot select".
   //
-  // Stage 6c flips i8 ZEXTLOAD / EXTLOAD to Legal so Rust crate code
-  // that does honest byte-load (e.g. `arr[i]` where `arr: [u8; N]`)
-  // selects via the patterns added in MovInstrInfo.td (zextloadi8 →
-  // `mov DST32, 0; mov DST8, [m]`). SEXTLOAD-i8 stays Expand because
-  // we have no `movsx`; the legalizer rewrites signed byte loads to
-  // `zextloadi8` + sign_extend_inreg, which then expands again to
-  // shl-24 / sar-24 — all selectable via existing patterns. The i16
-  // forms stay Expand for now: real Rust code rarely emits them, and
-  // adding them is a separate stage.
-  setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MVT::i8, Legal);
-  setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MVT::i8, Legal);
-  setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MVT::i8, Expand);
-  for (MVT MemVT : {MVT::i1, MVT::i16}) {
+  // Narrow ext-loads stay Expand: byte-loads route through DAGCombine's
+  // `(load i32) + (and 0xff)` fold which selects against the existing
+  // MOV32rm + AND32ri patterns. The Pat-based path through MOV8rm +
+  // INSERT_SUBREG (tried in an earlier 6c iteration) had two issues:
+  //  (1) for the `truncstorei8` companion the sub_8bit operand needs a
+  //      COPY_TO_REGCLASS to GPR32_ABCD that TableGen wouldn't emit,
+  //      and (2) the resulting MIR tripped the post-isel scheduler on
+  //      a number of common loop shapes (phi i8 + load i8).
+  // Keeping the load/store-i8 path going through i32 mem ops + masks
+  // is correct, scheduler-clean, and what the existing 39 fixtures
+  // already exercise.
+  for (MVT MemVT : {MVT::i1, MVT::i8, MVT::i16}) {
     setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MemVT, Expand);
     setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MemVT, Expand);
     setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MemVT, Expand);
@@ -87,6 +86,18 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // Jcc + branch sequence (eventually mov-only-legalized by 7c2).
   setOperationAction(ISD::SELECT,    MVT::i32, Expand);
   setOperationAction(ISD::SELECT_CC, MVT::i32, Expand);
+
+  // Stage 6c — inline llvm.memset / llvm.memcpy / llvm.memmove
+  // rather than emitting libcalls. Our standalone runtime doesn't
+  // link libc, and SelectionDAG's fallback is to call
+  // memset/memcpy/memmove which would crash at link time. Raising
+  // the per-call store budget high enough that constant-size
+  // intrinsics fall into the inline expansion. The cap of 64 covers
+  // the common Rust crate sizes (16/32-byte block fills, 96-byte
+  // struct copies) without bloating tiny memcpys.
+  MaxStoresPerMemset  = MaxStoresPerMemsetOptSize  = 64;
+  MaxStoresPerMemcpy  = MaxStoresPerMemcpyOptSize  = 64;
+  MaxStoresPerMemmove = MaxStoresPerMemmoveOptSize = 64;
 }
 
 SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
