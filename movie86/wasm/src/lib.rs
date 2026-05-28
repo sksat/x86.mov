@@ -468,20 +468,18 @@ impl Vm {
         core::mem::take(&mut self.host.stderr)
     }
 
-    /// EFLAGS stub. movie86 doesn't model EFLAGS — there's no
-    /// arithmetic and no cmp/jcc to consume the flags, so tracking
-    /// them would just be dead state. We expose the Linux i386
-    /// process-startup value (`IF=1`, reserved bit 1 set) so the
-    /// register pane has something honest to show; the demo labels
-    /// this as a stub so it's not read as live state.
-    #[wasm_bindgen(getter)]
-    pub fn eflags(&self) -> u32 {
-        0x0000_0202
-    }
-
     /// Address of the registered SIGSEGV handler (movfuscator's
     /// `dispatch`), or `None` if the loader didn't find the symbol.
-    /// Real, non-stubbed state — kept distinct from `eflags` above.
+    /// Real, post-load-immutable state — populated by the loader
+    /// scanning the ELF symbol table.
+    ///
+    /// Note: we intentionally do **not** expose `eflags` or segment
+    /// registers because movie86 doesn't model them. EFLAGS would be
+    /// dead state (no arithmetic / no `cmp`/`jcc` in scope), and the
+    /// `Cpu` struct simply has no segment-register fields — the only
+    /// supported `mov sreg, ...` form is `mov cs, ax`, which is
+    /// modelled as the SIGILL-dispatch trick rather than as an
+    /// actual write to CS.
     #[wasm_bindgen(getter, js_name = sigsegvHandler)]
     pub fn sigsegv_handler(&self) -> Option<u32> {
         self.cpu.signal_handler(Signal::Segv)

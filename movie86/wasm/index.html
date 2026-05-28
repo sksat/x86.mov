@@ -81,8 +81,6 @@
   .regs .reg.changed .rv { background: #ffeb88; padding: 0 0.2rem; }
   .regs .reg.eip .rn { color: #1a5; font-weight: bold; }
   .regs .reg.eip .rv { color: #1a5; }
-  .regs .reg.stub .rn { color: #aaa; }
-  .regs .reg.stub .rv { color: #aaa; font-style: italic; }
   .regs hr {
       grid-column: 1 / -1;
       border: 0; border-top: 1px dashed #ddd;
@@ -93,18 +91,6 @@
       font-size: 0.7rem; color: #888; line-height: 1.2;
       margin-top: 0.2rem;
   }
-  /* Decoded EFLAGS bit tags */
-  .flagbits {
-      grid-column: 1 / -1;
-      display: flex; gap: 0.25rem; flex-wrap: wrap; margin-top: 0.1rem;
-  }
-  .flagbits .fb {
-      font-size: 0.7rem; padding: 0 0.3rem;
-      border-radius: 2px; background: #eaeef3; color: #557;
-      font-variant-numeric: tabular-nums;
-  }
-  .flagbits .fb.on  { background: #1d6; color: white; }
-  .flagbits .fb.off { background: #eee; color: #aaa; }
 
   /* Memory */
   .memrow { font-size: 0.85rem; white-space: pre; font-variant-numeric: tabular-nums; }
@@ -341,14 +327,6 @@ async function loadFromBytes(bytes, label) {
     render();
 }
 
-// EFLAGS bit tags (low 16 bits — the ones a real i386 sets at startup
-// and the ones any future modelling effort would touch first).
-const EFLAGS_BITS = [
-    [0,  'CF'], [2,  'PF'], [4,  'AF'], [6,  'ZF'],
-    [7,  'SF'], [8,  'TF'], [9,  'IF'], [10, 'DF'],
-    [11, 'OF'],
-];
-
 function renderRegs() {
     const vm = state.vm; if (!vm) return;
     const regs = vm.regs;  // Uint32Array(8)
@@ -368,25 +346,11 @@ function renderRegs() {
         );
     }
 
-    // EFLAGS (stub — see Rust-side comment). Decoded bit tags so the
-    // value isn't a mystery hex number.
-    rows.push('<hr>');
-    const eflags = vm.eflags;
-    rows.push(
-        `<div class="reg stub" title="movie86 doesn't model EFLAGS — no arithmetic / no jcc. Shown as the Linux i386 process-startup value.">` +
-        `<span class="rn">EFLAGS</span><span class="rv">${fmt32(eflags)}</span></div>`,
-    );
-    rows.push(
-        '<div class="flagbits">' +
-        EFLAGS_BITS.map(([bit, name]) => {
-            const on = (eflags >>> bit) & 1;
-            return `<span class="fb ${on ? 'on' : 'off'}">${name}</span>`;
-        }).join('') +
-        '</div>',
-    );
-
-    // Signal-handler addresses — real CPU state, populated by the
-    // loader from the ELF symbol table.
+    // Signal-handler addresses — real CPU state populated by the
+    // loader from the ELF symbol table. movie86 deliberately doesn't
+    // model EFLAGS (no arithmetic / no `cmp`/`jcc`) or segment
+    // registers (flat 32-bit mode, the only `mov sreg` form supported
+    // is the SIGILL dispatch trick), so they don't get a row here.
     const segv = vm.sigsegvHandler;
     const ill = vm.sigillHandler;
     rows.push('<hr>');
@@ -400,8 +364,10 @@ function renderRegs() {
     );
 
     rows.push(
-        '<div class="note">EFLAGS is a stub — movie86 doesn\'t model flags. ' +
-        'SIGSEGV / SIGILL are wired from the ELF symbol table at load time.</div>',
+        '<div class="note">Handler addresses are wired from the ELF ' +
+        'symbol table at load time (movfuscator\'s <code>dispatch</code> / ' +
+        '<code>master_loop</code>). EFLAGS and segment registers aren\'t ' +
+        'modelled — none of the supported instructions touch them.</div>',
     );
 
     $('regs').innerHTML = rows.join('');
