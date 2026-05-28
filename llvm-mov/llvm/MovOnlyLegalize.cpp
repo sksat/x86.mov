@@ -458,9 +458,8 @@ private:
           emitIdxZero(MBB, Insert, DL, TII, *Addr);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
               .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
               .addReg(Mov::EBP).addImm(Addr->IdxDisp);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
@@ -606,9 +605,8 @@ private:
         emitIdxZero(MBB, Insert, DL, TII, *Addr);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
             .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
             .addReg(Mov::EBP).addImm(Addr->IdxDisp);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
@@ -700,9 +698,8 @@ private:
             emitIdxZero(MBB, Insert, DL, TII, *Addr);
             BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
                 .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
             BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
                 .addReg(Mov::EBP).addImm(Addr->IdxDisp);
             BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
@@ -730,9 +727,8 @@ private:
             emitIdxZero(MBB, Insert, DL, TII, *Addr);
             BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
                 .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
             BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
                 .addReg(Mov::EBP).addImm(Addr->IdxDisp);
             BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
@@ -755,9 +751,8 @@ private:
               emitIdxZero(MBB, Insert, DL, TII, *Addr);
               BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
                   .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-              BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
-              BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                  .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+              BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+                  .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
               BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
                   .addReg(Mov::EBP).addImm(Addr->IdxDisp);
               BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
@@ -774,9 +769,8 @@ private:
         emitIdxZero(MBB, Insert, DL, TII, *Addr);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
             .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
             .addReg(Mov::EBP).addImm(Addr->IdxDisp);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
@@ -2624,9 +2618,8 @@ private:
       emitIdxZero(MBB, Insert, DL, TII, *Addr);
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL).addImm(0xFF);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
           .addReg(Mov::EBP).addImm(Addr->IdxDisp);
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
