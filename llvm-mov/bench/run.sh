@@ -235,8 +235,11 @@ build_llvm_mov() {
     local src="$1" out_dir="$2"
     mkdir -p "$out_dir"
     "$CLANG" -m32 -O0 -emit-llvm -S "$src" -o "$out_dir/ir.ll" 2>/dev/null
-    "$LLVM_MOV_LLC" "$out_dir/ir.ll" -mtriple=mov-unknown-linux-gnu \
-        -o "$out_dir/elf.s" 2>/dev/null
+    # -verify-machineinstrs keeps the bench in lockstep with the test
+    # runners: any MIR invariant the legalize breaks gets surfaced
+    # at bench time too, before the size/runtime numbers can drift.
+    "$LLVM_MOV_LLC" -verify-machineinstrs "$out_dir/ir.ll" \
+        -mtriple=mov-unknown-linux-gnu -o "$out_dir/elf.s" 2>/dev/null
     as --32 -o "$out_dir/elf.o" "$out_dir/elf.s" 2>/dev/null
     # Synthesise a minimal _start so the linked binary uses int 0x80 to
     # exit with main's return value, matching the test/Execution harness.
@@ -295,7 +298,8 @@ build_llvm_mov_rust() {
         echo "build_llvm_mov_rust: .ll not found for $cargo_name under $crate_dir/target/$triple/release/deps/" >&2
         return 1
     fi
-    "$LLVM_MOV_LLC" -mtriple=mov-unknown-linux-gnu "$ll" -o "$out_dir/elf.s" 2>/dev/null
+    "$LLVM_MOV_LLC" -verify-machineinstrs -mtriple=mov-unknown-linux-gnu \
+        "$ll" -o "$out_dir/elf.s" 2>/dev/null
     as --32 -o "$out_dir/elf.o" "$out_dir/elf.s" 2>/dev/null
     # Each Rust crate ships its own _start.s pinning the entry symbol
     # (rust_main vs fib_main).

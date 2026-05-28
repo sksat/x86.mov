@@ -77,7 +77,11 @@ for ll in "${fixtures[@]}"; do
     # Codex's stage-7a0 review (P1) flagged that build failures used to
     # report SKIP and the harness still exited 0 — that lets a regression
     # silently take a mov-only fixture offline. Now they count as FAILs.
-    if ! "${DRIVER}" "${ll}" -o "${s}" 2>"${WORK}/${name}.driver.log"; then
+    # -verify-machineinstrs catches MIR-level invariant violations
+    # (missing live-ins, mis-classified terminators, dangling
+    # successors, …) that the mov-only gate's asm shape check
+    # wouldn't otherwise notice.
+    if ! "${DRIVER}" -verify-machineinstrs "${ll}" -o "${s}" 2>"${WORK}/${name}.driver.log"; then
         echo "FAIL  ${name}: llvm-mov-llc failed:"
         sed 's/^/  /' "${WORK}/${name}.driver.log"
         fail=$((fail + 1))

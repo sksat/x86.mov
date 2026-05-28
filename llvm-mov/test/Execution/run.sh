@@ -100,7 +100,12 @@ for ll in "${HERE}"/*.ll; do
         continue
     fi
 
-    if ! "${DRIVER}" "${ll}" -o "${s}" 2>"${WORK}/${name}.driver.log"; then
+    # -verify-machineinstrs runs LLVM's MachineVerifier after each
+    # MachineFunctionPass — late-MI invariants the stage-7 legalize
+    # touches (live-ins, terminator class, CFG successors, …) get
+    # caught here rather than ~3 months later when codex review
+    # surfaces them. Negligible runtime cost on our fixtures.
+    if ! "${DRIVER}" -verify-machineinstrs "${ll}" -o "${s}" 2>"${WORK}/${name}.driver.log"; then
         echo "FAIL  ${name}: llvm-mov-llc failed:"
         sed 's/^/  /' "${WORK}/${name}.driver.log"
         fail=$((fail + 1))

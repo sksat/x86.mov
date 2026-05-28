@@ -56,6 +56,7 @@
 #include "MovTargetMachine.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -232,6 +233,23 @@ public:
           break;
         }
       }
+    }
+
+    // Recompute live-ins for every MBB once all rewrites have
+    // settled. The byte-chain legalize introduces fresh uses of
+    // EAX/ECX/EDX (save/restore around table lookups) inside MBBs
+    // whose pre-existing live-in sets reflected the IR-level
+    // register use only. Without this, -verify-machineinstrs flags
+    // those new reads as "using undefined physical register". A
+    // bottom-up fixed-point pass (which is what fullyRecomputeLiveIns
+    // does internally) propagates correct live-ins through the
+    // post-legalize CFG, including dispatcher- and call-continuation
+    // MBBs added by stages 7c1 / 7d3.
+    if (Changed) {
+      SmallVector<MachineBasicBlock *, 16> MBBs;
+      for (MachineBasicBlock &MBB : MF)
+        MBBs.push_back(&MBB);
+      fullyRecomputeLiveIns(MBBs);
     }
     return Changed;
   }
@@ -1237,35 +1255,13 @@ private:
       // as the sole successor (the call continuation edge).
       MBB.addSuccessor(ContMBB);
 
-      // Propagate live-ins to ContMBB so MachineVerifier doesn't
-      // reject the post-call code (codex P1). After CALL32d the
-      // caller-clobbered registers (EAX/ECX/EDX) are technically
-      // "undefined", but the existing byte-chain legalize passes
-      // (e.g. legalizeADD32ri on ADJCALLSTACKUP's
-      // `add esp, <args>`) save ECX/EDX into scratch and restore
-      // them at the end — they don't read the saved values
-      // semantically, but the verifier still flags the save's
-      // read of ECX/EDX as "using undefined physical register".
-      // Listing them as live-in formally lets the chain pretend
-      // those bytes carry through; the values are functionally
-      // garbage but they get overwritten before any user code
-      // observes them.
-      //
-      // EFLAGS is also clobbered by CALL32d's Defs, but no mov-only
-      // instruction reads EFLAGS, so it's not needed in live-ins.
-      ContMBB->addLiveIn(Mov::EAX);
-      ContMBB->addLiveIn(Mov::ECX);
-      ContMBB->addLiveIn(Mov::EDX);
-      // Also propagate any callee-saved live-ins the original MBB
-      // had at its head — the post-call code may reference them
-      // (EBP for frame access, ESP for stack access, callee-saved
-      // EBX/ESI/EDI if used).
-      for (const auto &LI : MBB.liveins())
-        ContMBB->addLiveIn(LI.PhysReg, LI.LaneMask);
-      // ESP is the active stack pointer at the post-call point;
-      // make it explicit.
-      ContMBB->addLiveIn(Mov::ESP);
-      ContMBB->addLiveIn(Mov::EBP);
+      // Live-ins for ContMBB get recomputed globally at the end of
+      // MovOnlyLegalize via `fullyRecomputeLiveIns` (see the bottom
+      // of runOnMachineFunction). Setting them here too would just
+      // be redundant — and the prior hand-rolled set
+      // {EAX, ECX, EDX, ESP, EBP, callee-saved-as-discovered}
+      // wasn't sufficient for IR-level MBBs whose live-ins also
+      // need refreshing after the byte-chain rewrites land.
 
       // opt 5 — fold the preceding ADJCALLSTACKDOWN's `sub esp, N`
       // (post-PEI, that's the SUB32ri ESP, N right before the arg

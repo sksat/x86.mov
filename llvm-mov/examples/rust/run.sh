@@ -102,7 +102,9 @@ START_S="$CRATE_DIR/_start.s"
 START_O="$WORK/_start.o"
 ELF="$WORK/$EXAMPLE.elf"
 
-"$DRIVER" -mtriple=mov-unknown-linux-gnu "$LL" -o "$S"
+# -verify-machineinstrs catches MIR-level regressions the rust
+# example's exit-code check otherwise wouldn't notice.
+"$DRIVER" -verify-machineinstrs -mtriple=mov-unknown-linux-gnu "$LL" -o "$S"
 
 as --32 -o "$O" "$S"
 as --32 -o "$START_O" "$START_S"
