@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-28T04:17:31Z on x86_64 (Linux).
+Generated 2026-05-28T21:10:21Z on x86_64 (Linux).
 
 ## return0
 
@@ -20,7 +20,7 @@ int main(void) { return 0; }
 | .rodata size | 524288 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 120 / 123 (97.6%) | 775 / 777 (99.7%) | 4 / 13 (30.8%) | 2 / 7 (28.6%) | 2 / 7 (28.6%) | 2 / 7 (28.6%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call int pop push ret xchg xor` | `call int ret xchg xor` | `call int ret xchg xor` | `call int ret xchg xor` |
-| wall-clock runtime (hyperfine mean) | 2.986 ms | 2.601 ms | 2.284 ms | 2.583 ms | 2.820 ms | 3.406 ms |
+| wall-clock runtime (hyperfine mean) | 1.656 ms | 3.611 ms | 1.478 ms | 0.473 ms | 2.874 ms | 1.203 ms |
 
 ## return42
 
@@ -35,7 +35,7 @@ int main(void) { return 42; }
 | .rodata size | 524288 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 120 / 123 (97.6%) | 775 / 777 (99.7%) | 5 / 13 (38.5%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call int pop push ret xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.178 ms | 0.547 ms | 0.178 ms | 0.152 ms | 0.164 ms | 0.151 ms |
+| wall-clock runtime (hyperfine mean) | 0.410 ms | 1.536 ms | 0.789 ms | 0.818 ms | 0.629 ms | 0.360 ms |
 
 ## eq42
 
@@ -59,7 +59,7 @@ int main(void) {
 | .rodata size | 721152 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 274 / 281 (97.5%) | 1050 / 1052 (99.8%) | 8 / 19 (42.1%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jmp jne pop push ret sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.222 ms | 0.568 ms | 0.153 ms | 0.154 ms | 0.175 ms | 0.152 ms |
+| wall-clock runtime (hyperfine mean) | 0.672 ms | 1.050 ms | 0.384 ms | 0.715 ms | 0.410 ms | 1.188 ms |
 
 ## lt_unsigned
 
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 | .rodata size | 721152 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 304 / 311 (97.7%) | 1045 / 1047 (99.8%) | 9 / 20 (45.0%) | 2 / 9 (22.2%) | 2 / 9 (22.2%) | 2 / 9 (22.2%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jae jmp pop push ret xchg` | `call cmp int ret setb xchg xor` | `call cmp int ret setb xchg xor` | `call cmp int ret setb xchg xor` |
-| wall-clock runtime (hyperfine mean) | 3.318 ms | 3.582 ms | 3.230 ms | 3.643 ms | 2.787 ms | 3.786 ms |
+| wall-clock runtime (hyperfine mean) | 1.539 ms | 2.772 ms | 0.856 ms | 2.431 ms | 1.432 ms | 1.832 ms |
 
 ## bitops
 
@@ -134,7 +134,7 @@ int main(void) {
 | .rodata size | 589824 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 164 / 167 (98.2%) | 922 / 924 (99.8%) | 8 / 19 (42.1%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add and call int or pop push ret sub xchg xor` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 3.340 ms | 3.185 ms | 2.588 ms | 0.155 ms | 0.199 ms | 0.159 ms |
+| wall-clock runtime (hyperfine mean) | 1.609 ms | 1.891 ms | 1.446 ms | 0.740 ms | 2.298 ms | 1.207 ms |
 
 ## sum10
 
@@ -154,7 +154,7 @@ int main(void) {
 | .rodata size | 721408 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 421 / 429 (98.1%) | 1225 / 1227 (99.8%) | 11 / 24 (45.8%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jg jmp pop push ret sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.193 ms | 0.575 ms | 0.164 ms | 0.155 ms | 0.150 ms | 0.153 ms |
+| wall-clock runtime (hyperfine mean) | 0.633 ms | 2.071 ms | 0.500 ms | 0.402 ms | 0.304 ms | 0.343 ms |
 
 ## fib10
 
@@ -191,7 +191,7 @@ int main(void) {
 | .rodata size | 721408 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 426 / 434 (98.2%) | 1267 / 1269 (99.8%) | 16 / 29 (55.2%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jge jmp pop push ret sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 3.189 ms | 3.773 ms | 3.002 ms | 0.183 ms | 3.588 ms | 2.073 ms |
+| wall-clock runtime (hyperfine mean) | 2.614 ms | 2.436 ms | 0.604 ms | 1.133 ms | 3.164 ms | 2.340 ms |
 
 ## shifts
 
@@ -228,7 +228,57 @@ int main(int argc, char **argv) {
 | .rodata size | 657152 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 458 / 461 (99.3%) | 1423 / 1425 (99.9%) | 14 / 28 (50.0%) | 3 / 9 (33.3%) | 3 / 9 (33.3%) | 3 / 9 (33.3%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add and call int or pop push ret sar shl sub xchg` | `call int or ret shl xchg` | `call int or ret shl xchg` | `call int or ret shl xchg` |
-| wall-clock runtime (hyperfine mean) | 3.186 ms | 3.205 ms | 3.391 ms | 1.781 ms | 2.677 ms | 3.586 ms |
+| wall-clock runtime (hyperfine mean) | 1.319 ms | 1.788 ms | 0.670 ms | 0.598 ms | 1.771 ms | 0.998 ms |
+
+## shift_reg
+
+```c
+/* opt 6 follow-up visibility — register-amount shifts (`x << n`,
+ * `x >> n` where `n` is a runtime value). The signed shifts lower
+ * to SHL32rCL and SAR32rCL; the unsigned `>>` is what surfaces
+ * SHR32rCL specifically. All three flow through the same heavy
+ * mov-only rewrite — `legalizeShift32rCL`, a 5-stage power-of-2
+ * unroll that historically emitted 50 redundant `mov dword [idx],
+ * 0` instructions per site. The "Phase 5 idx-zero hoist" follow-up
+ * to opt 6 turns those 50 into 1 (the invariant is identical to
+ * opt 6's CMP+Jcc Phase 5 hoist: nothing inside the unrolled loop
+ * writes idx[2..3], so a single hoisted MOV32mi is enough).
+ *
+ * `argc` keeps the LHS runtime so DAGCombine can't fold the shift;
+ * the amount is also derived from `argc` so it stays in CL and we
+ * hit the rCL path, not the ri path. Combining SHL (`<<`), SAR
+ * (signed `>>`), and SHR (unsigned `>>` on `unsigned int`) in the
+ * same fixture exercises all three legalize entry points and lets
+ * the bench surface the per-site savings in one row.
+ *
+ * C89 (declarations before statements) — movfuscator's LCC
+ * frontend rejects mixed declarations, and we keep the fixture
+ * apples-to-apples across the bench backends.
+ */
+int main(int argc, char **argv) {
+    int x;
+    int y;
+    int s;
+    unsigned u;
+    int amt;
+    (void)argv;
+    amt = argc & 7;             /* runtime amount, kept in [0, 7] */
+    x = argc << amt;            /* SHL32rCL */
+    y = (x | 0x32);
+    s = y >> amt;               /* SAR32rCL (signed int >>) */
+    u = (unsigned)y >> amt;     /* SHR32rCL (unsigned >>) */
+    return (s ^ (int)u) | (y & 0xFF);
+}
+```
+
+| metric | llvm-mov | movfuscator | clang -O0 | clang -O1 | clang -O2 | clang -O3 |
+|---|---:|---:|---:|---:|---:|---:|
+| total ELF (bytes) | 741704 | 10225204 | 8824 | 8820 | 8820 | 8820 |
+| .text size | 8757 | 8274 | 108 | 48 | 48 | 48 |
+| .rodata size | 723968 | 0 | 0 | 0 | 0 | 0 |
+| mov count / total | 2378 / 2381 (99.9%) | 1542 / 1544 (99.9%) | 21 / 37 (56.8%) | 7 / 20 (35.0%) | 7 / 20 (35.0%) | 7 / 20 (35.0%) |
+| non-mov mnemonics | `call int jmp` | `call` | `add and call int or pop push ret sar shl shr sub xchg xor` | `and call int or pop push ret sar shl shr xchg xor` | `and call int or pop push ret sar shl shr xchg xor` | `and call int or pop push ret sar shl shr xchg xor` |
+| wall-clock runtime (hyperfine mean) | 3.895 ms | 2.224 ms | 0.659 ms | 1.466 ms | 1.585 ms | 0.925 ms |
 
 ## fib_rec
 
@@ -275,7 +325,7 @@ int main(void) {
 | .rodata size | 721408 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 873 / 884 (98.8%) | 2248 / 2250 (99.9%) | 21 / 54 (38.9%) | 6 / 43 (14.0%) | 7 / 57 (12.3%) | 7 / 57 (12.3%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jge jmp nop pop push ret sub xchg` | `add call cmp int jge jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` |
-| wall-clock runtime (hyperfine mean) | 87.366 ms | 1496.402 ms | 3.785 ms | 3.163 ms | 1.646 ms | 0.467 ms |
+| wall-clock runtime (hyperfine mean) | 432.875 ms | 3450.920 ms | 4.580 ms | 1.966 ms | 1.832 ms | 1.377 ms |
 
 ## multi_call
 
@@ -316,7 +366,7 @@ int main(int argc, char **argv) {
 | .rodata size | 524288 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 704 / 711 (99.0%) | 2036 / 2038 (99.9%) | 22 / 46 (47.8%) | 4 / 22 (18.2%) | 4 / 22 (18.2%) | 4 / 22 (18.2%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call int nop pop push ret sub xchg` | `add call inc int lea nop ret xchg` | `add call inc int lea nop ret xchg` | `add call inc int lea nop ret xchg` |
-| wall-clock runtime (hyperfine mean) | 3.389 ms | 3.984 ms | 0.158 ms | 0.172 ms | 0.155 ms | 0.151 ms |
+| wall-clock runtime (hyperfine mean) | 0.201 ms | 1.338 ms | 0.919 ms | 1.412 ms | 1.716 ms | 0.605 ms |
 
 ## rust_main
 
@@ -351,7 +401,7 @@ pub extern "C" fn rust_main() -> i32 {
 | .rodata size | 524288 | — | 0 | 0 | 0 | 0 |
 | mov count / total | 193 / 199 (97.0%) | — | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | — | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 3.991 ms | — | 3.873 ms | 3.985 ms | 2.926 ms | 2.788 ms |
+| wall-clock runtime (hyperfine mean) | 0.783 ms | — | 0.396 ms | 0.801 ms | 0.556 ms | 0.717 ms |
 
 ## rust_fib
 
@@ -402,5 +452,5 @@ pub extern "C" fn fib_main() -> i32 {
 | .rodata size | 721408 | — | 0 | 0 | 0 | 0 |
 | mov count / total | 939 / 953 (98.5%) | — | 20 / 50 (40.0%) | 6 / 41 (14.6%) | 7 / 50 (14.0%) | 7 / 50 (14.0%) |
 | non-mov mnemonics | `call int jmp` | — | `add call cmp int jl jmp pop push ret sub xchg` | `add call cmp int jge jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` |
-| wall-clock runtime (hyperfine mean) | 115.265 ms | — | 3.010 ms | 3.587 ms | 3.330 ms | 3.056 ms |
+| wall-clock runtime (hyperfine mean) | 257.238 ms | — | 1.540 ms | 1.810 ms | 2.621 ms | 2.763 ms |
 
