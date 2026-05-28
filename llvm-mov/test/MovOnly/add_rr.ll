@@ -7,9 +7,11 @@
 ; `mov dl, IMM8` slice. Same epilogue / save_ecx / save_edx / srcdst /
 ; idx machinery as add42.
 ;
-; The objdump gate checks that the only non-mov opcodes in this
-; function are the four prologue/epilogue mnemonics that stage 7d
-; will eliminate (push, pop, sub, ret), listed in add_rr.expect.
+; After stage 7d the only non-mov opcode in this fixture's `.text` is
+; `jmp` (the dispatcher / call-continuation indirect branch, gate-
+; accepted as mov-equivalent). The earlier-stage non-mov opcodes
+; (push, pop, sub, ret) have all been legalised by 7d0/7d1/7d2/7d3
+; and no longer appear in the linked ELF. See `add_rr.expect`.
 
 target triple = "mov-unknown-linux-gnu"
 

@@ -160,10 +160,15 @@ void MovAsmPrinter::emitInstruction(const MachineInstr *MI) {
 // so emitting into the shared `.rodata` would keep the tables alive
 // whenever any other constant in the TU is live (string literals, FP
 // constants, jump tables, etc.). A dedicated section is independently
-// GC-eligible, so until MovOnlyLegalize starts producing references at
-// stage 7a1, every link drops the 256 KiB at no asm-side cost. Both
-// tables share one section because stage 7a1 always references them
-// together — splitting them gains nothing.
+// GC-eligible. Both tables share one section because stage 7a1 always
+// references them together — splitting them gains nothing.
+//
+// Note: at stage 7d the byte-add chain ends up referenced by every
+// non-trivial program (stage 7d1's `add esp, 8` for ret + post-call
+// add esp), so `--gc-sections` keeps the 256 KiB live in most linked
+// ELFs. Trivial fixtures with no ret/post-call ADD (rare) still drop
+// it. `bench/results.md`'s `.rodata` column shows which fixtures
+// retain how much of the table set.
 void MovAsmPrinter::emitAdd8Tables() {
   static constexpr unsigned kSize = 2u * 256u * 256u;
   SmallVector<uint8_t, kSize> Sum;

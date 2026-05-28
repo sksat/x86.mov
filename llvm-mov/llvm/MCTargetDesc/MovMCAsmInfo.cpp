@@ -11,9 +11,10 @@ MovMCAsmInfo::MovMCAsmInfo(const Triple & /*TT*/,
   CalleeSaveStackSlotSize = 4;
   IsLittleEndian        = true;
 
-  // GAS-flavoured Intel syntax (`mov\teax, 0`). The runner injects
+  // GAS-flavoured Intel syntax (`mov\teax, 0`). `MovAsmPrinter::
+  // emitStartOfAsmFile` writes
   //   .intel_syntax noprefix
-  // at the top of our `.s` output so `as` accepts it.
+  // once at the top of every `.s` output so `as` accepts it.
   CommentString         = "#";
   PrivateGlobalPrefix   = ".L";
   AlignmentIsInBytes    = false;

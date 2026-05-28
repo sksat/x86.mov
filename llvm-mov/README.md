@@ -17,32 +17,49 @@ the result is assembled by stock `as`/`ld`.
 
 ## Status
 
-Bootstrap. Goals listed in roughly increasing difficulty:
+Through stage 7d3: `.text` of every user function across the 12 bench
+fixtures (10 C + 2 Rust) is **fully mov-only**. The only non-mov
+mnemonics in the linked ELF are `call int jmp` — `call` / `int 0x80`
+in `_start.s` (the runtime escape, gate-accepted) and `jmp` from the
+7c1 dispatcher + 7d1 return-jmp + 7d3 call-jmp.
 
 | stage  | scope                                              | gate                                                     | done? |
 |--------|----------------------------------------------------|----------------------------------------------------------|-------|
 | 0      | `define i32 @main() { ret i32 0 }`                 | linked ELF exits 0                                       | ✅    |
 | 1      | `ret i32 <imm>` for any 32-bit constant            | exit code matches lower 8 bits                           | ✅    |
-| 2      | one i32 argument, cdecl                            | call from a synthesised `_start` (see `test/Execution/run.sh`) | ✅ |
-| 3      | i32 `add/sub/and/or/xor`, shift-imm                | execution tests (incl. 2-address chain coverage)         | ✅    |
-| 3.5    | reg-shift (CL constraint), narrow-int promotion    | execution tests (incl. i8/i16 wrap-around)               | ✅    |
-| 4      | `alloca/load/store` on a local stack frame + EBP frame + real spill | exec: `rmw` (no-arg alloca → `[ebp-4]`) + `spill_chain` (PEI spill) | ✅ |
-| 5      | `icmp + br` (CMP + Jcc 10 predicates, EBP frame interop) | execution: is_42 (eq) + is_not_42 + min (slt) + abs + is_lt_unsigned (ult) | ✅ |
-| 6a     | direct cdecl `call` between user-defined functions | exec: call_identity, call_add2, call_live_across (regmask) | ✅ |
-| 6.5    | `examples/rust` (rustc IR → llvm-mov-llc → ELF)    | `make test-rust-example` — `rust_main() -> i32 { 42 }`   | ✅    |
-| 6c     | indirect `call` via function pointer (CALL32r)     | execution tests                                          |       |
-| 7a0    | `MovOnlyLegalize` pass wired into `addPreEmitPass` + objdump gate harness | `make test-mov-only` runs (no fixtures yet) | ✅ |
-| 7a1    | ADD32r{r,i} mov-only via i32-cell lookup table     | 1 add fixture passes objdump gate                        |       |
-| 7b1    | AND / OR / XOR mov-only                            | objdump gate widens                                      |       |
-| 7b2    | SHL / SHR / SAR mov-only                           | objdump gate widens                                      |       |
-| 7c     | CMP + Jcc + JMP mov-only (control-flow substrate)  | objdump gate covers branching                            |       |
-| 7d     | CALL + RET mov-only                                | objdump gate covers calls                                |       |
-| 8      | bigger fixtures (movfuscator's `upstream-*` set)   | side-by-side bench vs movfuscator                        |       |
+| 2      | one i32 argument, cdecl                            | call from a synthesised `_start`                         | ✅    |
+| 3      | i32 `add/sub/and/or/xor`, shift-imm                | execution tests (2-address chain coverage)               | ✅    |
+| 3.5    | reg-shift (CL constraint), narrow-int promotion    | execution tests (i8/i16 wrap-around)                     | ✅    |
+| 4      | `alloca/load/store` + EBP frame + real spill       | exec: `rmw` + `spill_chain` + `use_alloca`               | ✅    |
+| 5      | `icmp + br` (CMP + Jcc 10 predicates)              | execution: `is_42` / `is_not_42` / `min` / `abs` / `is_lt_unsigned` | ✅ |
+| 6a     | direct cdecl `call` between user-defined functions | exec: `call_identity`, `call_add2`, `call_live_across`   | ✅    |
+| 6.5    | `examples/rust` (cargo → IR → llvm-mov-llc → ELF)  | `make test-rust-example` — `rust_main` + `fib_main`      | ✅    |
+| 7a     | ADD32 rr/ri mov-only via byte-add carry-chain table | `test/MovOnly/add42` + `add_rr` pass the objdump gate   | ✅    |
+| 7b1    | AND / OR / XOR rr/ri mov-only                      | bitwise objdump fixtures pass                            | ✅    |
+| 7b2    | SHL / SHR / SAR ri mov-only                        | shift-imm fixtures pass                                  | ✅    |
+| 7b3    | SHL / SHR / SAR rCL mov-only (5-stage unroll)      | variable-shift fixtures pass                             | ✅    |
+| 7c1    | CFG → branchless dispatcher                        | every BB ends with `mov [next_pc]; jmp dispatcher`        | ✅    |
+| 7c2    | CMP + Jcc(E/NE) mov-only                           | `is_42`, `eq42` lose all `cmp`/`je`/`jne`                | ✅    |
+| 7c3    | CMP + Jcc(B/AE/BE/A) (unsigned) mov-only           | `is_lt_unsigned`, `lt_unsigned`                          | ✅    |
+| 7c4    | CMP + Jcc(L/GE/LE/G) (signed) mov-only             | `smin`, `is_lt_signed`, `sum10`'s `jl` loop bound        | ✅    |
+| 7d0    | `SUB32ri` incl. prologue `sub esp, K` mov-only     | bench's `sub` column drops out                           | ✅    |
+| 7d1    | `pop ebp + ret` via `__mov_return_addr_slot`       | bench's `pop` / `ret` columns drop                       | ✅    |
+| 7d2    | prologue `push ebp` via `__mov_esp_dec_scratch`    | bench's `push` column drops                              | ✅    |
+| 7d3    | `CALL32d` → MBB-split + `JMP32d_CALL`              | `call_*` fixtures gate green                             | ✅    |
+| 6c     | indirect `call` via function pointer (CALL32r)     | execution tests                                          | future |
+| 8      | bigger fixtures (AES, mandelbrot, …)               | richer side-by-side bench                                | future |
 
-At stage 0–6 the emitter is "mov-heavy" — `jmp/call/ret/cmp` are still allowed.
-At stage 7 the dedicated legalization pass eliminates them. Splitting that wall
-in two is intentional: it lets the compiler skeleton stabilise before the
-mov-only constraint dominates every decision.
+At stage 0–6 the emitter is "mov-heavy" — `jmp/call/ret/cmp` were
+still allowed. Stage 7 (the `MovOnlyLegalize` `MachineFunctionPass`)
+rewrites every one into a mov-only byte-table chain. Splitting the
+two phases is intentional: it lets the compiler skeleton stabilise
+before the mov-only constraint dominates every decision.
+
+The mov-only legalize is followed by six rounds of per-site
+optimisation (`opt 1`..`opt 6`) which together shave 5–16 % off the
+post-stage-7d byte-chain sites without changing semantics — see the
+[`bench/results.md`](bench/results.md) commit history for the
+fixture-by-fixture impact of each.
 
 ## Layout
 
@@ -61,8 +78,11 @@ llvm-mov/
     Execution/           .ll → built ELF → run → assert exit code
     CodeGen/             lit + FileCheck, asserts on emitted asm shape
   examples/
-    rust/                rustc --emit=llvm-ir → llvm-mov-llc → ELF (planned)
-  bench/                 side-by-side vs movfuscator (planned)
+    rust/main/           cargo + rustc → llvm-mov-llc → ELF (`rust_main` → 42)
+    rust/fib/            cargo + rustc → llvm-mov-llc → ELF (`fib_main` → 32, fib(24))
+  bench/                 side-by-side vs movfuscator + clang/rustc -O0..-O3
+  CLAUDE.md              meta dev guidance (TDD, gate matrix, dep pins)
+  DESIGN.md              architecture / staged plan
   CMakeLists.txt
   Makefile               single entry point (mirrors movfuscator-wasm conventions)
 ```
@@ -109,11 +129,13 @@ The first signal is **execution**: build an `.ll` fixture through
 The second signal is **codegen shape**: lit + FileCheck over the asm. That's
 [`test/CodeGen/`](test/CodeGen/) — added once a feature's asm form is stable.
 
-The third signal (planned for stage 7+) is the **mov-only gate**: parse
+The third signal is the **mov-only gate**: parse
 `build/bin/llvm-mov-llc` output with `objdump -d -Mintel` and assert no
-instruction other than `mov` (and a small whitelist of structurally
-unavoidable ones like `ret` while bootstrapping the legalization) appears in
-`.text`.
+instruction other than `mov` (with each fixture's `.expect` whitelist for
+opcodes that remain pending a future stage) appears in `.text`. After
+stage 7d the `.expect` files have shrunk to a single line — `jmp` (the
+dispatcher / call-continuation indirect branch, gate-accepted as
+mov-equivalent). The gate runs in CI via `make test-mov-only`.
 
 ## Relationship to movfuscator-wasm
 
