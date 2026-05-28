@@ -22,22 +22,18 @@ cipher = { version = "0.4", default-features = false }
 
 [profile.release]
 panic = "abort"
-# opt-level = 3 with a single CGU so rustc inlines the iterator /
-# Zip / generic-array trait soup down to a small set of flat
-# functions before llvm-mov-llc sees it. At opt-level=0 the
-# per-method monomorphizations balloon to ~60 separate functions
-# and the byte-chain mov-only legalize takes well over ten minutes
-# to chew through — opt-level=3 collapses the encrypt path to
-# <10 functions visible at the IR boundary.
+# opt-level=3 + single CGU: rustc inlines the iterator / Zip /
+# generic-array trait soup down to a small set of flat functions
+# before llvm-mov-llc sees it. The trade-off is that the resulting
+# aes_main has lots of per-byte SSA values that scalarizer + the
+# byte-chain mov-only legalize have to expand individually —
+# compile time is in the multi-minute range. See aes/src/lib.rs
+# header for the full status; stage 6d (i8-promote-to-i32 work)
+# is still required for AES to round-trip end-to-end.
 opt-level = 3
 overflow-checks = false
 debug = false
 strip = false
-# No LTO: thin LTO splits the IR into per-crate `.rcgu.ll`
-# artifacts whose names confuse run.sh's `ls -t | head -1`
-# heuristic, and the largest file ends up being core's
-# monomorphized soup rather than our crate. A single CGU keeps the
-# pipeline a one-file feed into llvm-mov-llc.
 lto = false
 codegen-units = 1
 

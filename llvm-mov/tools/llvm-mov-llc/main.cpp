@@ -17,8 +17,10 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Pass.h"
+#include "llvm/PassRegistry.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
@@ -29,6 +31,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Scalar/Scalarizer.h"
 
 using namespace llvm;
 
@@ -59,6 +62,18 @@ int main(int argc, char **argv) {
   LLVMInitializeMovTarget();
   LLVMInitializeMovTargetMC();
   LLVMInitializeMovAsmPrinter();
+
+  // Stage 6d1 — register the LLVM Scalarizer legacy pass + its
+  // analysis dependencies (DominatorTree, ScalarOpts group,
+  // TransformUtils, Analysis) on the global registry. Without
+  // these, `PassManager::run` aborts with "Required pass not
+  // found" when the driver-level IR pre-pass below adds Scalarizer.
+  PassRegistry &Reg = *PassRegistry::getPassRegistry();
+  initializeCore(Reg);
+  initializeAnalysis(Reg);
+  initializeTransformUtils(Reg);
+  initializeScalarOpts(Reg);
+  initializeScalarizerLegacyPassPass(Reg);
 
   cl::ParseCommandLineOptions(argc, argv,
                               "llvm-mov-llc — .ll -> mov-target asm\n");
@@ -145,6 +160,34 @@ int main(int argc, char **argv) {
   if (EC) {
     WithColor::error(errs(), argv[0]) << EC.message() << "\n";
     return 1;
+  }
+
+  // Stage 6d1 — pre-codegen IR scalarization.
+  //
+  // Rust crate IR ships `<N x ty>` vector ops (the `aes` crate's
+  // block constants are `store <16 x i8>`, AES state is loaded as
+  // `<16 x i8>`, etc.) that the DAG type legalizer can't split for
+  // our strictly-scalar backend ("Do not know how to split the
+  // result of this operator"). The built-in Scalarizer rewrites
+  // each vector op into a chain of element-wise scalar ops; with
+  // `ScalarizeLoadStore=true` it also expands vector loads and
+  // stores into per-element scalar memory ops.
+  //
+  // We run it here as a dedicated FunctionPassManager on the IR
+  // *before* `addPassesToEmitFile` adds the codegen pipeline.
+  // Running it inside MovPassConfig::addIRPasses would technically
+  // also work, but the LegacyPM TargetPassConfig already runs a
+  // long fixed-order chain there and Scalarizer's results would
+  // not survive the subsequent `expand-reductions` (which can
+  // synthesise new vector shuffles + XORs from `vector.reduce.*`).
+  // Stage 6d2 deals with that follow-up.
+  {
+    legacy::PassManager IRPM;
+    ScalarizerPassOptions Opts;
+    Opts.ScalarizeMinBits   = 0;
+    Opts.ScalarizeLoadStore = true;
+    IRPM.add(createScalarizerPass(Opts));
+    IRPM.run(*M);
   }
 
   legacy::PassManager PM;

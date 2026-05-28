@@ -14,26 +14,30 @@
 //! Tested entry: `aes_main()` returns the XOR sum modulo 256 of the
 //! ciphertext bytes after `N_ROUNDS` encrypts.
 //!
-//! Current backend status (stage 6c — 2026-05): the example builds
-//! cleanly through `cargo rustc --emit=llvm-ir` but `llvm-mov-llc`
-//! does NOT yet lower it to assembly. Two outstanding blockers
-//! visible in `aes_main`'s IR at opt-level=3:
+//! Current backend status (stage 6d1 — 2026-05):
 //!
-//!   1. **SIMD vector types.** rustc emits `<16 x i8>` for the
-//!      block constants (`store <16 x i8>`, `phi <16 x i8>`,
-//!      `load <16 x i8>`) and a `llvm.vector.reduce.xor.v16i8`
-//!      intrinsic for the final XOR reduction. The Mov backend
-//!      only registers i32 (+ i8 for narrow memory at stage 6c).
-//!      The type legalizer hits "Don't know how to split the
-//!      result of this operator" trying to lower the v16i8 ops.
-//!
-//!   2. **`llvm.memset.p0.i32` intrinsic.** Lowering needs either
-//!      a libcall to `memset` (we don't link libc) or an inline
-//!      byte-write loop expansion.
+//!   * `llvm.memset.p0.i32` is inlined (stage 6c —
+//!     MaxStoresPerMemset = 64).
+//!   * `<16 x i8>` load/store/phi are scalarised pre-codegen by
+//!     the LLVM Scalarizer pass (stage 6d1 — driver IRPM in
+//!     tools/llvm-mov-llc/main.cpp).
+//!   * `llvm.vector.reduce.xor.v16i8` is *not* yet handled cleanly:
+//!     LLVM's `expand-reductions` pass rewrites it into a
+//!     shufflevector + vector-XOR tree that re-introduces vector
+//!     ops after the Scalarizer ran. Stage 6d2 (custom reduction
+//!     expander) is required to land it.
+//!   * The fundamental missing piece is i8-promote-to-i32: with
+//!     i8 left as a non-register-class type, the resulting DAG of
+//!     thousands of scalar i8 ops + a vector.reduce tail makes
+//!     DAG-ISel either crash (sub_8bit-less GR8 vregs) or balloon
+//!     to multi-minute compile times. Stage 6d3 (i8 Custom
+//!     lowering — keep GR8 vregs out of MIR entirely) is the
+//!     planned fix; see codex review on 825044a + d842da3 for
+//!     the rationale.
 //!
 //! The example is committed so the backend can ship and the
-//! blockers stay visible for the next stage. Use `--example=fib`
-//! for a working compute-bound bench fixture in the meantime.
+//! blockers stay visible. Use `--example=fib` for a working
+//! compute-bound bench fixture in the meantime.
 
 #![no_std]
 
