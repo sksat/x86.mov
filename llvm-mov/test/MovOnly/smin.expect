@@ -1,6 +1,4 @@
 # Stage 7d (CALL/RET + prologue/epilogue) is the remaining gate. `jmp`
 # stays in any branchless-dispatcher CFG.
 push
-pop
-ret
 jmp

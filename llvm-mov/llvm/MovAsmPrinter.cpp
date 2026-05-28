@@ -56,6 +56,7 @@ public:
     emitBitwise8Tables();
     emitShift8Tables();
     emitSub8Tables();
+    emitReturnAddrSlot();
   }
 
 private:
@@ -66,6 +67,7 @@ private:
   void emitShift8Tables();
   void emitUnaryByteTable(StringRef Name, uint8_t (*Op)(uint8_t));
   void emitSub8Tables();
+  void emitReturnAddrSlot();
 };
 } // namespace
 
@@ -367,6 +369,32 @@ void MovAsmPrinter::emitSub8Tables() {
   };
   emitTable("__mov_sub8_diff_table", Diff);
   emitTable("__mov_sub8_borrow_table", Borrow);
+}
+
+// Stage 7d1 — `__mov_return_addr_slot`: a 4-byte cell in .bss that the
+// epilogue-tail rewrite (POP32r EBP + RET → mov-only sequence) uses to
+// stash the function's return address before tearing down EBP. The slot
+// is read once at the very end of the rewrite (`jmp dword ptr
+// [__mov_return_addr_slot]`) and then becomes free again — single-
+// threaded, signal-handler-free assumption holds for the bootstrap
+// runtime.
+//
+// One global slot is sufficient: recursion is safe because each function
+// runs the stash-then-jump pair atomically before any nested call's
+// return can reach this point. (Concurrent rets from a signal handler
+// would clobber the slot, but the bootstrap pipeline installs none.)
+//
+// Lives in `.bss.__mov_return_addr_slot` so --gc-sections can drop it
+// when no function references it (stage 7d1 fixtures bring the
+// reference in via legalizeRetEpilogueTail's BuildMI).
+void MovAsmPrinter::emitReturnAddrSlot() {
+  MCSection *Sec = OutContext.getELFSection(
+      ".bss.__mov_return_addr_slot",
+      ELF::SHT_NOBITS, ELF::SHF_ALLOC | ELF::SHF_WRITE);
+  OutStreamer->switchSection(Sec);
+  MCSymbol *Sym = OutContext.getOrCreateSymbol("__mov_return_addr_slot");
+  OutStreamer->emitLabel(Sym);
+  OutStreamer->emitZeros(/*NumBytes=*/4);
 }
 
 extern "C" void LLVMInitializeMovAsmPrinter() {

@@ -101,6 +101,14 @@ public:
     // the predicate-selected target to next_pc.
     Changed |= legalizeCmpJccPairs(MF, TII);
 
+    // Stage 7d1: epilogue tail (`pop ebp; ret`) → mov-only sequence
+    // that stashes the return address in `__mov_return_addr_slot`,
+    // restores caller's EBP, adjusts ESP, and jumps via the slot.
+    // Runs BEFORE the per-MI byte-chain loop so the byte-chain ADD
+    // ESP, 8 emitted inline gets seen as already-lowered MovInst
+    // sequences (uses MOV32mr/MOV32rm/MOV8rm_idx etc., not ADD32ri).
+    Changed |= legalizeRetEpilogueTail(MF, TII);
+
     for (MachineBasicBlock &MBB : MF) {
       for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
         switch (MI.getOpcode()) {
@@ -903,6 +911,126 @@ private:
   // end of an MBB. `mov` doesn't touch EFLAGS, so a preceding Jcc that
   // reads EFLAGS from a `cmp` further up still sees the right flags.
   //
+  // Stage 7d1 — `pop ebp; ret` (function epilogue tail) → mov-only
+  // sequence ending in `jmp dword ptr [__mov_return_addr_slot]`.
+  //
+  // Why this pair (not just RET): at the moment `ret` would execute,
+  // POP32r EBP has already restored caller's EBP, so [EBP + scratch]
+  // / [EBP + next_pc_disp] all point into the caller's frame. Any
+  // mov-only rewrite of RET in isolation can't reach our scratch.
+  // Splitting the pair across two MachineInstrs is also fragile
+  // because POP32r EBP itself is what destroys our EBP base.
+  //
+  // The rewrite handles them together. At entry the state is:
+  //   ESP == EBP   (the preceding `mov esp, ebp` in emitEpilogue set this)
+  //   [ESP + 0]    = caller's EBP (saved by prologue's `push ebp`)
+  //   [ESP + 4]    = our return address (pushed by `call`)
+  //
+  // Emitted sequence (every line is mov / movzx-style; the only
+  // non-mov is the trailing JMP32m, which is the dispatcher-style
+  // indirect jump we accept as mov-equivalent):
+  //
+  //   mov  edx, [esp + 4]                        ; edx = RA
+  //   mov  ecx, __mov_return_addr_slot           ; ecx = &slot
+  //   mov  [ecx], edx                            ; *slot = RA
+  //   ; ESP += 8 via the 7a byte ADD chain (uses [ebp + scratch],
+  //   ; EBP still ours throughout). The chain saves/restores ECX
+  //   ; around itself, so ECX = &slot survives.
+  //   <byte-chain ADD ESP, 8 over [ebp + SaveEcx/SaveEdx/SrcDst/Idx]>
+  //   mov  ebp, [esp - 8]                        ; caller's EBP (was at
+  //                                              ; [old_esp+0] = [new_esp-8])
+  //   jmp  dword ptr [ecx]                       ; indirect jump via slot
+  //
+  // After this the MBB ends with JMP32m (isBarrier=1), no MBB
+  // successor — matches the original RET-terminated shape. The
+  // implicit EAX use that RET had is preserved on the new JMP32m
+  // so MachineVerifier keeps EAX live to function exit.
+  //
+  // Recursion: `__mov_return_addr_slot` is shared across all
+  // functions, but each `ret` writes-then-reads atomically before
+  // the next nested call can return. No re-entrance from signal
+  // handlers in the bootstrap runtime.
+  bool legalizeRetEpilogueTail(MachineFunction &MF,
+                               const TargetInstrInfo &TII) const {
+    const std::optional<EbpAddr> Addr = resolveScratchAddrs(MF);
+    if (!Addr)
+      return false;
+
+    bool Changed = false;
+    for (MachineBasicBlock &MBB : MF) {
+      auto It = MBB.begin();
+      while (It != MBB.end()) {
+        if (It->getOpcode() != Mov::POP32r ||
+            It->getOperand(0).getReg() != Mov::EBP) {
+          ++It;
+          continue;
+        }
+        // Next non-debug MI must be RET.
+        auto Next = std::next(It);
+        while (Next != MBB.end() && Next->isDebugInstr())
+          ++Next;
+        if (Next == MBB.end() || Next->getOpcode() != Mov::RET) {
+          ++It;
+          continue;
+        }
+
+        MachineInstr &PopMI = *It;
+        MachineInstr &RetMI = *Next;
+        const DebugLoc DL = PopMI.getDebugLoc();
+        auto Insert = MachineBasicBlock::iterator(&PopMI);
+
+        // Step 1: stash RA in __mov_return_addr_slot.
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+            .addReg(Mov::ESP).addImm(4);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32ri), Mov::ECX)
+            .addExternalSymbol("__mov_return_addr_slot");
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+            .addReg(Mov::ECX).addImm(0).addReg(Mov::EDX);
+
+        // Step 2: byte-chain ADD ESP, 8.
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+            .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+            .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Mov::ESP);
+
+        const uint32_t K = 8;
+        const std::array<uint8_t, 4> KBytes = {
+            static_cast<uint8_t>(K & 0xFFu),
+            static_cast<uint8_t>((K >> 8) & 0xFFu),
+            static_cast<uint8_t>((K >> 16) & 0xFFu),
+            static_cast<uint8_t>((K >> 24) & 0xFFu),
+        };
+        for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
+          emitByteStageAdd(MBB, Insert, DL, TII, *Addr, ByteIdx,
+                           ByteSource::fromImm(KBytes[ByteIdx]));
+
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+            .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ESP)
+            .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
+
+        // Step 3: restore caller's EBP and jmp via slot.
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EBP)
+            .addReg(Mov::ESP).addImm(-8);
+        BuildMI(MBB, Insert, DL, TII.get(Mov::JMP32m))
+            .addReg(Mov::ECX).addImm(0)
+            .addReg(Mov::EAX, RegState::Implicit);
+
+        // Erase pop ebp + ret. Resume scan past the original ret.
+        auto NextOuter = std::next(MachineBasicBlock::iterator(&RetMI));
+        PopMI.eraseFromParent();
+        RetMI.eraseFromParent();
+        It = NextOuter;
+        Changed = true;
+      }
+    }
+    return Changed;
+  }
+
   // Returns true when at least one BB was rewritten.
   bool legalizeCFG(MachineFunction &MF, const TargetInstrInfo &TII) const {
     if (MF.size() < 2)

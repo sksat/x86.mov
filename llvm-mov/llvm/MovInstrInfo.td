@@ -123,9 +123,17 @@ class MovInst<dag outs, dag ins, string asmstr, list<dag> pattern>
 // MOV
 //===----------------------------------------------------------------------===//
 
+// Stage 7d1 — the asmstr uses `offset $src` so MachineInstrs that
+// carry a MO_ExternalSymbol (or MO_GlobalAddress) operand assemble
+// as a true address-immediate rather than a memory load. GAS Intel
+// syntax treats `mov reg, sym` as `mov reg, [sym]`; `mov reg,
+// offset sym` is the unambiguous form for "load the symbol's
+// address into reg". For numeric immediates `offset N` evaluates
+// to N, so this asmstr is backwards-compatible with the existing
+// imm: pattern below.
 let isReMaterializable = 1, isAsCheapAsAMove = 1 in
 def MOV32ri : MovInst<(outs GPR32:$dst), (ins i32imm_op:$src),
-                      "mov\t$dst, $src",
+                      "mov\t$dst, offset $src",
                       [(set GPR32:$dst, imm:$src)]>;
 
 let isMoveReg = 1 in

@@ -3,6 +3,4 @@
 # except for `jmp` (the dispatcher's indirect jump stays — codex
 # noted it's the only non-mov a branchless dispatcher truly needs).
 push
-pop
-ret
 jmp
