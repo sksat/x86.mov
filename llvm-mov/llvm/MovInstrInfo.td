@@ -95,15 +95,19 @@ def MovIdxMemOperand : Operand<i32> {
 // frame-index-only addresses: outgoing-arg stores arrive as
 // `(add (CopyFromReg ESP), imm)`, which is a register-base + displacement.
 //
-// SelectAddr (in MovISelDAGToDAG.cpp) handles three shapes:
+// SelectAddr (in MovISelDAGToDAG.cpp) handles these shapes:
 //   1. plain FrameIndex             → (TargetFrameIndex, 0)
 //   2. ADD(FrameIndex, imm)         → (TargetFrameIndex, imm)
 //   3. ADD(reg, imm)                → (reg, imm)
-//   4. any other reg                → (reg, 0)
-// Cases (1)/(2) feed eliminateFrameIndex (EBP-relative resolution); cases
-// (3)/(4) bypass it and emit straight register-base addresses.
+//   4. OR(FrameIndex/reg, imm)      → (base, imm)    (stage 6c)
+//   5. any other reg                → (reg, 0)
+// Cases (1)/(2)/(4-on-FI) feed eliminateFrameIndex (EBP-relative
+// resolution); the others bypass it and emit straight register-base
+// addresses. The OR shape (case 4) shows up when DAGCombine proves
+// the low bits of `base` are zero, e.g. an aligned alloca + small
+// const offset — semantically identical to ADD by the same imm.
 def addr : ComplexPattern<i32, 2, "SelectAddr",
-                          [frameindex, add]>;
+                          [frameindex, add, or]>;
 
 //===----------------------------------------------------------------------===//
 // Instruction base class
@@ -217,6 +221,108 @@ def MOV8ri : MovInst<(outs GR8:$dst), (ins i8imm_op:$src),
 let mayLoad = 1, isCodeGenOnly = 1 in
 def MOV8rm_idx : MovInst<(outs GR8:$dst), (ins MovIdxMemOperand:$src),
                          "mov\t$dst, byte ptr $src", []>;
+
+// Stage 6b — bare FrameIndex materialization. When a callee receives
+// a pointer to a stack-allocated value (e.g. byval-by-pointer, sret,
+// or `&local`), ISel emits a bare i32 FrameIndex SDNode whose value
+// is the address itself. Selection lowers it to LEA32r, which PEI's
+// eliminateFrameIndex resolves to `(EBP, disp)` exactly as for the
+// load/store memory operands. The `lea` mnemonic survives stages
+// 0–6.5 (mov-heavy bootstrap) and is rewritten into mov-only form by
+// MovOnlyLegalize::legalizeLEA32r at stage 7 (mov ebp into dst, then
+// byte-chain ADD32ri the displacement).
+//
+// Codegen-only — no DAG pattern; `MovDAGToDAGISel::Select` matches
+// ISD::FrameIndex explicitly and builds this via getMachineNode.
+let isReMaterializable = 1, isAsCheapAsAMove = 1, isCodeGenOnly = 1 in
+def LEA32r : MovInst<(outs GPR32:$dst), (ins MovMemOperand:$src),
+                     "lea\t$dst, $src", []>;
+
+//===----------------------------------------------------------------------===//
+// Stage 6c — narrow (i8/i16) memory ops, DAG patterns.
+//
+// Rust crate ABIs walk through i8 / i16 slots: byval struct fields,
+// `u8` counters, `[u8; N]` GenericArray buffers (AES state, etc.).
+// Without these patterns, the legalizer hits truncstorei8 / zextloadi8
+// nodes with no selection rule and crashes ("Cannot select: ch =
+// store ...trunc to i8...").
+//
+// Strategy:
+//   - For stores, the i32 source is constrained to GPR32_ABCD (the
+//     four registers that *have* a sub_8bit subreg) via
+//     COPY_TO_REGCLASS, then EXTRACT_SUBREG pulls the low byte and
+//     MOV8mr writes it. The mov-heavy phase still has it as `mov
+//     byte ptr [m], <byte_reg>`, and MovOnlyLegalize leaves narrow
+//     memory ops alone (they're already mov-only).
+//   - For zero-extended loads (i8/i16 → i32), we materialize zero
+//     into the full 32-bit destination first, then overwrite the
+//     low byte / low word. `xor` is illegal here, so we use
+//     `MOV32ri 0` + sub_8bit overwrite. INSERT_SUBREG into the
+//     just-written zero gives a clean 32-bit zero-extended value.
+//===----------------------------------------------------------------------===//
+
+// truncstorei8 — store low 8 bits of a GPR32 to memory.
+//
+// The source must end up in one of the four registers that have a
+// sub_8bit (EAX/ECX/EDX/EBX). We express that by typing the input
+// as GPR32_ABCD; isel inserts the necessary register-class
+// constraint / COPY as part of the live-range setup. With the
+// broader GPR32 class TableGen rejects the pattern (EXTRACT_SUBREG
+// on a register without the requested subreg is a malformed Pat).
+def : Pat<(truncstorei8 GPR32_ABCD:$src, addr:$dst),
+          (MOV8mr addr:$dst, (EXTRACT_SUBREG GPR32_ABCD:$src, sub_8bit))>;
+
+// SDNodeXForm — narrow an i32 immediate to i8 in the output pattern.
+// `trunc` is input-side syntax only; for an *output* operand we need
+// an explicit XForm that takes the matched i32 ConstantSDNode and
+// rebuilds it as a fresh i8 TargetConstant. The MOV8mi printer then
+// emits the byte form.
+def imm8_xform : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(
+      N->getZExtValue() & 0xFF, SDLoc(N), MVT::i8);
+}]>;
+
+// truncstorei8 immediate — store an 8-bit-truncated constant via
+// MOV8mi (`mov byte ptr [m], imm8`). The xform converts the i32
+// SDNode's value to an i8 TargetConstant for the output.
+def : Pat<(truncstorei8 (i32 imm:$src), addr:$dst),
+          (MOV8mi addr:$dst, (imm8_xform imm:$src))>;
+
+// zextloadi8 — load a byte, zero-extend to i32.
+//
+// Sequence is `mov dst, 0; mov dst_low, [m]` (the byte write into
+// the just-zeroed register leaves the upper 24 bits at 0). LLVM's
+// INSERT_SUBREG models that exactly: the high bits of the zeroed
+// MOV32ri stay live, and the sub_8bit slot is overwritten by the
+// MOV8rm result. We name the destination class GPR32_ABCD so the
+// sub_8bit operand of INSERT_SUBREG has somewhere to land.
+def : Pat<(i32 (zextloadi8 addr:$src)),
+          (INSERT_SUBREG (i32 (COPY_TO_REGCLASS (MOV32ri 0), GPR32_ABCD)),
+                         (MOV8rm addr:$src),
+                         sub_8bit)>;
+
+// extloadi8 — caller doesn't care about the upper bits; treat as
+// zextload (cheaper than sextload and always semantically safe).
+def : Pat<(i32 (extloadi8 addr:$src)),
+          (INSERT_SUBREG (i32 (COPY_TO_REGCLASS (MOV32ri 0), GPR32_ABCD)),
+                         (MOV8rm addr:$src),
+                         sub_8bit)>;
+
+//===----------------------------------------------------------------------===//
+// Stage 6c — materialize global addresses.
+//
+// Rust crate code reaches `static` items (lookup tables, `&'static
+// str` data, vtables) via TargetGlobalAddress nodes that have no
+// built-in selection rule in our backend. We treat them like 32-bit
+// immediates: MOV32ri already accepts an MCExpr operand (it prints
+// `mov reg, offset <sym>`), so the rule is `(set GPR32, tglobaladdr)
+// → MOV32ri tglobaladdr`. Same for ExternalSymbol (used by intrinsic
+// lowering / inline asm references).
+//===----------------------------------------------------------------------===//
+
+def : Pat<(i32 (tglobaladdr:$src)),    (MOV32ri tglobaladdr:$src)>;
+def : Pat<(i32 (texternalsym:$src)),   (MOV32ri texternalsym:$src)>;
+def : Pat<(i32 (tblockaddress:$src)),  (MOV32ri tblockaddress:$src)>;
 
 //===----------------------------------------------------------------------===//
 // Integer arithmetic + bitwise — stage 3 (mov-heavy bootstrap).

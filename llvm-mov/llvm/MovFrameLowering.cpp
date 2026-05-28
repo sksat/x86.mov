@@ -166,6 +166,16 @@ void MovFrameLowering::processFunctionBeforeFrameFinalized(
         // tail mov-only across all shapes.
         NeedsByteOpScratch = true;
         break;
+      case Mov::LEA32r:
+        // Stage 6b — bare FrameIndex materialization. MovOnlyLegalize
+        // expands each LEA32r into `mov dst, ebp` + `add dst, disp`;
+        // that ADD32ri then needs the base 4 byte-op scratch slots
+        // for the per-byte sum/carry chain. Almost every LEA32r site
+        // already implies `getNumObjects() > 0` (the FrameIndex it
+        // points to is itself a stack object), but list it explicitly
+        // so the trigger doesn't depend on that incidental signal.
+        NeedsByteOpScratch = true;
+        break;
       default:
         break;
       }

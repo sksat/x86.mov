@@ -31,16 +31,26 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setStackPointerRegisterToSaveRestore(Mov::ESP);
   setBooleanContents(ZeroOrOneBooleanContent);
 
-  // Without these, DAGCombine cheerfully folds `(and (load i32), 255)` and
-  // `(lshr (load i32), 16)` into ZEXTLOAD/SEXTLOAD/EXTLOAD-from-i8/i16
-  // patterns that MOV32rm doesn't match — codex's stage-3 review caught
-  // both `and i32 %x, 255` and `lshr %x, 16` crashing with "Cannot select"
-  // on the resulting narrow ext-load. Marking the narrow ext-load forms
-  // Expand keeps DAGCombine from forming them in the first place, so the
-  // arithmetic stays as a plain `load + and/lshr` pair that our existing
-  // MOV32rm + ADD32ri/AND32ri/etc. patterns cover. Narrow loads
-  // re-enable as Legal at stage 3.5 alongside narrow-int support proper.
-  for (MVT MemVT : {MVT::i1, MVT::i8, MVT::i16}) {
+  // Narrow ext-load policy.
+  //
+  // Stage 3 ran with everything Expand: real Rust code didn't have i8
+  // load/store sites because i8 ABI values were promoted through i32
+  // slots (no narrow memory). DAGCombine then couldn't fold `(and (load
+  // i32), 255)` into ZEXTLOAD-i8, which would have hit "Cannot select".
+  //
+  // Stage 6c flips i8 ZEXTLOAD / EXTLOAD to Legal so Rust crate code
+  // that does honest byte-load (e.g. `arr[i]` where `arr: [u8; N]`)
+  // selects via the patterns added in MovInstrInfo.td (zextloadi8 →
+  // `mov DST32, 0; mov DST8, [m]`). SEXTLOAD-i8 stays Expand because
+  // we have no `movsx`; the legalizer rewrites signed byte loads to
+  // `zextloadi8` + sign_extend_inreg, which then expands again to
+  // shl-24 / sar-24 — all selectable via existing patterns. The i16
+  // forms stay Expand for now: real Rust code rarely emits them, and
+  // adding them is a separate stage.
+  setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MVT::i8, Legal);
+  setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MVT::i8, Legal);
+  setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MVT::i8, Expand);
+  for (MVT MemVT : {MVT::i1, MVT::i16}) {
     setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MemVT, Expand);
     setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MemVT, Expand);
     setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MemVT, Expand);
@@ -69,6 +79,14 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::BRCOND, MVT::Other, Custom);
   setOperationAction(ISD::BR_CC,  MVT::i32,   Custom);
   setOperationAction(ISD::SETCC,  MVT::i32,   Expand);
+
+  // No CMOVcc — Expand SELECT / SELECT_CC into the standard
+  // branch + PHI shape (BRCOND target_bb, fallthrough). The
+  // resulting BRCOND/BR_CC pair flows back through our existing
+  // Custom hook above, so a `select` IR node ends up as a CMP +
+  // Jcc + branch sequence (eventually mov-only-legalized by 7c2).
+  setOperationAction(ISD::SELECT,    MVT::i32, Expand);
+  setOperationAction(ISD::SELECT_CC, MVT::i32, Expand);
 }
 
 SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
@@ -145,12 +163,28 @@ SDValue MovTargetLowering::LowerFormalArguments(
                  *DAG.getContext());
   CCInfo.AnalyzeFormalArguments(Ins, CC_Mov);
 
-  for (CCValAssign &VA : ArgLocs) {
+  for (size_t i = 0; i < ArgLocs.size(); ++i) {
+    CCValAssign &VA = ArgLocs[i];
+    const ISD::ArgFlagsTy &Flags = Ins[i].Flags;
     if (!VA.isMemLoc()) {
       // Register-passed args land at stage 6 — until then CC_Mov assigns
       // everything to the stack, so a reg-loc here means the CC table and
       // this lowering have diverged.
       report_fatal_error("Mov: register-passed formal arg unexpected");
+    }
+
+    // Stage 6b — byval formal arg. The struct's bytes are at
+    // [esp + 4 + locmem-offset]; the IR-level callee receives a
+    // pointer to that location (a FrameIndex pointer, lowered to
+    // [ebp + …] post-PEI). Allocate the FixedObject at the struct's
+    // full size so PEI's stack-size computation accounts for it.
+    if (Flags.isByVal()) {
+      const unsigned Size = Flags.getByValSize();
+      const int FI = MFI.CreateFixedObject(Size, 4 + VA.getLocMemOffset(),
+                                           /*IsImmutable=*/false);
+      SDValue FIN = DAG.getFrameIndex(FI, getPointerTy(DAG.getDataLayout()));
+      InVals.push_back(FIN);
+      continue;
     }
 
     // cdecl: each i32 (incl. promoted i1/i8/i16) arg occupies one 4-byte
@@ -262,16 +296,35 @@ SDValue MovTargetLowering::LowerCall(CallLoweringInfo &CLI,
   if (CLI.IsVarArg)
     report_fatal_error("Mov: vararg calls not yet supported (stage 6+)");
   for (const ISD::OutputArg &O : Outs) {
-    if (O.Flags.isSRet() || O.Flags.isByVal())
-      report_fatal_error(
-          "Mov: sret/byval call args not yet supported (stage 6+)");
+    // Stage 6b — accept sret + byval. sret is just a pointer arg
+    // (caller-allocated return slot, pushed as the first cdecl arg);
+    // byval is handled below by emitting a `getMemcpy` from the
+    // source pointer to the outgoing stack slot instead of a plain
+    // store. Both flags are common in Rust IR (trait returns
+    // bigger than 4 bytes become sret; `&struct` borrowed args
+    // sometimes use byval).
+    if (O.Flags.isSRet()) {
+      // sret pointer — just a regular i32 pointer arg from here on.
+      // Don't apply the scalar-VT check; the pointer's VT is i32.
+      continue;
+    }
+    if (O.Flags.isByVal()) {
+      // byval — the per-arg loop below emits getMemcpy. The VT here
+      // is just the pointer; the byval-size lives in Flags.
+      continue;
+    }
     if (O.VT != MVT::i1 && O.VT != MVT::i8 && O.VT != MVT::i16 &&
         O.VT != MVT::i32)
       report_fatal_error(
           "Mov: only i1/i8/i16/i32 scalar call args supported (stage 6a)");
   }
-  if (Ins.size() > 1)
-    report_fatal_error("Mov: multi-value call returns not yet supported");
+  // Stage 6b — two-i32 returns (EDX:EAX) are accepted now. RetCC_Mov
+  // assigns the second i32 to EDX. Bigger aggregate returns route
+  // through sret (handled above as a regular pointer arg).
+  if (Ins.size() > 2)
+    report_fatal_error(
+        "Mov: returns wider than EDX:EAX must use sret (stage 6b only "
+        "handles up to 8-byte register returns)");
 
   // Tail-call elimination not implemented; CallLoweringInfo asks us to
   // unset the flag rather than silently keep emitting a tail call.
@@ -297,6 +350,32 @@ SDValue MovTargetLowering::LowerCall(CallLoweringInfo &CLI,
   for (size_t i = 0; i < ArgLocs.size(); ++i) {
     CCValAssign &VA = ArgLocs[i];
     SDValue Arg = OutVals[i];
+    const ISD::ArgFlagsTy &Flags = Outs[i].Flags;
+
+    if (!VA.isMemLoc())
+      report_fatal_error("Mov: register-passed call args unexpected (stage 6+)");
+
+    // Stage 6b — byval struct passing. Source is a pointer to the
+    // caller's struct; cdecl wants the struct's bytes copied to the
+    // outgoing arg slot. Emit a getMemcpy and skip the scalar
+    // extend/store path below.
+    if (Flags.isByVal()) {
+      const unsigned Size = Flags.getByValSize();
+      const Align Alignment = Flags.getNonZeroByValAlign();
+      SDValue SizeNode = DAG.getIntPtrConstant(Size, DL);
+      SDValue Offset = DAG.getIntPtrConstant(VA.getLocMemOffset(), DL);
+      SDValue Dst = DAG.getNode(ISD::ADD, DL,
+                                getPointerTy(DAG.getDataLayout()),
+                                StackPtr, Offset);
+      SDValue MemcpyChain = DAG.getMemcpy(
+          Chain, DL, Dst, Arg, SizeNode, Alignment,
+          /*isVolatile=*/false, /*AlwaysInline=*/false,
+          /*CI=*/nullptr, std::nullopt,
+          MachinePointerInfo::getStack(MF, VA.getLocMemOffset()),
+          MachinePointerInfo());
+      MemOpChains.push_back(MemcpyChain);
+      continue;
+    }
 
     // CC_Mov stamps the LocInfo for promoted narrow args; widen back to
     // i32 before storing so the slot is 4 bytes wide.
@@ -315,9 +394,6 @@ SDValue MovTargetLowering::LowerCall(CallLoweringInfo &CLI,
     default:
       report_fatal_error("Mov: unexpected LocInfo in LowerCall");
     }
-
-    if (!VA.isMemLoc())
-      report_fatal_error("Mov: register-passed call args unexpected (stage 6+)");
 
     // store i32 Arg, ptr [esp + VA.getLocMemOffset()]
     SDValue Offset = DAG.getIntPtrConstant(VA.getLocMemOffset(), DL);

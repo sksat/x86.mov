@@ -7,9 +7,10 @@
 #   run.sh --example=fib      # build fib, show asm
 #   run.sh --example=fib --run    # build fib, run; expect exit 32
 #                                  # (fib(24)=46368, mod 256)
+#   run.sh --example=aes --run    # build aes (RustCrypto crate), run
 #
-# The two examples are independent Cargo crates under `main/` and
-# `fib/` so each linked ELF only contains the entry point that fixture
+# Each example is an independent Cargo crate under its own directory
+# so each linked ELF only contains the entry point that fixture
 # exercises (separate compilation unit → cleaner bench numbers when
 # comparing per-example shapes).
 #
@@ -47,7 +48,16 @@ done
 case "$EXAMPLE" in
     main) ENTRY="rust_main"; EXPECTED=42; CRATE="rust_mov_main" ;;
     fib)  ENTRY="fib_main";  EXPECTED=32; CRATE="rust_mov_fib" ;;
-    *) echo "error: unknown --example=$EXAMPLE (try main, fib)" 1>&2; exit 2 ;;
+    # AES-128 ECB encrypt of NIST's AES-128 test vector, iterated
+    # N_ROUNDS times (see aes/src/lib.rs). The example does NOT
+    # currently round-trip through llvm-mov-llc: rustc emits
+    # `<16 x i8>` SIMD ops and `llvm.memset.p0.i32` that the
+    # backend can't lower yet — see aes/src/lib.rs for details.
+    # EXPECTED is the XOR sum of the final ciphertext bytes mod
+    # 256 once the encrypt path can be compiled (placeholder value
+    # until a real run produces it).
+    aes)  ENTRY="aes_main";  EXPECTED=0;   CRATE="rust_mov_aes" ;;
+    *) echo "error: unknown --example=$EXAMPLE (try main, fib, aes)" 1>&2; exit 2 ;;
 esac
 
 CRATE_DIR="$HERE/$EXAMPLE"
@@ -78,7 +88,19 @@ trap 'rm -rf "$WORK"' EXIT
 
 TARGET_TRIPLE="i686-unknown-linux-gnu"
 
-cargo rustc \
+# aes_force_soft: the `aes` crate at version 0.8+ defaults to compiling
+# both the software path and the AES-NI intrinsics path on x86/x86_64,
+# choosing at runtime via cpufeatures. The NI path uses i128 / x86 SSE
+# vector intrinsics that this backend can't lower (the i32 DAG type
+# legalizer hits "Do not know how to split the result of this
+# operator" on i128 vector splits). The `aes_force_soft` cfg disables
+# the NI compile entirely.
+EXTRA_RUSTFLAGS=""
+if [ "$EXAMPLE" = "aes" ]; then
+    EXTRA_RUSTFLAGS="--cfg aes_force_soft"
+fi
+
+RUSTFLAGS="$EXTRA_RUSTFLAGS" cargo rustc \
     --manifest-path="$CRATE_DIR/Cargo.toml" \
     --release \
     --target="$TARGET_TRIPLE" \

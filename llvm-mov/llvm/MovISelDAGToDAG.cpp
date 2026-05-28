@@ -79,6 +79,67 @@ public:
 char MovDAGToDAGISelLegacy::ID = 0;
 
 void MovDAGToDAGISel::Select(SDNode *Node) {
+  // Bare FrameIndex used as an i32 value (i.e. *not* as the base of a
+  // memory operand — that case is handled by SelectAddr inside the
+  // load/store ComplexPattern). Examples: a callee that takes a
+  // pointer arg flowing through registers, an `&local` materialized
+  // into a vreg before the GEP. The TableGen-generated SelectCode has
+  // no built-in pattern for this, so we lower it manually to
+  //     LEA32r dst, FrameIndex, 0
+  // PEI's eliminateFrameIndex resolves the FrameIndex operand to
+  // (EBP, disp) using the same logic as for load/store ops, and stage
+  // 7 mov-only legalization rewrites LEA32r into `mov dst, ebp` +
+  // byte-chain ADD32ri disp.
+  if (Node->getOpcode() == ISD::FrameIndex) {
+    SDLoc DL(Node);
+    const EVT PtrTy = TLI->getPointerTy(CurDAG->getDataLayout());
+    const int FI = cast<FrameIndexSDNode>(Node)->getIndex();
+    SDValue TFI  = CurDAG->getTargetFrameIndex(FI, PtrTy);
+    SDValue Zero = CurDAG->getTargetConstant(0, DL, MVT::i32);
+    SDNode *Lea  = CurDAG->getMachineNode(Mov::LEA32r, DL, MVT::i32,
+                                          {TFI, Zero});
+    ReplaceNode(Node, Lea);
+    return;
+  }
+
+  // Global / external / blockaddress symbol → MOV32ri.
+  //
+  // ISD::GlobalAddress arrives un-lowered from DAG building because we
+  // haven't marked it Custom in LowerOperation. The TableGen-generated
+  // SelectCode only matches the *target* form (tglobaladdr), so we
+  // convert here and emit MOV32ri ourselves. MOV32ri's asmstr uses
+  // `offset $src`, which produces `mov reg, offset <sym>` — the
+  // unambiguous GAS Intel-syntax form for materializing a symbol's
+  // address. Same handling for ExternalSymbol and BlockAddress.
+  if (Node->getOpcode() == ISD::GlobalAddress) {
+    SDLoc DL(Node);
+    auto *GA = cast<GlobalAddressSDNode>(Node);
+    SDValue Sym = CurDAG->getTargetGlobalAddress(
+        GA->getGlobal(), DL, MVT::i32, GA->getOffset(), GA->getTargetFlags());
+    SDNode *MI = CurDAG->getMachineNode(Mov::MOV32ri, DL, MVT::i32, Sym);
+    ReplaceNode(Node, MI);
+    return;
+  }
+  if (Node->getOpcode() == ISD::ExternalSymbol) {
+    SDLoc DL(Node);
+    auto *ES = cast<ExternalSymbolSDNode>(Node);
+    SDValue Sym = CurDAG->getTargetExternalSymbol(
+        ES->getSymbol(), MVT::i32, ES->getTargetFlags());
+    SDNode *MI = CurDAG->getMachineNode(Mov::MOV32ri, DL, MVT::i32, Sym);
+    ReplaceNode(Node, MI);
+    return;
+  }
+  if (Node->getOpcode() == ISD::BlockAddress) {
+    SDLoc DL(Node);
+    auto *BA = cast<BlockAddressSDNode>(Node);
+    SDValue Sym = CurDAG->getTargetBlockAddress(
+        BA->getBlockAddress(), MVT::i32, BA->getOffset(),
+        BA->getTargetFlags());
+    SDNode *MI = CurDAG->getMachineNode(Mov::MOV32ri, DL, MVT::i32, Sym);
+    ReplaceNode(Node, MI);
+    return;
+  }
+
   // MovISD::CALL: emit
   //     CALL32d <callee_symbol>     ; Uses=[ESP], Defs=[EAX/ECX/EDX/EFLAGS]
   //
@@ -201,10 +262,17 @@ bool MovDAGToDAGISel::SelectAddr(SDValue Addr, SDValue &Base, SDValue &Disp) {
     return true;
   }
 
-  // Case 2/3: ADD(base, imm). DAGCombine canonicalises constants to the
-  // RHS, so we only check that side. Base may itself be a FrameIndex
-  // (alloca + GEP-style offset) — handled inline.
-  if (Addr.getOpcode() == ISD::ADD) {
+  // Case 2/3: ADD(base, imm) or OR(base, imm). DAGCombine canonicalises
+  // constants to the RHS, so we only check that side. Base may itself
+  // be a FrameIndex (alloca + GEP-style offset) — handled inline.
+  //
+  // The OR shape arises when the optimiser knows the low N bits of
+  // `base` are zero — e.g. an aligned FrameIndex with a small const
+  // offset added — and `add(base, K) == or(base, K)` for K that fits
+  // in the zero-bits. Treating OR-by-constant identically to ADD
+  // here is exactly what eliminateFrameIndex needs (it only cares
+  // about the (FI, disp) pair the operand carries).
+  if (Addr.getOpcode() == ISD::ADD || Addr.getOpcode() == ISD::OR) {
     SDValue LHS = Addr.getOperand(0);
     SDValue RHS = Addr.getOperand(1);
     if (auto *C = dyn_cast<ConstantSDNode>(RHS)) {

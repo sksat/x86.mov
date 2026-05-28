@@ -125,6 +125,17 @@ public:
     // jmp back to via the 7d1 `__mov_return_addr_slot` machinery.
     Changed |= legalizeCallSites(MF, TII);
 
+    // Stage 6b — expand bare FrameIndex materializations. Each
+    // LEA32r emitted by ISel for ISD::FrameIndex (e.g. `&local`
+    // passed by-pointer to a callee) is rewritten into
+    //     mov dst, ebp
+    //     add dst, disp                   ; goes through ADD32ri
+    // where `disp` is the EBP-relative offset that eliminateFrameIndex
+    // resolved. Runs BEFORE the per-MI loop so the inserted ADD32ri
+    // is picked up by the byte-chain rewrite below (and the disp==0
+    // shape is handled there by the existing opt-3 fold).
+    Changed |= legalizeLEA32rs(MF, TII);
+
     for (MachineBasicBlock &MBB : MF) {
       for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
         switch (MI.getOpcode()) {
@@ -407,9 +418,9 @@ private:
 
         // === PROLOGUE: save ECX/EDX, spill lhs (and rhs for rr-form) ===
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-            .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+            .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
             .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(LhsReg);
         if (!IsImmRhs) {
@@ -1027,9 +1038,9 @@ private:
 
         // Step 2: byte-chain ADD ESP, 8.
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-            .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+            .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
             .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Mov::ESP);
 
@@ -1054,9 +1065,16 @@ private:
         // Step 3: restore caller's EBP and jmp via slot.
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EBP)
             .addReg(Mov::ESP).addImm(-8);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::JMP32m))
-            .addReg(Mov::ECX).addImm(0)
-            .addReg(Mov::EAX, RegState::Implicit);
+        // Preserve the original RET's implicit operands (e.g. `$eax`
+        // for i32-returning functions, `$edx`+`$eax` for multi-value
+        // returns) on the dispatcher jump so MachineVerifier sees the
+        // return value as live through to function exit. Void / sret
+        // returns have no implicit operands on the RET, so this
+        // correctly omits the (otherwise undefined) EAX use.
+        auto JmpMI = BuildMI(MBB, Insert, DL, TII.get(Mov::JMP32m))
+            .addReg(Mov::ECX).addImm(0);
+        for (const MachineOperand &MO : RetMI.implicit_operands())
+          JmpMI.add(MO);
 
         // Erase pop ebp + ret. Resume scan past the original ret.
         auto NextOuter = std::next(MachineBasicBlock::iterator(&RetMI));
@@ -1517,6 +1535,59 @@ private:
     return Changed;
   }
 
+  // Stage 6b — expand bare FrameIndex materializations (LEA32r).
+  //
+  // After PEI, LEA32r looks like
+  //     LEA32r <dst>, <base=EBP>, <disp=Imm>
+  // (eliminateFrameIndex rewrote the FrameIndex operand into (EBP,
+  // disp) the same way it does for load/store memory operands). We
+  // expand each occurrence into
+  //     MOV32rr <dst>, EBP
+  //     ADD32ri <dst>, <dst>, disp
+  // and erase the original LEA. The per-MI byte-chain loop below
+  // then sees the ADD32ri and turns it into mov-only.
+  //
+  // Edge case: disp == 0 is rare (the FrameIndex would have to land
+  // exactly on EBP) — we still emit the ADD32ri, and the per-MI
+  // loop's opt-3 fold (`add reg, 0` → erase) drops it.
+  //
+  // Defensive bail: if a LEA32r somehow survived without being
+  // resolved by eliminateFrameIndex (the base operand isn't a
+  // physical register), leave it alone and rely on the verifier to
+  // surface the bug — no mov-only rewrite is possible.
+  bool legalizeLEA32rs(MachineFunction &MF,
+                       const TargetInstrInfo &TII) const {
+    bool Changed = false;
+    for (MachineBasicBlock &MBB : MF) {
+      for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+        if (MI.getOpcode() != Mov::LEA32r)
+          continue;
+        assert(MI.getNumOperands() >= 3 && "LEA32r must have dst,base,disp");
+        const MachineOperand &DstOp  = MI.getOperand(0);
+        const MachineOperand &BaseOp = MI.getOperand(1);
+        const MachineOperand &DispOp = MI.getOperand(2);
+        if (!DstOp.isReg() || !BaseOp.isReg() || !DispOp.isImm())
+          continue;
+        const Register Dst  = DstOp.getReg();
+        const Register Base = BaseOp.getReg();
+        const int64_t Disp  = DispOp.getImm();
+        const DebugLoc DL   = MI.getDebugLoc();
+        auto Insert = MachineBasicBlock::iterator(&MI);
+
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rr), Dst)
+            .addReg(Base);
+        // ADD32ri is 2-address (`$src1 = $dst`); post-RA we just
+        // restate the dst register on both slots.
+        BuildMI(MBB, Insert, DL, TII.get(Mov::ADD32ri), Dst)
+            .addReg(Dst)
+            .addImm(Disp);
+        MI.eraseFromParent();
+        Changed = true;
+      }
+    }
+    return Changed;
+  }
+
   // Returns true when at least one BB was rewritten.
   bool legalizeCFG(MachineFunction &MF, const TargetInstrInfo &TII) const {
     if (MF.size() < 2)
@@ -1973,11 +2044,11 @@ private:
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP)
         .addImm(Addr->SaveEcxDisp)
-        .addReg(Mov::ECX);
+        .addReg(Mov::ECX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP)
         .addImm(Addr->SaveEdxDisp)
-        .addReg(Mov::EDX);
+        .addReg(Mov::EDX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP)
         .addImm(Addr->SrcDstDisp)
@@ -2076,11 +2147,11 @@ private:
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP)
         .addImm(Addr->SaveEcxDisp)
-        .addReg(Mov::ECX);
+        .addReg(Mov::ECX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP)
         .addImm(Addr->SaveEdxDisp)
-        .addReg(Mov::EDX);
+        .addReg(Mov::EDX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP)
         .addImm(Addr->SrcDstDisp)
@@ -2143,11 +2214,11 @@ private:
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP)
         .addImm(Addr->SaveEcxDisp)
-        .addReg(Mov::ECX);
+        .addReg(Mov::ECX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP)
         .addImm(Addr->SaveEdxDisp)
-        .addReg(Mov::EDX);
+        .addReg(Mov::EDX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP)
         .addImm(Addr->SrcDstDisp)
@@ -2207,9 +2278,9 @@ private:
 
     // PROLOGUE — same as ADD32ri: save ECX, EDX, spill DST32.
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Dst);
 
@@ -2254,9 +2325,9 @@ private:
     // rationale as ADD32rr (Dst == Rhs is fine — both spills capture
     // the current value before any byte register is borrowed).
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Dst);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
@@ -2503,9 +2574,9 @@ private:
 
     // PROLOGUE — save ECX/EDX, spill DST32 to srcdst.
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Dst);
 
@@ -2658,9 +2729,9 @@ private:
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
         .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp).addReg(Mov::CL);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX);
+        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Dst);
 
