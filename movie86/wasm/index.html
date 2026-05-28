@@ -25,31 +25,47 @@
   .status { font-size: 0.85rem; color: #666; margin-left: auto; }
   .status.err { color: #b00; }
 
+  /* Status cards — each metric gets its own small panel with a big
+     value and a short uppercase label underneath. The "total mov" card
+     leans into the project's "is Turing-complete" joke: every
+     executed instruction counts as a mov in spirit. */
   .meta {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
-      gap: 0.25rem 1rem;
-      font-size: 0.85rem;
-      background: #f0f4f8;
-      border: 1px solid #cfd8dc;
-      padding: 0.4rem 0.5rem;
-      margin: 0.5rem 0;
+      gap: 0.5rem;
+      margin: 0.5rem 0 1rem;
   }
-  .meta span.k { color: #555; }
-  .meta span.v { color: #111; }
-  .meta span.v.fault { color: #b00; }
-  .meta span.v.exit  { color: #060; }
+  .meta .card {
+      background: linear-gradient(180deg, #f6f9fc 0%, #eaf0f6 100%);
+      border: 1px solid #cfd8dc;
+      padding: 0.45rem 0.7rem;
+      border-radius: 4px;
+      min-width: 0;  /* prevent overflow inside the grid track */
+  }
+  .meta .card .v {
+      font-size: 1.05rem; font-weight: bold; color: #111;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.2;
+      word-break: break-all;
+  }
+  .meta .card .k {
+      font-size: 0.7rem; color: #557; margin-top: 0.1rem;
+      text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .meta .card.fault .v { color: #b00; }
+  .meta .card.exit  .v { color: #060; }
 
+  /* Top row is the live state — Registers + Disassembly + Memory side
+     by side; the console (stdout/stderr) sits full-width underneath so
+     it has room to grow and autoscroll vertically as output lands. */
   .grid {
       display: grid;
-      grid-template-columns: minmax(13rem, 0.8fr) minmax(26rem, 1.8fr) minmax(26rem, 1.8fr) minmax(16rem, 1.3fr);
+      grid-template-columns: minmax(13rem, 0.9fr) minmax(26rem, 1.8fr) minmax(26rem, 1.8fr);
       gap: 1rem;
   }
-  @media (max-width: 1500px) {
-      .grid { grid-template-columns: minmax(13rem, 1fr) minmax(26rem, 2fr); }
-      .grid .io { grid-column: 1 / -1; }
-  }
-  @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .grid .io { grid-column: 1 / -1; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: minmax(13rem, 1fr) minmax(26rem, 2fr); } }
+  @media (max-width: 800px)  { .grid { grid-template-columns: minmax(0, 1fr); } }
 
   h2 { font-size: 0.95rem; margin: 0 0 0.4rem; color: #333; }
 
@@ -90,12 +106,16 @@
   .dr.cur .db { color: #333; }
   .dr.cur .dt { font-weight: bold; }
 
-  /* Output */
+  /* Console — sits full-width at the bottom so vertical content has
+     room to autoscroll. Side-by-side stdout/stderr on wide screens
+     uses the horizontal real estate the bottom row gets. */
+  .io { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 1100px) { .io { grid-template-columns: minmax(0, 1fr); } }
   pre.out {
     box-sizing: border-box; width: 100%;
     font: inherit; border: 1px solid #ccc; padding: 0.5rem;
     background: #fafafa;
-    min-height: 6rem; max-height: 20rem;
+    min-height: 8rem; max-height: 28rem;
     overflow: auto; white-space: pre;
     margin: 0; font-size: 0.85rem;
   }
@@ -149,11 +169,12 @@
 </div>
 
 <div class="meta">
-  <div><span class="k">steps:</span> <span class="v" id="m-steps">0</span></div>
-  <div><span class="k">halt:</span> <span class="v" id="m-halt">—</span></div>
-  <div><span class="k">exit:</span> <span class="v" id="m-exit">—</span></div>
-  <div><span class="k">wall time:</span> <span class="v" id="m-wall">—</span></div>
-  <div><span class="k">memory:</span> <span class="v" id="m-memrange">—</span></div>
+  <div class="card"><div class="v" id="m-steps">0</div><div class="k">total mov</div></div>
+  <div class="card"><div class="v" id="m-rate">—</div><div class="k">mov / sec</div></div>
+  <div class="card" id="card-halt"><div class="v" id="m-halt">—</div><div class="k">halt</div></div>
+  <div class="card"><div class="v" id="m-exit">—</div><div class="k">exit</div></div>
+  <div class="card"><div class="v" id="m-wall">—</div><div class="k">wall time</div></div>
+  <div class="card"><div class="v" id="m-memrange">—</div><div class="k">memory</div></div>
 </div>
 
 <div class="grid">
@@ -182,10 +203,14 @@
     <div id="mem"></div>
   </div>
   <div class="io">
-    <h2>stdout</h2>
-    <pre id="stdout" class="out"></pre>
-    <h2 style="margin-top: 0.5rem;">stderr</h2>
-    <pre id="stderr" class="out err"></pre>
+    <div>
+      <h2>stdout</h2>
+      <pre id="stdout" class="out"></pre>
+    </div>
+    <div>
+      <h2>stderr</h2>
+      <pre id="stderr" class="out err"></pre>
+    </div>
   </div>
 </div>
 
@@ -224,6 +249,11 @@ const state = {
     // through a stable listing" effect works.
     disasmStart: null,
     disasmEnd: 0,
+    // mov/sec sampling — refreshed every ~250 ms so the displayed
+    // value is smooth instead of jittering with every render.
+    rateSampleSteps: 0n,
+    rateSampleTime: 0,
+    lastRate: null,
 };
 
 const dec = new TextDecoder('utf-8', { fatal: false });
@@ -232,6 +262,20 @@ function fmt32(v) { return '0x' + v.toString(16).padStart(8, '0'); }
 
 function hexBytes(arr) {
     return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join(' ');
+}
+
+// 1234567 → "1,234,567" — works on Number and BigInt.
+function fmtCount(n) {
+    return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+// 1234567 → "1.23 M" — short metric form for rates.
+function fmtRate(r) {
+    if (!isFinite(r)) return '—';
+    if (r >= 1e9) return (r / 1e9).toFixed(2) + ' G';
+    if (r >= 1e6) return (r / 1e6).toFixed(2) + ' M';
+    if (r >= 1e3) return (r / 1e3).toFixed(2) + ' k';
+    return r.toFixed(0);
 }
 
 function escapeHtml(s) {
@@ -260,6 +304,9 @@ async function loadFromBytes(bytes, label) {
     state.stderrBuf = '';
     state.disasmStart = null;
     state.disasmEnd = 0;
+    state.rateSampleSteps = 0n;
+    state.rateSampleTime = 0;
+    state.lastRate = null;
     $('stdout').textContent = '';
     $('stderr').textContent = '';
     $('m-wall').textContent = '—';
@@ -416,13 +463,43 @@ function renderMem() {
 function renderMeta() {
     const vm = state.vm; if (!vm) return;
     const halt = vm.haltReason;
-    $('m-steps').textContent = vm.steps.toString();
-    const haltEl = $('m-halt');
-    haltEl.textContent = halt ?? '—';
+
+    $('m-steps').textContent = fmtCount(vm.steps);
+
+    // mov/sec — sample steps + wall clock over a ~250 ms window so the
+    // displayed rate is smooth. Halted guests show the last rate so the
+    // user can read "how fast was it going before it stopped".
+    if (!halt) {
+        const now = performance.now();
+        const dt = now - state.rateSampleTime;
+        if (dt >= 250 && state.rateSampleTime !== 0) {
+            const dSteps = Number(vm.steps - state.rateSampleSteps);
+            state.lastRate = dSteps / (dt / 1000);
+            state.rateSampleSteps = vm.steps;
+            state.rateSampleTime = now;
+        } else if (state.rateSampleTime === 0) {
+            state.rateSampleSteps = vm.steps;
+            state.rateSampleTime = now;
+        }
+    }
+    $('m-rate').textContent = state.lastRate == null ? '—' : fmtRate(state.lastRate);
+
+    const haltCard = $('card-halt');
+    $('m-halt').textContent = halt ?? '—';
     const isExit = halt && halt.startsWith('Exit(');
-    haltEl.classList.toggle('exit', !!isExit);
-    haltEl.classList.toggle('fault', !!halt && !isExit);
+    haltCard.classList.toggle('exit', !!isExit);
+    haltCard.classList.toggle('fault', !!halt && !isExit);
     $('m-exit').textContent = vm.exitCode ?? '—';
+}
+
+// Snap-to-bottom only when the user was already there — if they
+// scrolled up to inspect earlier output, leave the view alone instead
+// of yanking them back every time another chunk lands.
+function appendAndAutoscroll(el, text) {
+    const stickToBottom =
+        el.scrollHeight - el.scrollTop - el.clientHeight < 5;
+    el.textContent = text;
+    if (stickToBottom) el.scrollTop = el.scrollHeight;
 }
 
 function pumpOutput() {
@@ -430,14 +507,12 @@ function pumpOutput() {
     const so = vm.drainStdout();
     if (so.length) {
         state.stdoutBuf += dec.decode(so);
-        $('stdout').textContent = state.stdoutBuf;
-        $('stdout').scrollTop = $('stdout').scrollHeight;
+        appendAndAutoscroll($('stdout'), state.stdoutBuf);
     }
     const se = vm.drainStderr();
     if (se.length) {
         state.stderrBuf += dec.decode(se);
-        $('stderr').textContent = state.stderrBuf;
-        $('stderr').scrollTop = $('stderr').scrollHeight;
+        appendAndAutoscroll($('stderr'), state.stderrBuf);
     }
 }
 
@@ -524,11 +599,58 @@ async function doReset() {
     await loadFromBytes(state.elfBytes, 'reset');
 }
 
+// --- URL query param sync ---
+//
+// Parameter selections (preset, follow toggles, delay / batch / refresh,
+// manually-pinned disasm/mem addrs) are mirrored in the URL so the demo
+// state is shareable / bookmarkable. Action buttons (reset / step /
+// run) deliberately stay out of the URL — they're imperative, not
+// configuration.
+const URL_PARAMS = ['preset', 'follow', 'delay', 'batch', 'refresh',
+                    'disasm-follow', 'disasm-addr',
+                    'mem-follow', 'mem-addr'];
+
+function syncUrlFromControls() {
+    const p = new URLSearchParams();
+    const presetVal = $('preset').value;
+    if (presetVal && presetVal !== 'upload') p.set('preset', presetVal);
+    p.set('follow', $('follow').checked ? '1' : '0');
+    p.set('delay', $('delay').value);
+    p.set('batch', $('batch').value);
+    p.set('refresh', $('refresh').value);
+    p.set('disasm-follow', $('disasm-follow').checked ? '1' : '0');
+    // Only round-trip the manually-pinned address when follow is off —
+    // when on, the renderer overwrites the field every frame so saving
+    // it would just round-trip whatever EIP happened to be at the time
+    // the URL was captured.
+    if (!$('disasm-follow').checked) p.set('disasm-addr', $('disasm-addr').value);
+    p.set('mem-follow', $('mem-follow').checked ? '1' : '0');
+    if (!$('mem-follow').checked) p.set('mem-addr', $('mem-addr').value);
+    const url = new URL(window.location.href);
+    url.search = p.toString();
+    history.replaceState(null, '', url.toString());
+}
+
+function applyUrlToControls() {
+    const p = new URLSearchParams(window.location.search);
+    const apply = (key, fn) => { if (p.has(key)) fn(p.get(key)); };
+    apply('preset', (v) => { if (EXAMPLES[v]) $('preset').value = v; });
+    apply('follow',        (v) => { $('follow').checked = v === '1'; });
+    apply('delay',         (v) => { $('delay').value = v; });
+    apply('batch',         (v) => { $('batch').value = v; });
+    apply('refresh',       (v) => { $('refresh').value = v; });
+    apply('disasm-follow', (v) => { $('disasm-follow').checked = v === '1'; });
+    apply('disasm-addr',   (v) => { $('disasm-addr').value = v; });
+    apply('mem-follow',    (v) => { $('mem-follow').checked = v === '1'; });
+    apply('mem-addr',      (v) => { $('mem-addr').value = v; });
+}
+
 // --- UI wiring ---
 
 $('preset').addEventListener('change', async (e) => {
     const k = e.target.value;
     if (k === 'upload') { $('file').click(); return; }
+    syncUrlFromControls();
     try {
         setStatus('loading…');
         const bytes = await fetchExample(k);
@@ -537,6 +659,19 @@ $('preset').addEventListener('change', async (e) => {
         setStatus(`load failed: ${err.message || err}`, true);
     }
 });
+
+// Mirror every parameter input to the URL on change. Action buttons
+// (run/step/reset/upload) deliberately stay out of this set.
+for (const id of ['follow', 'delay', 'batch', 'refresh',
+                  'disasm-follow', 'mem-follow']) {
+    $(id).addEventListener('change', syncUrlFromControls);
+}
+// Sync the URL on every keystroke too — `change` only fires on blur /
+// Enter, so without an input handler the address typed into the bar
+// wouldn't land in the URL until the field loses focus. The sync fn
+// itself drops the addr param when its follow toggle is still on.
+$('disasm-addr').addEventListener('input', syncUrlFromControls);
+$('mem-addr').addEventListener('input', syncUrlFromControls);
 
 $('file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
@@ -561,6 +696,7 @@ $('mem-addr').addEventListener('change', () => {
     // follow-EIP automatically so the next render doesn't snap back.
     $('mem-follow').checked = false;
     renderMem();
+    syncUrlFromControls();
 });
 $('mem-follow').addEventListener('change', renderMem);
 
@@ -568,6 +704,7 @@ $('disasm-addr').addEventListener('change', () => {
     $('disasm-follow').checked = false;
     state.disasmStart = parseAddr($('disasm-addr').value) ?? state.vm?.memBase ?? 0;
     renderDisasm();
+    syncUrlFromControls();
 });
 $('disasm-follow').addEventListener('change', () => {
     // Re-snapping to EIP next render is desirable, so wipe the cached
@@ -579,11 +716,16 @@ $('disasm-follow').addEventListener('change', () => {
     renderDisasm();
 });
 
-// Boot: load the default preset so the panes have something to show.
+// Boot: apply URL params to the controls (so the deep-linked state
+// takes effect before the first example load), then fetch the chosen
+// preset and seed the panes.
 (async () => {
+    applyUrlToControls();
+    const initialPreset = EXAMPLES[$('preset').value] ? $('preset').value : 'return42';
+    syncUrlFromControls();
     try {
-        const bytes = await fetchExample('return42');
-        await loadFromBytes(bytes, 'return42');
+        const bytes = await fetchExample(initialPreset);
+        await loadFromBytes(bytes, initialPreset);
     } catch (err) {
         setStatus(`init: ${err.message || err}`, true);
     }
