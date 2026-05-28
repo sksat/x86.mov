@@ -1,0 +1,4 @@
+# Stage 7f2 — same allowance as udiv.ll. The `call __modsi3` chain
+# (which in turn calls __udivsi3 and a 32-bit MUL) is rewritten into
+# dispatcher `jmp`s by 7c1 + 7d3.
+jmp

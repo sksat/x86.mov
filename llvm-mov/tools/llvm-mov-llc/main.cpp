@@ -57,6 +57,205 @@ static cl::opt<std::string> MTriple("mtriple",
                                     cl::desc("Override target triple"),
                                     cl::init("mov-unknown-linux-gnu"));
 
+// Stage 7f2 — inject restoring-division IR definitions of the standard
+// compiler-rt libcall helpers (__udivsi3 / __umodsi3 / __divsi3 /
+// __modsi3) so that SDAG's Expand → libcall path for ISD::{UDIV,SDIV,
+// UREM,SREM} resolves at link time without a user-crate stub. Each
+// helper goes through the same codegen pipeline as user code: the
+// Function-level rewrites below (i32 SELECT → bit-blend, sext-i1
+// removal) are critical for compile time — a 32-iter loop with raw
+// i32 SELECTs pushes DAG-ISel into the multi-minute pathology that
+// motivated the SELECT-rewrite pass in the first place.
+//
+// Linkage is `linkonce_odr` so multiple translation units each
+// emitting the helpers don't conflict at link time; the linker
+// keeps one definition and discards the rest.
+//
+// Only invoked when the module contains at least one of the four
+// div/rem IR opcodes whose **scalar element** type is i32. Checking
+// the scalar element (`getScalarType`) — rather than the whole type —
+// catches `udiv <N x i32>` shapes too: the driver's Scalarizer pass
+// (stage 6d1, runs after this injection) will rewrite each lane into
+// a scalar `udiv i32` whose SDAG Expand path ends up calling
+// `__udivsi3`. Missing those at this scan would leave undefined
+// helper symbols in the resulting object (codex-review P2).
+static bool moduleNeedsDivRemHelpers(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      switch (I.getOpcode()) {
+      case Instruction::UDiv:
+      case Instruction::SDiv:
+      case Instruction::URem:
+      case Instruction::SRem:
+        if (I.getType()->getScalarType()->isIntegerTy(32))
+          return true;
+        break;
+      default:
+        break;
+      }
+    }
+  }
+  return false;
+}
+
+static Function *makeOrPromoteHelper(Module &M, StringRef Name,
+                                     FunctionType *Ty) {
+  if (Function *Existing = M.getFunction(Name)) {
+    // If user code (or a previous run) already defines the symbol,
+    // leave it alone — the existing body wins.
+    if (!Existing->isDeclaration())
+      return nullptr;
+    // Pure declaration left by SDAG-Expand prep. Upgrade to a
+    // definition we own.
+    Existing->setLinkage(GlobalValue::LinkOnceODRLinkage);
+    return Existing;
+  }
+  Function *F = Function::Create(Ty, GlobalValue::LinkOnceODRLinkage, Name, &M);
+  F->setCallingConv(CallingConv::C);
+  return F;
+}
+
+static void injectDivRemHelpers(Module &M, LLVMContext &Ctx) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  FunctionType *BinFnTy = FunctionType::get(I32, {I32, I32}, /*isVarArg=*/false);
+
+  Function *UDiv = makeOrPromoteHelper(M, "__udivsi3", BinFnTy);
+  Function *UMod = makeOrPromoteHelper(M, "__umodsi3", BinFnTy);
+  Function *SDiv = makeOrPromoteHelper(M, "__divsi3",  BinFnTy);
+  Function *SMod = makeOrPromoteHelper(M, "__modsi3",  BinFnTy);
+
+  // Resolve `__udivsi3` once for the body builders that delegate to it.
+  // The Module-level `getFunction` call lets the umod / sdiv / smod
+  // bodies refer to the canonical declaration even when the user
+  // already provided their own __udivsi3 (in which case `UDiv` above
+  // is null and we don't rebuild the body, but the user's definition
+  // is still what the call resolves to at link time).
+  FunctionCallee UDivCallee = M.getOrInsertFunction("__udivsi3", BinFnTy);
+
+  // __udivsi3 — 32-iter restoring long division.
+  //   if d == 0: return 0     (matches the user stub semantics; SDAG
+  //                            never lowers a div-by-zero in well-
+  //                            formed IR, so this is a belt-and-braces
+  //                            guard, not a code-path the tests hit.)
+  //   r = q = 0
+  //   for i in 31..=0:
+  //     r = (r << 1) | ((n >> i) & 1)
+  //     if r >= d: r -= d; q |= (1 << i)
+  //   return q
+  if (UDiv) {
+    Argument *NArg = UDiv->getArg(0); NArg->setName("n");
+    Argument *DArg = UDiv->getArg(1); DArg->setName("d");
+
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry",   UDiv);
+    BasicBlock *Zero  = BasicBlock::Create(Ctx, "ret_zero",UDiv);
+    BasicBlock *Loop  = BasicBlock::Create(Ctx, "loop",    UDiv);
+    BasicBlock *Exit  = BasicBlock::Create(Ctx, "exit",    UDiv);
+
+    IRBuilder<> B(Entry);
+    Value *DZero = B.CreateICmpEQ(DArg, B.getInt32(0));
+    B.CreateCondBr(DZero, Zero, Loop);
+
+    B.SetInsertPoint(Zero);
+    B.CreateRet(B.getInt32(0));
+
+    B.SetInsertPoint(Loop);
+    PHINode *IPhi = B.CreatePHI(I32, 2, "i");
+    PHINode *RPhi = B.CreatePHI(I32, 2, "r");
+    PHINode *QPhi = B.CreatePHI(I32, 2, "q");
+    IPhi->addIncoming(B.getInt32(31), Entry);
+    RPhi->addIncoming(B.getInt32(0),  Entry);
+    QPhi->addIncoming(B.getInt32(0),  Entry);
+
+    Value *Bit    = B.CreateAnd(B.CreateLShr(NArg, IPhi), B.getInt32(1));
+    Value *RShift = B.CreateShl(RPhi, B.getInt32(1));
+    Value *RCand  = B.CreateOr(RShift, Bit);
+    Value *Take   = B.CreateICmpUGE(RCand, DArg);
+    Value *RSub   = B.CreateSub(RCand, DArg);
+    Value *QSet   = B.CreateOr(QPhi, B.CreateShl(B.getInt32(1), IPhi));
+    Value *RNext  = B.CreateSelect(Take, RSub, RCand);
+    Value *QNext  = B.CreateSelect(Take, QSet, QPhi);
+    Value *INext  = B.CreateSub(IPhi, B.getInt32(1));
+    Value *Done   = B.CreateICmpSLT(INext, B.getInt32(0));
+    B.CreateCondBr(Done, Exit, Loop);
+
+    IPhi->addIncoming(INext, Loop);
+    RPhi->addIncoming(RNext, Loop);
+    QPhi->addIncoming(QNext, Loop);
+
+    B.SetInsertPoint(Exit);
+    // QPhi is the SSA value at the loop header; the loop's final
+    // iteration writes QNext into it via the back-edge. Returning
+    // QPhi from Exit reads the post-loop value (the same one PHI
+    // would hold on entry to a hypothetical next iteration).
+    PHINode *QOut = B.CreatePHI(I32, 1, "q.out");
+    QOut->addIncoming(QNext, Loop);
+    B.CreateRet(QOut);
+  }
+
+  // __umodsi3(n, d) = n - __udivsi3(n, d) * d
+  // The `*` here is a real i32 MUL, which stage 7f1's MUL32rr already
+  // covers — no extra plumbing needed.
+  if (UMod) {
+    Argument *NArg = UMod->getArg(0); NArg->setName("n");
+    Argument *DArg = UMod->getArg(1); DArg->setName("d");
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", UMod);
+    IRBuilder<> B(BB);
+    Value *Q  = B.CreateCall(UDivCallee, {NArg, DArg});
+    Value *QD = B.CreateMul(Q, DArg);
+    Value *R  = B.CreateSub(NArg, QD);
+    B.CreateRet(R);
+  }
+
+  // __divsi3(a, b) — signed; sign(q) = sign(a) ^ sign(b).
+  //   neg   = (a < 0) ^ (b < 0)
+  //   |a|   = a < 0 ? -a : a
+  //   |b|   = b < 0 ? -b : b
+  //   q     = __udivsi3(|a|, |b|)
+  //   return neg ? -q : q
+  if (SDiv) {
+    Argument *AArg = SDiv->getArg(0); AArg->setName("a");
+    Argument *BArg = SDiv->getArg(1); BArg->setName("b");
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", SDiv);
+    IRBuilder<> B(BB);
+    Value *Zero = B.getInt32(0);
+    Value *ANeg = B.CreateICmpSLT(AArg, Zero);
+    Value *BNeg = B.CreateICmpSLT(BArg, Zero);
+    // CreateXor on i1s -> i1, exactly the sign-flip predicate.
+    Value *SignFlip = B.CreateXor(ANeg, BNeg);
+    Value *AbsA = B.CreateSelect(ANeg, B.CreateSub(Zero, AArg), AArg);
+    Value *AbsB = B.CreateSelect(BNeg, B.CreateSub(Zero, BArg), BArg);
+    Value *Q    = B.CreateCall(UDivCallee, {AbsA, AbsB});
+    Value *NegQ = B.CreateSub(Zero, Q);
+    Value *R    = B.CreateSelect(SignFlip, NegQ, Q);
+    B.CreateRet(R);
+  }
+
+  // __modsi3(a, b) — signed; sign(r) = sign(a) (C / Rust convention).
+  //   |a| = ... ; |b| = ...
+  //   q   = __udivsi3(|a|, |b|)
+  //   r   = |a| - q * |b|
+  //   return a < 0 ? -r : r
+  if (SMod) {
+    Argument *AArg = SMod->getArg(0); AArg->setName("a");
+    Argument *BArg = SMod->getArg(1); BArg->setName("b");
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", SMod);
+    IRBuilder<> B(BB);
+    Value *Zero = B.getInt32(0);
+    Value *ANeg = B.CreateICmpSLT(AArg, Zero);
+    Value *BNeg = B.CreateICmpSLT(BArg, Zero);
+    Value *AbsA = B.CreateSelect(ANeg, B.CreateSub(Zero, AArg), AArg);
+    Value *AbsB = B.CreateSelect(BNeg, B.CreateSub(Zero, BArg), BArg);
+    Value *Q    = B.CreateCall(UDivCallee, {AbsA, AbsB});
+    Value *QD   = B.CreateMul(Q, AbsB);
+    Value *AbsR = B.CreateSub(AbsA, QD);
+    Value *NegR = B.CreateSub(Zero, AbsR);
+    Value *R    = B.CreateSelect(ANeg, NegR, AbsR);
+    B.CreateRet(R);
+  }
+}
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
 
@@ -165,6 +364,17 @@ int main(int argc, char **argv) {
     WithColor::error(errs(), argv[0]) << EC.message() << "\n";
     return 1;
   }
+
+  // Stage 7f2 — inject `__udivsi3 / __umodsi3 / __divsi3 / __modsi3`
+  // bodies as IR. Must happen before the Function-level rewrite loop
+  // below so the loop's SELECT → bit-blend / SExt-i1 rewrites also
+  // apply to the helpers' i1-cond SELECTs. Without that rewrite, the
+  // 32-iter loop with raw SELECTs would push DAG-ISel into the
+  // multi-minute compile-time pathology that motivated the SELECT
+  // rewrite in the first place (see the SELECT-rewrite comment
+  // around stage 6d3e below).
+  if (moduleNeedsDivRemHelpers(*M))
+    injectDivRemHelpers(*M, Ctx);
 
   // Stage 6d2 — pre-Scalarizer lowering of `llvm.vector.reduce.*`.
   //

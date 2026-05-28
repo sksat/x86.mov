@@ -46,7 +46,10 @@ in `_start.s` (the runtime escape, gate-accepted) and `jmp` from the
 | 7d1    | `pop ebp + ret` via `__mov_return_addr_slot`       | bench's `pop` / `ret` columns drop                       | ✅    |
 | 7d2    | prologue `push ebp` via `__mov_esp_dec_scratch`    | bench's `push` column drops                              | ✅    |
 | 7d3    | `CALL32d` → MBB-split + `JMP32d_CALL`              | `call_*` fixtures gate green                             | ✅    |
-| 6c     | indirect `call` via function pointer (CALL32r)     | execution tests                                          | future |
+| 7e     | CTPOP / CTLZ / CTTZ via 256-entry byte tables      | `test/MovOnly/{popcount,ctlz,cttz}` gate green           | ✅    |
+| 7f1    | 32-bit MUL via byte-pair schoolbook + add chain    | `mul` / `mul_ri` / `mul_wide` fixtures green             | ✅    |
+| 7f2    | 32-bit UDIV / SDIV / UREM / SREM via `__udivsi3` etc. injected by `llvm-mov-llc` as IR (restoring 32-iter division) | `udiv` / `sdiv` / `urem` / `srem` + `udiv` / `srem` MovOnly gates green | ✅ |
+| 6e     | indirect `call` via function pointer (CALL32r)     | `indirect_call` exec + MovOnly                           | ✅    |
 | 8      | bigger fixtures (AES, mandelbrot, …)               | richer side-by-side bench                                | future |
 
 At stage 0–6 the emitter is "mov-heavy" — `jmp/call/ret/cmp` were
