@@ -314,6 +314,22 @@ movie86 has more native-code coverage (current 1474-PC body suggests
 each iteration is dominated by movfuscator's dispatch overhead, which
 movie86 emulates one mov at a time).
 
+**Update (snapshot+diff)**: the new `--snapshot-at-step / movie86 diff`
+infra (see § "Snapshot / diff" below) confirms multi-add IS making
+memory-state progress, just at an extremely sparse rate:
+
+- step 1k → step 100k (99k-step window): 43 bytes changed across 5 pages
+- step 100k → step 10M (9.9M-step window): 19 bytes changed across 3 pages
+
+So it's not literally stuck, but ~2 changed bytes per million steps is
+not going anywhere reasonable in human time. The repeat structural
+locations (`0x08286xxx`, `0x08487xxx`, `0x08687xxx`) likely point at
+the dispatch / target / branch_temp state cells movfuscator's
+master_loop walks per logical C-level operation — confirming the
+"logical progress encoded in memory state, not PC" hypothesis. Whether
+the early concentration of changes is "initialization" vs the steady-
+state being "near-deadlock" needs another investigation pass.
+
 `sum10` and `branch` have no observable side effects through movie86
 because both rely on `main`'s return value, which the crt0 always
 overrides with `exit(0)`. That is a movfuscator convention, not a
@@ -348,6 +364,57 @@ sees the `CD 81` sentinel byte pattern.
 control-flow needs (movfuscator only avoids them via the master_loop
 trick; a future mov-only LLVM backend may want them honestly), but
 they are no longer load-bearing for libc-using fixtures.
+
+## Snapshot / diff
+
+`cli/src/snapshot.rs` + `cli/src/diff.rs`. Memory + register state
+capture and comparison — the answer to "is the multi-add fixture
+making progress, or is it stuck?".
+
+**Snapshot file format** (custom binary, not gdb core / QEMU):
+
+```
+  0..4    magic = b"M86S"
+  4..6    version u16 LE
+  6..7    kind u8 (AfterStep/Exit/Fault/Break/MaxSteps)
+  8..16   step_count u64 LE
+ 16..48   regs[8] u32 LE
+ 48..52   eip u32 LE
+ 52..56   sigsegv_handler (or u32::MAX = None)
+ 56..60   sigill_handler
+ 60..64   detail (kind-specific u32)
+ 64..68   mem_base
+ 68..72   mem_len
+ 72..     raw memory bytes
+```
+
+**Capture semantics is "AFTER step N succeeded"** — `step_count` is
+the count of `Cpu::step()` calls that returned `Ok`. For fault
+captures, `step_count` is the count before the faulting step; `eip`
+still points at the faulting instruction.
+
+**CLI:**
+
+```sh
+# Capture at step N, also capture whenever the run halts:
+movie86 --snapshot-at-step 1000 a.snap --snapshot-on-stop b.snap prog.elf
+
+# Compare two snapshots:
+movie86 diff a.snap b.snap
+```
+
+Diff output (span-based to handle a 10 MB `FlatMemory`):
+
+- Register deltas (only changed registers listed)
+- Step delta + stop kind for each snapshot
+- Signal-handler deltas
+- Memory deltas as coalesced ranges (gap ≤ 16 bytes), capped at 32
+  ranges; rest summarized
+- 4 KiB page summary so structural location is visible at a glance
+  (stack / data / heap)
+
+Designed for the wasm runtime: snapshot uses the `Memory` trait, not
+`FlatMemory` directly, so a future paged memory impl works too.
 
 ## CI
 
