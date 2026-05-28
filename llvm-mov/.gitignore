@@ -7,3 +7,7 @@ vendor/
 compile_commands.json
 # Codex CLI runtime artifact — created by codex review/exec, not source.
 .codex
+# Cargo build artifacts for examples/rust/{main,fib}/. Lockfiles
+# (Cargo.lock) are checked in (recommended for staticlibs) but the
+# target/ output dirs are not.
+examples/rust/*/target/

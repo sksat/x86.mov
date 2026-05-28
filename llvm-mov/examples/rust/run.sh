@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
-# Stage-6.5 driver: rustc → llvm-mov-llc → as → ld → run.
+# Stage-6.5 / 7d3 driver: cargo (rustc) → llvm-mov-llc → as → ld → run.
 #
-# The full pipeline is kept here (rather than in the main execution-
-# test runner) on purpose — the existing test/Execution/run.sh is for
-# .ll fixtures, and mixing in Rust toolchain dependencies would muddy
-# its surface. This script consumes main.rs and either prints the
-# pipeline asm (default) or runs the linked ELF (`--run`).
+# Usage:
+#   run.sh                    # build main, show asm
+#   run.sh --run              # build main, run; expect exit 42
+#   run.sh --example=fib      # build fib, show asm
+#   run.sh --example=fib --run    # build fib, run; expect exit 55
 #
-# Why -mtriple=mov-unknown-linux-gnu is non-optional here:
-# rustc emits IR with target triple `i686-unknown-linux-gnu` and data
-# layout `e-m:e-p:32:32-...-S128`. Our backend's layout differs in
-# `S32` and a few pointer-bank attributes — llvm-mov-llc refuses
-# implicit mismatch but honours `-mtriple` as a retarget request, then
-# overwrites the layout with ours. The example deliberately stays within
-# IR shapes that don't depend on those differences (scalar i32 return,
-# no aggregates, no FP), so the retarget is safe.
+# The two examples are independent Cargo crates under `main/` and
+# `fib/` so each linked ELF only contains the entry point that fixture
+# exercises (separate compilation unit → cleaner bench numbers when
+# comparing per-example shapes).
+#
+# Cargo emits the staticlib + LLVM IR via `cargo rustc -- --emit=
+# llvm-ir,link`. The staticlib is a by-product; we pluck the .ll file
+# from `target/i686-unknown-linux-gnu/release/deps/` and feed it to
+# llvm-mov-llc.
+#
+# Why -mtriple=mov-unknown-linux-gnu is mandatory:
+# rustc emits `i686-unknown-linux-gnu` + a data layout that differs
+# from ours in `S128 vs S32` and a few pointer-bank attributes. The
+# driver refuses an implicit mismatch but honours `-mtriple` as a
+# retarget request — it then overwrites the layout with ours. Each
+# example deliberately stays within IR shapes that don't depend on
+# those differences (scalar i32 return, no aggregates, no FP).
 
 set -euo pipefail
 
@@ -22,19 +31,36 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$(cd "$HERE/../.." && pwd)/build}"
 DRIVER="${BUILD_DIR}/bin/llvm-mov-llc"
 
+# -- arg parsing ---------------------------------------------------------
+
+EXAMPLE="main"
+DO_RUN=0
+for arg in "$@"; do
+    case "$arg" in
+        --example=*) EXAMPLE="${arg#--example=}" ;;
+        --run)       DO_RUN=1 ;;
+        *) echo "usage: $0 [--example={main,fib}] [--run]" 1>&2; exit 2 ;;
+    esac
+done
+
+case "$EXAMPLE" in
+    main) ENTRY="rust_main"; EXPECTED=42; CRATE="rust_mov_main" ;;
+    fib)  ENTRY="fib_main";  EXPECTED=55; CRATE="rust_mov_fib" ;;
+    *) echo "error: unknown --example=$EXAMPLE (try main, fib)" 1>&2; exit 2 ;;
+esac
+
+CRATE_DIR="$HERE/$EXAMPLE"
+
+# -- prerequisites -------------------------------------------------------
+
 if ! [ -x "$DRIVER" ]; then
     echo "error: $DRIVER not found — run 'make build' first." 1>&2
     exit 2
 fi
-
-if ! command -v rustc >/dev/null; then
-    echo "error: rustc not found on PATH." 1>&2
+if ! command -v cargo >/dev/null; then
+    echo "error: cargo not found on PATH." 1>&2
     exit 2
 fi
-
-# rustc needs the precompiled i686 std/core rlibs even for no_std builds
-# (it links nothing, but checks the target). Bail with a clear message
-# rather than letting rustc's diagnostic land cold.
 if ! rustup target list --installed 2>/dev/null \
         | grep -q '^i686-unknown-linux-gnu$'; then
     cat 1>&2 <<EOF
@@ -47,65 +73,60 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-RS="${HERE}/main.rs"
-START_S="${HERE}/_start.s"
+# -- cargo build → LLVM IR ----------------------------------------------
 
-LL="${WORK}/main.ll"
-S="${WORK}/main.s"
-O="${WORK}/main.o"
-START_O="${WORK}/_start.o"
-ELF="${WORK}/main.elf"
+TARGET_TRIPLE="i686-unknown-linux-gnu"
 
-# 1. rustc → LLVM IR
-#
-# edition=2021: the 2024 edition makes `#[no_mangle]` an `unsafe(...)`
-# attribute, which complicates the no_std demo without buying us anything.
-# Stay on 2021 until the rest of the example needs newer features.
-rustc \
-    --edition=2021 \
-    --crate-type=staticlib \
-    --target=i686-unknown-linux-gnu \
-    -C panic=abort \
-    -C opt-level=0 \
-    --emit=llvm-ir \
-    -o "$LL" \
-    "$RS"
+cargo rustc \
+    --manifest-path="$CRATE_DIR/Cargo.toml" \
+    --release \
+    --target="$TARGET_TRIPLE" \
+    --quiet \
+    -- --emit=llvm-ir,link
 
-# 2. llvm-mov-llc retargets the i686 IR to the Mov backend.
+# Locate the emitted .ll. Cargo's hashing makes the file name a moving
+# target (`<crate>-<hash>.ll`); pick the most recently modified one
+# for this crate.
+DEPS_DIR="$CRATE_DIR/target/$TARGET_TRIPLE/release/deps"
+LL="$(ls -t "$DEPS_DIR"/${CRATE}-*.ll 2>/dev/null | head -1 || true)"
+if [ -z "$LL" ] || ! [ -f "$LL" ]; then
+    echo "error: emitted .ll not found under $DEPS_DIR" 1>&2
+    exit 1
+fi
+
+# -- llvm-mov-llc + binutils → ELF --------------------------------------
+
+S="$WORK/$EXAMPLE.s"
+O="$WORK/$EXAMPLE.o"
+START_S="$CRATE_DIR/_start.s"
+START_O="$WORK/_start.o"
+ELF="$WORK/$EXAMPLE.elf"
+
 "$DRIVER" -mtriple=mov-unknown-linux-gnu "$LL" -o "$S"
 
-# 3. as + ld through the standard binutils.
 as --32 -o "$O" "$S"
 as --32 -o "$START_O" "$START_S"
-ld -m elf_i386 -static -e _start -o "$ELF" "$START_O" "$O"
+ld -m elf_i386 -static --gc-sections -e _start -o "$ELF" "$START_O" "$O"
 
-# Default: show what we built. `--run` actually invokes it and checks
-# the exit code against the expected 42.
-EXPECTED=42
+# -- run or print --------------------------------------------------------
 
-case "${1:-}" in
-    --run)
-        set +e
-        "$ELF"
-        exit_code=$?
-        set -e
-        if [ "$exit_code" = "$EXPECTED" ]; then
-            echo "PASS  rust_main  (exit ${exit_code})"
-            exit 0
-        else
-            echo "FAIL  rust_main  (expected ${EXPECTED}, got ${exit_code})"
-            exit 1
-        fi
-        ;;
-    "")
-        echo "=== generated asm ($S) ==="
-        cat "$S"
-        echo "=== linked ELF ($ELF) ==="
-        file "$ELF"
-        echo "(re-run with --run to execute and check exit code = ${EXPECTED})"
-        ;;
-    *)
-        echo "usage: $0 [--run]" 1>&2
-        exit 2
-        ;;
-esac
+if [ "$DO_RUN" = "1" ]; then
+    set +e
+    "$ELF"
+    exit_code=$?
+    set -e
+    if [ "$exit_code" = "$EXPECTED" ]; then
+        echo "PASS  $ENTRY  (exit ${exit_code})"
+        exit 0
+    else
+        echo "FAIL  $ENTRY  (expected ${EXPECTED}, got ${exit_code})"
+        exit 1
+    fi
+else
+    echo "=== Rust source (${EXAMPLE}) → entry: ${ENTRY} ==="
+    echo "=== generated asm ($S) ==="
+    cat "$S"
+    echo "=== linked ELF ($ELF) ==="
+    file "$ELF"
+    echo "(re-run with --run to execute and check exit code = ${EXPECTED})"
+fi

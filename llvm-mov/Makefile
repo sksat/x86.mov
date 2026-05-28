@@ -69,12 +69,15 @@ test-codegen: build
 		echo "test-codegen: lit not installed or no CodeGen suite yet — skipping"; \
 	fi
 
-# Stage-6.5 demo: rustc → llvm-mov-llc → as → ld → run. Opt-in — not
-# in the default `test` target because it pulls in a Rust toolchain
-# dependency. The script itself surfaces a clear message if the i686
-# rust-std rlibs aren't installed.
+# Stage-6.5 / 7d3 demo: cargo (rustc) → llvm-mov-llc → as → ld → run.
+# Opt-in — not in the default `test` target because it pulls in a Rust
+# toolchain dependency. The script itself surfaces a clear message if
+# the i686 rust-std rlibs aren't installed.
+#
+# Runs both Cargo-backed examples under examples/rust/{main,fib}/.
 test-rust-example: build
-	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --run
+	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=main --run
+	BUILD_DIR=$(BUILD_DIR) ./examples/rust/run.sh --example=fib --run
 
 # Stage-7+ gate. `test/MovOnly/run.sh` builds every fixture under
 # test/MovOnly/ and asserts the disassembly contains only mov-family

@@ -1,79 +1,91 @@
-# examples/rust — Rust → mov-only x86-32 (stage 6.5)
+# examples/rust — Rust → mov-only x86-32
 
 End-to-end pipeline:
 
 ```
-main.rs ──rustc --emit=llvm-ir──> .ll ──llvm-mov-llc──> .s ──as --32──> .o ──ld -m elf_i386──> ELF32
-                                                                                                │
-                                                                                                └─→ exit 42
+src/lib.rs ──cargo rustc --emit=llvm-ir──> .ll ──llvm-mov-llc──> .s ──as --32──> .o ──ld -m elf_i386──> ELF32
 ```
 
-[`main.rs`](main.rs) is a `#![no_std]` `#![no_main]` `panic=abort` crate
-that exposes a single `extern "C" fn rust_main() -> i32 { 42 }`.
-[`_start.s`](_start.s) calls it and `int 0x80`s with the return value.
-[`run.sh`](run.sh) drives the whole pipeline.
+Two independent Cargo crates live under this directory:
 
-## Why this works (and what to expect)
+| crate | entry | stage exercised | expected exit |
+|---|---|---|---:|
+| [`main/`](main/) | `rust_main` | 6.5 (trivial scalar return) | 42 |
+| [`fib/`](fib/) | `fib_main` | 7d1 + 7d3 (recursion through global return-addr slot) | 55 |
 
-This isn't a "Rust frontend" — we're just demonstrating that the Mov
-backend can already consume a minimal slice of rustc-generated LLVM IR.
-The pipeline rests on three load-bearing constraints:
+Both crates are edition **2024** (`#[no_mangle]` → `#[unsafe(no_mangle)]`)
+and target `i686-unknown-linux-gnu`. The shared
+[`run.sh`](run.sh) driver picks one via `--example={main,fib}`.
+
+## Build invariants
 
 1. **`-mtriple=mov-unknown-linux-gnu` is mandatory.** Rustc emits the
-   `i686-unknown-linux-gnu` triple with data layout
-   `e-m:e-p:32:32-...-S128`. Our backend uses `...-S32` and a slightly
-   different pointer-bank shape. The driver refuses implicit triple
-   mismatches but honours explicit `-mtriple` as a retarget request,
-   at which point it overwrites the layout with ours. The fixture stays
-   within IR shapes that don't depend on the difference (scalar `i32`
-   return, no aggregates, no FP).
-2. **Tight Rust surface.** No std, no panic message formatting, no
-   atomics, no aggregates, no FP. The function must be `extern "C"`
-   and return a single scalar. Anything richer hits IR shapes the Mov
-   backend doesn't yet lower (struct return → post-stage-7,
-   floats/atomics/inline-asm → out of scope).
-3. **Static link, no libc.** `_start.s` invokes `int 0x80` directly,
-   sidestepping the host's 32-bit dynamic loader and crt0 entirely
-   (same approach as the rest of `test/Execution/`).
+   `i686-unknown-linux-gnu` triple with data layout `e-m:e-p:32:32-…-S128`.
+   Our backend uses `…-S32` and a slightly different pointer-bank shape.
+   `llvm-mov-llc` refuses an implicit mismatch but honours an explicit
+   `-mtriple` as a retarget request — at which point it overwrites the
+   layout with ours. Each example deliberately stays within IR shapes
+   that don't depend on those differences (scalar `i32` return,
+   no aggregates, no FP).
+2. **`panic = "abort"` + `overflow-checks = false`** in each crate's
+   `[profile.release]`. The latter is what stops the integer subtractions
+   in `fib` from lowering to `llvm.ssub.with.overflow.i32`, which would
+   return an `{i32, i1}` aggregate the Mov backend doesn't yet handle.
+3. **Tight surface.** `no_std`, no panic message formatting, no atomics,
+   no aggregates, no FP. The Cargo profile knobs (above) plus the
+   `#![no_std]` attribute in each `lib.rs` enforce this.
+4. **Static link, no libc.** Each crate's `_start.s` invokes `int 0x80`
+   directly, sidestepping the host's 32-bit dynamic loader and crt0
+   entirely (same approach as `test/Execution/`).
 
-## Running it
+## Running
 
 ```sh
 # One-time toolchain prerequisite (~10 MB precompiled rlibs):
 rustup target add i686-unknown-linux-gnu
 
 # From the llvm-mov/ root:
-make build                # builds llvm-mov-llc
-make test-rust-example    # runs examples/rust/run.sh --run
+make build                              # builds llvm-mov-llc
+
+# Trivial example:
+bash examples/rust/run.sh --example=main --run    # → PASS  rust_main  (exit 42)
+
+# Recursive example:
+bash examples/rust/run.sh --example=fib --run     # → PASS  fib_main   (exit 55)
 ```
 
-`run.sh` without arguments prints the generated asm and `file` output
-of the linked ELF without executing it; pass `--run` to actually
-launch the linked binary and surface its exit code.
+Omit `--run` to dump the generated asm + `file` output of the linked
+ELF without executing it.
 
-Sample asm for `rust_main`:
+## What it shows
 
-```
-rust_main:
-    push    ebp
-    mov     ebp, esp
-    mov     eax, 42
-    mov     esp, ebp
-    pop     ebp
-    ret
-```
+Both binaries land **fully mov-only** in the user-side `.text`. The
+only non-mov mnemonics are the `call int jmp` set we already accept
+across the bench: `call` / `int 0x80` in `_start.s`, `jmp` from the
+7c1 dispatcher + 7d1 return-jmp + 7d3 `JMP32d_CALL` terminators.
 
-The crate also emits an implementation of
-`__rustc::rust_begin_unwind` (Rust's panic-abort hook), which compiles
-to `push ebp; mov ebp, esp; jmp self`. We don't reach it from
-`rust_main`, so the loop is harmless dead code in the linked ELF.
+Approximate per-example sizes (clang `-O0` C reference shown for
+context):
+
+| binary | source | `.text` | mov / total |
+|---|---|---:|---:|
+| `examples/rust/main/` | Rust | 794 B | 193 / 199 (97.0 %) |
+| `bench/fixtures/return0.c` | C | 488 B | 120 / 123 (97.6 %) |
+| `examples/rust/fib/` | Rust | 3997 B | 984 / 998 (98.6 %) |
+| `bench/fixtures/fib_rec.c` | C | 3720 B | 918 / 929 (98.8 %) |
+
+Rust binaries trail C by ~7 % at the `fib` shape and ~60 % at the
+trivial shape (the larger gap at `main` is the rustc-emitted panic
+handler stub, which `--gc-sections` keeps because the symbol is
+externally reachable). Both back-ends through `llvm-mov-llc` land
+substantially smaller than `movfuscator`'s C-only output on the same
+source (~3-4× smaller for `fib_rec`).
 
 ## What grows next
 
-- `extern "C" fn rust_main(x: i32) -> i32 { x + 1 }` lands as soon as
-  the example takes a CLI-passed arg.
-- Multi-function Rust (one Rust fn calling another) is already
-  supported by stage 6a's direct-call lowering — adding a fixture
-  here is just a matter of writing the Rust.
-- Richer Rust (collections, formatting, allocator) waits for a much
-  larger backend surface.
+- Richer Rust (struct returns, slices, references) waits on aggregate
+  + pointer-arithmetic lowering in the Mov backend.
+- Adding a Cargo-based bench column would let the side-by-side table
+  in [`bench/results.md`](../../bench/results.md) include Rust rows
+  next to the existing C and movfuscator rows — open question whether
+  the toolchain dependency is worth taking on in CI.
