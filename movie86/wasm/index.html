@@ -204,7 +204,8 @@
       <option value="canvas_bars">canvas_bars — mode 13h SMPTE-ish color bars</option>
       <option value="canvas_smile">canvas_smile — mode 13h smiley face</option>
       <option value="canvas_modes">canvas_modes — switch mode 13h → 12h mid-run</option>
-      <option value="canvas_mandelbrot">canvas_mandelbrot — Mandelbrot fractal (precomputed)</option>
+      <option value="canvas_mandelbrot">canvas_mandelbrot — real-compute Mandelbrot (clang -O2 → llvm-mov, ~90 s)</option>
+      <option value="canvas_mandelbrot_mov">canvas_mandelbrot_mov — same C, movfuscator pipeline (~10 min, for comparison)</option>
       <option value="upload">(upload your own ELF)</option>
     </select>
   </label>
@@ -279,8 +280,9 @@ const EXAMPLES = {
     cycle:        './examples/cycle.elf',
     canvas_bars:       './examples/canvas_bars.elf',
     canvas_smile:      './examples/canvas_smile.elf',
-    canvas_modes:      './examples/canvas_modes.elf',
-    canvas_mandelbrot: './examples/canvas_mandelbrot.elf',
+    canvas_modes:          './examples/canvas_modes.elf',
+    canvas_mandelbrot:     './examples/canvas_mandelbrot.elf',
+    canvas_mandelbrot_mov: './examples/canvas_mandelbrot_mov.elf',
 };
 
 // Register file order matches movie86's `Reg32`: EAX, ECX, EDX, EBX,

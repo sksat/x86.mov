@@ -236,6 +236,38 @@ try {
     failed++;
 }
 
+// --- llvm-mov Mandelbrot smoke (partial run) ---
+//
+// canvas_mandelbrot.elf is real C compiled through clang -O2 → llvm-mov-llc;
+// a full run takes ~90 s, way too long for CI. So we step a fixed budget
+// and verify that (a) the new 0xB0..0xB7 + 0xC6 decoders didn't trap on
+// the way in, (b) the `int 0x10` mode-set ran, and (c) at least one
+// FB pixel got written (i.e. the loop body is actually executing).
+// Catches: decoder regressions, BIOS dispatch breaking, or a silent loop
+// where execution stalls before reaching the framebuffer-paint phase.
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/canvas_mandelbrot.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        vm.stepN(30_000_000n);
+        assert.equal(vm.haltReason, undefined,
+            `canvas_mandelbrot unexpected early halt: ${vm.haltReason}`);
+        assert.equal(vm.activeVideoMode, 0x13,
+            `canvas_mandelbrot should set VGA mode 13h — activeVideoMode = ${vm.activeVideoMode}`);
+        const fb = vm.readMem(0xA0000, 320 * 200 * 4);
+        let colored = 0;
+        for (let i = 3; i < fb.length; i += 4) if (fb[i] === 255) colored++;
+        assert.ok(colored > 0,
+            `canvas_mandelbrot should have written at least one pixel after 30M steps (got ${colored})`);
+        console.log(`ok  canvas_mandelbrot (partial)  steps=${vm.steps} pixels=${colored}/64000`);
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL canvas_mandelbrot: ${e.message}`);
+    failed++;
+}
+
 if (failed > 0) {
     console.error(`${failed} smoke test(s) failed`);
     process.exit(1);

@@ -183,6 +183,26 @@ slider — they answer different questions ("show me each step" vs
   `history.replaceState`. Reset / Step / Run are imperative actions
   and intentionally stay out of the URL — they'd just confuse the
   shareable-state mental model.
+- **Mandelbrot ships in two flavours from the same C source.**
+  `examples/canvas_mandelbrot.elf` is `clang -O2` → `llvm-mov-llc`
+  (~1.4 MB, ~90 s on a typical browser tab);
+  `canvas_mandelbrot_mov.elf` is the same C through the movfuscator
+  pipeline (~6.6 MB stripped, ~10 min). llvm-mov wins by ~7× in both
+  step count and wall time because clang inlines `fmul`, constant-
+  folds the loop bounds, and llvm-mov's CodeGen is closer to the
+  metal than movfuscator's per-instruction table-lookup dispatch.
+  Both are committed so the speed difference is visible side-by-
+  side. The C source + `set_video_mode` stubs + a
+  `build-mandelbrot.sh` that drives both pipelines live in
+  `examples/sources/` for regeneration.
+- **`mov r8, imm8` (B0+rb) and `mov r/m8, imm8` (C6 /0) are now
+  supported** — they used to trap with `UnknownOpcode` per
+  `DESIGN.md`'s "movfuscator never emits these" stance, but
+  llvm-mov's CodeGen does emit them (it doesn't widen byte stores
+  to 32-bit the way movfuscator does), and the Mandelbrot demo
+  through that pipeline tripped both at `set_video_mode`'s
+  `mov dl, 0x13` and at clang's byte-granular spill init. Filled
+  the gap with unit tests pinned to those exact byte sequences.
 
 ## CI
 
