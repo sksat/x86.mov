@@ -183,19 +183,19 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setLibcallImpl(RTLIB::UREM_I32,  RTLIB::impl___umodsi3);
   setLibcallImpl(RTLIB::SREM_I32,  RTLIB::impl___modsi3);
 
-  // Stage 7g1 — single-precision floating-point ops. No FPU exists
-  // in mov-only land, so every FP op routes through compiler-rt-
-  // named libcalls. ADD_F32 lands first (this PR); the helper body
-  // for `__addsf3` is injected as IR by `llvm-mov-llc` along the
-  // same path that 7f2 used for the integer DIV/REM helpers.
-  // SUB / MUL / DIV / CMP / conversions are deferred to follow-up
-  // stage-7g rounds. The action mark below is LibCall so that the
-  // SDAG legalizer emits `call __addsf3` without trying to find a
-  // native FADD instruction first.
+  // Stage 7g1 / 7g2 — single-precision floating-point ops. No FPU
+  // exists in mov-only land, so every FP op routes through compiler-
+  // rt-named libcalls. The action mark below is LibCall so that the
+  // SDAG legalizer emits `call __<op>sf3` without trying to find a
+  // native FP instruction first. `fdiv` is still deferred to a
+  // follow-up round (mantissa long-division is materially longer
+  // than mantissa multiply).
   setOperationAction(ISD::FADD, MVT::f32, LibCall);
   setOperationAction(ISD::FSUB, MVT::f32, LibCall);
+  setOperationAction(ISD::FMUL, MVT::f32, LibCall);
   setLibcallImpl(RTLIB::ADD_F32, RTLIB::impl___addsf3);
   setLibcallImpl(RTLIB::SUB_F32, RTLIB::impl___subsf3);
+  setLibcallImpl(RTLIB::MUL_F32, RTLIB::impl___mulsf3);
 
   // FP comparisons. Each predicate routes to its compiler-rt-named
   // helper; the helper bodies share a single underlying compare and
