@@ -26,23 +26,37 @@ import init, { runElf as runElfRaw, Vm as VmRaw } from './build/browser/movie86_
  * empty canvases. Querying `vm.activeVideoMode` returns the mode
  * number set by the guest, or `undefined` if none was ever set.
  *
- * The address + mode-number layout echoes real x86:
+ * The address + mode-number layout echoes real x86 graphics history:
  *
- *   - `0x13` (mode 13h) → 320×200 at **0xA0000** (the classic VGA
- *     window; in real mode 13h this held 1-byte-per-pixel paletted
- *     data, here it's straight RGBA — close in spirit, not in
- *     encoding)
- *   - `0x12` (mode 12h) → 640×480 at **0x100000** (real mode 12h is
- *     planar 4bpp at A0000; the RGBA-flat equivalent doesn't fit in
- *     the 64 KB window so we park it above 1 MB)
+ *   - `0x13` (mode 13h) → 320×200 — classic VGA, the demoscene 256-
+ *     colour mode. In real mode 13h this was 1-byte-per-pixel paletted
+ *     data; here it's straight RGBA. "Spirit of", not exact.
+ *   - `0x12` (mode 12h) → 640×480 — standard VGA 16-colour planar in
+ *     real life; RGBA-flat here.
+ *   - `0x10` (mode 10h) → 640×350 — EGA/VGA mid-res. The "missing"
+ *     resolution between mode 13h and mode 12h that anyone who
+ *     remembers DOS asks about.
+ *   - `0x6A` (VESA VBE 1.0) → 800×600 — the standardised SVGA step
+ *     up. Not strictly VGA but the universally-supported next mode.
+ *
+ * Addresses are spaced so the loader's single flat region can fit
+ * them all if an ELF declares more than one PT_LOAD: mode 13h sits
+ * at the real-VGA window (0xA0000) and each subsequent mode is parked
+ * past the end of the previous one, leaving room without overlap.
+ *
+ * Unofficial modes like "mode-X" (320×240 — square pixels, demoscene
+ * favourite) aren't listed because they were set by direct VGA
+ * register programming, not by a BIOS function number.
  *
  * `64×64`-style sizes don't show up in real PC history and felt
  * arbitrary, so the catalogue is deliberately limited to famous
- * VGA modes.
+ * VGA / VESA modes.
  */
 export const FRAMEBUFFER_MODES = Object.freeze([
-    { id: 'mode 13h', modeNumber: 0x13, addr: 0x000A_0000, width: 320, height: 200 }, // 250 KB
-    { id: 'mode 12h', modeNumber: 0x12, addr: 0x0010_0000, width: 640, height: 480 }, // 1.2 MB
+    { id: 'mode 13h', modeNumber: 0x13, addr: 0x000A_0000, width: 320, height: 200 }, //  250 KB — VGA 256c (the famous one)
+    { id: 'mode 12h', modeNumber: 0x12, addr: 0x0010_0000, width: 640, height: 480 }, // 1.2 MB  — VGA 16c
+    { id: 'mode 10h', modeNumber: 0x10, addr: 0x0030_0000, width: 640, height: 350 }, //  875 KB — EGA/VGA mid-res
+    { id: 'VESA 6Ah', modeNumber: 0x6A, addr: 0x0040_0000, width: 800, height: 600 }, // 1.9 MB  — VESA VBE 1.0 SVGA
 ].map(m => Object.freeze({
     ...m,
     bytesPerPixel: 4,
