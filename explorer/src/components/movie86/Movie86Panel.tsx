@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { Pause, Play, RefreshCw, StepForward } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { AlertCircle, Pause, Play, RefreshCw, StepForward, Upload } from 'lucide-react';
 import {
     Card,
     CardContent,
@@ -9,6 +9,14 @@ import {
 } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
+import { Label } from '@/components/ui/label';
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from '@/components/ui/select';
 import { Registers } from './Registers';
 import { Disassembly } from './Disassembly';
 import { Memory } from './Memory';
@@ -16,6 +24,7 @@ import { Canvas } from './Canvas';
 import { Console } from './Console';
 import { fmt32, fmtBytes } from '@/lib/utils';
 import type { UseMovie86VmReturn } from '@/hooks/useMovie86Vm';
+import { EXAMPLE_ELFS, loadExampleElf } from '@/lib/examples';
 
 interface Movie86PanelProps {
     elf: Uint8Array | null;
@@ -34,6 +43,19 @@ interface Movie86PanelProps {
  *
  * The actual Vm lifecycle lives in `useMovie86Vm`; this component is
  * pure rendering + Run / Step / Reset wiring.
+ *
+ * Three input paths:
+ *  1. `elf` prop — the freshly-compiled binary from the upper Compile
+ *     row. Today the in-browser pipelines (movfuscator-wasm + llvm-mov
+ *     via the shared binutils-wasm `ld`) always pass `-dynamic-linker`,
+ *     so movie86 (which only loads static ELFs) rejects them with
+ *     `LoadError: DynamicLinkingUnsupported`. We surface that error
+ *     plainly instead of leaving the user staring at a disabled Run
+ *     button — see the `loadError` state below.
+ *  2. Example fixture from the dropdown — pre-built static ELFs that
+ *     ship under `movie86/wasm/examples/` (canvas_*, hello, return42,
+ *     …). These run + handover cleanly.
+ *  3. Upload — same shape as #2 for user-supplied static ELFs.
  */
 export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
     const { vm, tick, running, run, step, stop, reset, loadElf, drainOutput } =
@@ -41,6 +63,9 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
 
     const [stdout, setStdout] = useState('');
     const [stderr, setStderr] = useState('');
+    const [loadError, setLoadError] = useState<string | null>(null);
+    const [exampleId, setExampleId] = useState<string>('');
+    const fileInputRef = useRef<HTMLInputElement | null>(null);
 
     // Load the latest compiled ELF when it changes — but also re-fire
     // once the movie86 wasm wrapper finishes loading. A fast compile
@@ -55,9 +80,44 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
         if (!elf || !movie86Ready) return;
         setStdout('');
         setStderr('');
-        loadElf(elf).catch((e) => console.error('movie86 loadElf failed', e));
+        setLoadError(null);
+        loadElf(elf).catch((e) => {
+            const msg = (e as Error).message ?? String(e);
+            console.error('movie86 loadElf failed', e);
+            setLoadError(msg);
+        });
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [elf, movie86Ready]);
+
+    const loadFromBytes = async (bytes: Uint8Array) => {
+        setStdout('');
+        setStderr('');
+        setLoadError(null);
+        try {
+            await loadElf(bytes);
+        } catch (e) {
+            const msg = (e as Error).message ?? String(e);
+            console.error('movie86 loadElf failed', e);
+            setLoadError(msg);
+        }
+    };
+
+    const onExampleChange = async (id: string) => {
+        setExampleId(id);
+        if (!id) return;
+        try {
+            const bytes = await loadExampleElf(id);
+            await loadFromBytes(bytes);
+        } catch (e) {
+            setLoadError(`example fetch failed: ${(e as Error).message ?? e}`);
+        }
+    };
+
+    const onUpload = async (file: File) => {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        await loadFromBytes(bytes);
+        setExampleId('');
+    };
 
     // Drain stdout/stderr on every tick.
     useEffect(() => {
@@ -77,8 +137,19 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
                     <div>
                         <CardTitle className="text-base">Run · movie86</CardTitle>
                         <CardDescription>
-                            In-browser ELF32 i386 emulator. Loads the latest
-                            compile automatically; click Run to step until halt.
+                            In-browser ELF32 i386 emulator. The latest compile
+                            auto-loads, but in-browser pipelines today only
+                            emit dynamic ELFs (
+                            <a
+                                className="underline"
+                                href="https://github.com/sksat/x86.mov/issues"
+                                target="_blank"
+                                rel="noreferrer"
+                            >
+                                static-link follow-up
+                            </a>
+                            ) — for now pick an example fixture below to run
+                            something through movie86 + turbo86.
                         </CardDescription>
                     </div>
                     <div className="flex items-center gap-2">
@@ -128,6 +199,76 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
                 </div>
             </CardHeader>
             <CardContent className="grid gap-4">
+                <div className="flex flex-wrap items-end gap-3">
+                    <div className="flex flex-col gap-1.5 grow min-w-[20ch]">
+                        <Label htmlFor="example-elf">Example fixture (static ELF)</Label>
+                        <Select value={exampleId} onValueChange={onExampleChange}>
+                            <SelectTrigger
+                                id="example-elf"
+                                data-testid="example-select"
+                            >
+                                <SelectValue placeholder="pick a pre-built static ELF" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                {EXAMPLE_ELFS.map((e) => (
+                                    <SelectItem key={e.id} value={e.id}>
+                                        {e.label}
+                                    </SelectItem>
+                                ))}
+                            </SelectContent>
+                        </Select>
+                    </div>
+                    <input
+                        ref={fileInputRef}
+                        type="file"
+                        accept=".elf,application/octet-stream"
+                        hidden
+                        onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (f) onUpload(f);
+                            e.target.value = '';
+                        }}
+                        data-testid="elf-upload-input"
+                    />
+                    <Button
+                        variant="outline"
+                        onClick={() => fileInputRef.current?.click()}
+                        data-testid="elf-upload"
+                    >
+                        <Upload className="h-4 w-4" />
+                        Upload ELF
+                    </Button>
+                </div>
+                {loadError && (
+                    <div
+                        className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs"
+                        data-testid="load-error"
+                        role="alert"
+                    >
+                        <AlertCircle className="h-4 w-4 text-destructive shrink-0 mt-0.5" />
+                        <div>
+                            <p className="font-semibold text-destructive">
+                                movie86 couldn't load the ELF.
+                            </p>
+                            <p className="text-muted-foreground mt-1">
+                                {loadError}
+                            </p>
+                            {/DynamicLinkingUnsupported|dynamic/i.test(loadError) && (
+                                <p className="text-muted-foreground mt-1">
+                                    The in-browser <code>ld</code> currently
+                                    only emits dynamic ELFs (see
+                                    <code> -dynamic-linker</code> in
+                                    movfuscator-wasm's link command). movie86
+                                    needs static ELFs. Pick an example fixture
+                                    above or upload a static ELF to keep
+                                    going; the inspection panes (IR / asm /
+                                    ELF hex) still work for the dynamic
+                                    output.
+                                </p>
+                            )}
+                        </div>
+                    </div>
+                )}
                 <StatusRow tick={tick} memBase={vm?.memBase} memLen={vm?.memLen} />
                 <Separator />
 

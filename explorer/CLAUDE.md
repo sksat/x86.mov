@@ -125,6 +125,23 @@ goes through `make -C ../movfuscator-wasm build-wasm-browser` /
 `make -C ../movie86/wasm build-wasm` / `make -C ../llvm-mov/wasm build`
 first.
 
+## Known limitations
+
+- **`Compile` → `movie86 Run` doesn't round-trip yet.** Both in-browser
+  pipelines (movfuscator-wasm and llvm-mov clang) go through binutils-
+  wasm `ld` with `-dynamic-linker /lib/ld-linux.so.2`, so the produced
+  ELF is **dynamically linked**. movie86 only loads **static** ELFs
+  (PT_INTERP / PT_DYNAMIC → `LoadError: DynamicLinkingUnsupported` at
+  `Vm::new`). The explorer surfaces this clearly in the Movie86Panel
+  error banner. To actually run / hand-off, pick one of the pre-built
+  static fixtures from the "Example fixture" dropdown (sourced from
+  `movie86/wasm/examples/*.elf`) or upload your own static ELF. A
+  follow-up will add a `static: true` option to
+  `movfuscator-wasm/movfuscator.mjs`'s `link()` so the in-browser
+  pipeline can emit movie86-runnable ELFs directly. Until then the
+  compile path is for **inspection** (IR / asm / ELF hex / disasm)
+  and the run / handover path is for the example fixtures.
+
 ## Things future Claude shouldn't relearn
 
 - **Don't bundle the sibling wrappers** (see Operating model #2). If

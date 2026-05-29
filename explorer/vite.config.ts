@@ -32,44 +32,52 @@ const SIBLING_DEV_MAP: Record<string, string> = {
     '/llvm-mov/':          '../llvm-mov/wasm/',
 };
 
+function makeSiblingHandler(): Connect.NextHandleFunction {
+    return (req, res, next) => {
+        const url = req.url ?? '';
+        for (const [prefix, srcPrefix] of Object.entries(SIBLING_DEV_MAP)) {
+            if (!url.startsWith(prefix)) continue;
+            const rel = url.slice(prefix.length).split('?')[0]!.split('#')[0]!;
+            const absPath = path.resolve(__dirname, srcPrefix, rel);
+            const allowedRoot = path.resolve(__dirname, '..');
+            if (!absPath.startsWith(allowedRoot + path.sep)) {
+                return next();
+            }
+            fs.stat(absPath, (err, stat) => {
+                if (err || !stat.isFile()) return next();
+                const ext = path.extname(absPath).toLowerCase();
+                const ctype =
+                    ext === '.mjs' || ext === '.js'
+                        ? 'application/javascript'
+                        : ext === '.wasm'
+                            ? 'application/wasm'
+                            : ext === '.json'
+                                ? 'application/json'
+                                : ext === '.css'
+                                    ? 'text/css'
+                                    : 'application/octet-stream';
+                res.setHeader('Content-Type', ctype);
+                fs.createReadStream(absPath).pipe(res);
+            });
+            return;
+        }
+        return next();
+    };
+}
+
 function siblingSubprojects(): Plugin {
+    // Identical mapping logic runs in both dev (`vite`) and preview
+    // (`vite preview`) — the bundled dist/ ships only the explorer
+    // assets, so sibling subprojects still need the middleware to be
+    // reachable when previewing locally. CF Pages prod doesn't need it
+    // because the deploy pre-stages every sibling under dist/.
     return {
         name: 'x86mov-sibling-subprojects',
         configureServer(server) {
-            const handler: Connect.NextHandleFunction = (req, res, next) => {
-                const url = req.url ?? '';
-                for (const [prefix, srcPrefix] of Object.entries(SIBLING_DEV_MAP)) {
-                    if (!url.startsWith(prefix)) continue;
-                    const rel = url.slice(prefix.length).split('?')[0]!.split('#')[0]!;
-                    const absPath = path.resolve(__dirname, srcPrefix, rel);
-                    // server.fs.allow scoping check: absPath must stay
-                    // within the parent worktree.
-                    const allowedRoot = path.resolve(__dirname, '..');
-                    if (!absPath.startsWith(allowedRoot + path.sep)) {
-                        return next();
-                    }
-                    fs.stat(absPath, (err, stat) => {
-                        if (err || !stat.isFile()) return next();
-                        const ext = path.extname(absPath).toLowerCase();
-                        const ctype = ext === '.mjs' || ext === '.js'
-                            ? 'application/javascript'
-                            : ext === '.wasm'
-                                ? 'application/wasm'
-                                : ext === '.json'
-                                    ? 'application/json'
-                                    : ext === '.css'
-                                        ? 'text/css'
-                                        : 'application/octet-stream';
-                        res.setHeader('Content-Type', ctype);
-                        fs.createReadStream(absPath).pipe(res);
-                    });
-                    return;
-                }
-                return next();
-            };
-            // Run before Vite's built-in static handler so the deploy
-            // URLs win over any accidental same-name files in /public/.
-            server.middlewares.use(handler);
+            server.middlewares.use(makeSiblingHandler());
+        },
+        configurePreviewServer(server) {
+            server.middlewares.use(makeSiblingHandler());
         },
     };
 }
