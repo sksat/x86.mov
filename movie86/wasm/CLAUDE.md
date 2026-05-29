@@ -84,10 +84,15 @@ Both ship today; pick by what you want from the call.
 - **`vm.disasmAt(addr) -> DecodedInsn`** — same `movie86::decode` the
   CPU uses, but exposed so the demo can render a "next-N-instructions"
   pane with the current EIP highlighted. The decoded text is the
-  Rust `Debug` form of `Insn` (e.g.
-  `Mov { dst: Reg32(Ebx), src: Imm32(42) }`); a nicer Intel-syntax
-  formatter is a future polish step. Tolerates short reads at the end
-  of the segment so a 1-byte `ret` at the last address still decodes.
+  `core::fmt::Display` rendering of `movie86::Insn` in AT&T (gas)
+  syntax (e.g. `movl $0x2a, %ebx`), matching the flavour of `.s`
+  files emitted by movfuscator and llvm-mov-llc throughout this repo.
+  Jumps render their displacement as a signed offset (`jmp +0x40`,
+  `call -0x5`) because `Insn::Display` doesn't know the
+  instruction's own EIP; resolving the absolute target is a future
+  step at the disasmAt layer, which does. Tolerates short reads at
+  the end of the segment so a 1-byte `ret` at the last address still
+  decodes.
 
 ## Engine handoff to local turbo86
 

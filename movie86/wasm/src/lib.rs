@@ -655,7 +655,7 @@ impl Vm {
                 Some(DecodedInsn {
                     addr,
                     bytes_buf: buf[..len_usize].to_vec(),
-                    text_buf: format!("{insn:?}"),
+                    text_buf: format!("{insn}"),
                     len_val: u32::from(len),
                 })
             }
@@ -957,12 +957,14 @@ impl DecodedInsn {
         self.bytes_buf.clone()
     }
 
-    /// Symbolic form of the decoded instruction — currently the Rust
-    /// `Debug` print of `movie86::Insn`, e.g.
-    /// `Mov { dst: Reg32(Ebx), src: Imm32(42) }`. A nicer Intel-syntax
-    /// formatter is a future polish step; the current form is
-    /// machine-readable and good enough to follow execution at a
-    /// glance, which is all the demo needs.
+    /// Symbolic form of the decoded instruction in AT&T (gas) syntax,
+    /// e.g. `movl $0x2a, %ebx` for `mov ebx, 42`. Matches the flavour
+    /// of `.s` files emitted by movfuscator and llvm-mov-llc so the
+    /// disassembly pane reads the same way as the source asm. Jumps
+    /// and calls render their displacement as a signed offset
+    /// (`jmp +0x40`, `call -0x5`) — `Insn::Display` doesn't know the
+    /// instruction's own EIP, so resolving absolute targets is a job
+    /// for a higher layer that does.
     #[wasm_bindgen(getter)]
     pub fn text(&self) -> String {
         self.text_buf.clone()
