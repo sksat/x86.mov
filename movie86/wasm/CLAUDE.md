@@ -142,19 +142,38 @@ pair brings the session back into the local Vm. Six pieces:
   splitting them spatially — the user reads one continuous output
   transcript across both engines.
 
-- **Meta cards always describe the local Vm**, never relabel during
-  a turbo86 session. `proto.Outbound` has no instruction counter
-  (`Stdout` / `Stderr` / `Exit` / `Fault` / `Paused` only), so
-  there's no honest `mov / sec` we could compute for turbo86;
-  swapping the labels to "events / events per sec" would drift the
-  project's "everything is a mov" narrative across engines. Instead
-  the local Vm's last `mov / sec` stays visible (frozen post-
-  handover) and turbo86's live session stats — event count, rate,
-  wall time, status — render into `#turbo86-stats` inside the
-  session pane header. Updated by `renderT86Stats()` on every
-  Outbound and a 200 ms `setInterval` while the WS is open. Don't
-  reintroduce a global "engine" switch; the data sources are
-  genuinely different and the UI is clearer for separating them.
+- **Meta cards keep their labels but switch their data source via
+  `state.engine`.** Labels are constant (`total mov` / `mov per
+  sec` / `halt` / `exit` / `wall time` / `memory`); the values come
+  from `state.vm` while engine == 'local' and from `turbo86.stats`
+  while engine == 'turbo86'. The conceptual stretch — turbo86
+  Outbound *events* stand in for *movs* — is acknowledged: turbo86
+  has no instruction counter on the wire, and the alternative
+  ("freeze the cards") loses the live signal the user is here for.
+  Same labels on both engines keeps the project narrative
+  ("everything is a mov") intact. `setEngine` flips at three
+  boundaries: `doSendToTurbo86` (→ 'turbo86'), `doRun` / `doReset`
+  / `doRestoreFromTurbo86` (→ 'local'). `prevRegs` / `prevEip` get
+  wiped on flip so the change-highlight doesn't paint every reg
+  yellow at the engine boundary.
+
+- **Regs panel sources from the last turbo86 Paused while engine ==
+  'turbo86'.** turbo86 emits regs only at Paused boundaries (Pause
+  Inbound, guest fault, signal). Until the first Paused, the panel
+  shows the local Vm's snapshot regs ("what got handed over") with
+  a "from turbo86 Paused" note appearing once the first Paused
+  arrives. `currentRegsView()` is the single source of truth — both
+  `renderRegs` and any future panes that need EIP/regs should go
+  through it.
+
+- **Follow toggle drives the in-handover render cadence**, same as
+  for the local Run loop:
+    - `follow on`  → re-render the full UI on every Outbound event.
+    - `follow off` → leave the periodic ticker (`refresh` ms input)
+                     to redraw, batching event arrivals so the wasm
+                     boundary overhead stays low for chatty guests.
+  The WS open handler installs the `setInterval`; the close handler
+  clears it.
 
 ## Display strategy: follow vs periodic
 
