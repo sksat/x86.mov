@@ -105,28 +105,36 @@ if [ ! -f "$rust_src/wild/libwild/Cargo.toml" ]; then
         && git checkout "$wild_sha" )
 fi
 
-# Apply local patches. `git apply --reverse --check` test detects an
-# already-applied patch so re-running the script across cached vendor
-# trees doesn't die. Order matters lexicographically; current set:
+# Apply local patches. Two scopes:
+#   patches/wasm-rustc/      → applied at vendor/rust/ (rust-lang/rust)
+#   patches/wasm-rustc-llvm/ → applied at vendor/rust/src/llvm-project/
 #
-#   0001-llvm_target-wasm32-wasi-threads.patch
-#       wasm32-wasip1-threads target spec: switch llvm_target from
-#       "wasm32-wasi" (no threads) to "wasm32-wasi-threads". Without
-#       this the LLVM-for-wasm32-wasip1-threads build's CMake
-#       try-compile passes -pthread + --target=wasm32-wasi and
-#       wasm-ld trips on errno.o "not compiled with atomics".
-patch_dir="$root/patches/wasm-rustc"
-if [ -d "$patch_dir" ]; then
-    for p in "$patch_dir"/*.patch; do
+# `git apply --reverse --check` detects already-applied so re-running
+# across cached vendor trees doesn't die. Order matters lexicographically.
+#
+# Current set:
+#   wasm-rustc/0001-llvm_target-wasm32-wasi-threads.patch
+#     wasm32-wasip1-threads spec: switch llvm_target to "wasm32-wasi-threads"
+#     so the produced rustc reports the threads-aware LLVM triple.
+#   wasm-rustc-llvm/0002-llvm-bit-h-treat-wasi-like-linux.patch
+#     llvm/ADT/bit.h: treat __wasi__ like __linux__ so it pulls
+#     <endian.h> (which exists in wasi-sysroot) instead of the BSD
+#     <machine/endian.h> (which doesn't).
+apply_patches_from() {
+    local dir="$1" cwd="$2"
+    [ -d "$dir" ] || return 0
+    for p in "$dir"/*.patch; do
         [ -f "$p" ] || continue
-        if ( cd "$rust_src" && git apply --reverse --check "$p" 2>/dev/null ); then
+        if ( cd "$cwd" && git apply --reverse --check "$p" 2>/dev/null ); then
             echo "==> skip $(basename "$p") — already applied"
         else
-            echo "==> applying $(basename "$p")"
-            ( cd "$rust_src" && git apply --check "$p" && git apply "$p" )
+            echo "==> applying $(basename "$p") (in $(basename "$cwd"))"
+            ( cd "$cwd" && git apply --check "$p" && git apply "$p" )
         fi
     done
-fi
+}
+apply_patches_from "$root/patches/wasm-rustc"      "$rust_src"
+apply_patches_from "$root/patches/wasm-rustc-llvm" "$rust_src/src/llvm-project"
 
 # ── 4. Build + install via ./x.py ────────────────────────────────────
 install_dir="$cache/dist"
