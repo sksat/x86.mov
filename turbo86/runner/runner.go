@@ -676,6 +676,27 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 		return
 	}
 	if msg.withCtx {
+		// Reservations come first. They cover address ranges the
+		// guest's mov-only ABI mmap_request handler already mapped
+		// on the sender — invisible in Regions when those pages
+		// were still all-zero at snapshot time (the sparse-region
+		// walk skips zero pages). Without this, the canvas demo's
+		// post-set_video_mode handover SIGSEGVs on its first
+		// pixel write because the FB page was never mapped here.
+		// Regions that overlap a reservation are still safe: their
+		// mmap below re-maps the page (MAP_FIXED, fresh zero) and
+		// the region bytes get written on top — same net result.
+		for _, res := range msg.ctx.Reservations {
+			if regionFitsStaticGuest(res.Addr, res.Size) {
+				continue
+			}
+			if err := r.mmapRegionForLoadContext(res.Addr, res.Size, &regs); err != nil {
+				r.emitFault(fmt.Sprintf(
+					"mmap context reservation 0x%x..0x%x: %v",
+					res.Addr, res.Addr+res.Size, err))
+				return
+			}
+		}
 		for _, region := range msg.ctx.Regions {
 			// Regions outside the stub's static guestRegions
 			// (canvas framebuffers from a wasm snapshot, etc.) need a

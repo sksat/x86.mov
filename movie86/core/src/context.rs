@@ -45,6 +45,21 @@ pub struct MemRegion {
     pub bytes: Vec<u8>,
 }
 
+/// An address range the receiver must map before resuming, even when
+/// the snapshot carries no bytes for it. Mirrors turbo86's
+/// `proto.Reservation`. The motivating case is the mov-only ABI
+/// `mmap_request` side effect: the sender executed the request, the
+/// resulting page is still all-zero, so `capture_sparse_regions`
+/// skipped it — but the next guest write expects the page to be
+/// mapped. Receivers with a fixed [`FlatMemory`] (movie86 core)
+/// treat reservations as a no-op; receivers that mmap dynamically
+/// (turbo86) replay them at load time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reservation {
+    pub addr: u32,
+    pub size: u32,
+}
+
 /// Canonical i386 register set for migration.
 ///
 /// Field order matches turbo86's `proto.Regs` so a JSON encoder can
@@ -105,11 +120,14 @@ pub const SPARSE_PAGE_SIZE: u32 = 4096;
 
 /// A transferable guest-state snapshot. Receivers apply [`Context::regions`]
 /// to memory first, then load [`Context::regs`] into the CPU, then continue
-/// execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// execution. [`Context::reservations`] declares additional ranges that
+/// need to be mapped on the receiver but carry no bytes (e.g. an ABI
+/// `mmap_request` whose page was still zero at snapshot time).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Context {
     pub regs: Regs,
     pub regions: Vec<MemRegion>,
+    pub reservations: Vec<Reservation>,
 }
 
 /// Walk `mem` from `base` to `base + len` page by page, emitting only
@@ -292,6 +310,7 @@ mod tests {
         let ctx = Context {
             regs: Regs::from_cpu(&cpu),
             regions: capture_sparse_regions(&mem, 0x1000, 0x4000).unwrap(),
+            reservations: Vec::new(),
         };
 
         // Load into a fresh CPU + zero memory of the same extent.

@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use movie86::bios_host::{BiosArgs, BiosHost, BiosResult};
-use movie86::context::{capture_sparse_regions, Regs as CoreRegs};
+use movie86::context::{capture_sparse_regions, Regs as CoreRegs, Reservation};
 use movie86::decode::decode as decode_insn;
 use movie86::elf::{flatten_with_stack, parse, LoadedElf};
 use movie86::libc_host::{LibcCall, LibcHost, LibcResult};
@@ -42,6 +42,16 @@ struct WasmHost {
     /// `None` until the guest sets a mode (so the demo UI knows to
     /// show "no mode selected" rather than picking a default canvas).
     active_video_mode: Option<u8>,
+    /// Address ranges the guest requested via the mov-only ABI
+    /// `mmap_request` call. In wasm these are no-ops at the time of
+    /// call (canvas demos pre-declare the FB as PT_LOAD, so the page
+    /// is already mapped), but we record them so `snapshotContext`
+    /// can hand them to the next engine as Reservations. Without
+    /// this, a snapshot taken between `mmap_request` and the first
+    /// write to the requested page would lose the mmap state — the
+    /// receiving turbo86 wouldn't know to map the range and would
+    /// SIGSEGV on the first guest write.
+    reservations: Vec<Reservation>,
 }
 
 impl SysHost for WasmHost {
@@ -184,7 +194,16 @@ impl movie86::AbiHost for WasmHost {
                 self.active_video_mode = Some((value & 0xFF) as u8);
                 Ok(())
             }
-            movie86::CALL_MMAP_REQUEST => Ok(()),
+            movie86::CALL_MMAP_REQUEST => {
+                // Record the requested range so snapshotContext can
+                // hand it to the next engine as a Reservation. In wasm
+                // the page is already mapped via PT_LOAD so the call
+                // itself is a no-op, but a turbo86 receiving a mid-run
+                // snapshot can't know that without an explicit hint.
+                let (addr, size) = movie86::unpack_mmap_request(value);
+                self.reservations.push(Reservation { addr, size });
+                Ok(())
+            }
             movie86::CALL_EXIT => Err(Fault::Exit(value)),
             movie86::CALL_WRITE => {
                 let fd = regs[Reg32::Ebx as usize];
@@ -762,10 +781,14 @@ impl Vm {
             .expect("capture_sparse_regions inside FlatMemory's own extent should never fault");
         let region_addrs = regions.iter().map(|r| r.addr).collect();
         let region_bytes = regions.into_iter().map(|r| r.bytes).collect();
+        let reservation_addrs = self.host.reservations.iter().map(|r| r.addr).collect();
+        let reservation_sizes = self.host.reservations.iter().map(|r| r.size).collect();
         ContextSnapshot {
             regs,
             region_addrs,
             region_bytes,
+            reservation_addrs,
+            reservation_sizes,
         }
     }
 
@@ -850,6 +873,11 @@ pub struct ContextSnapshot {
     regs: CoreRegs,
     region_addrs: Vec<u32>,
     region_bytes: Vec<Vec<u8>>,
+    /// Parallel-array reservation storage. Same rationale as the region
+    /// arrays — keeps wasm-bindgen out of exporting `Vec<Reservation>`
+    /// (which would need its own wrapper type).
+    reservation_addrs: Vec<u32>,
+    reservation_sizes: Vec<u32>,
 }
 
 #[wasm_bindgen]
@@ -865,6 +893,8 @@ impl ContextSnapshot {
             regs: CoreRegs::default(),
             region_addrs: Vec::new(),
             region_bytes: Vec::new(),
+            reservation_addrs: Vec::new(),
+            reservation_sizes: Vec::new(),
         }
     }
 
@@ -909,6 +939,15 @@ impl ContextSnapshot {
     pub fn add_region(&mut self, addr: u32, bytes: Vec<u8>) {
         self.region_addrs.push(addr);
         self.region_bytes.push(bytes);
+    }
+
+    /// Append one reservation — a range the receiver must map before
+    /// resuming, even when no bytes for it appear in `regions` (the
+    /// ABI mmap_request side-effect carrier; see WasmHost::reservations).
+    #[wasm_bindgen(js_name = addReservation)]
+    pub fn add_reservation(&mut self, addr: u32, size: u32) {
+        self.reservation_addrs.push(addr);
+        self.reservation_sizes.push(size);
     }
 
     #[wasm_bindgen(getter)]
@@ -976,6 +1015,24 @@ impl ContextSnapshot {
     #[wasm_bindgen(js_name = regionBytesAt)]
     pub fn region_bytes_at(&self, idx: usize) -> Vec<u8> {
         self.region_bytes.get(idx).cloned().unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = reservationCount)]
+    pub fn reservation_count(&self) -> usize {
+        self.reservation_addrs.len()
+    }
+
+    /// Addr of the `idx`-th reservation, or `u32::MAX` if out of range.
+    /// Same defensive shape as `regionAddrAt`.
+    #[wasm_bindgen(js_name = reservationAddrAt)]
+    pub fn reservation_addr_at(&self, idx: usize) -> u32 {
+        self.reservation_addrs.get(idx).copied().unwrap_or(u32::MAX)
+    }
+
+    /// Size of the `idx`-th reservation, or 0 if out of range.
+    #[wasm_bindgen(js_name = reservationSizeAt)]
+    pub fn reservation_size_at(&self, idx: usize) -> u32 {
+        self.reservation_sizes.get(idx).copied().unwrap_or(0)
     }
 }
 

@@ -65,6 +65,22 @@ func TestInboundRoundTrip(t *testing.T) {
 				Regions: []MemRegion{},
 			}},
 		},
+		{
+			// Reservations cover ABI mmap_request pages: the sender's
+			// snapshot ran past the request but the page is all-zero
+			// so it wouldn't appear in Regions. Receiver must mmap
+			// the range before resuming so the next guest write
+			// doesn't SIGSEGV. mode 13h VGA-style framebuffer is the
+			// motivating case (64 pages from 0xA0000).
+			"LoadContext with reservations (FB mmap roundtrip)",
+			LoadContext{Context: Context{
+				Regs:    Regs{Eip: 0x08048000, Esp: 0x701FFFF0},
+				Regions: []MemRegion{{Addr: 0x08048000, Bytes: []byte{0xCD, 0x80}}},
+				Reservations: []Reservation{
+					{Addr: 0x000A_0000, Size: 64 * 0x1000},
+				},
+			}},
+		},
 		{"Stop", Stop{}},
 		{"Pause", Pause{}},
 	}

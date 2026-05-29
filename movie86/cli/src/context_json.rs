@@ -25,7 +25,7 @@ use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use movie86::{Context, MemRegion, Regs};
+use movie86::{Context, MemRegion, Regs, Reservation};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WireRegs {
@@ -107,6 +107,32 @@ impl From<WireRegion> for MemRegion {
 struct WireContext {
     regs: WireRegs,
     regions: Vec<WireRegion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reservations: Vec<WireReservation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireReservation {
+    addr: u32,
+    size: u32,
+}
+
+impl From<&Reservation> for WireReservation {
+    fn from(r: &Reservation) -> Self {
+        WireReservation {
+            addr: r.addr,
+            size: r.size,
+        }
+    }
+}
+
+impl From<WireReservation> for Reservation {
+    fn from(w: WireReservation) -> Self {
+        Reservation {
+            addr: w.addr,
+            size: w.size,
+        }
+    }
 }
 
 mod b64_bytes {
@@ -135,6 +161,7 @@ pub fn to_json(ctx: &Context) -> Result<Vec<u8>, serde_json::Error> {
     let w = WireContext {
         regs: WireRegs::from(&ctx.regs),
         regions: ctx.regions.iter().map(WireRegion::from).collect(),
+        reservations: ctx.reservations.iter().map(WireReservation::from).collect(),
     };
     serde_json::to_vec(&w)
 }
@@ -150,6 +177,7 @@ pub fn to_json_pretty(ctx: &Context) -> Result<Vec<u8>, serde_json::Error> {
     let w = WireContext {
         regs: WireRegs::from(&ctx.regs),
         regions: ctx.regions.iter().map(WireRegion::from).collect(),
+        reservations: ctx.reservations.iter().map(WireReservation::from).collect(),
     };
     serde_json::to_vec_pretty(&w)
 }
@@ -165,6 +193,7 @@ pub fn from_json(bytes: &[u8]) -> Result<Context, serde_json::Error> {
     Ok(Context {
         regs: w.regs.into(),
         regions: w.regions.into_iter().map(MemRegion::from).collect(),
+        reservations: w.reservations.into_iter().map(Reservation::from).collect(),
     })
 }
 
@@ -196,6 +225,7 @@ mod tests {
                     bytes: vec![0xca, 0xfe],
                 },
             ],
+            reservations: vec![],
         }
     }
 
@@ -274,9 +304,48 @@ mod tests {
         let ctx = Context {
             regs: Regs::default(),
             regions: vec![],
+            reservations: vec![],
         };
         let bytes = to_json(&ctx).unwrap();
         let back = from_json(&bytes).unwrap();
         assert_eq!(back, ctx);
+    }
+
+    #[test]
+    fn reservations_round_trip_through_json() {
+        // Pin that reservations make it through encode/decode and are
+        // emitted only when non-empty. The canvas FB mmap_request case
+        // (one 64-page reservation at 0xA0000) is the motivating
+        // shape; this test does not depend on the actual address.
+        let ctx = Context {
+            regs: Regs::default(),
+            regions: vec![],
+            reservations: vec![Reservation {
+                addr: 0x000A_0000,
+                size: 64 * 0x1000,
+            }],
+        };
+        let bytes = to_json(&ctx).unwrap();
+        let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            actual["reservations"],
+            serde_json::json!([{ "addr": 655_360, "size": 262_144 }]),
+            "reservations field shape must match turbo86's Go-side JSON byte-for-byte",
+        );
+        let back = from_json(&bytes).unwrap();
+        assert_eq!(back, ctx);
+    }
+
+    #[test]
+    fn empty_reservations_omitted_from_json_for_backwards_compat() {
+        // Older receivers don't know the field exists; ensure we don't
+        // emit `"reservations": []` for snapshots that don't use it.
+        let ctx = sample_context();
+        let bytes = to_json(&ctx).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v.get("reservations").is_none(),
+            "empty reservations should be omitted, got: {v}",
+        );
     }
 }

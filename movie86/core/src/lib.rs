@@ -18,7 +18,7 @@ pub use abi_host::{
     CALL_MMAP_REQUEST, CALL_SET_VIDEO_MODE, CALL_WRITE,
 };
 pub use bios_host::{BiosArgs, BiosHost, BiosResult};
-pub use context::{capture_sparse_regions, load_context, Context, MemRegion, Regs};
+pub use context::{capture_sparse_regions, load_context, Context, MemRegion, Regs, Reservation};
 pub use cpu::{Cpu, Signal};
 pub use decode::decode;
 pub use elf::{ElfError, LoadSegment, LoadedElf};

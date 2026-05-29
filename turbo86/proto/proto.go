@@ -90,6 +90,19 @@ type MemRegion struct {
 	Bytes []byte `json:"bytes"`
 }
 
+// Reservation declares an address range that must be mapped on the
+// receiver before the guest resumes, even when the sender's snapshot
+// carries no bytes for it (e.g. an all-zero framebuffer page the
+// sparse-region walk skipped). Concretely the guest may have already
+// issued a mov-only ABI `mmap_request` on the sender — that side
+// effect is invisible in Regs/Regions, so we record it here so the
+// receiver can replay the mmap. Addr and Size are in guest bytes;
+// the receiver page-aligns internally.
+type Reservation struct {
+	Addr uint32 `json:"addr"`
+	Size uint32 `json:"size"`
+}
+
 // Context is a transferable snapshot of guest execution: enough state
 // for either engine to pick up from where the other left off. The
 // receiver loads memory regions first, then sets Regs, then resumes
@@ -99,9 +112,15 @@ type MemRegion struct {
 // v1 ships the simplest workable schema — full memory in Regions, no
 // signal disposition, no generation counter. Both can be added later
 // without breaking existing payloads (additive JSON fields).
+//
+// Reservations are additive: pages the receiver must mmap before
+// resuming, even though they carry no bytes in Regions. Needed for
+// ABI mmap_request side effects (e.g. a mode-13h framebuffer that
+// was still all-zero when the snapshot was taken).
 type Context struct {
-	Regs    Regs        `json:"regs"`
-	Regions []MemRegion `json:"regions"`
+	Regs         Regs          `json:"regs"`
+	Regions      []MemRegion   `json:"regions"`
+	Reservations []Reservation `json:"reservations,omitempty"`
 }
 
 // LoadContext hands a Context to the runner: write each MemRegion into

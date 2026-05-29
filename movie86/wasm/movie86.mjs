@@ -179,7 +179,19 @@ export function snapshotContext(vm) {
                 bytes: s.regionBytesAt(i),
             });
         }
-        return { regs, regions };
+        // Reservations: address ranges the guest mmap_request'd that
+        // carry no bytes (the page may still be all-zero). turbo86
+        // mmaps each one at LoadContext so the next guest write
+        // doesn't SIGSEGV on an unmapped page.
+        const reservations = [];
+        const m = s.reservationCount;
+        for (let i = 0; i < m; i++) {
+            reservations.push({
+                addr: s.reservationAddrAt(i),
+                size: s.reservationSizeAt(i),
+            });
+        }
+        return { regs, regions, reservations };
     } finally {
         s.free();
     }
@@ -250,6 +262,15 @@ export function makeLoadContextMessage(ctx, mode = 'host', memUpdateIntervalMs =
         },
         mode,
     };
+    // Reservations are optional; emit only when non-empty so the wire
+    // shape stays byte-for-byte with Go's `omitempty` on the Reservations
+    // field for snapshots that don't use it.
+    if (ctx.reservations && ctx.reservations.length > 0) {
+        msg.context.reservations = ctx.reservations.map(r => ({
+            addr: r.addr,
+            size: r.size,
+        }));
+    }
     if (memUpdateIntervalMs > 0) {
         msg.mem_update_interval_ms = memUpdateIntervalMs;
     }

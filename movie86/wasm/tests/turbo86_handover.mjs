@@ -482,6 +482,51 @@ async function main() {
             console.error(`FAIL MemUpdate E2E: ${e.stack || e.message}`);
             failed++;
         }
+
+        // Reservations E2E. Without it, a canvas demo that handed over
+        // mid-flight (post-mmap_request, pre-first-FB-write) would
+        // SIGSEGV on the next pixel store: the sender's mmap_request
+        // side-effect is invisible in Regs/Regions, the receiver has
+        // no idea the page is supposed to be mapped, and a write to
+        // 0xA0000 traps. The Reservation roundtrip lets turbo86
+        // replay the mmap at LoadContext so the same write succeeds.
+        try {
+            const entry = 0x08048000;
+            const fbAddr = 0x000A_0000;
+            // Guest: mov [0xA0000], 0x12345678 ; mov eax, 1 ;
+            // mov ebx, 42 ; int 0x80. The write tests the page was
+            // actually mapped (a SIGSEGV would surface as Paused
+            // signal=11 with no Exit).
+            const code = new Uint8Array([
+                0xC7, 0x05, 0x00, 0x00, 0x0A, 0x00, 0x78, 0x56, 0x34, 0x12,
+                0xB8, 0x01, 0x00, 0x00, 0x00,
+                0xBB, 0x2A, 0x00, 0x00, 0x00,
+                0xCD, 0x80,
+            ]);
+            const ctxWithReservation = {
+                regs: {
+                    eax: 0, ebx: 0, ecx: 0, edx: 0,
+                    esi: 0, edi: 0, ebp: 0,
+                    esp: 0x701FFFF0,
+                    eip: entry,
+                    eflags: 0,
+                },
+                regions: [{ addr: entry, bytes: code }],
+                reservations: [{ addr: fbAddr, size: 0x1000 }],
+            };
+            const events = await runHandover(ctxWithReservation, 'host');
+            assert.equal(events.length, 1,
+                `expected 1 event (Exit), got ${events.length} (Paused → Reservation handling failed?)`);
+            assert.equal(events[0].type, 'exit',
+                `expected exit (not ${events[0].type} signal=${events[0].signal ?? '-'})`);
+            assert.equal(events[0].code, 42,
+                `expected exit 42, got ${events[0].code}`);
+
+            console.log('ok  real turbo86 handover (Reservation → FB page mmap\'d → guest writes succeed)');
+        } catch (e) {
+            console.error(`FAIL Reservation E2E: ${e.stack || e.message}`);
+            failed++;
+        }
     } finally {
         child.kill('SIGTERM');
         if (bin.cleanup) await bin.cleanup();
