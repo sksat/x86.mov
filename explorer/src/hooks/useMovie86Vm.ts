@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { loadMovie86, type Movie86Vm, type Movie86Wrapper } from '@/lib/wrappers';
+// Framework-free run loop (pure ESM + sidecar .d.mts), node-tested in
+// tests/runloop.test.mjs. Owned here rather than imported from the
+// movie86 subproject — same arm's-length pattern as explorer.mjs.
+import { runLoop } from '../../runloop.mjs';
 
 export interface VmTick {
     eip: number;
@@ -27,6 +31,15 @@ export interface UseMovie86VmReturn {
     stop: () => void;
     reset: () => Promise<void>;
     running: boolean;
+    /** Follow mode: one step + render per frame (watch each mov) vs the
+     *  default batched periodic dump. Read live by the run loop, so
+     *  toggling it mid-run takes effect on the next step. */
+    follow: boolean;
+    setFollow: (v: boolean) => void;
+    /** Step delay (ms) between instructions while Follow is on. Also
+     *  read live mid-run. */
+    delayMs: number;
+    setDelayMs: (v: number) => void;
     refresh: () => void;
     /** Pulls accumulated stdout/stderr bytes off the Vm. Called on
      *  every render tick. Buffers persist across drains. */
@@ -50,6 +63,25 @@ export function useMovie86Vm(): UseMovie86VmReturn {
 
     const elfBytesRef = useRef<Uint8Array | null>(null);
     const runIdRef = useRef(0);
+
+    // Follow / step-delay are mirrored into refs so the run loop reads
+    // their *current* value each iteration (state captured in the run()
+    // closure would be stale). The setters update both so the UI stays
+    // controlled and the live loop sees the change immediately.
+    const [follow, setFollowState] = useState(false);
+    const followRef = useRef(false);
+    const setFollow = useCallback((v: boolean) => {
+        followRef.current = v;
+        setFollowState(v);
+    }, []);
+
+    const [delayMs, setDelayState] = useState(0);
+    const delayRef = useRef(0);
+    const setDelayMs = useCallback((v: number) => {
+        const clamped = Math.max(0, Math.floor(v) || 0);
+        delayRef.current = clamped;
+        setDelayState(clamped);
+    }, []);
 
     useEffect(() => {
         let cancelled = false;
@@ -108,18 +140,25 @@ export function useMovie86Vm(): UseMovie86VmReturn {
             if (!vm || vm.haltReason) return;
             const myRun = ++runIdRef.current;
             setRunning(true);
-            let lastRender = performance.now();
+            // follow / delay are read live from refs each iteration so
+            // the toggle works mid-run; batch / refresh are fixed for
+            // this run (the caller's cadence for the periodic-dump mode).
             try {
-                while (myRun === runIdRef.current && !vm.haltReason) {
-                    vm.stepN(batchSize);
-                    const now = performance.now();
-                    if (now - lastRender >= refreshMs) {
-                        setTick(sampleTick(vm));
-                        lastRender = now;
-                    }
-                    await new Promise((r) => setTimeout(r, 0));
-                }
-                setTick(sampleTick(vm));
+                await runLoop({
+                    shouldContinue: () =>
+                        myRun === runIdRef.current && !vm.haltReason,
+                    readControls: () => ({
+                        follow: followRef.current,
+                        delayMs: delayRef.current,
+                        batchSize,
+                        refreshMs,
+                    }),
+                    stepOne: () => vm.stepN(1n),
+                    stepBatch: (n) => vm.stepN(n),
+                    render: () => setTick(sampleTick(vm)),
+                    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+                    now: () => performance.now(),
+                });
             } finally {
                 if (myRun === runIdRef.current) setRunning(false);
             }
@@ -152,6 +191,10 @@ export function useMovie86Vm(): UseMovie86VmReturn {
         stop,
         reset,
         running,
+        follow,
+        setFollow,
+        delayMs,
+        setDelayMs,
         refresh,
         drainOutput,
     };

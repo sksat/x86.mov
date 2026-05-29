@@ -53,8 +53,21 @@ interface Movie86PanelProps {
  * the explorer's intent away from "run what you compiled".
  */
 export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
-    const { vm, tick, running, run, step, stop, reset, loadElf, drainOutput } =
-        movie86Vm;
+    const {
+        vm,
+        tick,
+        running,
+        run,
+        step,
+        stop,
+        reset,
+        loadElf,
+        drainOutput,
+        follow,
+        setFollow,
+        delayMs,
+        setDelayMs,
+    } = movie86Vm;
 
     const [stdout, setStdout] = useState('');
     const [stderr, setStderr] = useState('');
@@ -144,6 +157,36 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
                             <RefreshCw className="h-3.5 w-3.5" />
                             Reset
                         </Button>
+                        <label
+                            className="flex items-center gap-1.5 text-xs text-muted-foreground select-none"
+                            title="Follow: step one instruction per frame and redraw every step (watch each mov land). Off: run in fast batches and refresh periodically. Toggle any time — including mid-run."
+                        >
+                            <input
+                                type="checkbox"
+                                className="h-3.5 w-3.5 accent-primary"
+                                checked={follow}
+                                onChange={(e) => setFollow(e.target.checked)}
+                                data-testid="vm-follow"
+                            />
+                            Follow
+                        </label>
+                        <label
+                            className="flex items-center gap-1 text-xs text-muted-foreground"
+                            title="Step delay (ms) between instructions while Follow is on."
+                        >
+                            delay
+                            <input
+                                type="number"
+                                min={0}
+                                step={50}
+                                value={delayMs}
+                                onChange={(e) => setDelayMs(Number(e.target.value))}
+                                disabled={!follow}
+                                className="w-14 rounded-md border bg-background px-1.5 py-0.5 text-xs tabular-nums disabled:opacity-50"
+                                data-testid="vm-delay"
+                            />
+                            ms
+                        </label>
                         <Button
                             variant="outline"
                             size="sm"
