@@ -544,12 +544,24 @@ function scanExecForInt(elfBuf) {
 
 // return42.elf is deliberately excluded — see return42.s. It's the
 // legacy `int 0x80 SYS_exit` canary, kept as a regression test for
-// the original syscall trap path. Everything else in the canvas
-// pipeline + the mov-only-stub examples is expected int-free.
+// the original syscall trap path.
+//
+// canvas_smile / canvas_modes / canvas_bars were originally generated
+// by a script that's lost to time (long sequences of mov-to-FB pixel
+// writes). The committed binaries are patched in place by
+// `examples/sources/patch_canvas_to_mov_only.py` — a 7-byte and
+// 12-byte byte-for-byte replacement that swaps `int 0x10` /
+// `int 0x80` for mov-only ABI equivalents without shifting any
+// surrounding pixel-write addresses. canvas_mandelbrot_mov.elf
+// (movfuscator pipeline) is still int 0x10 — vendor setup is needed
+// to rebuild it; tracked as a follow-up.
 const INT_FREE_FIXTURES = [
     'hello.elf',
     'cycle.elf',
     'call_greet.elf',
+    'canvas_smile.elf',
+    'canvas_modes.elf',
+    'canvas_bars.elf',
     'canvas_mandelbrot.elf',
     'canvas_mandelbrot_hires.elf',
     'canvas_mandelbrot_max.elf',
