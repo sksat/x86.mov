@@ -28,6 +28,23 @@ func TestInboundRoundTrip(t *testing.T) {
 			Start{Entry: 0, StackTop: 0},
 		},
 		{
+			"Start with periodic MemUpdate cadence",
+			Start{
+				Entry: 0x08048000, StackTop: 0x70200000,
+				Mode: ModeHost, MemUpdateIntervalMs: 100,
+			},
+		},
+		{
+			"LoadContext with MemUpdate interval",
+			LoadContext{
+				Context: Context{
+					Regs:    Regs{Eip: 0x08048000, Esp: 0x701FFFF0},
+					Regions: []MemRegion{{Addr: 0x08048000, Bytes: []byte{0xCD, 0x80}}},
+				},
+				MemUpdateIntervalMs: 50,
+			},
+		},
+		{
 			"LoadContext typical",
 			LoadContext{Context: Context{
 				Regs: Regs{
@@ -102,6 +119,23 @@ func TestOutboundRoundTrip(t *testing.T) {
 		},
 		{"VideoMode 13h", VideoMode{Mode: 0x13}},
 		{"VideoMode 12h", VideoMode{Mode: 0x12}},
+		{
+			"MemUpdate empty regions",
+			MemUpdate{Regions: nil},
+		},
+		{
+			"MemUpdate one region",
+			MemUpdate{Regions: []MemRegion{
+				{Addr: 0x000A_0000, Bytes: []byte{0xff, 0x00, 0x00, 0xff}},
+			}},
+		},
+		{
+			"MemUpdate multiple regions",
+			MemUpdate{Regions: []MemRegion{
+				{Addr: 0x000A_0000, Bytes: []byte{0x01, 0x02, 0x03, 0x04}},
+				{Addr: 0x000B_0000, Bytes: []byte{0x05, 0x06}},
+			}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

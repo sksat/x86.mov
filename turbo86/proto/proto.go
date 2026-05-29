@@ -48,10 +48,18 @@ const (
 
 // Start sets the guest's initial EIP and ESP and begins execution.
 // Sent after the Code messages that supply the entry-point's code.
+//
+// `MemUpdateIntervalMs` opts the session into periodic mid-run
+// memory snapshots — turbo86 will SIGSTOP the guest every N ms,
+// snapshot the sparse non-zero pages, emit `MemUpdate{Regions}`, and
+// resume. 0 (the default) disables it; the session emits no mid-run
+// memory events, matching the original behavior. Typical value for a
+// browser frontend driving a canvas: 100ms.
 type Start struct {
-	Entry    uint32 `json:"entry"`
-	StackTop uint32 `json:"stack_top"`
-	Mode     Mode   `json:"mode,omitempty"`
+	Entry               uint32 `json:"entry"`
+	StackTop            uint32 `json:"stack_top"`
+	Mode                Mode   `json:"mode,omitempty"`
+	MemUpdateIntervalMs uint32 `json:"mem_update_interval_ms,omitempty"`
 }
 
 func (Start) inboundKind() string { return "start" }
@@ -102,8 +110,9 @@ type Context struct {
 // turbo86 for the hot path. Mode picks the execution policy; empty
 // defaults to "host".
 type LoadContext struct {
-	Context Context `json:"context"`
-	Mode    Mode    `json:"mode,omitempty"`
+	Context             Context `json:"context"`
+	Mode                Mode    `json:"mode,omitempty"`
+	MemUpdateIntervalMs uint32  `json:"mem_update_interval_ms,omitempty"`
 }
 
 func (LoadContext) inboundKind() string { return "load_context" }
@@ -276,6 +285,25 @@ type VideoMode struct {
 
 func (VideoMode) outboundKind() string { return "video_mode" }
 
+// MemUpdate reports a periodic mid-session snapshot of guest memory
+// regions. Same sparse `MemRegion` shape Paused uses, but it's an
+// *intermediate* event — the session is still running — so a peer
+// engine can keep its own view of guest memory in sync for
+// progressive display (canvas filling in as a decoder writes pixels,
+// etc.) without waiting for terminal Paused / Exit.
+//
+// Cadence is configured at session start via Start.MemUpdateIntervalMs
+// / LoadContext.MemUpdateIntervalMs (default 0 = disabled). While
+// enabled, the runner periodically SIGSTOPs the guest, captures the
+// non-zero pages, emits one MemUpdate, and resumes. The guest never
+// sees the stop — `SIGSTOP` is non-forwardable and the snapshot path
+// doesn't dispatch into the guest's signal table.
+type MemUpdate struct {
+	Regions []MemRegion `json:"regions"`
+}
+
+func (MemUpdate) outboundKind() string { return "mem_update" }
+
 // MarshalOutbound encodes an Outbound as a JSON object with a "type" field.
 func MarshalOutbound(msg Outbound) ([]byte, error) {
 	switch m := msg.(type) {
@@ -308,6 +336,11 @@ func MarshalOutbound(msg Outbound) ([]byte, error) {
 		return json.Marshal(struct {
 			Type string `json:"type"`
 			VideoMode
+		}{m.outboundKind(), m})
+	case MemUpdate:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			MemUpdate
 		}{m.outboundKind(), m})
 	default:
 		return nil, fmt.Errorf("proto: unknown Outbound type %T", msg)
@@ -358,6 +391,12 @@ func UnmarshalOutbound(data []byte) (Outbound, error) {
 		var m VideoMode
 		if err := json.Unmarshal(data, &m); err != nil {
 			return nil, fmt.Errorf("proto: parsing VideoMode payload: %w", err)
+		}
+		return m, nil
+	case "mem_update":
+		var m MemUpdate
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, fmt.Errorf("proto: parsing MemUpdate payload: %w", err)
 		}
 		return m, nil
 	default:

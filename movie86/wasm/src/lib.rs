@@ -689,6 +689,36 @@ impl Vm {
         buf
     }
 
+    /// Apply `bytes` into guest memory starting at `addr`. Bytes that
+    /// fall outside the Vm's mapped region are silently skipped;
+    /// returns the count of bytes actually written.
+    ///
+    /// Used by the demo when receiving a turbo86 `MemUpdate` Outbound
+    /// during a handover — the snapshot covers the wasm Vm's mapped
+    /// range plus turbo86's stub regions, and we want the canvas to
+    /// progressively reflect the in-flight decode without crashing on
+    /// regions (e.g. the stub's stack at 0x70000000+) that the wasm
+    /// Vm doesn't map.
+    #[wasm_bindgen(js_name = writeMem)]
+    pub fn write_mem(&mut self, addr: u32, bytes: &[u8]) -> u32 {
+        let base = self.mem.base();
+        let mem_end = u64::from(base) + self.mem.len() as u64;
+        let req_start = u64::from(addr);
+        let req_end = req_start.saturating_add(bytes.len() as u64);
+        let start = req_start.max(u64::from(base));
+        let end = req_end.min(mem_end);
+        if end <= start {
+            return 0;
+        }
+        let skip_head = (start - req_start) as usize;
+        let take_len = (end - start) as usize;
+        let slice = &bytes[skip_head..skip_head + take_len];
+        if self.mem.write_bytes(start as u32, slice).is_err() {
+            return 0;
+        }
+        take_len as u32
+    }
+
     /// Capture the canonical migration snapshot of the current guest
     /// state: 10-word register file (GPRs + EIP + EFLAGS) and the
     /// sparse memory regions (non-zero 4 KiB pages merged into runs).

@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/sksat/x86.mov/turbo86/bridge"
@@ -398,6 +399,14 @@ type Runner struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
+	// tickerStop is closed by the tracer goroutine's defer as the
+	// very first step of teardown, *before* it closes eventsCh. The
+	// MemUpdate ticker (if running) watches this channel and exits
+	// without sending — otherwise a tick fired between syscallLoop
+	// returning and the ticker noticing closeCh would panic with
+	// "send on closed channel". Created in `New`.
+	tickerStop chan struct{}
+
 	// Mode-dependent state, populated when the syscall loop starts.
 	mode       proto.Mode       // host (default) or trap
 	handlers   map[uint8]uint32 // signum → handler addr (trap mode only)
@@ -410,14 +419,20 @@ type Runner struct {
 	// pre-declare every region; the Pause / Fault snapshot stays
 	// accurate. Only touched from the tracer goroutine.
 	extraRegions []struct{ addr, size uint32 }
+
+	// (No periodic-snapshot flags — the MemUpdate ticker reads
+	// /proc/PID/mem from a separate goroutine without stopping the
+	// tracee, so it doesn't interact with the tracer's signal-stop
+	// machinery. Pause()'s SIGSTOP path is unchanged.)
 }
 
 type startMsg struct {
-	withCtx  bool
-	entry    uint32
-	stackTop uint32
-	ctx      proto.Context
-	mode     proto.Mode
+	withCtx           bool
+	entry             uint32
+	stackTop          uint32
+	ctx               proto.Context
+	mode              proto.Mode
+	memUpdateInterval time.Duration
 }
 
 // New spawns the stub and drives it to its self-SIGSTOP. The internal
@@ -431,9 +446,10 @@ func New(stubBytes []byte) (*Runner, error) {
 		// consumer reads, so the tracer can't outrun the consumer and
 		// tear down resources (mem fd, child) before mid-session
 		// streaming writes have a chance to land.
-		eventsCh: make(chan proto.Outbound),
-		closeCh:  make(chan struct{}),
-		done:     make(chan struct{}),
+		eventsCh:   make(chan proto.Outbound),
+		closeCh:    make(chan struct{}),
+		done:       make(chan struct{}),
+		tickerStop: make(chan struct{}),
 	}
 
 	bootErr := make(chan error, 1)
@@ -480,6 +496,36 @@ func (r *Runner) RunWithContext(ctx proto.Context) <-chan proto.Outbound {
 // RunWithContextAndMode is RunWithContext with explicit mode selection.
 func (r *Runner) RunWithContextAndMode(ctx proto.Context, mode proto.Mode) <-chan proto.Outbound {
 	r.startCh <- startMsg{withCtx: true, ctx: ctx, mode: mode}
+	return r.eventsCh
+}
+
+// RunWithModeAndMemUpdate is RunWithMode plus periodic MemUpdate
+// Outbound events. `memUpdateInterval` controls the cadence: zero
+// disables (identical to RunWithMode), values > 0 enable a background
+// goroutine that SIGSTOPs the child every `memUpdateInterval`, the
+// tracer catches the resulting stop, emits a `proto.MemUpdate` with
+// the sparse memory snapshot, and resumes the guest. Typical use:
+// `100 * time.Millisecond` for a browser frontend driving a canvas
+// that wants to show partial decoder output mid-run.
+func (r *Runner) RunWithModeAndMemUpdate(
+	entry, stackTop uint32, mode proto.Mode, memUpdateInterval time.Duration,
+) <-chan proto.Outbound {
+	r.startCh <- startMsg{
+		entry: entry, stackTop: stackTop, mode: mode,
+		memUpdateInterval: memUpdateInterval,
+	}
+	return r.eventsCh
+}
+
+// RunWithContextModeAndMemUpdate is RunWithContextAndMode plus periodic
+// MemUpdate (see RunWithModeAndMemUpdate for the cadence semantics).
+func (r *Runner) RunWithContextModeAndMemUpdate(
+	ctx proto.Context, mode proto.Mode, memUpdateInterval time.Duration,
+) <-chan proto.Outbound {
+	r.startCh <- startMsg{
+		withCtx: true, ctx: ctx, mode: mode,
+		memUpdateInterval: memUpdateInterval,
+	}
 	return r.eventsCh
 }
 
@@ -547,6 +593,11 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 	// Single defer covers all exit paths (bootstrap failure, pre-Run
 	// close, post-Run close, natural session end).
 	defer func() {
+		// Signal the periodic MemUpdate ticker (if any) to stop
+		// before we close eventsCh — otherwise a tick fired between
+		// syscallLoop returning and the ticker noticing would panic
+		// with "send on closed channel".
+		close(r.tickerStop)
 		if r.cmd != nil && r.cmd.Process != nil {
 			_ = r.cmd.Process.Kill() // no-op if already dead
 			var ws syscall.WaitStatus
@@ -641,7 +692,58 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 		return
 	}
 
+	// Start the periodic MemUpdate ticker, if the caller asked for one.
+	// Stopped by closing `closeCh` (Close()) or the syscallLoop
+	// returning naturally (the loop's defer drains by sending SIGKILL,
+	// which closes the ticker's only effective recipient).
+	if msg.memUpdateInterval > 0 {
+		go r.memUpdateTicker(msg.memUpdateInterval)
+	}
+
 	r.syscallLoop(&regs)
+}
+
+// memUpdateTicker runs alongside the tracer goroutine and emits one
+// `proto.MemUpdate` every `interval`. **No SIGSTOP, no ptrace stop**:
+// the snapshot reads `/proc/PID/mem` from this goroutine while the
+// guest keeps executing. A small amount of tearing is OK — the
+// canvas / progressive-display consumer keeps each frame; the next
+// tick fully overwrites it. The trade-off (vs the SIGSTOP-based
+// design) is consistency: a snapshot taken while the guest is mid-
+// scanline-write may show half a row in the old state and half in
+// the new. For movie86's canvas pane that looks fine.
+//
+// Sends to the shared `eventsCh` are serialised against the tracer
+// goroutine's terminal-event sends by an unbuffered-channel race;
+// since both sides eventually progress, whichever wins delivery
+// first is fine. `Close()` short-circuits via `closeCh`.
+func (r *Runner) memUpdateTicker(interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			regions, err := r.snapshotMemory()
+			if err != nil {
+				// Best-effort: snapshot can fail mid-session if the
+				// guest is reading a page that just got remapped or
+				// /proc/PID/mem hit a transient EAGAIN. Skip the tick
+				// rather than tearing down the whole session.
+				continue
+			}
+			select {
+			case r.eventsCh <- proto.MemUpdate{Regions: regions}:
+			case <-r.closeCh:
+				return
+			case <-r.tickerStop:
+				return
+			}
+		case <-r.closeCh:
+			return
+		case <-r.tickerStop:
+			return
+		}
+	}
 }
 
 func (r *Runner) bootstrap(stubBytes []byte) error {
@@ -1198,7 +1300,19 @@ func (r *Runner) syscallLoop(regs *regs32) {
 				nextSignal = int(sig)
 				continue
 			}
+			// Periodic MemUpdate path: if this SIGSTOP is one we sent
+			// ourselves for a memory snapshot (CAS 1→0 on
+			// snapshotPending), grab the regions, emit MemUpdate, and
+			// resume the guest without delivering the signal. The
+			// alternative — sending Paused here — would terminate the
+			// session, which is the right thing for a user-initiated
+			// Pause but wrong for "tick periodically while still
+			// running". CAS distinguishes ours from a Pause()-sent or
+			// truly external SIGSTOP.
 			// Not forwardable (job-control, etc.) — surface as Paused.
+			// (No special-case for periodic SIGSTOP — that path no
+			// longer exists; the MemUpdate ticker reads memory async
+			// without stopping the tracee.)
 			snap, err := r.capturePausedSnapshot(sig)
 			if err != nil {
 				r.emitFault(fmt.Sprintf("snapshot at non-forwardable signal: %v", err))
