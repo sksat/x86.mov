@@ -52,6 +52,12 @@ declare -A EXPECTED=(
     [base64_decode]=105
     [qoi_decode]=8
     [indirect_call]=42
+    # Stage-7h7 — f64 mandelbrot escape-iter sum along the real axis;
+    # exercises sitofp (__floatsidf), uitofp (__floatunsidf, via
+    # `iter as f64` accumulation), fmul, fadd, fsub, fcmp (olt /
+    # ole / ogt), and fptosi (__fixdfsi, via `score as i32` at the
+    # tail) on real Rust f64 ops. 337 mod 256 = 81.
+    [mandelbrot]=81
 )
 
 # `aes` doesn't yet round-trip through llvm-mov-llc (see run.sh comment);

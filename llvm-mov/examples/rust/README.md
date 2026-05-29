@@ -29,6 +29,7 @@ project with its own deps:
 | [`base64_decode/`](base64_decode/) | `base64_decode_main` | 6d3c crates.io ecosystem (base64) | 105 |
 | [`qoi_decode/`](qoi_decode/) | `qoi_decode_main` | 6d3e crates.io ecosystem (qoi) | 8 |
 | [`aes/`](aes/) | `aes_main` | stage 8+ blocker (vector.reduce.xor) | n/a |
+| [`mandelbrot/`](mandelbrot/) | `mandelbrot_main` | 7h7 first f64 demo — sum of escape-iter counts along the real axis (`sitofp` / `fmul` / `fadd` / `fsub` / `fcmp` end to end) | 81 |
 
 All crates are edition **2024** (`#[no_mangle]` → `#[unsafe(no_mangle)]`),
 `#![no_std]` + `#![no_main]`, and target `i686-unknown-linux-gnu`.
