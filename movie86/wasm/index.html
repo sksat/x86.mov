@@ -487,12 +487,23 @@ function renderDisasm() {
         d.free();
     }
     state.disasmEnd = last;
-    $('disasm').innerHTML = rows.join('') ||
+    const body = $('disasm');
+    body.innerHTML = rows.join('') ||
         `<div class="memrow">(no decodable instructions at ${fmt32(start)})</div>`;
-    // Scroll the current row into view so it stays visible as it
-    // progresses down the listing.
-    const cur = $('disasm').querySelector('.dr.cur');
-    if (cur) cur.scrollIntoView({ block: 'nearest' });
+    // Keep the current row in view by adjusting **only** the disasm
+    // pane's own scrollTop. `element.scrollIntoView({ block: 'nearest' })`
+    // can also nudge the document on mobile when the pane is partially
+    // below the fold, which makes the whole page jitter on every Run
+    // tick. Doing it manually scopes the scroll strictly to the pane.
+    const cur = body.querySelector('.dr.cur');
+    if (cur) {
+        const top = cur.offsetTop;
+        const bot = top + cur.offsetHeight;
+        const vTop = body.scrollTop;
+        const vBot = vTop + body.clientHeight;
+        if (top < vTop) body.scrollTop = top;
+        else if (bot > vBot) body.scrollTop = bot - body.clientHeight;
+    }
 }
 
 function renderMem() {
