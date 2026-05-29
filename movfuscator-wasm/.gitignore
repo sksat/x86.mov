@@ -6,3 +6,4 @@ build/
 # from host /lib32 + /usr/lib32 + /usr/lib/gcc; ~24 MB and host-specific
 # so we don't commit it. Shipped to npm via package.json "files".
 lib/
+.codex

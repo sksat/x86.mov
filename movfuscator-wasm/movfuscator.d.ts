@@ -24,7 +24,26 @@ export interface LinkOptions {
    *  resulting ELF's `.symtab`; defaults to `a.out.o`. Ignored when
    *  `objs` is an array or Record (those carry their own basenames). */
   name?: string;
-  /** Extra `-l<name>` flags appended after the default `-lgcc -lc -lm`. */
+  /** Link statically. Drops `-dynamic-linker /lib/ld-linux.so.2` and the
+   *  default `-lgcc -lc -lm`, adds `-static`. The output has no
+   *  PT_INTERP / PT_DYNAMIC, so it can be loaded by movie86 (which
+   *  rejects dynamic ELFs at `Vm::new`). Suitable for the
+   *  movfuscator-CRT-only programs that don't call into libc; if the
+   *  caller needs libc symbols, they can re-introduce them with
+   *  `extraLibs: ['c', ...]` plus a libc.a staged via `extraInputs`.
+   *  Default `false`. */
+  static?: boolean;
+  /** Which runtime objects the wrapper auto-wraps the user inputs in.
+   *  - `'movfuscator'` (default): historical LCC + mov-backend recipe,
+   *    `crt0 ... crtf crtd softfloat32`.
+   *  - `'none'`: just the user inputs; caller supplies `_start` and
+   *    any other runtime symbols. Matches the llvm-mov pipeline's
+   *    `_start_llvm.o ... stubs.o` recipe (see
+   *    `movie86/wasm/examples/sources/build-mandelbrot.sh`'s `build_llvm`).
+   */
+  runtime?: 'movfuscator' | 'none';
+  /** Extra `-l<name>` flags appended after the per-mode defaults
+   *  (`-lgcc -lc -lm` in dynamic mode, none in static mode). */
   extraLibs?: string[];
   /** Extra `-L<path>` search paths appended after the default
    *  `-L/movfuscator -L/usr/lib32 -L/lib32`. */
