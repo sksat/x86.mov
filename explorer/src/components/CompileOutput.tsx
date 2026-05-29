@@ -5,6 +5,12 @@ import {
     CardHeader,
     CardTitle,
 } from '@/components/ui/card';
+import {
+    Tabs,
+    TabsContent,
+    TabsList,
+    TabsTrigger,
+} from '@/components/ui/tabs';
 import { CodeViewer } from '@/components/CodeViewer';
 import { ElfSummary } from '@/components/ElfSummary';
 import type { CompileResult } from '@/lib/compiler';
@@ -12,77 +18,76 @@ import type { MovfuscatorWrapper } from '@/lib/wrappers';
 
 interface CompileOutputProps {
     result: CompileResult | null;
-    /** When non-null, displayed above the IR pane as a status / error. */
+    /** When non-null, displayed inside an empty pane as a status / error
+     *  hint instead of the placeholder text. */
     statusMessage: string | null;
-    /** ELF header parser, forwarded into the binary pane. Lazy-loaded
+    /** ELF header parser, forwarded into the binary tab. Lazy-loaded
      *  with movfuscator-wasm. */
     parseElfHeader?: MovfuscatorWrapper['parseElfHeader'];
+    /** Column height in pixels — kept consistent with the SourceEditor
+     *  / IRPane heights so the three-column layout stays flat. */
+    height?: number;
 }
 
 /**
- * The three middle panes — IR | asm | binary. Each is a Card so the
- * Compiler-Explorer aesthetic carries through; the IR pane is hidden
- * (returns null inside the grid) when the active compiler doesn't
- * surface IR (movfuscator).
+ * Right-most column in the Compiler-Explorer-style strip. Holds the
+ * mov-only asm and the linked binary in **one** tabbed pane so the
+ * horizontal real estate goes to source / IR / output equally. Tabs
+ * default to `asm` because that's what the user is here for — the
+ * binary view is a follow-up step (download / hex inspect / disasm).
+ *
+ * The asm tab uses CodeMirror's gas language. The binary tab shows
+ * the ELF32 header summary + hex dump + Download buttons (same shape
+ * as the old standalone ElfSummary card).
  */
 export function CompileOutput({
     result,
     statusMessage,
     parseElfHeader,
+    height = 480,
 }: CompileOutputProps) {
-    const showIr = !result || result.ir !== null;
     return (
-        <div
-            className="grid gap-3"
-            style={{
-                gridTemplateColumns: showIr
-                    ? 'repeat(3, minmax(0, 1fr))'
-                    : 'repeat(2, minmax(0, 1fr))',
-            }}
-        >
-            {showIr && (
-                <Card className="flex flex-col">
-                    <CardHeader className="pb-2">
-                        <CardTitle className="text-base">LLVM IR</CardTitle>
-                        <CardDescription>
-                            clang -emit-llvm output (mov-* triple forced
-                            downstream).
-                        </CardDescription>
-                    </CardHeader>
-                    <CardContent className="flex-1 min-h-0 pt-0">
+        <Card className="flex flex-col h-full">
+            <CardHeader className="pb-2">
+                <CardTitle className="text-base">Output</CardTitle>
+                <CardDescription>
+                    mov-only x86 assembly (GAS syntax) and the linked
+                    ELF32 binary. Both pipelines emit a byte-identical
+                    `.s` shape for the as.wasm / ld.wasm tail.
+                </CardDescription>
+            </CardHeader>
+            <CardContent className="flex-1 min-h-0 pt-0 flex flex-col">
+                <Tabs defaultValue="asm" className="flex-1 flex flex-col">
+                    <TabsList className="self-start mb-2" data-testid="output-tabs">
+                        <TabsTrigger value="asm" data-testid="output-tab-asm">
+                            asm
+                        </TabsTrigger>
+                        <TabsTrigger value="binary" data-testid="output-tab-binary">
+                            binary
+                        </TabsTrigger>
+                    </TabsList>
+                    <TabsContent value="asm" className="flex-1 min-h-0 m-0">
                         <CodeViewer
-                            value={result?.ir ?? statusMessage ?? '(compile to populate)'}
-                            language="llvm"
-                            height={480}
-                            data-testid="ir-pane"
+                            value={
+                                result?.asm ??
+                                statusMessage ??
+                                '(compile to populate)'
+                            }
+                            language="gas"
+                            height={height}
+                            data-testid="asm-pane"
                         />
-                    </CardContent>
-                </Card>
-            )}
-
-            <Card className="flex flex-col">
-                <CardHeader className="pb-2">
-                    <CardTitle className="text-base">mov-only asm</CardTitle>
-                    <CardDescription>
-                        x86-32 GAS syntax. Both pipelines emit a
-                        byte-identical `.s` shape for the as.wasm / ld.wasm tail.
-                    </CardDescription>
-                </CardHeader>
-                <CardContent className="flex-1 min-h-0 pt-0">
-                    <CodeViewer
-                        value={result?.asm ?? statusMessage ?? '(compile to populate)'}
-                        language="gas"
-                        height={480}
-                        data-testid="asm-pane"
-                    />
-                </CardContent>
-            </Card>
-
-            <ElfSummary
-                elf={result?.elf ?? null}
-                obj={result?.obj ?? null}
-                parseElfHeader={parseElfHeader}
-            />
-        </div>
+                    </TabsContent>
+                    <TabsContent value="binary" className="flex-1 min-h-0 m-0">
+                        <ElfSummary
+                            elf={result?.elf ?? null}
+                            obj={result?.obj ?? null}
+                            parseElfHeader={parseElfHeader}
+                            height={height}
+                        />
+                    </TabsContent>
+                </Tabs>
+            </CardContent>
+        </Card>
     );
 }

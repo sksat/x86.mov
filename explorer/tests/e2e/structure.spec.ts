@@ -13,38 +13,61 @@ test('Explorer renders the major panes', async ({ page }) => {
     // Header + title.
     await expect(page.locator('h1')).toContainText('Explorer');
 
-    // Three top-level controls.
+    // Compiler-explorer-style top strip is present.
+    await expect(page.getByTestId('explorer-strip')).toBeVisible();
     await expect(page.getByTestId('source-editor')).toBeVisible();
     await expect(page.getByTestId('preset-select')).toBeVisible();
     await expect(page.getByTestId('compiler-select')).toBeVisible();
     await expect(page.getByTestId('compile-button')).toBeVisible();
 
-    // Compile output strip exists.
+    // Output column lives in a single Tabs panel — `asm` is the
+    // default tab; the asm CodeViewer is visible without clicking
+    // anything. Pin the asm pane visibility + tab strip presence.
+    await expect(page.getByTestId('output-tabs')).toBeVisible();
     await expect(page.getByTestId('asm-pane')).toBeVisible();
-    // IR pane visible iff llvm-mov is the active compiler.
-    await expect(page.getByTestId('ir-pane')).toBeVisible();
 
-    // ELF hex dump pane (empty until compile, but the pre exists).
-    // The pane only mounts when there's an elf, so just check the
-    // surrounding "Binary" card title.
-    await expect(page.locator('text=Binary').first()).toBeVisible();
+    // IR pane is visible only when llvm-mov is the active compiler.
+    // Initial state is llvm-mov (App.tsx default).
+    await expect(page.getByTestId('ir-pane')).toBeVisible();
 
     // movie86 panel + handover.
     await expect(page.locator('text=Run · movie86').first()).toBeVisible();
     await expect(page.getByTestId('turbo86-handover')).toBeVisible();
 });
 
-test('Compiler select hides the IR pane when movfuscator is chosen', async ({ page }) => {
+test('Compiler select hides the IR column when movfuscator is chosen', async ({ page }) => {
     await page.goto('/');
-    // Trigger the Select and pick movfuscator.
+    // The IR column is mounted initially (llvm-mov default).
+    await expect(page.getByTestId('ir-pane')).toBeVisible();
+
+    // Switch compiler → movfuscator. The IR column unmounts (the
+    // strip flips to 2 columns).
     await page.getByTestId('compiler-select').click();
     await page.getByRole('option', { name: /movfuscator/ }).click();
+    await expect(page.getByTestId('ir-pane')).toHaveCount(0);
 
-    // No compile has run yet, so the IR pane still shows (it
-    // disappears only after a compile result with ir=null lands). For
-    // the structural test we just confirm the asm pane is still
-    // present — the compile-flow spec asserts the hide behaviour.
+    // asm pane (default tab in the Output column) is still visible.
     await expect(page.getByTestId('asm-pane')).toBeVisible();
+});
+
+test('Output tabs switch between asm and binary; asm is the default', async ({ page }) => {
+    await page.goto('/');
+    // Default tab is `asm` — its [data-state="active"] flips on the
+    // trigger and the asm pane is in the visible TabsContent.
+    await expect(page.getByTestId('output-tab-asm')).toHaveAttribute(
+        'data-state',
+        'active',
+    );
+    await expect(page.getByTestId('asm-pane')).toBeVisible();
+
+    // Click the binary tab. The Tabs primitive only renders the
+    // active TabsContent's children, so the asm pane unmounts.
+    await page.getByTestId('output-tab-binary').click();
+    await expect(page.getByTestId('output-tab-binary')).toHaveAttribute(
+        'data-state',
+        'active',
+    );
+    await expect(page.getByTestId('asm-pane')).toHaveCount(0);
 });
 
 test('Preset switch swaps the source contents', async ({ page }) => {

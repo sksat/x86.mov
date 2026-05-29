@@ -1,4 +1,3 @@
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Download } from 'lucide-react';
 import { downloadBlob, fmtBytes, hexDump } from '@/lib/utils';
@@ -16,24 +15,41 @@ interface ElfSummaryProps {
         entry: string;
         sections: number;
     };
+    /** Optional explicit pane height to match the asm tab. Without
+     *  this the dump can grow taller than the source/IR columns and
+     *  break the flat three-column row. */
+    height?: number;
 }
 
 /**
- * The "Binary" pane. Shows a parsed ELF32 header summary if available,
- * a hex dump of the first ~4 KiB, plus Download buttons for the .o
- * (relocatable) and the linked ELF.
+ * The "binary" tab content. Shows a parsed ELF32 header summary if
+ * available, a hex dump of the first ~4 KiB, and Download buttons for
+ * the .o (relocatable) and the linked ELF.
  *
- * Kept separate from CodeViewer because the rendering is structurally
- * different (header summary on top, dump below) and the data is
- * bytes-not-text.
+ * Previously this was a standalone Card; now it lives inside the
+ * CompileOutput Tabs panel so the wrapper is the lean two-section
+ * layout (header row + hex dump) — no Card chrome of its own. The
+ * CompileOutput card carries the title + description.
  */
-export function ElfSummary({ elf, obj, parseElfHeader }: ElfSummaryProps) {
+export function ElfSummary({
+    elf,
+    obj,
+    parseElfHeader,
+    height = 480,
+}: ElfSummaryProps) {
     const parsed = elf && parseElfHeader ? parseElfHeader(elf) : null;
+    const baseClass =
+        'flex flex-col gap-3 font-mono text-xs rounded-md border bg-card p-3';
 
     return (
-        <Card className="flex flex-col h-full">
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                <CardTitle className="text-base">Binary</CardTitle>
+        <div
+            className={baseClass}
+            style={{ height: `${height}px` }}
+        >
+            <div className="flex items-center justify-between gap-3">
+                <span className="text-xs text-muted-foreground">
+                    ELF32 header + hex dump (first ~4 KiB).
+                </span>
                 <div className="flex gap-2">
                     <Button
                         variant="outline"
@@ -59,36 +75,31 @@ export function ElfSummary({ elf, obj, parseElfHeader }: ElfSummaryProps) {
                         ELF
                     </Button>
                 </div>
-            </CardHeader>
-            <CardContent className="flex-1 flex flex-col gap-3 font-mono text-xs min-h-0">
-                {parsed && 'class' in parsed ? (
-                    <ElfHeaderTable
-                        header={parsed}
-                        size={elf ? elf.length : 0}
-                    />
-                ) : parsed && 'raw' in parsed ? (
-                    <pre className="rounded border bg-muted/30 p-2 whitespace-pre-wrap">
-                        {parsed.raw}
-                    </pre>
-                ) : elf ? (
-                    <p className="text-muted-foreground">
-                        (parser unavailable — load movfuscator-wasm)
-                    </p>
-                ) : (
-                    <p className="text-muted-foreground">
-                        Compile a source to produce an ELF.
-                    </p>
-                )}
-                {elf && (
-                    <pre
-                        className="rounded border bg-muted/30 p-2 overflow-auto flex-1 min-h-0 whitespace-pre"
-                        data-testid="elf-hexdump"
-                    >
-                        {hexDump(elf)}
-                    </pre>
-                )}
-            </CardContent>
-        </Card>
+            </div>
+            {parsed && 'class' in parsed ? (
+                <ElfHeaderTable header={parsed} size={elf ? elf.length : 0} />
+            ) : parsed && 'raw' in parsed ? (
+                <pre className="rounded border bg-muted/30 p-2 whitespace-pre-wrap">
+                    {parsed.raw}
+                </pre>
+            ) : elf ? (
+                <p className="text-muted-foreground">
+                    (parser unavailable — load movfuscator-wasm)
+                </p>
+            ) : (
+                <p className="text-muted-foreground">
+                    Compile a source to produce an ELF.
+                </p>
+            )}
+            {elf && (
+                <pre
+                    className="rounded border bg-muted/30 p-2 overflow-auto flex-1 min-h-0 whitespace-pre"
+                    data-testid="elf-hexdump"
+                >
+                    {hexDump(elf)}
+                </pre>
+            )}
+        </div>
     );
 }
 

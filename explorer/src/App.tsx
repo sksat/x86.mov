@@ -17,6 +17,7 @@ import {
 import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import { SourceEditor } from '@/components/SourceEditor';
+import { CodeViewer } from '@/components/CodeViewer';
 import { CompilerControls } from '@/components/CompilerControls';
 import { CompileOutput } from '@/components/CompileOutput';
 import { Movie86Panel } from '@/components/movie86/Movie86Panel';
@@ -114,70 +115,121 @@ export function App() {
 
     const elf = useMemo(() => result?.elf ?? null, [result]);
 
+    // Tall horizontal panes on PC; stacked panes on mobile. The exact
+    // height is picked so the source / IR / output trio aligns with
+    // CodeMirror's default line metrics — roughly 30 visible rows.
+    const PANE_HEIGHT = 540;
+
+    const showIr = compiler === 'llvm-mov' && (result === null || result.ir !== null);
+
     return (
         <div className="min-h-svh">
             <Header />
             <main className="mx-auto max-w-screen-2xl px-4 py-4 flex flex-col gap-4">
-                {/* Source + controls */}
+                {/* Top toolbar — preset + compiler controls + Compile.
+                    Single horizontal strip on PC, wraps to multiple
+                    rows on mobile. */}
                 <Card>
-                    <CardHeader className="pb-2">
-                        <div className="flex items-start justify-between gap-3 flex-wrap">
-                            <div>
-                                <CardTitle className="text-base">C source</CardTitle>
-                                <CardDescription>
-                                    Edit and click Compile. The result feeds the
-                                    embedded movie86 below.
-                                </CardDescription>
+                    <CardContent className="py-3 grid gap-3">
+                        <div className="flex flex-wrap items-end gap-3">
+                            <div className="flex flex-col gap-1.5">
+                                <Label htmlFor="preset">Preset</Label>
+                                <Select value={presetId} onValueChange={onPresetChange}>
+                                    <SelectTrigger
+                                        id="preset"
+                                        className="w-[260px]"
+                                        data-testid="preset-select"
+                                    >
+                                        <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {PRESETS.map((p) => (
+                                            <SelectItem key={p.id} value={p.id}>
+                                                {p.label}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
                             </div>
-                            <div className="flex items-end gap-2">
-                                <div className="flex flex-col gap-1.5">
-                                    <Label htmlFor="preset">Preset</Label>
-                                    <Select value={presetId} onValueChange={onPresetChange}>
-                                        <SelectTrigger
-                                            id="preset"
-                                            className="w-[260px]"
-                                            data-testid="preset-select"
-                                        >
-                                            <SelectValue />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                            {PRESETS.map((p) => (
-                                                <SelectItem key={p.id} value={p.id}>
-                                                    {p.label}
-                                                </SelectItem>
-                                            ))}
-                                        </SelectContent>
-                                    </Select>
-                                </div>
-                            </div>
+                            <CompilerControls
+                                compiler={compiler}
+                                onCompilerChange={setCompiler}
+                                optLevel={optLevel}
+                                onOptLevelChange={setOptLevel}
+                                extraFlags={extraFlags}
+                                onExtraFlagsChange={setExtraFlags}
+                                onCompile={onCompile}
+                                busy={busy}
+                            />
                         </div>
-                    </CardHeader>
-                    <CardContent className="pt-0 grid gap-3">
-                        <SourceEditor
-                            value={source}
-                            onChange={setSource}
-                            height={300}
-                            data-testid="source-editor"
-                        />
-                        <CompilerControls
-                            compiler={compiler}
-                            onCompilerChange={setCompiler}
-                            optLevel={optLevel}
-                            onOptLevelChange={setOptLevel}
-                            extraFlags={extraFlags}
-                            onExtraFlagsChange={setExtraFlags}
-                            onCompile={onCompile}
-                            busy={busy}
-                        />
                         <StatusBar {...statusBar} />
                     </CardContent>
                 </Card>
 
-                <CompileOutput
-                    result={result}
-                    statusMessage={statusMessage}
-                    parseElfHeader={parseElf}
-                />
+                {/* The Compiler-Explorer strip: source on the left, IR
+                    in the middle (llvm-mov only), output (asm/binary
+                    tabs) on the right. Equal columns on ≥ lg; stacked
+                    on smaller widths. */}
+                <div
+                    className="grid gap-3"
+                    style={{
+                        gridTemplateColumns: showIr
+                            ? 'repeat(3, minmax(0, 1fr))'
+                            : 'repeat(2, minmax(0, 1fr))',
+                    }}
+                    data-testid="explorer-strip"
+                >
+                    {/* Source card */}
+                    <Card className="flex flex-col">
+                        <CardHeader className="pb-2">
+                            <CardTitle className="text-base">C source</CardTitle>
+                            <CardDescription>
+                                Edit and click Compile. The result feeds the
+                                embedded movie86 below.
+                            </CardDescription>
+                        </CardHeader>
+                        <CardContent className="flex-1 min-h-0 pt-0">
+                            <SourceEditor
+                                value={source}
+                                onChange={setSource}
+                                height={PANE_HEIGHT}
+                                data-testid="source-editor"
+                            />
+                        </CardContent>
+                    </Card>
+
+                    {/* IR card (llvm-mov path only). */}
+                    {showIr && (
+                        <Card className="flex flex-col">
+                            <CardHeader className="pb-2">
+                                <CardTitle className="text-base">LLVM IR</CardTitle>
+                                <CardDescription>
+                                    clang -emit-llvm output (mov-* triple forced
+                                    downstream).
+                                </CardDescription>
+                            </CardHeader>
+                            <CardContent className="flex-1 min-h-0 pt-0">
+                                <CodeViewer
+                                    value={
+                                        result?.ir ??
+                                        statusMessage ??
+                                        '(compile to populate)'
+                                    }
+                                    language="llvm"
+                                    height={PANE_HEIGHT}
+                                    data-testid="ir-pane"
+                                />
+                            </CardContent>
+                        </Card>
+                    )}
+
+                    <CompileOutput
+                        result={result}
+                        statusMessage={statusMessage}
+                        parseElfHeader={parseElf}
+                        height={PANE_HEIGHT}
+                    />
+                </div>
 
                 <Separator />
 
