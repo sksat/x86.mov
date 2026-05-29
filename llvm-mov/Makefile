@@ -2,7 +2,18 @@
 # Mirrors the make-driven convention used by sibling subproject movfuscator-wasm.
 
 LLVM_VERSION ?= 22
-LLVM_CONFIG  ?= llvm-config-$(LLVM_VERSION)
+# Prefer the version-tagged binary (Debian / apt.llvm.org). Fall back to a bare
+# `llvm-config` when its major version matches — distros like Arch ship LLVM
+# unversioned. If neither fits we keep the version-tagged name so `configure`
+# still fails loudly with the install hint.
+LLVM_CONFIG  ?= $(shell \
+	if command -v llvm-config-$(LLVM_VERSION) >/dev/null 2>&1; then \
+		echo llvm-config-$(LLVM_VERSION); \
+	elif [ "$$(llvm-config --version 2>/dev/null | cut -d. -f1)" = "$(LLVM_VERSION)" ]; then \
+		echo llvm-config; \
+	else \
+		echo llvm-config-$(LLVM_VERSION); \
+	fi)
 BUILD_DIR    ?= build
 BUILD_TYPE   ?= Release
 
@@ -48,9 +59,10 @@ help:
 # Surface the missing-llvm-config diagnostic before invoking cmake at all.
 configure:
 	@if [ -z "$(LLVM_CMAKE_DIR)" ]; then \
-		echo "error: $(LLVM_CONFIG) not found. Install LLVM $(LLVM_VERSION) from apt.llvm.org:" 1>&2; \
-		echo "  wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- $(LLVM_VERSION)" 1>&2; \
-		echo "  sudo apt-get install -y llvm-$(LLVM_VERSION)-dev clang-$(LLVM_VERSION) lld-$(LLVM_VERSION) ninja-build" 1>&2; \
+		echo "error: no usable llvm-config for LLVM $(LLVM_VERSION) (tried llvm-config-$(LLVM_VERSION) and a bare llvm-config)." 1>&2; \
+		echo "  Debian/Ubuntu: wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- $(LLVM_VERSION)" 1>&2; \
+		echo "                 sudo apt-get install -y llvm-$(LLVM_VERSION)-dev clang-$(LLVM_VERSION) lld-$(LLVM_VERSION) ninja-build" 1>&2; \
+		echo "  Arch:          sudo pacman -S llvm clang lld cmake ninja  (ships LLVM $(LLVM_VERSION) as a monolithic libLLVM.so)" 1>&2; \
 		exit 1; \
 	fi
 	cmake -S . -B $(BUILD_DIR) -G Ninja \

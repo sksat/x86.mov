@@ -14,17 +14,26 @@ target_link_libraries(llvm-mov-llc
   LLVMMovInfo
 )
 
-llvm_map_components_to_libnames(LLVM_LIBS
-  AsmPrinter
-  CodeGen
-  Core
-  IRReader
-  MC
-  ScalarOpts
-  SelectionDAG
-  Support
-  Target
-  TransformUtils
-)
+# LLVM ships in two link flavours. apt.llvm.org (Debian/Ubuntu CI) provides
+# per-component static archives (libLLVMCodeGen.a, ...). Arch's `llvm` package
+# ships ONLY the monolithic libLLVM.so and sets LLVM_LINK_LLVM_DYLIB=ON, so the
+# per-component names below don't exist as link targets there. Pick the flavour
+# the installed LLVM actually offers.
+if(LLVM_LINK_LLVM_DYLIB)
+  set(LLVM_LIBS LLVM)
+else()
+  llvm_map_components_to_libnames(LLVM_LIBS
+    AsmPrinter
+    CodeGen
+    Core
+    IRReader
+    MC
+    ScalarOpts
+    SelectionDAG
+    Support
+    Target
+    TransformUtils
+  )
+endif()
 
 target_link_libraries(llvm-mov-llc PRIVATE ${LLVM_LIBS})
