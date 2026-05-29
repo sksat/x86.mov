@@ -173,7 +173,23 @@ jobs:
         working-directory: llvm-mov/wasm
         run: make build-wasm-llvm
 
+      # clang.{js,wasm} is purely a function of the vendored llvm-project
+      # source (already keyed by fetch.sh) + the two link/build scripts.
+      # When it cache-hits we skip ~15 min of wasm-opt on the em++ link;
+      # llvm-mov-llc.wasm is built separately below so the backend
+      # iteration loop is unaffected.
+      - name: cache llvm-mov/wasm clang.wasm artifact
+        uses: actions/cache@v5.0.5
+        id: lmw-clang-cache
+        with:
+          path: |
+            llvm-mov/wasm/build/clang.js
+            llvm-mov/wasm/build/clang.wasm
+            llvm-mov/wasm/build/package.json
+          key: clang-wasm-${{ runner.os }}-${{ hashFiles('llvm-mov/wasm/scripts/build-wasm-clang.sh', 'llvm-mov/wasm/scripts/build-wasm-llvm.sh', 'llvm-mov/wasm/scripts/fetch.sh') }}-v1
+
       - name: llvm-mov/wasm build (clang driver wasm)
+        if: steps.lmw-clang-cache.outputs.cache-hit != 'true'
         working-directory: llvm-mov/wasm
         run: make build-wasm-clang
 

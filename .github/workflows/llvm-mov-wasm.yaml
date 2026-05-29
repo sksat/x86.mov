@@ -93,7 +93,23 @@ jobs:
       - name: build wasm LLVM + clang static libs
         run: make build-wasm-llvm
 
+      # clang.{js,wasm} is purely a function of the vendored llvm-project
+      # source (already keyed by fetch.sh) + the two link/build scripts.
+      # When it cache-hits we skip ~15 min of wasm-opt on the em++ link;
+      # llvm-mov-llc.wasm is built separately below so the backend
+      # iteration loop is unaffected.
+      - name: cache clang.wasm artifact
+        uses: actions/cache@v5.0.5
+        id: clang-wasm-cache
+        with:
+          path: |
+            llvm-mov/wasm/build/clang.js
+            llvm-mov/wasm/build/clang.wasm
+            llvm-mov/wasm/build/package.json
+          key: clang-wasm-${{ runner.os }}-${{ hashFiles('llvm-mov/wasm/scripts/build-wasm-clang.sh', 'llvm-mov/wasm/scripts/build-wasm-llvm.sh', 'llvm-mov/wasm/scripts/fetch.sh') }}-v1
+
       - name: build wasm clang driver
+        if: steps.clang-wasm-cache.outputs.cache-hit != 'true'
         run: make build-wasm-clang
 
       # The native reference for parity tests. The parent llvm-mov
