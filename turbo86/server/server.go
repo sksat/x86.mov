@@ -109,6 +109,17 @@ func serve(w http.ResponseWriter, r *http.Request, originPatterns []string) {
 	}
 	defer ws.CloseNow()
 
+	// Raise the per-frame read cap above coder/websocket's 32 KiB default.
+	// LoadContext frames are dominated by base64-encoded `Bytes` arrays;
+	// the bundled `canvas_mandelbrot*.elf` examples ship code regions of
+	// ~0.9 MiB (llvm-mov pipeline) up to ~6.6 MiB (movfuscator pipeline),
+	// so leaving the default in place silently caps every non-trivial
+	// browser handover at the wire layer (StatusMessageTooBig 1009).
+	// 16 MiB matches the stub's RWX code region — a snapshot whose code
+	// section is bigger than the stub's mapping wouldn't fit in the
+	// guest anyway, so the cap mirrors the actual address space.
+	ws.SetReadLimit(16 << 20)
+
 	slog := newSessionLogger(nil)
 	slog.logf("connect: remote=%s origin=%q",
 		r.RemoteAddr, r.Header.Get("Origin"))

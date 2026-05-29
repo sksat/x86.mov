@@ -96,6 +96,57 @@ func TestE2E_LoadContext_OverWebSocket(t *testing.T) {
 	}
 }
 
+// TestE2E_LoadContext_LargePayloadOverDefaultReadLimit pins the WS
+// read-limit override. The coder/websocket default caps incoming
+// messages at 32 KiB, which would silently kill any handover whose
+// snapshot payload exceeds that — e.g. the bundled
+// `canvas_mandelbrot*.elf` examples whose code regions are ~0.9–6.6 MiB.
+// Send a LoadContext containing a non-executed 64 KiB filler region
+// (well above the default limit) alongside the exit(42) entry. If the
+// server hasn't bumped the read limit, this closes with
+// `websocket: message too big`; if it has, the session runs to Exit{42}.
+func TestE2E_LoadContext_LargePayloadOverDefaultReadLimit(t *testing.T) {
+	srv := httptest.NewServer(server.Handler(nil))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer ws.CloseNow()
+
+	const entry uint32 = 0x08048000
+	// 64 KiB of zeros at a non-executed address inside the stub's code
+	// region. After base64-encoding inside the JSON frame this region
+	// alone is ~87 KiB, well clear of the 32 KiB default cap.
+	filler := make([]byte, 64*1024)
+	sendInbound(t, ctx, ws, proto.LoadContext{Context: proto.Context{
+		Regs: proto.Regs{
+			Eax: 1, Ebx: 42, Esp: 0x701FFFF0, Eip: entry,
+		},
+		Regions: []proto.MemRegion{
+			// mov eax,1 ; mov ebx,42 ; int 0x80 — same shape the small
+			// LoadContext test uses, just paired with the filler region.
+			{Addr: entry, Bytes: []byte{
+				0xB8, 0x01, 0x00, 0x00, 0x00,
+				0xBB, 0x2A, 0x00, 0x00, 0x00,
+				0xCD, 0x80,
+			}},
+			{Addr: 0x08049000, Bytes: filler},
+		},
+	}})
+
+	got := readAllEvents(t, ctx, ws)
+	want := []proto.Outbound{proto.Exit{Code: 42}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", got, want)
+	}
+}
+
 // TestE2E_PostStartCodeStreaming exercises the streaming case: after
 // Start, the client keeps sending Code messages while the guest is
 // running. The server must apply them via runner.WriteCode without
