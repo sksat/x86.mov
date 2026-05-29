@@ -11,24 +11,27 @@
 # detail, not something we want in the URL.
 #
 # clang.wasm carve-out: at ~76 MiB it busts Cloudflare Pages' 25 MiB
-# per-file limit. We host it on a GitHub Release instead. The deploy
-# workflow sets `$CLANG_WASM_URL` to the release asset URL and this
-# script substitutes it into wasm-config.js so the wrapper's
-# `locateFile` fetches the .wasm from there. clang.wasm itself is
-# *not* copied into dist/. For local dev/tests `$CLANG_WASM_URL` is
-# unset and llvm-mov.mjs falls back to `./build/clang.wasm`.
+# per-file limit. We host it on a GitHub Release. A Pages Function
+# (functions/clang.wasm.template.js) is installed at
+# `dist/functions/llvm-mov/build/clang.wasm.js` which proxies the
+# release asset with the CORS headers GitHub doesn't serve. The
+# Emscripten loader's default fetch path (`./build/clang.wasm`
+# relative to clang.js) hits the function — no wrapper-side override
+# needed.
 #
 # Layout produced:
 #   dist/
 #     index.html                       (top-level landing page; refreshed
 #                                       only if dist/ doesn't already
 #                                       have one from a sibling deploy)
+#     functions/
+#       llvm-mov/build/clang.wasm.js   (Pages Function proxying GH Release)
 #     llvm-mov/
 #       index.html                     (demo)
 #       llvm-mov.mjs, llvm-mov.d.ts, wasm-config.js
 #       build/llvm-mov-llc.{js,wasm}
 #       build/clang.js                 (small Emscripten loader; the
-#                                       .wasm is fetched from release)
+#                                       .wasm is served by the Function)
 #       build/package.json             ({"type":"module"} so the emcc ESM
 #                                       loader is parsed correctly)
 
@@ -43,6 +46,7 @@ sub="$dist/llvm-mov"
 required=(
     "$here/llvm-mov.mjs" "$here/llvm-mov.d.ts" "$here/index.html"
     "$here/wasm-config.js"
+    "$here/functions/clang.wasm.template.js"
     "$here/build/llvm-mov-llc.js" "$here/build/llvm-mov-llc.wasm"
     "$here/build/clang.js"
     "$here/build/package.json"
@@ -59,8 +63,8 @@ done
 # (e.g. a clang.wasm staged before we moved it to GitHub Releases)
 # don't sneak into the deploy. CI checkouts are clean already; this
 # matters for local repro of the deploy contents.
-rm -rf "$sub"
-mkdir -p "$sub/build"
+rm -rf "$sub" "$dist/functions/llvm-mov"
+mkdir -p "$sub/build" "$dist/functions/llvm-mov/build"
 
 # Top-level index.html — only refresh if the source tree's version is
 # newer or absent, so a parallel `movfuscator-wasm/scripts/stage-deploy.sh`
@@ -78,15 +82,18 @@ cp "$here/build/llvm-mov-llc.js"   \
    "$here/build/package.json"      \
    "$sub/build/"
 
-# Inject the GitHub Release URL when the deploy workflow provided one.
-# The substitution targets only the `null` placeholder so re-running on
-# a tree where the URL was already substituted is a no-op.
+# Stage the Pages Function proxy for clang.wasm. The function file
+# lives at dist/functions/<URL path>.js, so this lands at
+# `/llvm-mov/build/clang.wasm` — exactly where Emscripten's loader
+# looks for the .wasm sibling of clang.js.
+fn="$dist/functions/llvm-mov/build/clang.wasm.js"
+cp "$here/functions/clang.wasm.template.js" "$fn"
+
 if [ -n "${CLANG_WASM_URL:-}" ]; then
     # URL safety: reject anything that isn't an https:// URL pointing at a
     # known asset host. The substitution lands inside a JS string literal,
     # so a malformed value (e.g. one containing a single quote) would
-    # corrupt wasm-config.js. We also use a non-/ sed delimiter to avoid
-    # escaping the URL path.
+    # corrupt the function source.
     case "$CLANG_WASM_URL" in
         https://github.com/*/releases/download/*/clang.wasm) ;;
         *)
@@ -94,14 +101,21 @@ if [ -n "${CLANG_WASM_URL:-}" ]; then
             echo "expected https://github.com/.../releases/download/.../clang.wasm" >&2
             exit 1 ;;
     esac
-    sed -i "s|^export const CLANG_WASM_URL = null;|export const CLANG_WASM_URL = '$CLANG_WASM_URL';|" \
-        "$sub/wasm-config.js"
-    if ! grep -q "CLANG_WASM_URL = '$CLANG_WASM_URL';" "$sub/wasm-config.js"; then
-        echo "wasm-config.js placeholder substitution failed" >&2
+    # Restrict the substitution to the `const RELEASE_URL = '…'` line
+    # so the surrounding doc comments keep mentioning the placeholder
+    # name verbatim.
+    sed -i "/^const RELEASE_URL/ s|__CLANG_WASM_RELEASE_URL__|$CLANG_WASM_URL|" "$fn"
+    if ! grep -q "const RELEASE_URL = '$CLANG_WASM_URL';" "$fn"; then
+        echo "Pages Function placeholder substitution failed" >&2
         exit 1
     fi
+else
+    # No URL — the function will hit the placeholder which makes its
+    # fetch fail loudly at runtime. Useful for `make stage-deploy`
+    # locally where we just want to see the layout.
+    echo "warning: CLANG_WASM_URL not set, clang.wasm proxy will fail at runtime" >&2
 fi
 
-bytes=$(du -sb "$sub" | cut -f1)
-files=$(find "$sub" -type f | wc -l)
-echo "staged $files files / $(numfmt --to=iec --suffix=B "$bytes") into $sub"
+bytes=$(du -sb "$sub" "$dist/functions/llvm-mov" 2>/dev/null | awk '{s+=$1} END {print s}')
+files=$(find "$sub" "$dist/functions/llvm-mov" -type f 2>/dev/null | wc -l)
+echo "staged $files files / $(numfmt --to=iec --suffix=B "$bytes") into $sub + functions"
