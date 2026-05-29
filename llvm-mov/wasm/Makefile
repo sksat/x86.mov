@@ -10,7 +10,7 @@ BUILD_DIR     ?= build
 
 .PHONY: help setup build build-wasm-llvm build-wasm-clang \
         build-wasm-llvm-mov-llc build-native-llvm-mov-llc \
-        test test-e2e test-e2e-dist test-e2e-dist-fzstd \
+        test test-rust test-e2e test-e2e-dist test-e2e-dist-fzstd \
         stage-deploy serve clean distclean
 
 help:
@@ -73,6 +73,13 @@ build-native-llvm-mov-llc:
 
 test: build
 	./tests/run.sh
+
+# Rust-frontend parity. Currently RED — `rsToIR()` is not yet wired
+# into llvm-mov.mjs. See ../CLAUDE.md "Rust frontend (in progress)" §.
+# Kept off the default `test` target until the wasm artefact lands so
+# CI doesn't go red on a known-pending feature.
+test-rust: build-native-llvm-mov-llc
+	./tests/run-rust.sh
 
 # Playwright drives the demo at index.html in a real (headless) Chromium,
 # clicks Compile on every built-in example, and asserts the rendered .s

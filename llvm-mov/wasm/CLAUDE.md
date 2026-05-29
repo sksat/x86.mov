@@ -45,9 +45,13 @@ Three things shape every decision here:
 ## Pipeline
 
 ```
-.c ──clang.wasm──→ .ll ──llvm-mov-llc.wasm──→ .s ──as.wasm──→ .o ──ld.wasm──→ ELF32
-   │                  │
-   └→ cToIR()         └→ compile()
+.c  ──clang.wasm──→ .ll ──llvm-mov-llc.wasm──→ .s ──as.wasm──→ .o ──ld.wasm──→ ELF32
+    │                  │
+    └→ cToIR()         └→ compile()
+
+.rs ──rustc.wasm──→ .ll  ─┘   (in progress — see "Rust frontend" below)
+    │
+    └→ rsToIR()
 ```
 
 - **clang.wasm**: a standalone clang driver, statically linked against
@@ -59,6 +63,65 @@ Three things shape every decision here:
   `libLLVM` and our Emscripten-compiled `LLVMMov*` backend libs.
 - **as.wasm / ld.wasm**: reused unchanged from
   [`../../movfuscator-wasm/build/`](../../movfuscator-wasm/build/).
+
+## Rust frontend (in progress)
+
+Goal: ship a `rustc.wasm` so the whole `.rs → ELF32` pipeline runs
+inside Node / a browser tab, with no host rustc required. Once landed,
+`rsToIR()` joins `cToIR()` as a sibling entrypoint feeding the same
+`compile()` → `as.wasm` → `ld.wasm` tail.
+
+### Version is a registry, not a build flag
+
+Rust moves fast; pinning a single `rustc.wasm` build into this
+subproject would lock us out of every later language version. The
+wrapper instead carries a **`RUSTC_VERSIONS` table** in
+[`llvm-mov.mjs`](llvm-mov.mjs): one row per shippable rustc.wasm
+artefact (URL, sysroot URL, supported targets, supported editions,
+matching native `rustup` version for parity tests). `rsToIR(src,
+{ rustcVersion: '<key>' })` is the only place a caller chooses.
+Adding a new Rust version = appending one row + rebuilding artefacts;
+no wrapper or test change needed.
+
+The end consumer for this knob is the [`explorer`](../../explorer/)
+SPA, which is intended to expose the Rust-version choice as a UI
+dropdown the same way it already exposes the toolchain (movfuscator /
+llvm-mov clang) choice.
+
+### Why we start on rubrc v0.2.0 (Rust 1.79) anyway
+
+Building our own `rustc.wasm` is days of work
+([`bjorn3/rust:compile_rustc_for_wasm20`](https://github.com/bjorn3/rust/tree/compile_rustc_for_wasm20)
++ wasi-sdk-22 + a custom sysroot for i686-unknown-linux-gnu).
+[`oligamiq/rubrc`](https://github.com/oligamiq/rubrc) already publishes
+a prebuilt artefact at `rust_wasm/v0.2.0/rustc_opt.wasm.br` (Rust 1.79,
+edition ≤ 2021, targets wasm32-wasip1 + x86_64-unknown-linux-gnu).
+That's enough to prove end-to-end wiring works. The "i686 + edition
+2024" delta moves in as a second registry row driven by a self-hosted
+artefact.
+
+### Layered status
+
+| layer | state | next step |
+|---|---|---|
+| Registry API (`RUSTC_VERSIONS` + `rsToIR` validation) | landed | — |
+| Driver stub (`lib/rustc-driver.mjs`) | landed (throws clear next-step error) | wire fetch + WASI |
+| npm deps (`@oligami/rustc-browser-wasi_shim`, `@bjorn3/browser_wasi_shim`) | pending | `npm install` after sign-off |
+| Real driver (5 steps in `lib/rustc-driver.mjs` header) | pending | depends on deps |
+| Self-hosted Rust 1.96 artefact (i686 + edition 2024) | not started | `scripts/build-wasm-rustc.sh` from bjorn3 wasm20 |
+| Explorer UI integration | not started | dropdown + dynamic-import in `explorer/src/lib/wrappers.ts` |
+
+### Tests
+
+[`tests/run-rust.sh`](tests/run-rust.sh) is a *smoke* gate (not parity)
+because the wasm rustc is intentionally older than the host rustc. It
+asserts `rsToIR()` returns text containing `define … @rust_main`.
+Strict byte-identical parity comes when both sides are the same Rust
+version — at that point the script gets a `RUSTUP_VERSION` env var,
+runs `rustup run <ver> rustc …` on the native side, and diffs again.
+Fixture set starts at
+[`tests/fixtures/ret_42.rs`](tests/fixtures/ret_42.rs) (edition 2021
+mirror of `ret_42.c`).
 
 ## Build graph
 

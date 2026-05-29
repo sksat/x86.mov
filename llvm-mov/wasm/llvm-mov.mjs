@@ -341,3 +341,146 @@ export async function compileC(source, opts = {}) {
         onProgress: opts.onProgress,
     });
 }
+
+// ---------------------------------------------------------------------------
+// Rust frontend (in progress)
+// ---------------------------------------------------------------------------
+//
+// `rsToIR(source)` runs a wasm-hosted rustc on a single .rs file and
+// returns the LLVM IR text (`--emit=llvm-ir`). The downstream
+// `compile()` then takes it to mov-target asm exactly like the C path.
+//
+// Rust version is selectable via `opts.rustcVersion`, which keys into
+// `RUSTC_VERSIONS`. Adding a new rustc.wasm build means appending one
+// entry to that table — no wrapper or test changes required. See
+// ../CLAUDE.md "Rust frontend (in progress)" for the staged plan and
+// the rationale behind starting on the rubrc v0.2.0 (Rust 1.79)
+// artefact rather than building our own first.
+
+/**
+ * Catalogue of selectable rustc.wasm artefacts. Each entry is the
+ * single source of truth for *one* Rust version: where to fetch the
+ * compiler wasm and matching sysroot, which targets / editions it can
+ * cope with, and how to invoke the equivalent native rustc for parity
+ * tests. The wrapper code is intentionally agnostic about *which*
+ * version is in use — switching is a one-line opts change.
+ */
+export const RUSTC_VERSIONS = {
+    'rubrc-v0.2.0': {
+        rustVersion: '1.79.0',
+        // Edition 2024 stabilized in 1.85; this artefact predates it.
+        editions: ['2015', '2018', '2021'],
+        // What rubrc actually ships sysroot tarballs for under
+        // rust_wasm/v0.2.0/. i686-unknown-linux-gnu is *not* one of
+        // them — that's the gap we'd close by building our own
+        // artefact from bjorn3/rust:compile_rustc_for_wasm20 once the
+        // spike confirms the rest of the wiring works.
+        supportedTargets: ['wasm32-wasip1', 'x86_64-unknown-linux-gnu'],
+        artefacts: {
+            rustcWasm: 'https://oligamiq.github.io/rust_wasm/v0.2.0/rustc_opt.wasm.br',
+            // Per-target sysroot lives at `${sysrootBase}/${triple}.tar.br`.
+            sysrootBase: 'https://oligamiq.github.io/rust_wasm/v0.2.0',
+            compression: 'brotli',
+        },
+        // Parity-test hint: tests run `rustup run <nativeRustup> rustc …`
+        // so the native reference matches the wasm artefact's Rust
+        // version exactly. (`rustup install 1.79.0` is the one-time
+        // setup on the dev box.)
+        nativeRustup: '1.79.0',
+    },
+    // Future expansion:
+    //
+    // 'self-bjorn3-wasm20': {
+    //     rustVersion: '1.96.0',
+    //     editions: ['2015', '2018', '2021', '2024'],
+    //     supportedTargets: ['i686-unknown-linux-gnu', 'x86_64-unknown-linux-gnu', 'wasm32-wasip1'],
+    //     artefacts: {
+    //         // self-hosted from scripts/build-wasm-rustc.sh
+    //         rustcWasm: '/llvm-mov/rustc-1.96.0.wasm.br',
+    //         sysrootBase: '/llvm-mov/sysroot-1.96.0',
+    //         compression: 'brotli',
+    //     },
+    //     nativeRustup: '1.96.0',
+    // },
+};
+
+export const DEFAULT_RUSTC_VERSION = 'rubrc-v0.2.0';
+
+// Driver is dynamic-imported so callers that don't touch the Rust path
+// (e.g. the existing C parity tests) don't pull the WASI shim in.
+// Same lazy-load pattern as `loadClang()` above.
+let _rustcDriver = null;
+async function loadRustcDriver() {
+    if (_rustcDriver === null) {
+        const m = await import('./lib/rustc-driver.mjs');
+        _rustcDriver = m.rsToIRImpl;
+    }
+    return _rustcDriver;
+}
+
+/**
+ * Compile a single Rust source file to LLVM IR text via a
+ * wasm-hosted rustc.
+ *
+ * @param {string} source Rust source text.
+ * @param {{
+ *     name?: string,
+ *     rustcVersion?: keyof typeof RUSTC_VERSIONS,
+ *     target?: string,
+ *     edition?: '2015'|'2018'|'2021'|'2024',
+ *     optLevel?: '0'|'1'|'2'|'3'|'s'|'z',
+ *     artefacts?: { rustcWasm?: string, sysrootBase?: string },
+ *     onProgress?: (ev: { stage: string }) => void,
+ * }} [opts]
+ *   - `name`: MEMFS basename for the source file. Defaults to `main.rs`.
+ *   - `rustcVersion`: registry key. Defaults to `DEFAULT_RUSTC_VERSION`.
+ *   - `target`: `--target`. Must be in the version's `supportedTargets`.
+ *     Defaults to the first entry there.
+ *   - `edition`: `--edition`. Must be in the version's `editions`.
+ *     Defaults to `2021`.
+ *   - `optLevel`: forwarded as `-C opt-level=…`. No default (rustc's
+ *     own default applies — `0` for `--crate-type=lib`).
+ *   - `artefacts`: override the version's default URLs. Use this to
+ *     point at self-hosted mirrors or to pin a specific bjorn3 build
+ *     without editing the registry.
+ *   - `onProgress`: status callback. Stages: `fetch-rustc`,
+ *     `fetch-sysroot`, `instantiate-wasi`, `run-rustc`.
+ * @returns {Promise<string>} LLVM IR text from `--emit=llvm-ir`.
+ */
+export async function rsToIR(source, opts = {}) {
+    if (typeof source !== 'string') {
+        throw new TypeError('source must be a string');
+    }
+    const verKey = opts.rustcVersion ?? DEFAULT_RUSTC_VERSION;
+    const spec = RUSTC_VERSIONS[verKey];
+    if (!spec) {
+        throw new Error(
+            `unknown rustcVersion ${JSON.stringify(verKey)}; ` +
+            `known: ${Object.keys(RUSTC_VERSIONS).join(', ')}`,
+        );
+    }
+    const target = opts.target ?? spec.supportedTargets[0];
+    if (!spec.supportedTargets.includes(target)) {
+        throw new Error(
+            `target ${JSON.stringify(target)} not supported by ${verKey} ` +
+            `(supported: ${spec.supportedTargets.join(', ')})`,
+        );
+    }
+    const edition = opts.edition ?? '2021';
+    if (!spec.editions.includes(edition)) {
+        throw new Error(
+            `edition ${edition} not supported by ${verKey} ` +
+            `(supported: ${spec.editions.join(', ')})`,
+        );
+    }
+    const name = opts.name ?? 'main.rs';
+    assertSafeName(name);
+    const driver = await loadRustcDriver();
+    return driver(source, spec, {
+        ...opts,
+        name,
+        target,
+        edition,
+        artefacts: { ...spec.artefacts, ...(opts.artefacts ?? {}) },
+    });
+}
