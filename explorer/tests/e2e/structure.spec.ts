@@ -45,20 +45,20 @@ test('Movie86 panel exposes a live Follow toggle + step-delay control', async ({
     await expect(follow).toBeVisible();
     await expect(delay).toBeVisible();
 
-    // Default is batch (Follow off); the delay input is only meaningful
-    // in follow mode, so it starts disabled.
-    await expect(follow).not.toBeChecked();
-    await expect(delay).toBeDisabled();
-
-    // Flipping Follow enables the delay control — the toggle is plain
-    // UI state, so this works without a loaded Vm (and, in turn, can be
-    // flipped while a run is in flight). The run loop reads it live.
-    await follow.check();
+    // Default is Follow on (watch each mov land), so the step-delay
+    // input — only meaningful in follow mode — starts enabled.
     await expect(follow).toBeChecked();
     await expect(delay).toBeEnabled();
 
+    // Toggling is plain UI state, so it works without a loaded Vm (and,
+    // in turn, can be flipped while a run is in flight — the run loop
+    // reads it live). Off disables the delay input; on re-enables it.
     await follow.uncheck();
+    await expect(follow).not.toBeChecked();
     await expect(delay).toBeDisabled();
+
+    await follow.check();
+    await expect(delay).toBeEnabled();
 });
 
 test('Compiler select hides the IR column when movfuscator is chosen', async ({ page }) => {

@@ -31,9 +31,9 @@ export interface UseMovie86VmReturn {
     stop: () => void;
     reset: () => Promise<void>;
     running: boolean;
-    /** Follow mode: one step + render per frame (watch each mov) vs the
-     *  default batched periodic dump. Read live by the run loop, so
-     *  toggling it mid-run takes effect on the next step. */
+    /** Follow mode (default on): one step + render per frame (watch
+     *  each mov) vs the batched periodic dump. Read live by the run
+     *  loop, so toggling it mid-run takes effect on the next step. */
     follow: boolean;
     setFollow: (v: boolean) => void;
     /** Step delay (ms) between instructions while Follow is on. Also
@@ -68,8 +68,11 @@ export function useMovie86Vm(): UseMovie86VmReturn {
     // their *current* value each iteration (state captured in the run()
     // closure would be stale). The setters update both so the UI stays
     // controlled and the live loop sees the change immediately.
-    const [follow, setFollowState] = useState(false);
-    const followRef = useRef(false);
+    // Default to Follow on — the explorer runs small, freshly-compiled
+    // programs you want to watch instruction-by-instruction; the user
+    // can flip to fast batch mode any time, including mid-run.
+    const [follow, setFollowState] = useState(true);
+    const followRef = useRef(true);
     const setFollow = useCallback((v: boolean) => {
         followRef.current = v;
         setFollowState(v);
