@@ -126,6 +126,19 @@ for (const name of Object.keys(EXAMPLES)) {
             expect(ll).toBe(EXPECTED[name][opt].ll);
             expect(asm).toBe(EXPECTED[name][opt].s);
             expect(pageErrors).toEqual([]);
+
+            // When the run is supposed to exercise the in-browser fzstd
+            // fallback (the deploy server is stripping
+            // `Content-Encoding: zstd`), prove the wrapper actually
+            // took that path: it emits a `decompress-clang` stage
+            // event, which the demo renders as "decompress clang" in
+            // the timing breakdown below the status line. A
+            // byte-identical asm alone wouldn't catch a regression
+            // where the native-decode branch silently handled the
+            // raw zstd bytes.
+            if (process.env.E2E_FZSTD_EXPECTED) {
+                await expect(page.locator('#timing')).toContainText('decompress clang');
+            }
         });
     }
 }
