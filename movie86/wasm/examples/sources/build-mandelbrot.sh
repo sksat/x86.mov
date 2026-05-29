@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Build three flavours of `canvas_mandelbrot*.elf` from two C sources.
+# Build four flavours of `canvas_mandelbrot*.elf` from three C sources.
 #
 #   mandelbrot_coarse.c → (movfuscator pipeline) → canvas_mandelbrot_mov.elf
 #   mandelbrot_coarse.c → (clang -O2 → llvm-mov-llc) → canvas_mandelbrot.elf
 #   mandelbrot_hires.c  → (clang -O2 → llvm-mov-llc) → canvas_mandelbrot_hires.elf
+#   mandelbrot_max.c    → (clang -O2 → llvm-mov-llc) → canvas_mandelbrot_max.elf
 #
-# The "coarse" variant computes a small 80×50 grid and blits each cell
-# as a 4×4 block of mode-13h pixels; "hires" computes the full 320×200
-# at MAX_ITER=24 for a sharper boundary. movfuscator-coarse exists as
-# a slow side-by-side comparison; movfuscator-hires would take many
-# hours so we skip it.
+# Variants:
+#   - "coarse":  mode 13h, 80×50 compute + 4×4 blit, MAX_ITER=8.    ~90 s wall.
+#   - "hires":   mode 13h, 320×200 native, MAX_ITER=24.            ~40 min wall.
+#   - "max":     VESA 6Ah, 800×600 native, MAX_ITER=24.            ~8 hours wall.
+#
+# movfuscator-coarse exists as a slow side-by-side comparison;
+# movfuscator-hires/max would take many hours / days, so we skip them.
 #
 # All three flavours are statically linked, ship a `.fb13h` BSS region
 # at guest address 0xA0000 (mode 13h), and rely on a small
@@ -44,6 +47,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 as --32 -mx86-used-note=no -o "$TMP/stubs_mov.o" "$HERE/stubs_movfuscator.s"
 as --32 -mx86-used-note=no -o "$TMP/stubs_llvm.o" "$HERE/stubs_llvm.s"
+as --32 -mx86-used-note=no -o "$TMP/stubs_llvm_max.o" "$HERE/stubs_llvm_max.s"
 as --32 -mx86-used-note=no -o "$TMP/_start_llvm.o" "$HERE/_start_llvm.s"
 
 # ============================================================
@@ -65,15 +69,17 @@ echo "  → $(stat -c %s "$EX/canvas_mandelbrot_mov.elf") B"
 # llvm-mov pipeline — build both coarse and hires
 # ============================================================
 build_llvm() {
-    local src="$1" out="$2"
+    local src="$1" out="$2" stubs="$3" section_args="$4"
+    local base; base="$(basename "$src" .c)"
     echo "[llvm-mov] $(basename "$src")"
-    "$CLANG" -m32 -O2 -emit-llvm -S "$src" -o "$TMP/$(basename "$src" .c).ll"
-    "$LLC" -verify-machineinstrs "$TMP/$(basename "$src" .c).ll" \
-        -mtriple=mov-unknown-linux-gnu -o "$TMP/$(basename "$src" .c).s"
-    as --32 -mx86-used-note=no -o "$TMP/$(basename "$src" .c).o" "$TMP/$(basename "$src" .c).s"
+    "$CLANG" -m32 -O2 -emit-llvm -S "$src" -o "$TMP/$base.ll"
+    "$LLC" -verify-machineinstrs "$TMP/$base.ll" \
+        -mtriple=mov-unknown-linux-gnu -o "$TMP/$base.s"
+    as --32 -mx86-used-note=no -o "$TMP/$base.o" "$TMP/$base.s"
+    # shellcheck disable=SC2086 # intentional word-split of section_args
     ld -m elf_i386 -static --hash-style=gnu \
-        --section-start=.fb13h=0xA0000 --undefined=_fb13h_region \
-        "$TMP/_start_llvm.o" "$TMP/$(basename "$src" .c).o" "$TMP/stubs_llvm.o" \
+        $section_args \
+        "$TMP/_start_llvm.o" "$TMP/$base.o" "$stubs" \
         -o "$out"
     # llvm-mov binaries don't need the symbol table for movie86 to run
     # them (there's no master_loop / dispatch trick to wire up) so
@@ -82,7 +88,14 @@ build_llvm() {
     echo "  → $(stat -c %s "$out") B"
 }
 
-build_llvm "$HERE/mandelbrot_coarse.c" "$EX/canvas_mandelbrot.elf"
-build_llvm "$HERE/mandelbrot_hires.c"  "$EX/canvas_mandelbrot_hires.elf"
+build_llvm "$HERE/mandelbrot_coarse.c" "$EX/canvas_mandelbrot.elf" \
+    "$TMP/stubs_llvm.o" \
+    "--section-start=.fb13h=0xA0000 --undefined=_fb13h_region"
+build_llvm "$HERE/mandelbrot_hires.c"  "$EX/canvas_mandelbrot_hires.elf" \
+    "$TMP/stubs_llvm.o" \
+    "--section-start=.fb13h=0xA0000 --undefined=_fb13h_region"
+build_llvm "$HERE/mandelbrot_max.c"    "$EX/canvas_mandelbrot_max.elf" \
+    "$TMP/stubs_llvm_max.o" \
+    "--section-start=.fb6Ah=0x00400000 --undefined=_fb6Ah_region"
 
 echo "done."

@@ -206,6 +206,7 @@
       <option value="canvas_modes">canvas_modes — switch mode 13h → 12h mid-run</option>
       <option value="canvas_mandelbrot">canvas_mandelbrot — real-compute Mandelbrot (clang -O2 → llvm-mov, ~90 s)</option>
       <option value="canvas_mandelbrot_hires">canvas_mandelbrot_hires — same, native 320×200 + MAX_ITER=24 (~40 min)</option>
+      <option value="canvas_mandelbrot_max">canvas_mandelbrot_max — VESA 6Ah 800×600 native (~8 hours, overnight)</option>
       <option value="canvas_mandelbrot_mov">canvas_mandelbrot_mov — same C, movfuscator pipeline (~10 min, for comparison)</option>
       <option value="upload">(upload your own ELF)</option>
     </select>
@@ -284,6 +285,7 @@ const EXAMPLES = {
     canvas_modes:             './examples/canvas_modes.elf',
     canvas_mandelbrot:        './examples/canvas_mandelbrot.elf',
     canvas_mandelbrot_hires:  './examples/canvas_mandelbrot_hires.elf',
+    canvas_mandelbrot_max:    './examples/canvas_mandelbrot_max.elf',
     canvas_mandelbrot_mov:    './examples/canvas_mandelbrot_mov.elf',
 };
 
