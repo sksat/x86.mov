@@ -32,6 +32,18 @@ mmap_request:
     pop ecx
     jmp ecx
 
+# int poll_input(void)
+#   ABI call 0x040 — triggers a poll by writing any byte to
+#   [0x1FFE_0040]; the engine pops one key code off its input queue and
+#   hands it back in eax (KEY_NONE = 0 when empty). eax carries straight
+#   into the cdecl return; the ret-free pop ecx ; jmp ecx tail (#42)
+#   leaves eax untouched.
+.globl poll_input
+poll_input:
+    mov [0x1FFE0040], al
+    pop ecx
+    jmp ecx
+
 # void exit(int code)   __attribute__((noreturn))
 #   ABI call 0x0FE — writes `code` to [0x1FFE_00FE] (4-byte store).
 # The engine never lets the next instruction execute, so we can leave
