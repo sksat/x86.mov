@@ -366,6 +366,51 @@ try {
     failed++;
 }
 
+// --- cycle.elf: partial-step decode coverage ---
+//
+// The other fixtures terminate, so the runElf parity loop above ends
+// naturally. `cycle.elf` is an infinite call/ret + jmp loop, so it
+// never halts on its own — but the decoder must still walk every
+// instruction it contains without UnknownOpcode. Run for enough
+// steps to cover all five `pN` functions plus the bottom `jmp _start`
+// and check we collected a few iterations of "1 2 3 4 5\n" on
+// stdout. This would have caught a regression where the source-
+// rebuild emitted `EB rel8` (short jmp) instead of `E9 rel32`, which
+// the movie86 decoder doesn't accept.
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/cycle.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        // Each iteration is 5 prints + a jmp; ~80 instructions covers
+        // a handful of full cycles. Drain stdout periodically so we
+        // don't overflow the buffer between checks.
+        let stdout = new Uint8Array(0);
+        for (let i = 0; i < 5; i++) {
+            vm.stepN(200n);
+            const chunk = vm.drainStdout();
+            if (chunk.length) {
+                const merged = new Uint8Array(stdout.length + chunk.length);
+                merged.set(stdout); merged.set(chunk, stdout.length);
+                stdout = merged;
+            }
+            assert.equal(vm.haltReason, undefined,
+                `cycle halted unexpectedly after batch ${i}: ${vm.haltReason}`);
+        }
+        const text = new TextDecoder().decode(stdout);
+        // Expect at least two full "1 2 3 4 5\n" iterations to have
+        // landed by now.
+        const matches = text.match(/1 2 3 4 5\n/g) || [];
+        assert.ok(matches.length >= 2,
+            `expected ≥2 iterations of "1 2 3 4 5\\n", got ${matches.length}: ${JSON.stringify(text)}`);
+        console.log(`ok  cycle (${matches.length} iterations × "1 2 3 4 5\\n")`);
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL cycle decode coverage: ${e.stack || e.message}`);
+    failed++;
+}
+
 // --- Vm round-trip: snapshot → mutate → restore ---
 //
 // `wrapper.snapshotContext(vm)` + `wrapper.loadContextInto(vm, ctx)`
