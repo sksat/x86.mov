@@ -136,16 +136,25 @@ pair brings the session back into the local Vm. Six pieces:
   `vm.loadContext`, returns `{ applied, skipped }`. Used by the
   "Restore Vm from Paused" button after a turbo86 `Paused` event.
 
-- **Unified console + engine-aware cards.** turbo86's stdout/stderr
-  feed the SAME `#stdout` / `#stderr` panes the local Vm uses
-  (prefixed `[turbo86] ` so the two streams are visually separable
-  without splitting them spatially — the user reads one continuous
-  output transcript). The meta cards (`total mov` / `mov per sec` /
-  …) switch their data source AND their labels when a turbo86
-  session is active: while engine == 'turbo86' the cards report
-  `turbo86 events` / `events / sec` / `status` / `exit` / `session
-  time` / `paused regions`. `setEngine('local')` (called by Reset,
-  doRun, and doRestoreFromTurbo86) flips them back.
+- **Unified console.** turbo86's stdout/stderr feed the SAME
+  `#stdout` / `#stderr` panes the local Vm uses, prefixed
+  `[turbo86] ` so the two streams are visually separable without
+  splitting them spatially — the user reads one continuous output
+  transcript across both engines.
+
+- **Meta cards always describe the local Vm**, never relabel during
+  a turbo86 session. `proto.Outbound` has no instruction counter
+  (`Stdout` / `Stderr` / `Exit` / `Fault` / `Paused` only), so
+  there's no honest `mov / sec` we could compute for turbo86;
+  swapping the labels to "events / events per sec" would drift the
+  project's "everything is a mov" narrative across engines. Instead
+  the local Vm's last `mov / sec` stays visible (frozen post-
+  handover) and turbo86's live session stats — event count, rate,
+  wall time, status — render into `#turbo86-stats` inside the
+  session pane header. Updated by `renderT86Stats()` on every
+  Outbound and a 200 ms `setInterval` while the WS is open. Don't
+  reintroduce a global "engine" switch; the data sources are
+  genuinely different and the UI is clearer for separating them.
 
 ## Display strategy: follow vs periodic
 

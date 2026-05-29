@@ -46,6 +46,10 @@
   .t86events .ev.t-exit   { color: #060; font-weight: bold; }
   .t86events .ev.t-paused { color: #946; }
   .t86events .ev .ts { color: #999; margin-right: 0.4rem; }
+  .t86stats {
+      font-size: 0.78rem; color: #557; margin-left: 0.6rem;
+      font-variant-numeric: tabular-nums;
+  }
 
   /* Status cards — each metric gets its own small panel with a big
      value and a short uppercase label underneath. The "total mov" card
@@ -320,6 +324,7 @@
   <div class="panel-head">
     <h2>turbo86 session</h2>
     <span id="turbo86-summary" class="status">—</span>
+    <span id="turbo86-stats" class="t86stats">—</span>
     <button id="turbo86-pause" hidden>Pause turbo86</button>
     <button id="turbo86-restore" hidden>Restore Vm from Paused</button>
   </div>
@@ -364,10 +369,6 @@ const state = {
     elfBytes: null,
     prevRegs: null,
     prevEip: null,
-    // Which engine drives the meta cards / instruction preview right
-    // now: 'local' = wasm Vm, 'turbo86' = remote session. Flipped by
-    // doSendToTurbo86 / doRestoreFromTurbo86 / doReset.
-    engine: 'local',
     // Bumping runId cancels any in-flight Run loop without needing
     // shared mutable state to flip — the loop notices its id is stale
     // and bails out cleanly.
@@ -627,31 +628,26 @@ function renderMem() {
     $('mem').innerHTML = html.join('');
 }
 
+// The meta cards always describe the local Vm — `total mov` is the
+// movie86 instruction count, `mov / sec` the wasm interpreter's
+// throughput, etc. We deliberately do NOT relabel them during a
+// turbo86 session: turbo86's wire (proto.Outbound) has no instruction
+// count, so there's no honest "mov / sec" we could compute for it,
+// and swapping the labels to "events / events per sec" makes the
+// project's "everything is a mov" narrative drift across engines.
+// turbo86's own session metrics live in the #turbo86-pane header
+// instead, where the meaning is unambiguous.
 function renderMeta() {
-    if (state.engine === 'turbo86') {
-        renderMetaTurbo86();
-    } else {
-        renderMetaLocal();
-    }
-}
-
-// Cards in local-Vm mode: total mov / mov per sec / halt / exit /
-// wall time / memory range — the original labels and the original
-// data source (`state.vm`).
-function renderMetaLocal() {
-    setMetaLabels({
-        steps: 'total mov',
-        rate:  'mov / sec',
-        halt:  'halt',
-        exit:  'exit',
-        wall:  'wall time',
-        mem:   'memory',
-    });
     const vm = state.vm; if (!vm) return;
     const halt = vm.haltReason;
 
     $('m-steps').textContent = fmtCount(vm.steps);
 
+    // Sample rate over a ~250 ms window so the number stays readable.
+    // Halted (or paused-for-handover) Vms keep their last rate so the
+    // card doesn't snap to "—" the moment Send is pressed — the user
+    // can still read "how fast was movie86 going right before the
+    // handover" while turbo86 runs.
     if (!halt) {
         const now = performance.now();
         const dt = now - state.rateSampleTime;
@@ -673,65 +669,6 @@ function renderMetaLocal() {
     haltCard.classList.toggle('exit', !!isExit);
     haltCard.classList.toggle('fault', !!halt && !isExit);
     $('m-exit').textContent = vm.exitCode ?? '—';
-}
-
-// Cards in turbo86-session mode: the live ptrace-driven session
-// doesn't report instruction counts (no `vm.steps` analogue), so we
-// surface the closest things turbo86 *does* tell us — Outbound event
-// count + their rate, session status, exit code, wall time since
-// LoadContext was sent, and the bytes-in-last-Paused for the memory
-// card. Sampling shape mirrors the local rate: 250 ms windows so the
-// number stays readable.
-function renderMetaTurbo86() {
-    setMetaLabels({
-        steps: 'turbo86 events',
-        rate:  'events / sec',
-        halt:  'status',
-        exit:  'exit',
-        wall:  'session time',
-        mem:   'paused regions',
-    });
-    const s = turbo86.stats;
-    $('m-steps').textContent = fmtCount(s.events);
-
-    if (turbo86.ws && s.halt == null) {
-        const now = performance.now();
-        const dt = now - s.rateSampleAt;
-        if (dt >= 250 && s.rateSampleAt !== 0) {
-            s.lastRate = (s.events - s.rateSampleEvents) / (dt / 1000);
-            s.rateSampleAt = now;
-            s.rateSampleEvents = s.events;
-        }
-    }
-    $('m-rate').textContent = s.lastRate == null ? '—' : fmtRate(s.lastRate);
-
-    const haltCard = $('card-halt');
-    const haltText = s.halt ?? 'running';
-    $('m-halt').textContent = haltText;
-    haltCard.classList.toggle('exit', s.halt === 'exit');
-    haltCard.classList.toggle('fault', s.halt === 'fault');
-    $('m-exit').textContent = s.exit ?? '—';
-
-    if (s.startWall) {
-        const endWall = s.endWall || performance.now();
-        $('m-wall').textContent = `${Math.round(endWall - s.startWall)} ms`;
-    }
-    if (s.memBytes != null) {
-        $('m-memrange').textContent = `${s.memBytes.toLocaleString()} B`;
-    }
-}
-
-// Update the small uppercase label under each card's value. The keys
-// match the card ids (m-{key}) so wiring stays unambiguous.
-function setMetaLabels({ steps, rate, halt, exit, wall, mem }) {
-    const labels = document.querySelectorAll('.meta .card .k');
-    if (labels.length < 6) return;  // boot before DOM ready
-    labels[0].textContent = steps;
-    labels[1].textContent = rate;
-    labels[2].textContent = halt;
-    labels[3].textContent = exit;
-    labels[4].textContent = wall;
-    labels[5].textContent = mem;
 }
 
 // Snap-to-bottom only when the user was already there — if they
@@ -861,10 +798,6 @@ function setRunButton(running) {
 async function doRun() {
     const vm = state.vm;
     if (!vm || vm.haltReason) return;
-    // Starting a local Run flips the cards back to local semantics —
-    // a previous turbo86 session may have left them showing turbo86
-    // labels (events / status / session time).
-    setEngine('local');
     const myRun = ++state.runId;
     setRunButton(true);
     const follow = $('follow').checked;
@@ -918,7 +851,6 @@ async function doReset() {
     resetT86Pane();
     resetT86Stats();
     $('turbo86-pane').hidden = true;
-    setEngine('local');
     await loadFromBytes(state.elfBytes, 'reset');
 }
 
@@ -951,7 +883,10 @@ async function doReset() {
 
 const turbo86 = {
     ws: null,
-    // Live session stats — what the meta cards read while engine == 'turbo86'.
+    // Live session stats — rendered into `#turbo86-stats` in the pane
+    // header. The meta cards above the disasm pane stay on the local
+    // Vm (see renderMeta) because turbo86's wire has no instruction
+    // counter and we want labels to keep their literal meaning.
     stats: {
         events: 0,
         startWall: 0,
@@ -963,6 +898,10 @@ const turbo86 = {
         exit: null,          // exit code if a `exit` event arrived
         memBytes: null,      // bytes summed from the last Paused regions
     },
+    // setInterval handle for the 200 ms stats redraw. Active while
+    // the WS is open so the rate/wall-time keep ticking smoothly
+    // between Outbound events; cleared on close.
+    tickId: null,
     // Last received Paused — keeps the regs + regions around so the
     // user can Restore even after the WS closes.
     lastPaused: null,
@@ -986,17 +925,6 @@ function appendT86Event(label, detail, klass = '') {
     $('turbo86-events').scrollTop = $('turbo86-events').scrollHeight;
 }
 
-// Switch which engine the meta cards / instruction-preview describe.
-// 'local' (default) reads `state.vm`; 'turbo86' reads `turbo86.stats`.
-// Bumping the engine triggers a re-render so labels and values update
-// in lockstep — never leave the labels saying "total mov" while the
-// number is actually turbo86's event count.
-function setEngine(name) {
-    if (state.engine === name) return;
-    state.engine = name;
-    render();
-}
-
 function resetT86Stats() {
     turbo86.stats = {
         events: 0,
@@ -1011,10 +939,36 @@ function resetT86Stats() {
     };
 }
 
+// Render turbo86 session stats into the pane header — events count,
+// rate, wall time. Kept separate from the local-Vm meta cards because
+// turbo86's wire has no instruction counter, so blurring the two would
+// invite confusion. Called from any place that updates turbo86.stats
+// (Outbound message handler, periodic rate sampler tick, close).
+function renderT86Stats() {
+    const s = turbo86.stats;
+    if (!s.startWall) return;
+    if (turbo86.ws && s.halt == null) {
+        const now = performance.now();
+        const dt = now - s.rateSampleAt;
+        if (dt >= 250 && s.rateSampleAt !== 0) {
+            s.lastRate = (s.events - s.rateSampleEvents) / (dt / 1000);
+            s.rateSampleAt = now;
+            s.rateSampleEvents = s.events;
+        }
+    }
+    const endWall = s.endWall || performance.now();
+    const wall = Math.round(endWall - s.startWall);
+    const rateText = s.lastRate == null ? '—' : `${fmtRate(s.lastRate)}/s`;
+    const haltText = s.halt ?? (turbo86.ws ? 'running' : '—');
+    $('turbo86-stats').textContent =
+        `${haltText} · ${fmtCount(s.events)} ev · ${rateText} · ${wall} ms`;
+}
+
 function resetT86Pane() {
     $('turbo86-events').textContent = '';
     $('turbo86-summary').textContent = '—';
     $('turbo86-summary').className = 'status';
+    $('turbo86-stats').textContent = '—';
     $('turbo86-pause').hidden = true;
     $('turbo86-restore').hidden = true;
     turbo86.lastPaused = null;
@@ -1065,7 +1019,7 @@ async function doSendToTurbo86() {
         `${url} (mode=${mode}, EIP=${fmt32(ctx.regs.eip)}, ` +
         `${ctx.regions.length} region(s), ${totalBytes.toLocaleString()} B)`);
     setT86Status('connecting…');
-    setEngine('turbo86');
+    renderT86Stats();
 
     let ws;
     try {
@@ -1085,6 +1039,10 @@ async function doSendToTurbo86() {
             appendT86Event('sent', `LoadContext (${frame.length.toLocaleString()} B JSON)`);
             setT86Status('running…', 'ok');
             $('turbo86-pause').hidden = false;
+            // Periodic redraw — events / rate / wall-time. 200 ms is
+            // fast enough that the number feels live without
+            // dominating the event loop.
+            turbo86.tickId = setInterval(renderT86Stats, 200);
         } catch (err) {
             setT86Status(`send failed: ${err.message || err}`, 'err');
             appendT86Event('error', String(err), 't-fault');
@@ -1144,7 +1102,7 @@ async function doSendToTurbo86() {
                 $('turbo86-restore').hidden = false;
                 break;
         }
-        render();
+        renderT86Stats();
     };
 
     ws.onerror = () => {
@@ -1166,8 +1124,12 @@ async function doSendToTurbo86() {
         setT86Status(`closed (${e.code})`,
             e.code === 1000 || e.code === 1005 ? 'ok' : 'err');
         $('turbo86-pause').hidden = true;
+        if (turbo86.tickId) {
+            clearInterval(turbo86.tickId);
+            turbo86.tickId = null;
+        }
         if (turbo86.ws === ws) turbo86.ws = null;
-        render();
+        renderT86Stats();
     };
 }
 
@@ -1189,11 +1151,10 @@ function doRestoreFromTurbo86() {
         appendT86Event('restored',
             `${applied} region(s) applied${skipped ? `, ${skipped} skipped (outside Vm mapping)` : ''}`,
             't-paused');
-        // Hand the cards back to the local Vm — its state is now what
-        // turbo86 had at the Paused boundary.
-        setEngine('local');
         // Wipe the rate sampler so the next mov/sec sample starts
-        // clean from the restored boundary.
+        // clean from the restored boundary — Vm.steps doesn't reset
+        // by loadContext (it's cumulative), so without this the
+        // first sample would average the pre-handover rate too.
         state.rateSampleSteps = 0n;
         state.rateSampleTime = 0;
         state.lastRate = null;

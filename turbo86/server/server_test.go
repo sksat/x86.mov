@@ -3,11 +3,15 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -321,6 +325,94 @@ func sendInbound(t *testing.T, ctx context.Context, ws *websocket.Conn, msg prot
 	}
 }
 
+// TestE2E_LogsAreCoherentForOneSession is the structural test for the
+// session-logging surface. A LoadContext → Exit{42} session should
+// produce: connect, runner ready, inbound LoadContext, outbound Exit,
+// events summary, session end ok — all tagged with the same 8-hex
+// session id. Stdout/Stderr content stays out of the log (only
+// byte counts) by design — guests should not be able to leak data
+// into operator logs.
+func TestE2E_LogsAreCoherentForOneSession(t *testing.T) {
+	var buf safeBuffer
+	prev := log.Default().Writer()
+	log.Default().SetOutput(&buf)
+	defer log.Default().SetOutput(prev)
+
+	srv := httptest.NewServer(server.Handler(nil))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer ws.CloseNow()
+
+	const entry uint32 = 0x08048000
+	sendInbound(t, ctx, ws, proto.LoadContext{Context: proto.Context{
+		Regs: proto.Regs{Eax: 1, Ebx: 42, Esp: 0x701FFFF0, Eip: entry},
+		Regions: []proto.MemRegion{
+			{Addr: entry, Bytes: []byte{0xCD, 0x80}},
+		},
+	}})
+	// Drain — gives the handleSession event-forwarding loop a chance
+	// to emit the Exit event before we tear the connection down.
+	if got := readAllEvents(t, ctx, ws); len(got) != 1 {
+		t.Fatalf("events: got %d, want 1", len(got))
+	}
+	// Closing the WS unblocks the reader goroutine's ws.Read so the
+	// final "session end" log line gets emitted before we assert.
+	_ = ws.Close(websocket.StatusNormalClosure, "")
+
+	// A short wait covers the goroutine-scheduling tail; without it
+	// the "session end" log line can race the assertion below.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), "session end") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	logText := buf.String()
+
+	// All session log lines must share a single 8-hex session id.
+	ids := regexp.MustCompile(`\[([0-9a-f]{8})\]`).FindAllStringSubmatch(logText, -1)
+	if len(ids) == 0 {
+		t.Fatalf("expected at least one [session-id] log line, got:\n%s", logText)
+	}
+	first := ids[0][1]
+	for _, m := range ids {
+		if m[1] != first {
+			t.Errorf("multiple session ids in one session log: %q vs %q", first, m[1])
+			break
+		}
+	}
+
+	for _, want := range []string{
+		"connect: remote=",
+		"runner: ready",
+		"inbound LoadContext: mode=host",
+		"eip=0x8048000",
+		"outbound Exit: code=42",
+		"events: total=1",
+		"session end: ok",
+	} {
+		if !strings.Contains(logText, want) {
+			t.Errorf("log missing %q\nfull log:\n%s", want, logText)
+		}
+	}
+
+	// Stdout content must NOT leak into the log — guests shouldn't be
+	// able to push data into the operator's transcript. This program
+	// emits no stdout so we just sanity-check the counter format.
+	if !strings.Contains(logText, "stdout=0B") {
+		t.Errorf("log should include `stdout=0B` summary, got:\n%s", logText)
+	}
+}
+
 // TestHandler_RejectsCrossOriginWithoutAllowList pins the security
 // boundary: with `Handler(nil)` (no allow list configured) and a
 // browser-like cross-origin handshake (Origin set, mismatching Host),
@@ -404,6 +496,27 @@ func TestHandler_RejectsOriginOutsideAllowList(t *testing.T) {
 	if resp != nil && resp.StatusCode != http.StatusForbidden {
 		t.Errorf("expected HTTP 403, got %d", resp.StatusCode)
 	}
+}
+
+// safeBuffer is a `bytes.Buffer` guarded by a mutex so the test's
+// reader goroutine and the server's logger goroutine don't race on
+// `Write` / `String`. The stdlib `bytes.Buffer` isn't safe for
+// concurrent use.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // readAllEvents reads frames until the server closes the connection
