@@ -89,7 +89,23 @@ Companion to [`movie86`](../movie86/): movie86 is the in-browser interpreter ("w
 
 - **Trap-mode signal dispatch pushes a restorer trampoline.** At session start in trap mode, the runner writes a 7-byte `mov eax, 173; int 0x80` trampoline at `0x09040000` (near the end of the 16 MiB code region). At signal time, the runner pushes that address onto the guest stack before redirecting EIP into the handler — so a normally-returning handler `ret`s into the trampoline, which then invokes `rt_sigreturn` (which the runner intercepts and restores from `r.signalRegs`). Without this push, exit-from-handler works but a returning handler `ret`s to garbage, diverging from host mode.
 
-- **The WebSocket Accept does NOT set `InsecureSkipVerify`.** Turning it on would disable the browser Origin check, letting any visited web page open `ws://127.0.0.1:<port>` and drive the runner (cross-site RCE — this endpoint accepts and executes arbitrary guest bytes natively). coder/websocket's default Origin check passes when no Origin header is sent (the test client's case) and requires Origin to match Host otherwise. When deploying with a fixed browser frontend origin, add `OriginPatterns: []string{"https://x86.mov", …}` — don't reach for `InsecureSkipVerify`.
+- **The WebSocket Accept does NOT set `InsecureSkipVerify`.** Turning it on would disable the browser Origin check, letting any visited web page open `ws://127.0.0.1:<port>` and drive the runner (cross-site RCE — this endpoint accepts and executes arbitrary guest bytes natively). coder/websocket's default Origin check passes when no Origin header is sent (the test client's case) and requires Origin to match Host otherwise. The browser frontend (movie86/wasm at `https://x86.mov` or a CF Pages preview) is always cross-origin to the loopback `ws://127.0.0.1:1234`, so a default-only build rejects every browser handshake. `server.Handler(originPatterns)` takes an allow-list of host patterns (filepath.Match against the Origin URL's host, port-aware); `cmd/turbo86`'s `--allow-origin` flag is the wire — defaults to `x86.mov`, `*.x86-mov.pages.dev`, `localhost(:*)`, `127.0.0.1(:*)` so a stock `./turbo86` works with prod, every PR preview, and `make serve` without extra config. Override with a tighter list for hardened deploys; pass `--allow-origin=""` to get the original strict default back. Tests pass `nil` and dial without an `Origin` header so they stay in the strict path. Never reach for `InsecureSkipVerify`.
+
+- **Per-session structured logging.** `server.handleSession` emits a
+  log line for every connection (`connect`), each Inbound type
+  (`inbound Code`, `inbound LoadContext`, `inbound Pause`, …), each
+  *terminal* Outbound type (`outbound Exit`, `outbound Fault`,
+  `outbound Paused`), an aggregate events summary
+  (`events: total=… stdout=… stderr=…`), and a final `session end`
+  with a duration. All lines are tagged with an 8-hex random
+  `[session-id]` prefix so concurrent sessions can be grep'd apart.
+  Stdout/Stderr content is intentionally NOT logged — only byte
+  counts surface in the summary. Two reasons: noise (a chatty guest
+  would dominate the log), and the "operator logs aren't a covert
+  data channel" principle (the guest is untrusted code; making it
+  trivially loggable encourages users to leak data through the
+  server logs). Origin-rejected handshakes also log (with remote +
+  Origin) because the silent 403 is the most opaque failure mode.
 
 - **`PTRACE_O_EXITKILL` is set alongside TRACESYSGOOD.** If the turbo86 host process crashes or is killed (any reason), the kernel sends `SIGKILL` to the tracee. Without this, an orphaned guest keeps running with no bridge in front of it — it's executing untrusted bytes, so anything it does (open files, exec other binaries, …) would run as the server user with no filtering. EXITKILL closes that window.
 

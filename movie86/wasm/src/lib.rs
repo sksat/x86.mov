@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use movie86::bios_host::{BiosArgs, BiosHost, BiosResult};
+use movie86::context::{capture_sparse_regions, Regs as CoreRegs};
 use movie86::decode::decode as decode_insn;
 use movie86::elf::{flatten_with_stack, parse, LoadedElf};
 use movie86::libc_host::{LibcCall, LibcHost, LibcResult};
@@ -605,6 +606,250 @@ impl Vm {
             return Vec::new();
         }
         buf
+    }
+
+    /// Capture the canonical migration snapshot of the current guest
+    /// state: 10-word register file (GPRs + EIP + EFLAGS) and the
+    /// sparse memory regions (non-zero 4 KiB pages merged into runs).
+    ///
+    /// The schema matches the core crate's
+    /// [`movie86::context::Context`], which in turn matches turbo86's
+    /// `proto.Context` byte-for-byte once JSON-encoded by the JS
+    /// wrapper — so a snapshot taken here can be handed to turbo86 via
+    /// `LoadContext` and resumed.
+    ///
+    /// The JS wrapper in `movie86.mjs` provides `snapshotContext(vm)`
+    /// + `makeLoadContextMessage(ctx, mode)` on top of this; UI code
+    /// should call those instead of poking the raw struct, but the
+    /// struct's getters are public for tests that want field-level
+    /// assertions without going through JSON.
+    #[wasm_bindgen(js_name = snapshotContext)]
+    pub fn snapshot_context(&self) -> ContextSnapshot {
+        let regs = CoreRegs::from_cpu(&self.cpu);
+        let base = self.mem.base();
+        let len = u32::try_from(self.mem.len()).unwrap_or(u32::MAX);
+        // `capture_sparse_regions` only faults when a read goes outside
+        // the mapped extent; we ask for exactly `[base, base + len)`,
+        // which by construction is inside the FlatMemory region, so the
+        // unwrap can't fire.
+        let regions = capture_sparse_regions(&self.mem, base, len)
+            .expect("capture_sparse_regions inside FlatMemory's own extent should never fault");
+        let region_addrs = regions.iter().map(|r| r.addr).collect();
+        let region_bytes = regions.into_iter().map(|r| r.bytes).collect();
+        ContextSnapshot {
+            regs,
+            region_addrs,
+            region_bytes,
+        }
+    }
+
+    /// Apply a `ContextSnapshot` to this Vm — write each region into
+    /// guest memory, then load the register file, then clear the halt
+    /// state so the Vm can resume execution. The inverse of
+    /// `snapshotContext`.
+    ///
+    /// Used for the reverse handoff (turbo86 → movie86): a `Paused`
+    /// Outbound carries Regs + Regions; the JS wrapper deserializes
+    /// it, builds a `ContextSnapshot`, and calls this to "absorb" the
+    /// state back into the local Vm so `Run` continues from there.
+    ///
+    /// Lossy semantics: regions that fall outside the local Vm's
+    /// mapped extent (typically turbo86's stack region at 0x70000000+
+    /// which movie86's much smaller `FlatMemory` doesn't cover) are
+    /// skipped instead of erroring. The returned summary's `skipped`
+    /// count lets the UI surface that — the stack-resident bits of
+    /// the snapshot are lost, but everything in the code region
+    /// lands, which is sufficient for resuming most movfuscator-shape
+    /// programs whose hot state lives in code+regs rather than stack.
+    #[wasm_bindgen(js_name = loadContext)]
+    pub fn load_context(&mut self, snap: &ContextSnapshot) -> LoadContextSummary {
+        let mut applied: u32 = 0;
+        let mut skipped: u32 = 0;
+        for (idx, &addr) in snap.region_addrs.iter().enumerate() {
+            let bytes = &snap.region_bytes[idx];
+            if self.mem.write_bytes(addr, bytes).is_ok() {
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        snap.regs.load_into(&mut self.cpu);
+        // Restoring resets halt: a snapshot was taken from a running
+        // (or pre-run) Vm by definition, so clear the cached fault /
+        // exit label. Step / Run can then re-evaluate from the
+        // restored EIP.
+        self.halt = None;
+        self.exit_code = None;
+        LoadContextSummary { applied, skipped }
+    }
+}
+
+/// Result of [`Vm::loadContext`]: how many of the snapshot's regions
+/// landed inside the Vm's mapped memory, and how many had to be
+/// dropped because they were outside the mapping (e.g. turbo86 stack
+/// region 0x70000000+ when restoring into a small movie86 FlatMemory).
+#[wasm_bindgen]
+pub struct LoadContextSummary {
+    applied: u32,
+    skipped: u32,
+}
+
+#[wasm_bindgen]
+impl LoadContextSummary {
+    #[wasm_bindgen(getter)]
+    pub fn applied(&self) -> u32 {
+        self.applied
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn skipped(&self) -> u32 {
+        self.skipped
+    }
+}
+
+/// JS-visible mirror of [`movie86::context::Context`] — 10 register
+/// fields plus a list of (addr, bytes) regions. Returned by
+/// [`Vm::snapshotContext`]; the JS wrapper in `movie86.mjs` walks the
+/// getters to assemble the wire-format `LoadContext` payload for
+/// turbo86.
+///
+/// Parallel-array region storage (`region_addrs` + `region_bytes`)
+/// keeps wasm-bindgen out of returning `Vec<exported_struct>`, which
+/// would require an extra wrapper type per region with its own `free`.
+/// The cost is one extra JS-side getter call per region; the snapshot
+/// itself only happens at handoff time so the overhead is negligible.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct ContextSnapshot {
+    regs: CoreRegs,
+    region_addrs: Vec<u32>,
+    region_bytes: Vec<Vec<u8>>,
+}
+
+#[wasm_bindgen]
+impl ContextSnapshot {
+    /// Build an empty snapshot — all regs zero, no regions. Used by
+    /// the JS wrapper when reconstructing a snapshot from a parsed
+    /// `Paused` Outbound: fill the regs via `setRegs(...)`, then
+    /// `addRegion(addr, bytes)` for each MemRegion, then hand it to
+    /// `Vm::loadContext`.
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            regs: CoreRegs::default(),
+            region_addrs: Vec::new(),
+            region_bytes: Vec::new(),
+        }
+    }
+
+    /// Load all 10 register slots in one call. Ten positional u32
+    /// arguments isn't pretty, but it avoids defining a parallel JS
+    /// `WireRegs` struct just to pass it across the wasm boundary,
+    /// and the call site is generated by the wrapper so the
+    /// argument order isn't user-visible.
+    #[wasm_bindgen(js_name = setRegs)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_regs(
+        &mut self,
+        eax: u32,
+        ebx: u32,
+        ecx: u32,
+        edx: u32,
+        esi: u32,
+        edi: u32,
+        ebp: u32,
+        esp: u32,
+        eip: u32,
+        eflags: u32,
+    ) {
+        self.regs = CoreRegs {
+            eax,
+            ebx,
+            ecx,
+            edx,
+            esi,
+            edi,
+            ebp,
+            esp,
+            eip,
+            eflags,
+        };
+    }
+
+    /// Append one region. Regions are applied in the order added when
+    /// passed to `Vm::loadContext`, matching turbo86's "later region
+    /// wins for overlapping bytes" semantics on the receive side.
+    #[wasm_bindgen(js_name = addRegion)]
+    pub fn add_region(&mut self, addr: u32, bytes: Vec<u8>) {
+        self.region_addrs.push(addr);
+        self.region_bytes.push(bytes);
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn eax(&self) -> u32 {
+        self.regs.eax
+    }
+    #[wasm_bindgen(getter)]
+    pub fn ebx(&self) -> u32 {
+        self.regs.ebx
+    }
+    #[wasm_bindgen(getter)]
+    pub fn ecx(&self) -> u32 {
+        self.regs.ecx
+    }
+    #[wasm_bindgen(getter)]
+    pub fn edx(&self) -> u32 {
+        self.regs.edx
+    }
+    #[wasm_bindgen(getter)]
+    pub fn esi(&self) -> u32 {
+        self.regs.esi
+    }
+    #[wasm_bindgen(getter)]
+    pub fn edi(&self) -> u32 {
+        self.regs.edi
+    }
+    #[wasm_bindgen(getter)]
+    pub fn ebp(&self) -> u32 {
+        self.regs.ebp
+    }
+    #[wasm_bindgen(getter)]
+    pub fn esp(&self) -> u32 {
+        self.regs.esp
+    }
+    #[wasm_bindgen(getter)]
+    pub fn eip(&self) -> u32 {
+        self.regs.eip
+    }
+    /// Always 0 — movie86 does not model EFLAGS. The field is
+    /// preserved so wire payloads match turbo86's schema byte-for-byte
+    /// for the same logical state.
+    #[wasm_bindgen(getter)]
+    pub fn eflags(&self) -> u32 {
+        self.regs.eflags
+    }
+
+    #[wasm_bindgen(getter, js_name = regionCount)]
+    pub fn region_count(&self) -> usize {
+        self.region_addrs.len()
+    }
+
+    /// Address of the `idx`-th sparse region, or `u32::MAX` if `idx`
+    /// is out of range. JS callers check `regionCount` first; the
+    /// sentinel is only here so wasm-bindgen doesn't have to surface
+    /// an `Option<u32>` (which would become `number | undefined` and
+    /// invite a "missed undefined" bug in the JS wrapper).
+    #[wasm_bindgen(js_name = regionAddrAt)]
+    pub fn region_addr_at(&self, idx: usize) -> u32 {
+        self.region_addrs.get(idx).copied().unwrap_or(u32::MAX)
+    }
+
+    /// Bytes of the `idx`-th sparse region. Returns an empty `Vec`
+    /// when `idx` is out of range — same defensive shape as
+    /// `regionAddrAt`.
+    #[wasm_bindgen(js_name = regionBytesAt)]
+    pub fn region_bytes_at(&self, idx: usize) -> Vec<u8> {
+        self.region_bytes.get(idx).cloned().unwrap_or_default()
     }
 }
 

@@ -76,6 +76,105 @@ Both ship today; pick by what you want from the call.
   formatter is a future polish step. Tolerates short reads at the end
   of the segment so a 1-byte `ret` at the last address still decodes.
 
+## Engine handoff to local turbo86
+
+The demo's "Send to local turbo86" button packages the live Vm state
+as the canonical `movie86::context::Context` schema (same shape the
+CLI's handover uses) and ships it over WebSocket to a local turbo86
+process. A subsequent "Pause turbo86" + "Restore Vm from Paused"
+pair brings the session back into the local Vm. Six pieces:
+
+- **turbo86 `--allow-origin`** is what makes the cross-origin browser
+  handshake actually succeed. The frontend is served from
+  `https://x86.mov` or `https://<branch>.x86-mov.pages.dev` while
+  turbo86 listens on `ws://127.0.0.1:1234` — those Origins must be on
+  the allow-list or coder/websocket's default `Origin == Host` policy
+  rejects the upgrade with 403. `cmd/turbo86/main.go`'s default already
+  includes `x86.mov`, `*.x86-mov.pages.dev`, and `localhost(:*)` /
+  `127.0.0.1(:*)`, so a stock `./turbo86` works with prod, every PR
+  preview, and `make serve` without extra config. See turbo86
+  `DESIGN.md` for the InsecureSkipVerify doctrine this replaces.
+
+- **`vm.snapshotContext()`** — Rust-side. Builds a `ContextSnapshot`
+  by combining `Regs::from_cpu(&self.cpu)` with
+  `capture_sparse_regions(&self.mem, base, len)` from the core crate.
+  EFLAGS is captured as 0 (movie86 doesn't model flags) but the field
+  is preserved so the wire payload matches turbo86's `proto.Regs`
+  byte-for-byte. Region storage is parallel `Vec<u32>` /
+  `Vec<Vec<u8>>` rather than `Vec<exported_struct>` — avoids a wrapper
+  type per region with its own `free`, at the cost of one extra
+  cross-boundary getter call per region.
+- **`movie86.mjs` wrappers** — `snapshotContext(vm)` flattens the
+  Rust struct into a plain JS `{regs, regions}` (frees the wasm
+  handle before returning so callers don't manage `.free()`).
+  `makeLoadContextMessage(ctx, mode)` produces the JSON frame turbo86
+  accepts — lowercase `type` / field names, base64-encoded `bytes`,
+  matches `turbo86/proto/proto.go` exactly. `parseOutboundMessage`
+  decodes the reverse direction (Stdout / Stderr / Exit / Fault /
+  Paused), with `bytes` fields lifted back to `Uint8Array`.
+- **`tests/turbo86_handover.mjs`** — env-gated real-turbo86 E2E.
+  `TURBO86_BIN=/path/to/turbo86 node tests/turbo86_handover.mjs` runs
+  against an existing binary; with the env unset, tries `go build`
+  from source; with `go` also missing, skips cleanly. Verifies the
+  full round-trip (exit + write + full Pause → loadContextInto loop)
+  against a live turbo86 so a wire drift on either side breaks
+  loudly. The Rust CLI side has its own equivalent
+  (`movie86/cli/tests/handover_turbo86.rs`); the JS test pins the
+  browser code path specifically.
+
+- **`Vm::loadContext(snapshot) -> { applied, skipped }`** is the
+  reverse of `snapshotContext`. Writes each region into guest
+  memory, loads the regs, clears the halt cache so `stepN` re-
+  evaluates from the restored EIP. Lossy by design: regions outside
+  the Vm's mapped extent (typically turbo86's stack snapshot at
+  0x70000000+ when the local Vm only sized memory for a small ELF)
+  are silently skipped — the `skipped` count is surfaced in the
+  event log so the user knows stack-resident bits were lost.
+
+- **`loadContextInto(vm, ctx)`** is the JS wrapper. Builds a
+  `ContextSnapshot` via `setRegs` + `addRegion(...)`, calls
+  `vm.loadContext`, returns `{ applied, skipped }`. Used by the
+  "Restore Vm from Paused" button after a turbo86 `Paused` event.
+
+- **Unified console.** turbo86's stdout/stderr feed the SAME
+  `#stdout` / `#stderr` panes the local Vm uses, prefixed
+  `[turbo86] ` so the two streams are visually separable without
+  splitting them spatially — the user reads one continuous output
+  transcript across both engines.
+
+- **Meta cards keep their labels but switch their data source via
+  `state.engine`.** Labels are constant (`total mov` / `mov per
+  sec` / `halt` / `exit` / `wall time` / `memory`); the values come
+  from `state.vm` while engine == 'local' and from `turbo86.stats`
+  while engine == 'turbo86'. The conceptual stretch — turbo86
+  Outbound *events* stand in for *movs* — is acknowledged: turbo86
+  has no instruction counter on the wire, and the alternative
+  ("freeze the cards") loses the live signal the user is here for.
+  Same labels on both engines keeps the project narrative
+  ("everything is a mov") intact. `setEngine` flips at three
+  boundaries: `doSendToTurbo86` (→ 'turbo86'), `doRun` / `doReset`
+  / `doRestoreFromTurbo86` (→ 'local'). `prevRegs` / `prevEip` get
+  wiped on flip so the change-highlight doesn't paint every reg
+  yellow at the engine boundary.
+
+- **Regs panel sources from the last turbo86 Paused while engine ==
+  'turbo86'.** turbo86 emits regs only at Paused boundaries (Pause
+  Inbound, guest fault, signal). Until the first Paused, the panel
+  shows the local Vm's snapshot regs ("what got handed over") with
+  a "from turbo86 Paused" note appearing once the first Paused
+  arrives. `currentRegsView()` is the single source of truth — both
+  `renderRegs` and any future panes that need EIP/regs should go
+  through it.
+
+- **Follow toggle drives the in-handover render cadence**, same as
+  for the local Run loop:
+    - `follow on`  → re-render the full UI on every Outbound event.
+    - `follow off` → leave the periodic ticker (`refresh` ms input)
+                     to redraw, batching event arrivals so the wasm
+                     boundary overhead stays low for chatty guests.
+  The WS open handler installs the `setInterval`; the close handler
+  clears it.
+
 ## Display strategy: follow vs periodic
 
 The demo's "Follow execution" checkbox switches between two loop shapes.
@@ -179,10 +278,10 @@ slider — they answer different questions ("show me each step" vs
   `min-height` so EIP movement doesn't visibly jitter the layout.
 - **URL query params mirror parameter controls, not action buttons.**
   preset / follow / delay / batch / refresh / disasm-follow /
-  disasm-addr / mem-follow / mem-addr round-trip via
-  `history.replaceState`. Reset / Step / Run are imperative actions
-  and intentionally stay out of the URL — they'd just confuse the
-  shareable-state mental model.
+  disasm-addr / mem-follow / mem-addr / turbo86-url / turbo86-mode
+  round-trip via `history.replaceState`. Reset / Step / Run / Send-
+  to-turbo86 are imperative actions and intentionally stay out of the
+  URL — they'd just confuse the shareable-state mental model.
 - **Mandelbrot ships in two flavours from the same C source.**
   `examples/canvas_mandelbrot.elf` is `clang -O2` → `llvm-mov-llc`
   (~1.4 MB, ~90 s on a typical browser tab);
@@ -203,6 +302,31 @@ slider — they answer different questions ("show me each step" vs
   through that pipeline tripped both at `set_video_mode`'s
   `mov dl, 0x13` and at clang's byte-granular spill init. Filled
   the gap with unit tests pinned to those exact byte sequences.
+
+- **Handover takes a snapshot, it does not migrate ownership.** After
+  "Send to local turbo86" succeeds, the local Vm stays paused at the
+  same EIP — the user can `Run` it again and the two engines diverge.
+  We deliberately do not proxy turbo86's events back into the Vm; the
+  semantics of "merge two divergent stdout streams" aren't worth the
+  complexity for a demo. If you want a single canonical session, send
+  the snapshot then `vm.free()`; that's a UI-policy decision the
+  button intentionally leaves to the user.
+
+- **Bundled examples are linked at 0x08048000 by source-level
+  intent**, not by post-link patching. The fixture .s files live next
+  to the .elf files in `examples/`, and [`examples/Makefile`](examples/Makefile)
+  + [`examples/link.ld`](examples/link.ld) pin the link base — vaddr
+  `0x08048000`, single PT_LOAD covering Ehdr + Phdr + .text, section
+  headers stripped via `objcopy --strip-section-headers` so the
+  committed binaries stay ~100 B instead of ~4 KB. The address
+  matters for two reasons: it's the i386 SysV convention every other
+  ELF in this repo (movfuscator goldens, llvm-mov outputs, real
+  movfuscator binaries) also targets, and it's inside turbo86's stub
+  RWX region (`[0x08048000, 0x09048000)`) so a handover Context lands
+  in writable territory on the receiving side. Earlier fixtures sat
+  at `0x00001000` and tripped `mmap_min_addr` + the turbo86 mapping
+  range; never re-introduce that. Run `make examples` to rebuild from
+  source.
 
 ## CI
 

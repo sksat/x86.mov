@@ -3,10 +3,15 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,7 +27,7 @@ import (
 // back over the wire. Exercises proto + runner + stub + server in one
 // pass.
 func TestE2E_ExitFortyTwo_OverWebSocket(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -61,7 +66,7 @@ func TestE2E_ExitFortyTwo_OverWebSocket(t *testing.T) {
 // SYS_exit with status 42) and a single int 0x80 instruction, and the
 // session exits as 42 without the guest code ever touching eax/ebx.
 func TestE2E_LoadContext_OverWebSocket(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -91,6 +96,57 @@ func TestE2E_LoadContext_OverWebSocket(t *testing.T) {
 	}
 }
 
+// TestE2E_LoadContext_LargePayloadOverDefaultReadLimit pins the WS
+// read-limit override. The coder/websocket default caps incoming
+// messages at 32 KiB, which would silently kill any handover whose
+// snapshot payload exceeds that — e.g. the bundled
+// `canvas_mandelbrot*.elf` examples whose code regions are ~0.9–6.6 MiB.
+// Send a LoadContext containing a non-executed 64 KiB filler region
+// (well above the default limit) alongside the exit(42) entry. If the
+// server hasn't bumped the read limit, this closes with
+// `websocket: message too big`; if it has, the session runs to Exit{42}.
+func TestE2E_LoadContext_LargePayloadOverDefaultReadLimit(t *testing.T) {
+	srv := httptest.NewServer(server.Handler(nil))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer ws.CloseNow()
+
+	const entry uint32 = 0x08048000
+	// 64 KiB of zeros at a non-executed address inside the stub's code
+	// region. After base64-encoding inside the JSON frame this region
+	// alone is ~87 KiB, well clear of the 32 KiB default cap.
+	filler := make([]byte, 64*1024)
+	sendInbound(t, ctx, ws, proto.LoadContext{Context: proto.Context{
+		Regs: proto.Regs{
+			Eax: 1, Ebx: 42, Esp: 0x701FFFF0, Eip: entry,
+		},
+		Regions: []proto.MemRegion{
+			// mov eax,1 ; mov ebx,42 ; int 0x80 — same shape the small
+			// LoadContext test uses, just paired with the filler region.
+			{Addr: entry, Bytes: []byte{
+				0xB8, 0x01, 0x00, 0x00, 0x00,
+				0xBB, 0x2A, 0x00, 0x00, 0x00,
+				0xCD, 0x80,
+			}},
+			{Addr: 0x08049000, Bytes: filler},
+		},
+	}})
+
+	got := readAllEvents(t, ctx, ws)
+	want := []proto.Outbound{proto.Exit{Code: 42}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", got, want)
+	}
+}
+
 // TestE2E_PostStartCodeStreaming exercises the streaming case: after
 // Start, the client keeps sending Code messages while the guest is
 // running. The server must apply them via runner.WriteCode without
@@ -101,7 +157,7 @@ func TestE2E_LoadContext_OverWebSocket(t *testing.T) {
 // Sequence: Code + Code(data) + Start → recv Stdout("A") → Code(post-
 // Start, unused address) → recv Exit{42}.
 func TestE2E_PostStartCodeStreaming(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -158,7 +214,7 @@ func TestE2E_PostStartCodeStreaming(t *testing.T) {
 // dropping the WebSocket. Sends Stop after letting the loop spin
 // briefly, then reads the resulting Paused(SIGKILL).
 func TestE2E_StopMessageInterruptsTightLoop(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -203,7 +259,7 @@ func TestE2E_StopMessageInterruptsTightLoop(t *testing.T) {
 // Context via its own resume path; this test stops at "the WS round
 // trip works".
 func TestE2E_PauseMessageEmitsPausedWithContext(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -255,7 +311,7 @@ func TestE2E_PauseMessageEmitsPausedWithContext(t *testing.T) {
 // runaway guest would leave the handler blocked on the events channel
 // forever — and httptest.Server.Close() would hang waiting for it.
 func TestE2E_ClientDisconnectStopsTightLoop(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -318,6 +374,212 @@ func sendInbound(t *testing.T, ctx context.Context, ws *websocket.Conn, msg prot
 	if err := ws.Write(ctx, websocket.MessageText, data); err != nil {
 		t.Fatalf("write %T: %v", msg, err)
 	}
+}
+
+// TestE2E_LogsAreCoherentForOneSession is the structural test for the
+// session-logging surface. A LoadContext → Exit{42} session should
+// produce: connect, runner ready, inbound LoadContext, outbound Exit,
+// events summary, session end ok — all tagged with one 8-hex session
+// id. Stdout/Stderr content stays out of the log (only byte counts)
+// by design — guests should not be able to leak data into operator
+// logs.
+//
+// Identifying *our* session id by the last `connect:` line in the
+// captured buffer is deliberate: when the test runner replays prior
+// tests' deferred handlers (or another in-process WS connection
+// fires concurrently), unrelated `[xxxxxxxx]` ids may show up too.
+// The assertion is "every expected substring appears with our id",
+// not "the buffer contains only our id" — that's strictly testable
+// without false positives from log-buffer contamination.
+func TestE2E_LogsAreCoherentForOneSession(t *testing.T) {
+	var buf safeBuffer
+	prev := log.Default().Writer()
+	log.Default().SetOutput(&buf)
+	defer log.Default().SetOutput(prev)
+
+	srv := httptest.NewServer(server.Handler(nil))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer ws.CloseNow()
+
+	const entry uint32 = 0x08048000
+	sendInbound(t, ctx, ws, proto.LoadContext{Context: proto.Context{
+		Regs: proto.Regs{Eax: 1, Ebx: 42, Esp: 0x701FFFF0, Eip: entry},
+		Regions: []proto.MemRegion{
+			{Addr: entry, Bytes: []byte{0xCD, 0x80}},
+		},
+	}})
+	// Drain — gives the handleSession event-forwarding loop a chance
+	// to emit the Exit event before we tear the connection down.
+	if got := readAllEvents(t, ctx, ws); len(got) != 1 {
+		t.Fatalf("events: got %d, want 1", len(got))
+	}
+	// Closing the WS unblocks the reader goroutine's ws.Read so the
+	// final "session end" log line gets emitted before we assert.
+	_ = ws.Close(websocket.StatusNormalClosure, "")
+
+	// Wait for the per-session "session end" line to land in the
+	// buffer with our session's id — without this, the assertions
+	// below race the handler goroutine's final log flush.
+	connectRE := regexp.MustCompile(`\[([0-9a-f]{8})\] connect: remote=`)
+	var sessID string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		text := buf.String()
+		matches := connectRE.FindAllStringSubmatch(text, -1)
+		if len(matches) > 0 {
+			candidate := matches[len(matches)-1][1]
+			// Only treat the connect as ours once its session-end
+			// log has also landed; otherwise we may pick the right
+			// id but assert against an incomplete log.
+			if strings.Contains(text, "["+candidate+"] session end") {
+				sessID = candidate
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sessID == "" {
+		t.Fatalf("did not see our session's connect+session-end before deadline; log:\n%s",
+			buf.String())
+	}
+
+	logText := buf.String()
+	tag := "[" + sessID + "] "
+	for _, want := range []string{
+		tag + "connect: remote=",
+		tag + "runner: ready",
+		tag + "inbound LoadContext: mode=host",
+		"eip=0x8048000",
+		tag + "outbound Exit: code=42",
+		tag + "events: total=1",
+		tag + "session end: ok",
+	} {
+		if !strings.Contains(logText, want) {
+			t.Errorf("log missing %q\nfull log:\n%s", want, logText)
+		}
+	}
+
+	// Stdout content must NOT leak into the log — guests shouldn't be
+	// able to push data into the operator's transcript. This program
+	// emits no stdout so we just sanity-check the counter format on
+	// our session's events line.
+	if !strings.Contains(logText, tag+"events: total=1 stdout=0B") {
+		t.Errorf("expected %q to include stdout=0B, got:\n%s", tag+"events:", logText)
+	}
+}
+
+// TestHandler_RejectsCrossOriginWithoutAllowList pins the security
+// boundary: with `Handler(nil)` (no allow list configured) and a
+// browser-like cross-origin handshake (Origin set, mismatching Host),
+// the upgrade MUST fail. This is the "any visited page can drive
+// local turbo86 over ws://127.0.0.1" attack surface — the default
+// coder/websocket Origin == Host policy is what protects us, and a
+// regression here silently re-opens the cross-site RCE described in
+// DESIGN.md.
+func TestHandler_RejectsCrossOriginWithoutAllowList(t *testing.T) {
+	srv := httptest.NewServer(server.Handler(nil))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"https://attacker.example"}},
+	})
+	if err == nil {
+		t.Fatal("expected handshake rejection, got success")
+	}
+	if resp != nil && resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected HTTP 403, got %d", resp.StatusCode)
+	}
+}
+
+// TestHandler_AcceptsPatternMatchedOrigin verifies the allow-list path
+// works: a wildcard pattern matches a typical CF Pages preview Origin
+// (head-ref slug subdomain), and the resulting session runs cleanly to
+// completion. Uses the LoadContext path (no separate Start needed) so
+// the test is short and stays focused on the handshake.
+func TestHandler_AcceptsPatternMatchedOrigin(t *testing.T) {
+	srv := httptest.NewServer(server.Handler([]string{
+		"x86.mov",
+		"*.x86-mov.pages.dev",
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"https://my-branch.x86-mov.pages.dev"}},
+	})
+	if err != nil {
+		t.Fatalf("expected handshake success, got: %v", err)
+	}
+	defer ws.CloseNow()
+
+	const entry uint32 = 0x08048000
+	sendInbound(t, ctx, ws, proto.LoadContext{Context: proto.Context{
+		Regs: proto.Regs{Eax: 1, Ebx: 7, Esp: 0x701FFFF0, Eip: entry},
+		Regions: []proto.MemRegion{
+			{Addr: entry, Bytes: []byte{0xCD, 0x80}},
+		},
+	}})
+	got := readAllEvents(t, ctx, ws)
+	want := []proto.Outbound{proto.Exit{Code: 7}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", got, want)
+	}
+}
+
+// TestHandler_RejectsOriginOutsideAllowList completes the security
+// triangle: even with an allow list configured, an Origin that doesn't
+// match any pattern is still rejected. Otherwise a typo in the
+// `--allow-origin` flag could accidentally widen the door.
+func TestHandler_RejectsOriginOutsideAllowList(t *testing.T) {
+	srv := httptest.NewServer(server.Handler([]string{"x86.mov"}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"https://evil.example"}},
+	})
+	if err == nil {
+		t.Fatal("expected handshake rejection, got success")
+	}
+	if resp != nil && resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected HTTP 403, got %d", resp.StatusCode)
+	}
+}
+
+// safeBuffer is a `bytes.Buffer` guarded by a mutex so the test's
+// reader goroutine and the server's logger goroutine don't race on
+// `Write` / `String`. The stdlib `bytes.Buffer` isn't safe for
+// concurrent use.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // readAllEvents reads frames until the server closes the connection

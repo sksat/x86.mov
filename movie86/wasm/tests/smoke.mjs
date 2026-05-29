@@ -24,6 +24,7 @@ const root = `${here}/..`;
 const wasm = await readFile(`${root}/build/browser/movie86_wasm_bg.wasm`);
 const mod  = await import(`${root}/build/browser/movie86_wasm.js`);
 await mod.default({ module_or_path: wasm });
+const wrapper = await import(`${root}/movie86.mjs`);
 
 const cases = [
     { name: 'return42',   expectExit: 42, expectStdout: ''         },
@@ -265,6 +266,240 @@ try {
     }
 } catch (e) {
     console.error(`FAIL canvas_mandelbrot: ${e.message}`);
+    failed++;
+}
+
+// --- Turbo86 handover surface ---
+//
+// The demo's "Send to local turbo86" button needs two things from the
+// wasm side:
+//   1. A canonical Context snapshot (regs + sparse memory regions) matching
+//      turbo86's proto.Context schema, so a peer engine can pick the session
+//      up via LoadContext.
+//   2. A wire-format-compatible JSON encoder so the browser can serialize
+//      that snapshot into a frame turbo86's UnmarshalInbound accepts
+//      byte-for-byte.
+//
+// Verify both on return42: snapshot at entry, check that regs.eip /
+// regs.esp track the Vm's getters, the first instruction bytes survive
+// into a non-empty region, and the wire JSON has the exact shape
+// turbo86 expects (`type=load_context`, lowercase keys, base64 bytes).
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/return42.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        const ctx = wrapper.snapshotContext(vm);
+
+        // Regs must reflect the live Vm: full GPR file + EIP, plus
+        // EFLAGS = 0 (movie86 doesn't model flags but the schema
+        // field is preserved for turbo86 parity).
+        assert.equal(ctx.regs.eip, vm.eip, 'snapshot eip != vm.eip');
+        const gprs = vm.regs;
+        assert.equal(ctx.regs.eax, gprs[0], 'snapshot eax');
+        assert.equal(ctx.regs.ecx, gprs[1], 'snapshot ecx');
+        assert.equal(ctx.regs.edx, gprs[2], 'snapshot edx');
+        assert.equal(ctx.regs.ebx, gprs[3], 'snapshot ebx');
+        assert.equal(ctx.regs.esp, gprs[4], 'snapshot esp');
+        assert.equal(ctx.regs.ebp, gprs[5], 'snapshot ebp');
+        assert.equal(ctx.regs.esi, gprs[6], 'snapshot esi');
+        assert.equal(ctx.regs.edi, gprs[7], 'snapshot edi');
+        assert.equal(ctx.regs.eflags, 0, 'snapshot eflags should be 0');
+
+        // Regions must be non-empty and sparse — return42 has at
+        // least one non-zero page (its code) at the loader's mem base.
+        assert.ok(Array.isArray(ctx.regions), 'regions is not an array');
+        assert.ok(ctx.regions.length >= 1,
+            `expected ≥1 sparse region, got ${ctx.regions.length}`);
+        // The first region must contain the entry-point code: the
+        // first 5 bytes of return42 are mov ebx, 42 (BB 2A 00 00 00).
+        const entryRegion = ctx.regions.find(r =>
+            r.addr <= vm.eip && vm.eip + 5 <= r.addr + r.bytes.length);
+        assert.ok(entryRegion, `no region covers EIP=${vm.eip.toString(16)}`);
+        const off = vm.eip - entryRegion.addr;
+        assert.deepEqual(
+            Array.from(entryRegion.bytes.subarray(off, off + 5)),
+            [0xbb, 0x2a, 0x00, 0x00, 0x00],
+            'entry-point bytes inside the snapshot region disagree with the ELF',
+        );
+
+        // Wire-format encoder: must match turbo86's proto.Inbound
+        // shape — lowercase `type`/keys, base64 bytes, mode string.
+        const frame = wrapper.makeLoadContextMessage(ctx, 'host');
+        const parsed = JSON.parse(frame);
+        assert.equal(parsed.type, 'load_context');
+        assert.equal(parsed.mode, 'host');
+        assert.equal(parsed.context.regs.eip, vm.eip);
+        assert.equal(parsed.context.regs.eflags, 0);
+        assert.ok(Array.isArray(parsed.context.regions));
+        assert.equal(parsed.context.regions.length, ctx.regions.length);
+        // Each region's bytes round-trip through base64.
+        for (let i = 0; i < parsed.context.regions.length; i++) {
+            const wireRegion = parsed.context.regions[i];
+            assert.equal(wireRegion.addr, ctx.regions[i].addr);
+            assert.equal(typeof wireRegion.bytes, 'string',
+                'wire `bytes` must be a base64 string, not an array');
+            const decoded = Buffer.from(wireRegion.bytes, 'base64');
+            assert.deepEqual(
+                Array.from(decoded),
+                Array.from(ctx.regions[i].bytes),
+                `region[${i}] base64 round-trip mismatch`,
+            );
+        }
+
+        // Mode defaults to host when omitted — matching turbo86's Go
+        // side `mode == ""` → ModeHost fallback (we emit it explicitly
+        // to keep the wire deterministic, but the caller can rely on
+        // the default).
+        const defaultFrame = JSON.parse(wrapper.makeLoadContextMessage(ctx));
+        assert.equal(defaultFrame.mode, 'host');
+
+        // Trap mode round-trips literally.
+        const trapFrame = JSON.parse(wrapper.makeLoadContextMessage(ctx, 'trap'));
+        assert.equal(trapFrame.mode, 'trap');
+
+        console.log('ok  handover snapshot + wire format (return42)');
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL handover surface: ${e.stack || e.message}`);
+    failed++;
+}
+
+// --- cycle.elf: partial-step decode coverage ---
+//
+// The other fixtures terminate, so the runElf parity loop above ends
+// naturally. `cycle.elf` is an infinite call/ret + jmp loop, so it
+// never halts on its own — but the decoder must still walk every
+// instruction it contains without UnknownOpcode. Run for enough
+// steps to cover all five `pN` functions plus the bottom `jmp _start`
+// and check we collected a few iterations of "1 2 3 4 5\n" on
+// stdout. This would have caught a regression where the source-
+// rebuild emitted `EB rel8` (short jmp) instead of `E9 rel32`, which
+// the movie86 decoder doesn't accept.
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/cycle.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        // Each iteration is 5 prints + a jmp; ~80 instructions covers
+        // a handful of full cycles. Drain stdout periodically so we
+        // don't overflow the buffer between checks.
+        let stdout = new Uint8Array(0);
+        for (let i = 0; i < 5; i++) {
+            vm.stepN(200n);
+            const chunk = vm.drainStdout();
+            if (chunk.length) {
+                const merged = new Uint8Array(stdout.length + chunk.length);
+                merged.set(stdout); merged.set(chunk, stdout.length);
+                stdout = merged;
+            }
+            assert.equal(vm.haltReason, undefined,
+                `cycle halted unexpectedly after batch ${i}: ${vm.haltReason}`);
+        }
+        const text = new TextDecoder().decode(stdout);
+        // Expect at least two full "1 2 3 4 5\n" iterations to have
+        // landed by now.
+        const matches = text.match(/1 2 3 4 5\n/g) || [];
+        assert.ok(matches.length >= 2,
+            `expected ≥2 iterations of "1 2 3 4 5\\n", got ${matches.length}: ${JSON.stringify(text)}`);
+        console.log(`ok  cycle (${matches.length} iterations × "1 2 3 4 5\\n")`);
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL cycle decode coverage: ${e.stack || e.message}`);
+    failed++;
+}
+
+// --- Vm round-trip: snapshot → mutate → restore ---
+//
+// `wrapper.snapshotContext(vm)` + `wrapper.loadContextInto(vm, ctx)`
+// is the symmetry that lets the demo round-trip back from turbo86:
+// `Paused` arrives with a Context, the user clicks Restore, and the
+// local Vm absorbs that state to resume execution. Pin both
+// directions here: capture a snapshot, perturb the Vm by stepping
+// past it, then restore and verify the perturbations are gone.
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/return42.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        // Snapshot at entry: EIP = ELF entry, regs all zero, code
+        // bytes already in mapped memory.
+        const entryCtx = wrapper.snapshotContext(vm);
+        const entryEip = vm.eip;
+        const entryEbx = vm.regs[3];  // EBX index in Reg32 order
+
+        // Step past `mov ebx, 42; mov eax, 1` so EBX changes and
+        // EIP advances 10 bytes (two 5-byte mov-imm32 instructions).
+        vm.stepN(2n);
+        assert.equal(vm.regs[3], 42, 'EBX should be 42 after first mov');
+        assert.notEqual(vm.eip, entryEip, 'EIP should have advanced');
+
+        // Restore from the entry snapshot: regs + memory back to what
+        // they were before the steps. EBX must be back to its
+        // pre-step value (typically 0), EIP back to entry.
+        const summary = wrapper.loadContextInto(vm, entryCtx);
+        assert.equal(vm.eip, entryEip,
+            `restored EIP ${vm.eip.toString(16)} != entry ${entryEip.toString(16)}`);
+        assert.equal(vm.regs[3], entryEbx,
+            `restored EBX ${vm.regs[3]} != entry ${entryEbx}`);
+        assert.ok(summary.applied >= 1, 'expected at least one region applied');
+
+        // After restore, stepping should reproduce the original
+        // behavior — re-run the program from entry, expect Exit(42).
+        while (!vm.haltReason) vm.stepN(100n);
+        assert.equal(vm.exitCode, 42,
+            `re-executed after restore: exit ${vm.exitCode} != 42`);
+
+        console.log('ok  Vm round-trip (snapshot → mutate → restore → reexecute)');
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL Vm round-trip: ${e.stack || e.message}`);
+    failed++;
+}
+
+// --- Lossy restore: regions outside mapped memory are skipped ---
+//
+// turbo86's Paused snapshot may include a stack region (0x70000000+)
+// that movie86's much smaller FlatMemory can't fit. The restore must
+// skip those regions instead of erroring — the summary's `skipped`
+// count is what the UI uses to surface this to the user. Build a
+// synthetic Context with one in-range region and one wildly out-of-
+// range region; verify the in-range one lands and the other is
+// counted as skipped.
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/return42.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        const fakeCtx = {
+            regs: {
+                eax: 0xAAAA_AAAA, ebx: 0xBBBB_BBBB, ecx: 0, edx: 0,
+                esi: 0, edi: 0, ebp: 0, esp: vm.regs[4],
+                eip: vm.eip, eflags: 0,
+            },
+            regions: [
+                // In-range — should land.
+                { addr: vm.eip, bytes: new Uint8Array([0xCD, 0x80]) },
+                // Out-of-range — should be skipped.
+                { addr: 0x7000_0000, bytes: new Uint8Array([0x12, 0x34]) },
+            ],
+        };
+        const summary = wrapper.loadContextInto(vm, fakeCtx);
+        assert.equal(summary.applied, 1, `expected 1 applied, got ${summary.applied}`);
+        assert.equal(summary.skipped, 1, `expected 1 skipped, got ${summary.skipped}`);
+        assert.equal(vm.regs[0], 0xAAAA_AAAA, 'EAX should be loaded');
+        // Verify the in-range bytes actually landed at EIP.
+        const at = vm.readMem(vm.eip, 2);
+        assert.deepEqual(Array.from(at), [0xCD, 0x80],
+            'in-range region bytes should have replaced the code');
+        console.log('ok  Vm loadContext skips out-of-range regions');
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL Vm loadContext lossy restore: ${e.stack || e.message}`);
     failed++;
 }
 
