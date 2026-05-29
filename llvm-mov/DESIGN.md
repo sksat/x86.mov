@@ -282,15 +282,39 @@ above sidesteps all of that.
   repack → bitcast i32 to f32
   ```
 
-  Limitations of the first cut (deferred to follow-ups in this
-  stage 7g series):
+  Same stage adds the surrounding f32 ops that come together as a
+  set:
+
+  - **fsub** via `__subsf3`. The body flips b's sign bit and tail-
+    calls `__addsf3` — IEEE-754 says `a - b = a + (-b)` regardless of
+    NaN-ness or special-value handling, so no separate algorithm is
+    needed.
+  - **fcmp** via `__eqsf2 / __nesf2 / __ltsf2 / __lesf2 / __gtsf2 /
+    __gesf2 / __unordsf2`. All six ordered helpers share the same
+    three-way compare body, parameterised by the unord-return
+    convention (+1 for eq/ne/lt/le, -1 for gt/ge). The compare uses
+    the standard "total-order key" trick so signed-i32 compare of
+    `(x XOR (sign_x ? 0x7FFFFFFF : 0))` matches float ordering;
+    `+0 == -0` is short-circuited via a magnitude-zero check.
+  - **i32 ↔ f32 conversion** via `__floatsisf` / `__floatunsisf`
+    (`sitofp` / `uitofp`) and `__fixsfsi` / `__fixunssfsi`
+    (`fptosi` / `fptoui`). The int → float path normalises via
+    `ctlz`, rounds-to-nearest-ties-to-even with a guard bit and a
+    sticky bit synthesised from "magnitude minus truncated-and-
+    shifted-back-up". The float → int path is straight truncation
+    toward zero with explicit saturation at `INT_MIN/MAX` /
+    `UINT_MAX` and a zero-result gate for `|f| < 1`.
+
+  Limitations of this first cut (deferred to follow-up stages):
     - Inf / NaN inputs are best-effort; specifically a NaN input
-      may produce a finite garbage output. The execution fixtures
-      stay in the normal range so this does not surface.
+      may produce a finite garbage output for `fadd`/`fsub` (`fcmp`
+      and conversions handle NaN explicitly).
     - Subnormal inputs flush to zero; the result also flushes to
       zero on underflow.
-    - `fsub` / `fmul` / `fdiv` / `fcmp` and `i32 ↔ f32` / `f32 ↔
-      f64` conversions are not yet wired up.
+    - `fmul` / `fdiv` and `f32 ↔ f64` conversions are not yet wired
+      up. `fmul` needs a 32×32→48-bit byte-split multiply on top of
+      the existing 32-bit `mul i32`; `fdiv` needs a 24-iter long
+      division.
 
 ### Stage 7 gates
 

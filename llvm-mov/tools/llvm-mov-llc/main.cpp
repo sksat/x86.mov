@@ -100,25 +100,6 @@ static bool moduleNeedsDivRemHelpers(Module &M) {
   return false;
 }
 
-// Stage 7g1 — does the module contain any IR-level f32 operation
-// that triggers the SDAG soft-float libcall path? The injection is
-// scoped to FAdd for now (`__addsf3`); follow-up stages add sub /
-// mul / div / cmp / conversion helpers via the same shape.
-// We check `getScalarType()` so that `<N x float>` ops the Scalarizer
-// will later flatten still trigger the injection (same lesson as
-// the stage-7f2 codex review on `udiv <N x i32>`).
-static bool moduleNeedsAddSf3Helper(Module &M) {
-  for (Function &F : M) {
-    if (F.isDeclaration())
-      continue;
-    for (Instruction &I : instructions(F)) {
-      if (I.getOpcode() == Instruction::FAdd &&
-          I.getType()->getScalarType()->isFloatTy())
-        return true;
-    }
-  }
-  return false;
-}
 
 static Function *makeOrPromoteHelper(Module &M, StringRef Name,
                                      FunctionType *Ty) {
@@ -521,6 +502,425 @@ static void injectAddSf3Helper(Module &M, LLVMContext &Ctx) {
   B.CreateRet(Result);
 }
 
+// Stage 7g1 — `__subsf3 (a, b)` = `__addsf3 (a, -b)`. Flip the sign
+// bit of `b` and delegate. The injected `__addsf3` already handles
+// every shape (carry-out, opposite-sign cancellation, magnitude
+// ordering), so subtraction is essentially free.
+static void injectSubSf3Helper(Module &M, LLVMContext &Ctx) {
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(F32, {F32, F32}, /*isVarArg=*/false);
+  Function *F = makeOrPromoteHelper(M, "__subsf3", FnTy);
+  if (!F)
+    return;
+  F->getArg(0)->setName("a");
+  F->getArg(1)->setName("b");
+
+  // __addsf3 must exist by the time this runs (the entry-point caller
+  // injects __addsf3 first when fadd or fsub is present).
+  FunctionCallee AddSf3 =
+      M.getOrInsertFunction("__addsf3", FnTy);
+
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  Value *BI = B.CreateBitCast(F->getArg(1), I32);
+  Value *NegBI = B.CreateXor(BI, B.getInt32(0x80000000u));
+  Value *NegB = B.CreateBitCast(NegBI, F32);
+  Value *R = B.CreateCall(AddSf3, {F->getArg(0), NegB});
+  B.CreateRet(R);
+}
+
+// Stage 7g1 — IEEE-754 single-precision comparison helpers
+// (`__eqsf2`, `__nesf2`, `__ltsf2`, `__lesf2`, `__gtsf2`, `__gesf2`,
+// `__unordsf2`). The soft-float SDAG legalizer lowers each `fcmp
+// <pred> float` into a libcall to one of these, then compares the
+// returned i32 to zero with the predicate's expected sign.
+//
+// Compiler-rt semantics (compact summary; full table in libgcc /
+// compiler-rt's `fp_lib.h`):
+//
+//   ordered, no NaN involved:
+//     a == b → return  0
+//     a <  b → return -1
+//     a >  b → return +1
+//
+//   NaN involved (unordered):
+//     __eqsf2, __nesf2, __ltsf2, __lesf2 → return +1
+//     __gtsf2, __gesf2                    → return -1
+//     __unordsf2                          → return 1 if either is NaN,
+//                                           else 0
+//
+// All six ordered helpers share the same compare body, parameterised
+// by the unord-return convention. We materialise each as its own
+// definition so SDAG's symbol references resolve directly; the
+// shared compare is just an inline IR sequence per helper (no
+// internal call indirection).
+static void emitFloatCompareBody(Function *F, LLVMContext &Ctx,
+                                 int32_t UnordReturn) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+
+  Argument *A = F->getArg(0); A->setName("a");
+  Argument *B = F->getArg(1); B->setName("b");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> IR(Entry);
+  auto C = [&](uint32_t V) { return IR.getInt32(V); };
+
+  Value *AI = IR.CreateBitCast(A, I32, "ai");
+  Value *BI = IR.CreateBitCast(B, I32, "bi");
+
+  // Field extraction (only what we need for NaN detection + sign-
+  // aware ordering).
+  Value *SA = IR.CreateLShr(AI, C(31));
+  Value *SB = IR.CreateLShr(BI, C(31));
+  Value *EA = IR.CreateAnd(IR.CreateLShr(AI, C(23)), C(0xFFu));
+  Value *EB = IR.CreateAnd(IR.CreateLShr(BI, C(23)), C(0xFFu));
+  Value *MA = IR.CreateAnd(AI, C(0x7FFFFFu));
+  Value *MB = IR.CreateAnd(BI, C(0x7FFFFFu));
+
+  // NaN: exp == 0xFF AND mant != 0. Both bits.
+  Value *AExpMax = IR.CreateICmpEQ(EA, C(0xFFu));
+  Value *AMantNZ = IR.CreateICmpNE(MA, C(0));
+  Value *ANaN = IR.CreateAnd(AExpMax, AMantNZ);
+  Value *BExpMax = IR.CreateICmpEQ(EB, C(0xFFu));
+  Value *BMantNZ = IR.CreateICmpNE(MB, C(0));
+  Value *BNaN = IR.CreateAnd(BExpMax, BMantNZ);
+  Value *Unord = IR.CreateOr(ANaN, BNaN);
+
+  // Magnitude of each (sign-stripped i32).
+  Value *AMag = IR.CreateAnd(AI, C(0x7FFFFFFFu));
+  Value *BMag = IR.CreateAnd(BI, C(0x7FFFFFFFu));
+  Value *BothZero = IR.CreateAnd(IR.CreateICmpEQ(AMag, C(0)),
+                                 IR.CreateICmpEQ(BMag, C(0)));
+
+  // Total-order trick: transform each bit pattern so signed-i32
+  // compare matches float compare. For non-negatives keep the bits;
+  // for negatives flip everything below the sign bit (`x XOR
+  // 0x7FFFFFFF`). The transformed values then sort the same way
+  // floats do, modulo the +0 / -0 distinction that we handle as
+  // BothZero above.
+  Value *SAMask = IR.CreateSub(C(0), SA);    // 0 or 0xFFFFFFFF (sign extend SA)
+  Value *SBMask = IR.CreateSub(C(0), SB);
+  Value *AKey = IR.CreateXor(AI, IR.CreateAnd(SAMask, C(0x7FFFFFFFu)));
+  Value *BKey = IR.CreateXor(BI, IR.CreateAnd(SBMask, C(0x7FFFFFFFu)));
+
+  // Ordered three-way compare on the keys (signed).
+  Value *Lt = IR.CreateICmpSLT(AKey, BKey);
+  Value *Gt = IR.CreateICmpSGT(AKey, BKey);
+  // Ordered result: -1 / 0 / +1.
+  Value *Pos1 = C(1);
+  Value *Neg1 = C(0xFFFFFFFFu);   // = -1 as signed i32
+  Value *Ord = IR.CreateSelect(Lt, Neg1,
+                  IR.CreateSelect(Gt, Pos1, C(0)));
+  Value *OrdWithZero = IR.CreateSelect(BothZero, C(0), Ord);
+
+  // Unordered convention is helper-specific.
+  Value *UnordRet = C(static_cast<uint32_t>(UnordReturn));
+  Value *Result = IR.CreateSelect(Unord, UnordRet, OrdWithZero);
+  IR.CreateRet(Result);
+}
+
+static void injectFloatCompareHelpers(Module &M, LLVMContext &Ctx) {
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(I32, {F32, F32}, /*isVarArg=*/false);
+
+  struct HelperSpec {
+    const char *Name;
+    int32_t UnordReturn;
+  };
+  // The "pos unord" group (eq, ne, lt, le) returns +1 when either
+  // operand is NaN — that makes `result == 0` mean "ordered and
+  // equal", `result < 0` mean "ordered and a < b", and `result > 0`
+  // mean "ordered and a > b OR unordered". The "neg unord" group
+  // (gt, ge) flips the unord sign.
+  static const HelperSpec Specs[] = {
+      {"__eqsf2", +1}, {"__nesf2", +1}, {"__ltsf2", +1}, {"__lesf2", +1},
+      {"__gtsf2", -1}, {"__gesf2", -1},
+  };
+  for (const auto &S : Specs) {
+    Function *F = makeOrPromoteHelper(M, S.Name, FnTy);
+    if (F)
+      emitFloatCompareBody(F, Ctx, S.UnordReturn);
+  }
+
+  // __unordsf2 — returns 1 if either argument is NaN, 0 otherwise.
+  Function *UnordSf = makeOrPromoteHelper(M, "__unordsf2", FnTy);
+  if (UnordSf) {
+    Argument *A = UnordSf->getArg(0); A->setName("a");
+    Argument *B = UnordSf->getArg(1); B->setName("b");
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", UnordSf);
+    IRBuilder<> IR(BB);
+    auto C = [&](uint32_t V) { return IR.getInt32(V); };
+    Value *AI = IR.CreateBitCast(A, I32);
+    Value *BI = IR.CreateBitCast(B, I32);
+    Value *EA = IR.CreateAnd(IR.CreateLShr(AI, C(23)), C(0xFFu));
+    Value *EB = IR.CreateAnd(IR.CreateLShr(BI, C(23)), C(0xFFu));
+    Value *MA = IR.CreateAnd(AI, C(0x7FFFFFu));
+    Value *MB = IR.CreateAnd(BI, C(0x7FFFFFu));
+    Value *ANaN = IR.CreateAnd(IR.CreateICmpEQ(EA, C(0xFFu)),
+                               IR.CreateICmpNE(MA, C(0)));
+    Value *BNaN = IR.CreateAnd(IR.CreateICmpEQ(EB, C(0xFFu)),
+                               IR.CreateICmpNE(MB, C(0)));
+    Value *Unord = IR.CreateOr(ANaN, BNaN);
+    IR.CreateRet(IR.CreateZExt(Unord, I32));
+  }
+}
+
+// Stage 7g1 — `__floatsisf` and `__floatunsisf`: i32/u32 → f32.
+// Algorithm:
+//   - if value == 0: return +0.0
+//   - sign = (signed only) value < 0 ? 1 : 0
+//   - mag = signed: (value < 0) ? -value (as u32) : value
+//                   unsigned: value
+//   - lz = ctlz(mag)  // 0..31 for non-zero mag
+//   - hi = 31 - lz    // position of the leading 1
+//   - exp = hi + 127  (biased)
+//   - mantissa = mag shifted to put `hi` at bit 23, rounded with
+//                guard / round / sticky
+//   - pack (sign << 31) | (exp << 23) | (mant & 0x7FFFFF)
+//
+// Rounding follows the round-nearest-ties-to-even convention. The
+// guard / round / sticky bits live in the low bits when hi > 23
+// (i.e. precision is lost during conversion); when hi ≤ 23 the
+// result is exact.
+static void emitInt32ToFloatBody(Function *F, LLVMContext &Ctx,
+                                 Module &M, bool IsSigned) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *F32 = Type::getFloatTy(Ctx);
+
+  Argument *V = F->getArg(0); V->setName("v");
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  auto C = [&](uint32_t X) { return B.getInt32(X); };
+
+  Value *Sign;
+  Value *Mag;
+  if (IsSigned) {
+    // Sign = (v < 0). Magnitude is the absolute value, treating
+    // INT_MIN as 0x80000000 (wraps cleanly under unsigned negate).
+    Value *Neg = B.CreateICmpSLT(V, C(0));
+    Sign = B.CreateZExt(Neg, I32);
+    Value *VNeg = B.CreateSub(C(0), V);
+    Mag = B.CreateSelect(Neg, VNeg, V);
+  } else {
+    Sign = C(0);
+    Mag = V;
+  }
+
+  // Zero shortcut — handled via a final select to keep the helper
+  // straight-line.
+  Value *IsZero = B.CreateICmpEQ(Mag, C(0));
+
+  Function *Ctlz =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::ctlz, {I32});
+  Value *LZ = B.CreateCall(Ctlz, {Mag, ConstantInt::getFalse(Ctx)}, "lz");
+  Value *Hi = B.CreateSub(C(31), LZ);                    // 0..31
+  Value *ExpBiased = B.CreateAdd(Hi, C(127u));
+  Value *HiGt23 = B.CreateICmpUGT(Hi, C(23u));
+
+  // Lossless shift left when hi ≤ 23. Clamping `LeftShift` to keep
+  // the shift in [0, 31] even when the other path (Hi > 23) makes
+  // `23 - Hi` wrap as unsigned — the driver's SELECT → bit-blend
+  // rewrite evaluates both arms, so an out-of-range shift becomes
+  // poison that can propagate through the bit-blend mask. Codex-
+  // review P1.
+  Value *LeftShiftRaw = B.CreateSub(C(23u), Hi);
+  Value *LeftShift = B.CreateSelect(HiGt23, C(0u), LeftShiftRaw);
+  Value *LeftPath = B.CreateShl(Mag, LeftShift);
+
+  // Lossy shift right when hi > 23. Need guard / round / sticky for
+  // round-to-nearest-ties-to-even. When Hi ≤ 23 we force the right-
+  // path quantities to a safe minimum (Shift = 1) so the LShr and
+  // the `Shift - 1` for `Halfway` both stay in i32-shift range; the
+  // computed values are unused (the outer select picks LeftPath
+  // instead), but the bit-blend still needs them to be well-defined.
+  Value *ShiftRaw = B.CreateSub(Hi, C(23u));
+  Value *Shift = B.CreateSelect(HiGt23, ShiftRaw, C(1u));
+  Value *MantTrunc = B.CreateLShr(Mag, Shift);            // 24 bits
+  // Bits we're about to lose:
+  //   discarded[shift-1] = guard
+  //   discarded[shift-2] = round
+  //   discarded[0..shift-3] OR ⇒ sticky
+  // Compute these branchlessly: the lost mask covers low `shift` bits
+  // of Mag.
+  // Build "lost = Mag - (MantTrunc << Shift)" instead of `mask = (1 <<
+  // shift) - 1` to avoid the shift-by-32 hazard if Shift could be 32
+  // (it can't here, but the same primitive is reused below).
+  Value *LostMask = B.CreateSub(Mag, B.CreateShl(MantTrunc, Shift));
+  Value *Halfway = B.CreateShl(C(1), B.CreateSub(Shift, C(1)));
+  Value *Above = B.CreateICmpUGT(LostMask, Halfway);
+  Value *Tie = B.CreateICmpEQ(LostMask, Halfway);
+  Value *LsbSet = B.CreateICmpNE(B.CreateAnd(MantTrunc, C(1)), C(0));
+  Value *RoundUp = B.CreateOr(Above, B.CreateAnd(Tie, LsbSet));
+  Value *MantRounded = B.CreateAdd(MantTrunc,
+                                   B.CreateZExt(RoundUp, I32));
+  // Rounding may push mantissa to 0x1000000, requiring exponent +1.
+  Value *RoundOvf = B.CreateICmpEQ(MantRounded, C(0x1000000u));
+  Value *MantFinal = B.CreateSelect(RoundOvf,
+                                    B.CreateLShr(MantRounded, C(1)),
+                                    MantRounded);
+  Value *ExpRight = B.CreateSelect(RoundOvf, B.CreateAdd(ExpBiased, C(1u)),
+                                   ExpBiased);
+  Value *RightPath = MantFinal;
+  // We're going to pack later, so the "value to pack" must be the
+  // 24-bit mantissa (rounded for hi > 23, left-shifted for hi ≤ 23).
+  // `HiGt23` was computed at the top of the body so the shift counts
+  // for both arms could be clamped before evaluating either; reuse
+  // it here as the pack-selector.
+  Value *MantForPack = B.CreateSelect(HiGt23, RightPath, LeftPath);
+  Value *ExpForPack  = B.CreateSelect(HiGt23, ExpRight, ExpBiased);
+
+  Value *MantField = B.CreateAnd(MantForPack, C(0x7FFFFFu));
+  Value *ExpField  = B.CreateAnd(B.CreateShl(ExpForPack, C(23)),
+                                 C(0x7F800000u));
+  Value *SignField = B.CreateShl(Sign, C(31));
+  Value *Packed = B.CreateOr(SignField, B.CreateOr(ExpField, MantField));
+  Value *Result = B.CreateSelect(IsZero, C(0), Packed);
+  B.CreateRet(B.CreateBitCast(Result, F32));
+}
+
+static void injectFloatsisfHelpers(Module &M, LLVMContext &Ctx) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *F32 = Type::getFloatTy(Ctx);
+  FunctionType *FnTy = FunctionType::get(F32, {I32}, /*isVarArg=*/false);
+  if (Function *F = makeOrPromoteHelper(M, "__floatsisf", FnTy))
+    emitInt32ToFloatBody(F, Ctx, M, /*IsSigned=*/true);
+  if (Function *F = makeOrPromoteHelper(M, "__floatunsisf", FnTy))
+    emitInt32ToFloatBody(F, Ctx, M, /*IsSigned=*/false);
+}
+
+// Stage 7g1 — `__fixsfsi` and `__fixunssfsi`: f32 → i32/u32 (truncate
+// toward zero). Algorithm:
+//   - if exp < 127: |f| < 1, result = 0
+//   - if exp >= 158 (signed) / 159 (unsigned): out-of-range,
+//     saturate to INT_MIN/MAX or UINT_MAX
+//   - mantissa = mantissa_raw | 0x800000
+//   - shift = exp - 23 - 127
+//   - if shift >= 0: integer = mantissa << shift
+//     else (shift < 0): integer = mantissa >> (-shift)
+//   - if signed and original sign was negative: integer = -integer
+static void emitFloatToInt32Body(Function *F, LLVMContext &Ctx,
+                                 bool IsSigned) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+
+  Argument *V = F->getArg(0); V->setName("f");
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  auto C = [&](uint32_t X) { return B.getInt32(X); };
+
+  Value *VI = B.CreateBitCast(V, I32);
+  Value *Sign = B.CreateLShr(VI, C(31));
+  Value *Exp = B.CreateAnd(B.CreateLShr(VI, C(23)), C(0xFFu));
+  Value *Mant = B.CreateOr(B.CreateAnd(VI, C(0x7FFFFFu)), C(0x800000u));
+
+  // Underflow: exp < 127 ⇒ |f| < 1 ⇒ truncate to 0.
+  Value *Underflow = B.CreateICmpULT(Exp, C(127u));
+
+  // Compute shift = exp - 150 (= exp - 127 - 23). Positive shift
+  // means left-shift; negative means right-shift.
+  Value *Shift = B.CreateSub(Exp, C(150u));
+  Value *NeedLeft = B.CreateICmpUGT(Exp, C(150u));
+  Value *NeedRight = B.CreateICmpULT(Exp, C(150u));
+  Value *RightAmt = B.CreateSub(C(150u), Exp);
+  // Cap right-shift at 31 to keep the lshr defined; values with
+  // exp < 127 are already gated by `Underflow` and overwritten with
+  // zero at the end, but the lshr's argument is still computed in the
+  // straight-line body.
+  Value *RightAmtClamped = B.CreateSelect(
+      B.CreateICmpULT(RightAmt, C(31u)), RightAmt, C(31u));
+  // Cap left-shift at 31 too. Out-of-range values (exp ≥ 158/159)
+  // route through saturation below.
+  Value *LeftAmt = B.CreateSelect(NeedLeft, Shift, C(0u));
+  Value *LeftAmtClamped = B.CreateSelect(
+      B.CreateICmpULT(LeftAmt, C(31u)), LeftAmt, C(31u));
+  Value *LeftPath = B.CreateShl(Mant, LeftAmtClamped);
+  Value *RightPath = B.CreateLShr(Mant, RightAmtClamped);
+  Value *ShiftedNoSign = B.CreateSelect(NeedRight, RightPath,
+                                        B.CreateSelect(NeedLeft, LeftPath, Mant));
+
+  // Apply sign for signed conversion.
+  Value *Result;
+  if (IsSigned) {
+    Value *Neg = B.CreateICmpEQ(Sign, C(1));
+    Value *NegResult = B.CreateSub(C(0), ShiftedNoSign);
+    Result = B.CreateSelect(Neg, NegResult, ShiftedNoSign);
+
+    // Saturation: exp >= 158 ⇒ |result| ≥ 2^31 ⇒ saturate.
+    // Special case: -2^31 = INT_MIN fits exactly (exp 158, mant
+    // 0x800000, sign 1), but |INT_MIN| as a positive float overflows.
+    Value *ExpGe158 = B.CreateICmpUGE(Exp, C(158u));
+    Value *PosSat = C(0x7FFFFFFFu);                 // INT_MAX
+    Value *NegSat = C(0x80000000u);                 // INT_MIN
+    Value *Sat = B.CreateSelect(Neg, NegSat, PosSat);
+    Result = B.CreateSelect(ExpGe158, Sat, Result);
+  } else {
+    Result = ShiftedNoSign;
+    // Unsigned: positive overflow (|f| ≥ 2^32) → UINT_MAX, negative
+    // inputs → 0. Order matters (codex-review P2): if we apply the
+    // "negative → 0" gate first and then the "overflow → UINT_MAX"
+    // gate, a large negative number (e.g. `fptoui -4294967296.0`)
+    // would hit both gates in sequence and end up at UINT_MAX. The
+    // overflow saturation must therefore be conditioned on the
+    // positive sign, and the negative clamp comes last.
+    Value *NegSign = B.CreateICmpEQ(Sign, C(1));
+    Value *ExpGe159 = B.CreateICmpUGE(Exp, C(159u));
+    Value *PosOverflow = B.CreateAnd(B.CreateNot(NegSign), ExpGe159);
+    Result = B.CreateSelect(PosOverflow, C(0xFFFFFFFFu), Result);
+    Result = B.CreateSelect(NegSign, C(0), Result);
+  }
+
+  // Final underflow gate.
+  Result = B.CreateSelect(Underflow, C(0), Result);
+  B.CreateRet(Result);
+}
+
+static void injectFixsfsiHelpers(Module &M, LLVMContext &Ctx) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *F32 = Type::getFloatTy(Ctx);
+  FunctionType *FnTy = FunctionType::get(I32, {F32}, /*isVarArg=*/false);
+  if (Function *F = makeOrPromoteHelper(M, "__fixsfsi", FnTy))
+    emitFloatToInt32Body(F, Ctx, /*IsSigned=*/true);
+  if (Function *F = makeOrPromoteHelper(M, "__fixunssfsi", FnTy))
+    emitFloatToInt32Body(F, Ctx, /*IsSigned=*/false);
+}
+
+// Convenience scan over the entire f32 operation set this stage
+// covers. Mirrors `moduleNeedsAddSf3Helper` but is permissive over
+// any FP / int↔FP IR construct that's expected to lower into one of
+// our injected libcalls.
+static bool moduleNeedsF32Helpers(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      switch (I.getOpcode()) {
+      case Instruction::FAdd:
+      case Instruction::FSub:
+      case Instruction::FCmp:
+        if (I.getOperand(0)->getType()->getScalarType()->isFloatTy())
+          return true;
+        break;
+      case Instruction::SIToFP:
+      case Instruction::UIToFP:
+        if (I.getType()->getScalarType()->isFloatTy() &&
+            I.getOperand(0)->getType()->getScalarType()->isIntegerTy(32))
+          return true;
+        break;
+      case Instruction::FPToSI:
+      case Instruction::FPToUI:
+        if (I.getOperand(0)->getType()->getScalarType()->isFloatTy() &&
+            I.getType()->getScalarType()->isIntegerTy(32))
+          return true;
+        break;
+      default:
+        break;
+      }
+    }
+  }
+  return false;
+}
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
 
@@ -641,10 +1041,18 @@ int main(int argc, char **argv) {
   if (moduleNeedsDivRemHelpers(*M))
     injectDivRemHelpers(*M, Ctx);
 
-  // Stage 7g1 — `__addsf3` body. Same shape as the DIV/REM helpers
-  // above: scan the IR for the trigger op and inject when present.
-  if (moduleNeedsAddSf3Helper(*M))
+  // Stage 7g1 — single-precision FP helper bodies. Each scan triggers
+  // only when its respective IR op is present, so a module with no
+  // f32 ops pays nothing in helper-body code. `__addsf3` lands first
+  // because `__subsf3` delegates to it; fcmp / conversion bodies are
+  // independent.
+  if (moduleNeedsF32Helpers(*M)) {
     injectAddSf3Helper(*M, Ctx);
+    injectSubSf3Helper(*M, Ctx);
+    injectFloatCompareHelpers(*M, Ctx);
+    injectFloatsisfHelpers(*M, Ctx);
+    injectFixsfsiHelpers(*M, Ctx);
+  }
 
   // Stage 6d2 — pre-Scalarizer lowering of `llvm.vector.reduce.*`.
   //

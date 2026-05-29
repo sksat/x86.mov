@@ -193,7 +193,30 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // SDAG legalizer emits `call __addsf3` without trying to find a
   // native FADD instruction first.
   setOperationAction(ISD::FADD, MVT::f32, LibCall);
+  setOperationAction(ISD::FSUB, MVT::f32, LibCall);
   setLibcallImpl(RTLIB::ADD_F32, RTLIB::impl___addsf3);
+  setLibcallImpl(RTLIB::SUB_F32, RTLIB::impl___subsf3);
+
+  // FP comparisons. Each predicate routes to its compiler-rt-named
+  // helper; the helper bodies share a single underlying compare and
+  // dispatch on the NaN-return convention. Driver injection sets up
+  // the bodies so SDAG's f32 SETCC legalizer can issue these as
+  // plain C-call libcalls and interpret the i32 result as the
+  // three-way ordered compare (-1 / 0 / +1).
+  setLibcallImpl(RTLIB::OEQ_F32, RTLIB::impl___eqsf2);
+  setLibcallImpl(RTLIB::UNE_F32, RTLIB::impl___nesf2);
+  setLibcallImpl(RTLIB::OLT_F32, RTLIB::impl___ltsf2);
+  setLibcallImpl(RTLIB::OLE_F32, RTLIB::impl___lesf2);
+  setLibcallImpl(RTLIB::OGT_F32, RTLIB::impl___gtsf2);
+  setLibcallImpl(RTLIB::OGE_F32, RTLIB::impl___gesf2);
+  setLibcallImpl(RTLIB::UO_F32,  RTLIB::impl___unordsf2);
+
+  // i32 ⇄ f32 conversions. Same shape — the libcalls are bound to
+  // compiler-rt names; the helper bodies are injected by the driver.
+  setLibcallImpl(RTLIB::SINTTOFP_I32_F32, RTLIB::impl___floatsisf);
+  setLibcallImpl(RTLIB::UINTTOFP_I32_F32, RTLIB::impl___floatunsisf);
+  setLibcallImpl(RTLIB::FPTOSINT_F32_I32, RTLIB::impl___fixsfsi);
+  setLibcallImpl(RTLIB::FPTOUINT_F32_I32, RTLIB::impl___fixunssfsi);
 
   // No `bswap` opcode either. Rust idioms like `u32::from_be(x)` or
   // `x.swap_bytes()` lower to ISD::BSWAP. Expand re-spells it as
