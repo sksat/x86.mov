@@ -1,0 +1,45 @@
+# Minimal "deps go through mov" fixture (issue #11 Option C).
+#
+# Same shape as the trivial rust-mov-main example, but the body is
+# moved into a separate `triv_dep` crate so cargo links it as an
+# rlib and rustc emits two distinct code objects:
+#
+#   1. The user crate's `.o` (carries `dep_mov_add_main`) — already
+#      goes through llvm-mov-llc via cargo-link.sh today.
+#   2. The dep crate's `.o` inside `libtriv_dep-<hash>.rlib` (carries
+#      `triv_add`) — currently linked natively. Issue #11 / Option C
+#      wants this object to also round-trip through llvm-mov-llc by
+#      extracting the `.llvmbc` section rustc embeds (with
+#      `embed-bitcode=yes` in rustflags) and feeding it to the
+#      backend, with native fallback when lowering fails.
+#
+# Stage-7d's CALL/RET legalization is the prerequisite that lets a
+# *cross-crate* function call survive in mov-only form, so the
+# moment dep `triv_add` lowers through llvm-mov-llc the linked ELF's
+# `.text` should be mov-only end-to-end. That's the gate this
+# fixture exists to assert (see test/DepsMov/).
+
+[package]
+name = "rust-mov-dep-mov-add"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "rust-mov-dep-mov-add"
+path = "src/main.rs"
+
+[dependencies]
+triv_dep = { path = "triv_dep" }
+
+[profile.release]
+panic = "abort"
+opt-level = 0
+overflow-checks = false
+debug = false
+strip = false
+lto = false
+
+[profile.dev]
+panic = "abort"
+overflow-checks = false
