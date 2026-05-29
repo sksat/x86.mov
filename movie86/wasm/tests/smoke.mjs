@@ -140,6 +140,12 @@ try {
         assert.equal(vm.sigsegvHandler, undefined, `sigsegvHandler expected undefined, got ${vm.sigsegvHandler}`);
         assert.equal(vm.sigillHandler,  undefined, `sigillHandler expected undefined, got ${vm.sigillHandler}`);
 
+        // return42 also doesn't `int 0x10`, so no video mode is active.
+        // Run to completion and check the getter stays undefined.
+        while (!vm.haltReason) vm.stepN(100n);
+        assert.equal(vm.activeVideoMode, undefined,
+            `return42 shouldn't touch BIOS — activeVideoMode expected undefined, got ${vm.activeVideoMode}`);
+
         console.log('ok  Vm introspection (return42)');
     } finally {
         vm.free();
@@ -179,7 +185,13 @@ try {
         assert.deepEqual(Array.from(corner), [0, 0, 0, 0],
             `canvas_smile (0,0) = ${Array.from(corner).join(',')} (expected all-zero BSS)`);
 
-        console.log(`ok  canvas_smile  exit=0 center=yellow corner=zero`);
+        // The example's prologue is `mov eax, 0x13 ; int 0x10` (set
+        // VGA mode 13h). After running, the host should have recorded
+        // that mode as active.
+        assert.equal(vm.activeVideoMode, 0x13,
+            `canvas_smile should set VGA mode 13h — activeVideoMode = ${vm.activeVideoMode}`);
+
+        console.log(`ok  canvas_smile  exit=0 mode=0x13 center=yellow corner=zero`);
     } finally {
         vm.free();
     }

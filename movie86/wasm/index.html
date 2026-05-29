@@ -266,7 +266,7 @@
 <div class="canvases" id="canvases"></div>
 
 <script type="module">
-import { loadVm, FRAMEBUFFER_MODES } from './movie86.mjs';
+import { loadVm, FRAMEBUFFER_MODES, modeForNumber } from './movie86.mjs';
 
 const $ = (id) => document.getElementById(id);
 
@@ -594,18 +594,34 @@ function pumpOutput() {
     }
 }
 
-// One <canvas> per framebuffer mode, set up at boot. Each entry caches
-// the 2D context + a reusable ImageData backed by a single
-// Uint8ClampedArray to avoid allocating per render.
-const canvasHandles = [];
+// One <canvas> per framebuffer mode, plus a placeholder shown when
+// no mode has been set. Each handle caches the 2D context + a
+// reusable ImageData backed by a single Uint8ClampedArray to avoid
+// allocating per render.
+const canvasHandles = new Map();   // modeNumber → { wrap, ctx, imageData, mode }
+let canvasPlaceholder = null;
 
 function setupCanvases() {
     const host = $('canvases');
+    // Placeholder shown until the guest sets a video mode. Mirrors
+    // real BIOS: "no mode set yet" means there's nothing to draw.
+    canvasPlaceholder = document.createElement('div');
+    canvasPlaceholder.className = 'panel canv-placeholder';
+    canvasPlaceholder.innerHTML =
+        '<div class="panel-head"><h2>canvas</h2></div>' +
+        '<div class="canv-info">no video mode set — guest must call ' +
+        '<code>mov ax, NN ; int 0x10</code> (AH=0, AL=mode) first.<br>' +
+        'available modes: ' +
+        FRAMEBUFFER_MODES.map(m => `<code>0x${m.modeNumber.toString(16)}</code> (${m.id}, ${m.width}×${m.height})`).join(', ') +
+        '.</div>';
+    host.appendChild(canvasPlaceholder);
+
     for (const m of FRAMEBUFFER_MODES) {
         const wrap = document.createElement('div');
         wrap.className = 'panel';
+        wrap.hidden = true;
         wrap.innerHTML =
-            `<div class="panel-head"><h2>canvas ${m.id}</h2></div>` +
+            `<div class="panel-head"><h2>canvas ${m.id} <small style="color:#888;font-weight:normal">(0x${m.modeNumber.toString(16)})</small></h2></div>` +
             `<canvas width="${m.width}" height="${m.height}"></canvas>` +
             `<div class="canv-info">@ 0x${m.addr.toString(16).padStart(8, '0')} · ${m.byteLength.toLocaleString()} B</div>`;
         host.appendChild(wrap);
@@ -615,7 +631,8 @@ function setupCanvases() {
         const scale = Math.max(1, Math.floor(240 / Math.max(m.width, m.height)));
         canvas.style.width  = `${m.width * scale}px`;
         canvas.style.height = `${m.height * scale}px`;
-        canvasHandles.push({
+        canvasHandles.set(m.modeNumber, {
+            wrap,
             mode: m,
             ctx: canvas.getContext('2d'),
             imageData: new ImageData(m.width, m.height),
@@ -625,18 +642,23 @@ function setupCanvases() {
 
 function renderCanvases() {
     const vm = state.vm; if (!vm) return;
-    for (const h of canvasHandles) {
-        const bytes = vm.readMem(h.mode.addr, h.mode.byteLength);
-        if (bytes.length === h.mode.byteLength) {
-            h.imageData.data.set(bytes);
-            h.ctx.putImageData(h.imageData, 0, 0);
-        } else {
-            // Region not mapped by this ELF — paint black so the
-            // canvas doesn't keep showing a stale image from the
-            // previous program.
-            h.ctx.fillStyle = '#000';
-            h.ctx.fillRect(0, 0, h.mode.width, h.mode.height);
-        }
+    const active = vm.activeVideoMode;
+    // Hide every mode's panel except the active one (if any).
+    for (const [num, h] of canvasHandles) h.wrap.hidden = num !== active;
+    canvasPlaceholder.hidden = active != null && modeForNumber(active) != null;
+
+    if (active == null) return;
+    const h = canvasHandles.get(active);
+    if (!h) return;  // guest set a mode we don't render — keep placeholder shown
+    const bytes = vm.readMem(h.mode.addr, h.mode.byteLength);
+    if (bytes.length === h.mode.byteLength) {
+        h.imageData.data.set(bytes);
+        h.ctx.putImageData(h.imageData, 0, 0);
+    } else {
+        // Region not mapped — paint black so a stale image from a
+        // previous program doesn't linger.
+        h.ctx.fillStyle = '#000';
+        h.ctx.fillRect(0, 0, h.mode.width, h.mode.height);
     }
 }
 

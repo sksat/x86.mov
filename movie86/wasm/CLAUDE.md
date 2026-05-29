@@ -43,6 +43,11 @@ fit for an in-browser run. The semantics match:
   `printf` (host-side, restricted `%s`/`%d`/`%c`/`%%` subset — `%n`
   and unknowns abort with `-1` per the smart-friend boundary the CLI
   also follows).
+- `int 0x10` BIOS video services: only `AH=0` (set video mode) is
+  implemented — guests select a framebuffer with `mov eax, 0x13` (or
+  `0x12`) + `int 0x10`. Other AH values trap. The CLI deliberately
+  doesn't implement this (no canvas to write to) and leaves the
+  `BiosHost` default-trap in place.
 - Signal-handler auto-wiring: `dispatch` → SIGSEGV, `master_loop` →
   SIGILL, looked up from the ELF symbol table at run time.
 
@@ -129,21 +134,38 @@ slider — they answer different questions ("show me each step" vs
   introspection that *does* show up: `Vm::sigsegvHandler` /
   `Vm::sigillHandler` (populated by the loader from the ELF symbol
   table at load time — static post-load, but real, not a stub).
-- **The framebuffer is purely a memory-mapped convention, no syscall.**
-  `FRAMEBUFFER_MODES` in `movie86.mjs` lists `(addr, width, height)`
-  triples; the guest draws by `mov`-ing 4-byte RGBA pixels into that
-  guest address range. The host polls each slot every render and
-  `putImageData`s the bytes. ELFs that want a canvas declare a second
-  PT_LOAD covering the slot they care about (`filesz=0, memsz=W*H*4`,
-  `p_flags=RW`) — the loader's `flatten_with_stack` already handles
-  multiple PT_LOAD segments, so no core change was needed. Addresses
-  echo real VGA (mode 13h at `0xA0000`, mode 12h at `0x100000`) but
-  the encoding is straight RGBA, not paletted 8bpp / 4bpp planar; the
-  spec is "spirit of VGA" not "exact VGA". Hand-written canvas demos
-  are kept feasible by run-length-encoding same-color pixels into one
-  `mov eax, COLOR` followed by a string of 5-byte `A3 disp32` stores
-  — see `examples/canvas_*.elf` generators in the commit history for
-  the encoding pattern.
+- **The framebuffer convention is memory-mapped + BIOS-selected, not
+  syscall-driven.** `FRAMEBUFFER_MODES` in `movie86.mjs` lists
+  `(modeNumber, addr, width, height)` quadruples; the guest:
+    1. Sets the active mode with `mov eax, 0x000000NN ; int 0x10`
+       (`AH=0`, `AL=NN` — the real BIOS video-mode-set call), routed
+       through `core::bios_host::BiosHost::bios_call` to
+       `WasmHost::active_video_mode`.
+    2. Draws by `mov`-ing 4-byte RGBA pixels into that mode's address
+       range.
+  The host renders only the **active** mode's canvas each frame
+  (`vm.activeVideoMode` → `modeForNumber()` → blit `vm.readMem(addr,
+  byteLength)` via `putImageData`). ELFs that never call `int 0x10`
+  get no canvas at all — non-canvas examples don't clutter the UI
+  with empty placeholders. ELFs that want a canvas declare a second
+  PT_LOAD covering the slot (`filesz=0, memsz=W*H*4`, `p_flags=RW`);
+  the loader's `flatten_with_stack` already handles multiple PT_LOAD
+  segments, so the only core change needed was the new `BiosHost`
+  trait + the `int 0x10` arm in `Cpu::step`. Addresses echo real VGA
+  (mode 13h at `0xA0000`, mode 12h at `0x100000`) but the encoding is
+  straight RGBA, not paletted 8bpp / 4bpp planar — "spirit of VGA",
+  not exact. Hand-written canvas demos are kept feasible by run-
+  length-encoding same-color pixels into one `mov eax, COLOR`
+  followed by a string of 5-byte `A3 disp32` stores — see
+  `examples/canvas_*.elf` generators in the commit history.
+- **`BiosHost` is opt-in like `LibcHost`.** Each host (CLI's
+  `StdHost`, wasm's `WasmHost`, test hosts) declares its own
+  `impl BiosHost`; the trait's default `bios_call` traps with
+  `Fault::UnsupportedInterrupt(0x10)`. The CLI deliberately leaves
+  the default in place — it has no canvas to write to, so a
+  canvas-flavoured ELF running under `movie86-cli` surfaces a fault
+  the same way an unknown syscall would. WasmHost is the one place
+  that actually implements `AH=0` (set mode).
 - **`Vm::disasmAt` exists separately from the CPU's internal decode
   path** so the demo's disassembly pane can render rows without driving
   execution. Tolerates short reads at the end of the mapped region
