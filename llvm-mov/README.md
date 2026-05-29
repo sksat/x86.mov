@@ -52,6 +52,7 @@ in `_start.s` (the runtime escape, gate-accepted) and `jmp` from the
 | 7g1    | `f32 fadd / fsub / fcmp / sitofp / fptosi (+ unsigned)` via SDAG soft-float → `__addsf3 / __subsf3 / __{eq,ne,lt,le,gt,ge,unord}sf2 / __floatsisf / __fixsfsi` injected as IR | exec: `fadd_*`, `fsub_*`, `fcmp_*`, `sitofp`, `fptosi`, `round_trip`; MovOnly: `fadd`, `fsub`, `fcmp`, `sitofp`, `fptosi` | ✅ |
 | 7g2    | `f32 fmul` via SDAG soft-float → `__mulsf3` injected as IR (24×24→48-bit byte-split multiply on top of stage-7f1 `mul i32`) | exec: `fmul_*`; MovOnly: `fmul` | ✅ |
 | 7g3    | `f32 fdiv` via SDAG soft-float → `__divsf3` injected as IR (23-iter mantissa restoring long-division loop with PHIs, same shape as stage-7f2 `__udivsi3`) | exec: `fdiv_*`; MovOnly: `fdiv` | ✅ |
+| 7g4    | Inf / NaN propagation for fadd / fmul / fdiv (`fsub` inherits via `__subsf3 → __addsf3`). Canonical qNaN (0x7FC00000) for NaN inputs and IEEE-indeterminate cases (`Inf − Inf`, `0 × Inf`, `Inf / Inf`, `0 / 0`); signed Inf preserved for `Inf + finite`, `Inf × finite`, `Inf / finite`; signed zero for `finite / Inf` | exec: `fadd_{nan,inf_inf,inf_neg_inf,finite_inf}`, `fmul_{nan,zero_inf,inf_finite,inf_inf}`, `fdiv_{nan,inf_inf,inf_finite,finite_inf}` | ✅ |
 | 6e     | indirect `call` via function pointer (CALL32r)     | `indirect_call` exec + MovOnly                           | ✅    |
 | 8      | bigger fixtures (AES, mandelbrot, …)               | richer side-by-side bench                                | future |
 

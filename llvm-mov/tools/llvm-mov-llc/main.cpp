@@ -498,7 +498,42 @@ static void injectAddSf3Helper(Module &M, LLVMContext &Ctx) {
   Value *Step2 = B.CreateSelect(BIsZero, AI, Step1);
   Value *Step3 = B.CreateSelect(CancelZero, C(0u), Step2);
 
-  Value *Result = B.CreateBitCast(Step3, F32);
+  // Stage 7g4 — Inf / NaN propagation overrides the loop-body result.
+  //
+  //   - NaN input             → canonical qNaN (0x7FC00000)
+  //   - Inf + Inf (same sign) → signed Inf with that sign
+  //   - Inf + (-Inf)          → NaN  (IEEE indeterminate)
+  //   - Inf + finite          → Inf preserved from the Inf operand
+  //
+  // Detection: exp == 0xFF distinguishes Inf/NaN from finites;
+  // mant_raw != 0 distinguishes NaN from Inf. The overrides apply at
+  // the very end so they win over the existing zero / cancellation
+  // / overflow paths (which would, for example, route Inf + Inf to
+  // signed Inf via the er-overflow gate but route Inf + (-Inf) to
+  // signed zero via CancelZero — wrong for IEEE).
+  Value *EAMax = B.CreateICmpEQ(EA, C(0xFFu));
+  Value *EBMax = B.CreateICmpEQ(EB, C(0xFFu));
+  Value *MANonZero = B.CreateICmpNE(MARaw, C(0u));
+  Value *MBNonZero = B.CreateICmpNE(MBRaw, C(0u));
+  Value *AIsNaN = B.CreateAnd(EAMax, MANonZero);
+  Value *BIsNaN = B.CreateAnd(EBMax, MBNonZero);
+  Value *AIsInf = B.CreateAnd(EAMax, B.CreateNot(MANonZero));
+  Value *BIsInf = B.CreateAnd(EBMax, B.CreateNot(MBNonZero));
+  Value *BothInf = B.CreateAnd(AIsInf, BIsInf);
+  Value *SignSame = B.CreateICmpEQ(SA, SB);
+  Value *InfMinusInf = B.CreateAnd(BothInf, B.CreateNot(SignSame));
+  Value *EitherNaN = B.CreateOr(AIsNaN, BIsNaN);
+  Value *NaNCase = B.CreateOr(EitherNaN, InfMinusInf);
+  // Inf preservation: pick the Inf operand's bits so the result
+  // sign matches the surviving Inf side. When both are Inf with the
+  // same sign, AI and BI are equal (mant == 0), so either works.
+  Value *AnyInf = B.CreateOr(AIsInf, BIsInf);
+  Value *InfBitsPick = B.CreateSelect(AIsInf, AI, BI);
+
+  Value *WithInf = B.CreateSelect(AnyInf, InfBitsPick, Step3);
+  Value *WithNaN = B.CreateSelect(NaNCase, C(0x7FC00000u), WithInf);
+
+  Value *Result = B.CreateBitCast(WithNaN, F32);
   B.CreateRet(Result);
 }
 
@@ -706,6 +741,31 @@ static void injectMulSf3Helper(Module &M, LLVMContext &Ctx) {
   Result = B.CreateSelect(Underflow, SignedZero, Result);
   Result = B.CreateSelect(EitherZero, SignedZero, Result);
 
+  // Stage 7g4 — Inf / NaN propagation:
+  //   - NaN input            → canonical qNaN
+  //   - 0 * Inf, Inf * 0     → NaN  (IEEE indeterminate)
+  //   - Inf * finite (≠ 0)   → signed Inf with sr
+  //   - Inf * Inf            → signed Inf with sr
+  // Inf override comes before NaN override so 0 * Inf falls through
+  // to NaN (Inf wins over the EitherZero gate but NaN wins over Inf).
+  Value *EAMaxM = B.CreateICmpEQ(EA, C(0xFFu));
+  Value *EBMaxM = B.CreateICmpEQ(EB, C(0xFFu));
+  Value *MANonZeroM = B.CreateICmpNE(MARaw, C(0u));
+  Value *MBNonZeroM = B.CreateICmpNE(MBRaw, C(0u));
+  Value *AIsNaNM = B.CreateAnd(EAMaxM, MANonZeroM);
+  Value *BIsNaNM = B.CreateAnd(EBMaxM, MBNonZeroM);
+  Value *AIsInfM = B.CreateAnd(EAMaxM, B.CreateNot(MANonZeroM));
+  Value *BIsInfM = B.CreateAnd(EBMaxM, B.CreateNot(MBNonZeroM));
+  Value *ZeroTimesInf = B.CreateOr(B.CreateAnd(AIsZero, BIsInfM),
+                                   B.CreateAnd(BIsZero, AIsInfM));
+  Value *EitherNaNM = B.CreateOr(AIsNaNM, BIsNaNM);
+  Value *NaNCaseM = B.CreateOr(EitherNaNM, ZeroTimesInf);
+  Value *AnyInfM = B.CreateOr(AIsInfM, BIsInfM);
+  Value *MulInfBits = B.CreateOr(SignField, C(0x7F800000u));
+
+  Result = B.CreateSelect(AnyInfM, MulInfBits, Result);
+  Result = B.CreateSelect(NaNCaseM, C(0x7FC00000u), Result);
+
   B.CreateRet(B.CreateBitCast(Result, F32));
 }
 
@@ -886,21 +946,48 @@ static void injectDivSf3Helper(Module &M, LLVMContext &Ctx) {
 
   Value *Result = B.CreateSelect(Overflow, SignedInf, Packed);
   Result = B.CreateSelect(Underflow, SignedZero, Result);
-  // Final input-zero gates, applied so divisor-zero wins over
-  // dividend-zero. With this ordering:
-  //   - a == 0, b != 0   → signed zero with sr  (correct)
-  //   - a != 0, b == 0   → signed Inf  with sr  (correct, IEEE)
-  //   - a == 0, b == 0   → signed Inf            (best-effort; real
-  //                                               IEEE would emit a
-  //                                               quiet NaN, out of
-  //                                               scope alongside
-  //                                               `__addsf3` etc.)
-  // The codex-review P2 reordering matters: applying AIsZero last
-  // would let the dividend-zero gate overwrite the divisor-zero
-  // gate, so `0.0 / 0.0` would silently return signed zero instead
-  // of the documented signed Inf.
+  // Input-zero gates first (a == 0, b == 0). With this ordering
+  // divisor-zero wins over dividend-zero so `0.0 / 0.0` is signed
+  // Inf at this point; the 7g4 NaN override below upgrades it to
+  // NaN.
   Result = B.CreateSelect(AIsZero, SignedZero, Result);
   Result = B.CreateSelect(BIsZero, SignedInf, Result);
+
+  // Stage 7g4 — Inf / NaN propagation overrides for fdiv:
+  //   - NaN input             → canonical qNaN
+  //   - Inf / Inf, 0 / 0      → NaN  (IEEE indeterminate)
+  //   - Inf / finite (≠ 0)    → signed Inf with sr
+  //   - finite / Inf          → signed zero with sr
+  // Ordering: Inf-result / zero-result selects run first so they
+  // override the loop-body's stale numbers; the NaN gate runs last
+  // so 0/0 and Inf/Inf end up as NaN regardless of which way the
+  // earlier gates set the bits.
+  Value *EAMaxD = B.CreateICmpEQ(EA, C(0xFFu));
+  Value *EBMaxD = B.CreateICmpEQ(EB, C(0xFFu));
+  Value *MANonZeroD = B.CreateICmpNE(MARaw, C(0u));
+  Value *MBNonZeroD = B.CreateICmpNE(MBRaw, C(0u));
+  Value *AIsNaND = B.CreateAnd(EAMaxD, MANonZeroD);
+  Value *BIsNaND = B.CreateAnd(EBMaxD, MBNonZeroD);
+  Value *AIsInfD = B.CreateAnd(EAMaxD, B.CreateNot(MANonZeroD));
+  Value *BIsInfD = B.CreateAnd(EBMaxD, B.CreateNot(MBNonZeroD));
+  Value *BothInfD = B.CreateAnd(AIsInfD, BIsInfD);
+  Value *BothZeroD = B.CreateAnd(AIsZero, BIsZero);
+  Value *EitherNaND = B.CreateOr(AIsNaND, BIsNaND);
+  Value *NaNCaseD = B.CreateOr(EitherNaND,
+                               B.CreateOr(BothInfD, BothZeroD));
+
+  // Inf / finite → signed Inf. "finite" here means !Inf && !NaN &&
+  // (the divisor isn't itself zero, otherwise the 0-divisor gate
+  // already routed us to Inf which is the same).
+  Value *AInfBFinite = B.CreateAnd(AIsInfD,
+                                   B.CreateNot(B.CreateOr(BIsInfD, BIsNaND)));
+  // finite / Inf → signed zero. Mirror condition on the dividend.
+  Value *BInfAFinite = B.CreateAnd(BIsInfD,
+                                   B.CreateNot(B.CreateOr(AIsInfD, AIsNaND)));
+
+  Result = B.CreateSelect(AInfBFinite, SignedInf, Result);
+  Result = B.CreateSelect(BInfAFinite, SignedZero, Result);
+  Result = B.CreateSelect(NaNCaseD, C(0x7FC00000u), Result);
 
   B.CreateRet(B.CreateBitCast(Result, F32));
 }

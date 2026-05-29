@@ -1,11 +1,13 @@
-; Stage 7g3 — codex-review P2 regression. 0.0 / 0.0 must surface as
-; signed Inf in our best-effort scope (real IEEE would emit a quiet
-; NaN; out-of-scope alongside `__addsf3` etc.). The original select
-; order applied `AIsZero` after `BIsZero`, so 0/0 silently returned
-; signed zero instead of Inf — fixed by swapping the gate order so
-; divisor-zero wins.
+; Stage 7g3 — codex-review P2 regression on divisor-zero ordering.
+; Stage 7g4 upgraded the 7g3 best-effort scope: 0/0 is now
+; correctly the IEEE quiet NaN (0x7FC00000), not signed Inf.
 ;
-;   0.0 / 0.0 → +Inf → exp byte = 0xFF = 255
+; This fixture keeps the original "exp byte == 255" check (which is
+; true for both Inf and NaN), so 7g3's signed-Inf and 7g4's NaN both
+; satisfy it. The new fixture `fdiv_inf_inf` distinguishes Inf vs
+; NaN explicitly via the quiet bit (bit 22).
+;
+;   0.0 / 0.0 → qNaN → exp byte = 0xFF = 255 (was: +Inf in 7g3)
 
 target triple = "mov-unknown-linux-gnu"
 
