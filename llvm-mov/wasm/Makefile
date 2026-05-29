@@ -10,7 +10,7 @@ BUILD_DIR     ?= build
 
 .PHONY: help setup build build-wasm-llvm build-wasm-clang \
         build-wasm-llvm-mov-llc build-native-llvm-mov-llc \
-        test test-e2e stage-deploy serve clean distclean
+        test test-e2e test-e2e-dist stage-deploy serve clean distclean
 
 help:
 	@echo "Targets:"
@@ -23,6 +23,8 @@ help:
 	@echo "  test                        parity test: wasm .s vs native .s (per fixture)"
 	@echo "  test-e2e                    playwright: drive the demo page in a headless browser"
 	@echo "                              and diff the rendered .s against native (needs npm + browsers)"
+	@echo "  test-e2e-dist               same as test-e2e but against the staged ../../dist/ via a"
+	@echo "                              _headers-respecting Node server — exercises the zstd path"
 	@echo "  stage-deploy                stage ../../dist/llvm-mov/ for Cloudflare Pages"
 	@echo "  serve                       static-serve the demo on \$$PORT (default 8087)"
 	@echo "  clean                       remove $(BUILD_DIR)"
@@ -83,6 +85,16 @@ test-e2e: build
 	@if [ ! -d node_modules/@playwright ]; then npm install; fi
 	@npx playwright install chromium >/dev/null 2>&1 || true
 	npx playwright test
+
+# Same as test-e2e but the webServer reads from `../../dist/` and
+# applies the `_headers` rules. The wrapper sees `CLANG_WASM_VERSION`
+# set in the staged wasm-config.js and fetches `clang.wasm-{hash}.zst`
+# with `Content-Encoding: zstd`, which exercises the production-shape
+# loader path. The same demo.spec.js runs against this baseURL.
+test-e2e-dist: stage-deploy
+	@if [ ! -d node_modules/@playwright ]; then npm install; fi
+	@npx playwright install chromium >/dev/null 2>&1 || true
+	E2E_SERVE_DIST=1 npx playwright test
 
 # Same shape as ../../movfuscator-wasm/scripts/stage-deploy.sh — copies
 # the browser-loadable artifacts + the demo index.html into

@@ -89,6 +89,15 @@ for (const name of Object.keys(EXAMPLES)) {
         test(`demo compiles "${name}" at -O${opt} with byte-identical parity vs native`, async ({ page }) => {
             const pageErrors = [];
             page.on('pageerror', (e) => pageErrors.push(String(e)));
+            if (process.env.E2E_DEBUG) {
+                page.on('console', (msg) => console.log(`[console.${msg.type()}]`, msg.text()));
+                page.on('requestfailed', (req) => console.log(
+                    `[requestfailed] ${req.method()} ${req.url()} :: ${req.failure()?.errorText}`,
+                ));
+                page.on('response', (resp) => console.log(
+                    `[response] ${resp.status()} ${resp.url()}`,
+                ));
+            }
 
             // `index.html` (not `/`) so the path component of baseURL
             // is preserved. A leading slash would resolve against the

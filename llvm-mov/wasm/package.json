@@ -9,5 +9,8 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0"
+  },
+  "dependencies": {
+    "fzstd": "^0.1.1"
   }
 }

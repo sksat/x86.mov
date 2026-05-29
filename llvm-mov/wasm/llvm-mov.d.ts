@@ -1,20 +1,26 @@
 /**
  * Status event emitted by `onProgress` callbacks. Stages:
- *  - `fetch-clang`: a clang.wasm chunk fetch made progress. Throttled
- *    to ~20 Hz on the wire; an initial event with all zeros fires
- *    before the first byte lands. Only emitted when the deploy uses
- *    chunked artefacts.
- *    - `done`/`total`: chunks completed / chunks total.
- *    - `bytes`/`totalBytes`: bytes downloaded so far / sum of all
- *      chunks' `Content-Length` (may be 0 until the first response
- *      header arrives).
+ *  - `fetch-clang`: progress streaming the zstd-encoded
+ *    clang.wasm-{version}.zst from the deploy. Throttled to ~20 Hz
+ *    on the wire; an initial event with all zeros fires before the
+ *    first byte lands. Only emitted when the deploy is in use
+ *    (`CLANG_WASM_VERSION` non-null in `wasm-config.js`).
+ *    - `bytes`: bytes received so far. Equal to wire bytes when the
+ *      browser is decompressing zstd natively, otherwise compressed
+ *      bytes that will get decompressed on the JS side after fetch.
+ *    - `totalBytes`: server's `Content-Length` (0 until the response
+ *      header lands).
+ *  - `decompress-clang`: fzstd is about to run on the compressed
+ *    bytes. Only fires on browsers without native `Content-Encoding:
+ *    zstd` support.
  *  - `instantiate-clang` / `instantiate-llc`: the Emscripten module
  *    is about to be instantiated.
  *  - `compile-c`: clang's main() is about to run (C → LLVM IR).
  *  - `compile-ir`: llvm-mov-llc's main() is about to run (IR → asm).
  */
 export type ProgressEvent =
-    | { stage: 'fetch-clang'; done: number; total: number; bytes: number; totalBytes: number }
+    | { stage: 'fetch-clang'; bytes: number; totalBytes: number }
+    | { stage: 'decompress-clang' }
     | { stage: 'instantiate-clang' }
     | { stage: 'instantiate-llc' }
     | { stage: 'compile-c' }

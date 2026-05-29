@@ -133,9 +133,12 @@ function setStatus(text) {
 }
 
 // Labels for stage breakdown rendered below the status line. Order
-// matters: it's the visual order in the timing element.
+// matters: it's the visual order in the timing element. The
+// `decompress-clang` stage only shows up on browsers without native
+// `Content-Encoding: zstd` (modern Chromium/Firefox/Edge skip it).
 const STAGE_LABEL = {
     'fetch-clang':       'fetch clang',
+    'decompress-clang':  'decompress clang',
     'instantiate-clang': 'instantiate clang',
     'compile-c':         'compile c→ir',
     'instantiate-llc':   'instantiate llc',
@@ -191,16 +194,21 @@ function fmtMB(bytes) {
 function statusFor(ev) {
     switch (ev.stage) {
         case 'fetch-clang': {
-            // The chunk-count line ticks slowly (4 chunks total); the
-            // bytes line ticks ~20 Hz with progress info from each
-            // active stream. Pre-header (totalBytes === 0) we just show
-            // the chunk count so the user sees motion immediately.
+            // The deploy ships clang.wasm as a zstd-compressed file.
+            // On browsers with native `Content-Encoding: zstd`,
+            // `bytes` is the running decompressed-byte count and
+            // `totalBytes` is the compressed `Content-Length` — i.e.
+            // the percentage tends >100% as decompression races
+            // ahead of the wire counter. The user-visible signal is
+            // "stuff is happening at network speed"; the literal
+            // percentage matters less.
             if (ev.totalBytes > 0) {
                 const pct = ((ev.bytes / ev.totalBytes) * 100).toFixed(0);
-                return `fetching clang.wasm chunks ${ev.done}/${ev.total} — ${fmtMB(ev.bytes)} / ${fmtMB(ev.totalBytes)} MiB (${pct}%)…`;
+                return `fetching clang.wasm — ${fmtMB(ev.bytes)} MiB (${pct}% of ${fmtMB(ev.totalBytes)} MiB wire)…`;
             }
-            return `fetching clang.wasm chunks ${ev.done}/${ev.total}…`;
+            return `fetching clang.wasm — ${fmtMB(ev.bytes)} MiB…`;
         }
+        case 'decompress-clang':  return 'decompressing clang.wasm (zstd)…';
         case 'instantiate-clang': return 'instantiating clang…';
         case 'compile-c':         return 'compiling C → LLVM IR…';
         case 'instantiate-llc':   return 'instantiating llvm-mov-llc…';
