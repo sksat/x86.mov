@@ -68,7 +68,15 @@ export function Turbo86Handover({ vm, movie86 }: Turbo86HandoverProps) {
                 setStatus('turbo86 → (unparsable)');
             }
         });
-        ws.addEventListener('error', () => setStatus('ws error (see DevTools)'));
+        ws.addEventListener('error', (ev) => {
+            // The DOM `error` event has no detail. Log the URL +
+            // readyState so the user (and the E2E suite) can tell
+            // "couldn't reach turbo86" from "connected then dropped".
+            const states = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
+            const rs = states[ws.readyState] ?? `?${ws.readyState}`;
+            console.error('ws error', { url, readyState: rs, event: ev });
+            setStatus(`ws error (readyState=${rs}; see DevTools)`);
+        });
         ws.addEventListener('close', () => {
             setStatus((prev) => `${prev} · closed`);
             setBusy(false);
