@@ -142,6 +142,32 @@ exec "$wasi_sdk/bin/clang++" "\$@"
 EOF
 chmod +x "$linker_wrapper"
 
+# wasm32-wasip1-threads cc/cxx wrappers: the cc-rs crate normalises
+# `wasm32-wasip1-threads` → `wasm32-wasi` in its target table
+# (cc-1.2.62/src/target/generated.rs:276), so even with a patched
+# rustc target spec the LLVM-for-wasm CMake try-compile gets
+# `--target=wasm32-wasi -pthread` and wasm-ld fails on errno.o
+# missing atomics. Rewrite that flag on the way in.
+threads_cc_wrapper="$cache/wrapper-wasi-threads-cc.sh"
+threads_cxx_wrapper="$cache/wrapper-wasi-threads-cxx.sh"
+make_threads_wrapper() {
+    local out="$1" exe="$2"
+    cat > "$out" <<WRAPPER_EOF
+#!/usr/bin/env bash
+args=()
+for a in "\$@"; do
+    case "\$a" in
+        --target=wasm32-wasi) args+=(--target=wasm32-wasi-threads);;
+        *) args+=("\$a");;
+    esac
+done
+exec "$wasi_sdk/bin/$exe" "\${args[@]}"
+WRAPPER_EOF
+    chmod +x "$out"
+}
+make_threads_wrapper "$threads_cc_wrapper" "wasm32-wasip1-threads-clang"
+make_threads_wrapper "$threads_cxx_wrapper" "wasm32-wasip1-threads-clang++"
+
 # config.toml — bootstrap shape:
 #   build = the box we're invoking x.py from (this dev machine).
 #   host  = where the produced rustc will *run*. We want it to run in
@@ -194,6 +220,17 @@ deny-warnings = false
 # deterministic option from a shallow tree.
 [llvm]
 download-ci-llvm = false
+
+# Route wasm32-wasip1-threads C/C++ through wrappers that rewrite
+# cc-rs's --target=wasm32-wasi flag to --target=wasm32-wasi-threads
+# (see the wrapper-wasi-threads-cc.sh creation above for why).
+[target.wasm32-wasip1-threads]
+cc = "$threads_cc_wrapper"
+cxx = "$threads_cxx_wrapper"
+linker = "$threads_cc_wrapper"
+ar = "$wasi_sdk/bin/llvm-ar"
+ranlib = "$wasi_sdk/bin/llvm-ranlib"
+wasi-root = "$wasi_sdk/share/wasi-sysroot"
 EOF
 # Sweep any leftover config.toml from earlier runs so its (possibly
 # stale) settings can't shadow bootstrap.toml via the deprecated
