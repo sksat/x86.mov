@@ -163,6 +163,12 @@ jobs:
             llvm-mov/wasm/build/llvm-wasm/.ninja_log
             llvm-mov/wasm/build/llvm-wasm/.ninja_deps
           key: llvm-mov-wasm-llvm-${{ runner.os }}-${{ hashFiles('llvm-mov/wasm/scripts/build-wasm-llvm.sh', 'llvm-mov/wasm/scripts/fetch.sh') }}-v1
+          # The cached .a/.o files are a function of the vendored LLVM
+          # source + the cmake flags, not the post-build short-circuit
+          # logic. Falling back to any previous cache lets unrelated
+          # script tweaks land without forcing a 90-min cold rebuild.
+          restore-keys: |
+            llvm-mov-wasm-llvm-${{ runner.os }}-
 
       - name: llvm-mov/wasm setup (fetch llvm-project)
         if: steps.lmw-vendor-cache.outputs.cache-hit != 'true'

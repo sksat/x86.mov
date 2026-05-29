@@ -89,6 +89,11 @@ jobs:
             llvm-mov/wasm/build/llvm-wasm/.ninja_log
             llvm-mov/wasm/build/llvm-wasm/.ninja_deps
           key: llvm-mov-wasm-llvm-${{ runner.os }}-${{ hashFiles('llvm-mov/wasm/scripts/build-wasm-llvm.sh', 'llvm-mov/wasm/scripts/fetch.sh') }}-v1
+          # See comment in deploy.yaml: the cached .a/.o files don't
+          # depend on the script's post-build short-circuit logic, so
+          # any previous cache is a valid restore base.
+          restore-keys: |
+            llvm-mov-wasm-llvm-${{ runner.os }}-
 
       - name: build wasm LLVM + clang static libs
         run: make build-wasm-llvm
