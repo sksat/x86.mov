@@ -121,15 +121,24 @@ test('explorer hands a static example off to a real turbo86 over WS', async ({ p
 
         await page.goto('');
 
-        // Load a known-good static ELF (return42 — exits 42 immediately
-        // under either engine).
-        await page.getByTestId('example-select').click();
-        await page.getByRole('option', { name: /return42/ }).click();
+        // Production UX has no "pick a fixture" preset — the panel is
+        // for the compiled binary or an upload. Until issue #36 fixes
+        // the compile→run path's static-link gap, drive the upload
+        // input directly with a known-good static ELF (return42.elf
+        // ships under /movie86/examples/ via the movie86/wasm
+        // stage-deploy).
+        const elfBytes = await page.evaluate(async () => {
+            const r = await fetch('/movie86/examples/return42.elf');
+            if (!r.ok) throw new Error(`return42.elf fetch: ${r.status}`);
+            const buf = await r.arrayBuffer();
+            return Array.from(new Uint8Array(buf));
+        });
+        await page.getByTestId('elf-upload-input').setInputFiles({
+            name: 'return42.elf',
+            mimeType: 'application/octet-stream',
+            buffer: Buffer.from(elfBytes),
+        });
 
-        // The status row should pick up `Exit(42)` only after Run, so
-        // skip Run here — we want a pre-Exit snapshot to hand over,
-        // because turbo86 can then step the program itself.
-        // Just confirm vm-run is enabled (the load succeeded).
         try {
             await expect(page.getByTestId('vm-run')).toBeEnabled({ timeout: 10_000 });
         } catch (e) {

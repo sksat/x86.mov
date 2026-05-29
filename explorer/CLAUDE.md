@@ -125,22 +125,38 @@ goes through `make -C ../movfuscator-wasm build-wasm-browser` /
 `make -C ../movie86/wasm build-wasm` / `make -C ../llvm-mov/wasm build`
 first.
 
+## Product intent
+
+The explorer is fundamentally a **compile → run** tool: the user
+edits C, clicks Compile, and the produced binary auto-loads into the
+embedded movie86 emulator so they can Step / Run / hand off to
+turbo86. Everything else is supporting cast.
+
+There is exactly one optional escape hatch: the **Upload** button in
+the Movie86 panel header (`data-testid="elf-upload"`), for the case
+where the user wants to drop in an arbitrary static ELF instead of
+the just-compiled one. **Do not** reintroduce pre-built "example"
+preset dropdowns — that would push the page's intent away from "run
+what you compiled".
+
 ## Known limitations
 
-- **`Compile` → `movie86 Run` doesn't round-trip yet.** Both in-browser
-  pipelines (movfuscator-wasm and llvm-mov clang) go through binutils-
-  wasm `ld` with `-dynamic-linker /lib/ld-linux.so.2`, so the produced
-  ELF is **dynamically linked**. movie86 only loads **static** ELFs
-  (PT_INTERP / PT_DYNAMIC → `LoadError: DynamicLinkingUnsupported` at
-  `Vm::new`). The explorer surfaces this clearly in the Movie86Panel
-  error banner. To actually run / hand-off, pick one of the pre-built
-  static fixtures from the "Example fixture" dropdown (sourced from
-  `movie86/wasm/examples/*.elf`) or upload your own static ELF. A
-  follow-up will add a `static: true` option to
-  `movfuscator-wasm/movfuscator.mjs`'s `link()` so the in-browser
-  pipeline can emit movie86-runnable ELFs directly. Until then the
-  compile path is for **inspection** (IR / asm / ELF hex / disasm)
-  and the run / handover path is for the example fixtures.
+- **Compile → Run is blocked by dynamic linking today.** Both in-
+  browser pipelines (movfuscator-wasm and llvm-mov clang) go through
+  the shared binutils-wasm `ld` with
+  `-dynamic-linker /lib/ld-linux.so.2`, so the produced ELF is
+  **dynamically linked**. movie86 only loads **static** ELFs
+  (PT_INTERP / PT_DYNAMIC → `LoadError: DynamicLinkingUnsupported`
+  at `Vm::new`). The Movie86Panel surfaces this in a red banner
+  (`data-testid="load-error"`) so the user understands the gap
+  rather than staring at a disabled Run button. Issue #36 tracks
+  adding a `static: true` option to
+  `movfuscator-wasm/movfuscator.mjs`'s `link()`; once that lands the
+  compile output will load cleanly and this section becomes a
+  historical footnote.
+- Until then, the optional **Upload** button is the only way to run a
+  user-supplied static ELF in-tab. The compiled output still feeds
+  the inspection panes (IR / asm / ELF hex / disasm) cleanly.
 
 ## Things future Claude shouldn't relearn
 
