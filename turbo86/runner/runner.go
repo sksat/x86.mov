@@ -303,7 +303,16 @@ func (r *Runner) snapshotMemory() ([]proto.MemRegion, error) {
 			return nil, err
 		}
 	}
-	for _, gr := range r.extraRegions {
+	// Copy extraRegions under the lock so the tracer goroutine can
+	// still append (mmap_request handler) without racing the walk.
+	// The async MemUpdate ticker is the other reader; without the
+	// snapshot under lock a guest that calls mmap_request mid-run
+	// would trigger a Go data race on the slice header.
+	r.extraRegionsMu.RLock()
+	extras := make([]struct{ addr, size uint32 }, len(r.extraRegions))
+	copy(extras, r.extraRegions)
+	r.extraRegionsMu.RUnlock()
+	for _, gr := range extras {
 		if err := walk(gr.addr, gr.size); err != nil {
 			return nil, err
 		}
@@ -399,13 +408,24 @@ type Runner struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
-	// tickerStop is closed by the tracer goroutine's defer as the
-	// very first step of teardown, *before* it closes eventsCh. The
-	// MemUpdate ticker (if running) watches this channel and exits
-	// without sending — otherwise a tick fired between syscallLoop
-	// returning and the ticker noticing closeCh would panic with
-	// "send on closed channel". Created in `New`.
+	// tickerStop is closed by the tracer goroutine's defer to signal
+	// the MemUpdate ticker (if running) to wind down, and tickerWg
+	// is the join handle the defer waits on **before** closing
+	// eventsCh. Without the wait the ticker's `select { send,
+	// tickerStop }` could pick the send case after we've closed
+	// eventsCh and panic with "send on closed channel" — a real
+	// hazard when a terminal event races a pending MemUpdate.
+	// Created in `New`.
 	tickerStop chan struct{}
+	tickerWg   sync.WaitGroup
+
+	// extraRegionsMu guards extraRegions against concurrent access
+	// between the tracer goroutine (which appends in the mmap_request
+	// ABI path) and the MemUpdate ticker goroutine (which iterates the
+	// slice via snapshotMemory). Without it a guest that grows its
+	// address space mid-session triggers a Go data race on the slice
+	// header.
+	extraRegionsMu sync.RWMutex
 
 	// Mode-dependent state, populated when the syscall loop starts.
 	mode       proto.Mode       // host (default) or trap
@@ -593,11 +613,15 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 	// Single defer covers all exit paths (bootstrap failure, pre-Run
 	// close, post-Run close, natural session end).
 	defer func() {
-		// Signal the periodic MemUpdate ticker (if any) to stop
-		// before we close eventsCh — otherwise a tick fired between
-		// syscallLoop returning and the ticker noticing would panic
-		// with "send on closed channel".
+		// Signal the periodic MemUpdate ticker to stop AND join its
+		// goroutine before closing eventsCh. Without the join the
+		// ticker's `select { send_to_eventsCh, <-tickerStop }` can
+		// observe the send case becoming "ready for evaluation" (Go
+		// makes no ordering guarantees on which case fires when
+		// multiple ready cases exist) and then panic when
+		// `close(eventsCh)` lands mid-pick.
 		close(r.tickerStop)
+		r.tickerWg.Wait()
 		if r.cmd != nil && r.cmd.Process != nil {
 			_ = r.cmd.Process.Kill() // no-op if already dead
 			var ws syscall.WaitStatus
@@ -692,12 +716,16 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 		return
 	}
 
-	// Start the periodic MemUpdate ticker, if the caller asked for one.
-	// Stopped by closing `closeCh` (Close()) or the syscallLoop
-	// returning naturally (the loop's defer drains by sending SIGKILL,
-	// which closes the ticker's only effective recipient).
+	// Start the periodic MemUpdate ticker, if the caller asked for
+	// one. tracerLoop's defer joins via `tickerWg.Wait()` before
+	// closing eventsCh so the ticker can't panic on a closed
+	// channel.
 	if msg.memUpdateInterval > 0 {
-		go r.memUpdateTicker(msg.memUpdateInterval)
+		r.tickerWg.Add(1)
+		go func() {
+			defer r.tickerWg.Done()
+			r.memUpdateTicker(msg.memUpdateInterval)
+		}()
 	}
 
 	r.syscallLoop(&regs)
@@ -969,9 +997,12 @@ func regionFitsStaticGuest(addr, size uint32) bool {
 // same ptrace mechanics. Only difference is *when* it's called (init
 // vs mid-execution); the child is stopped in both cases.
 func (r *Runner) mmapRegionForLoadContext(addr, size uint32, regs *regs32) error {
+	r.extraRegionsMu.RLock()
 	if len(r.extraRegions) >= mmapMaxRegions {
+		r.extraRegionsMu.RUnlock()
 		return fmt.Errorf("too many dynamic regions (cap=%d)", mmapMaxRegions)
 	}
+	r.extraRegionsMu.RUnlock()
 	pageAddr := addr & mmapAddrMask
 	pageEnd := (addr + size + 0xFFF) & mmapAddrMask
 	if pageEnd <= pageAddr {
@@ -986,7 +1017,9 @@ func (r *Runner) mmapRegionForLoadContext(addr, size uint32, regs *regs32) error
 	if ret != pageAddr {
 		return fmt.Errorf("mmap returned 0x%x, asked for 0x%x", ret, pageAddr)
 	}
+	r.extraRegionsMu.Lock()
 	r.extraRegions = append(r.extraRegions, struct{ addr, size uint32 }{pageAddr, pageSize})
+	r.extraRegionsMu.Unlock()
 	return nil
 }
 
@@ -1035,7 +1068,10 @@ func (r *Runner) handleAbiWrite(regs *regs32) bool {
 // progress without the region it asked for, and silent partial success
 // would let the next mov into that range fault confusingly.
 func (r *Runner) handleMmapRequest(call abiCall, regs *regs32) bool {
-	if len(r.extraRegions) >= mmapMaxRegions {
+	r.extraRegionsMu.RLock()
+	full := len(r.extraRegions) >= mmapMaxRegions
+	r.extraRegionsMu.RUnlock()
+	if full {
 		r.emitFault(fmt.Sprintf(
 			"mov-only ABI mmap_request: too many dynamic regions (cap=%d)", mmapMaxRegions))
 		return false
@@ -1054,7 +1090,9 @@ func (r *Runner) handleMmapRequest(call abiCall, regs *regs32) bool {
 			"mmap_request: kernel mapped 0x%x, asked for 0x%x (size=0x%x)", ret, addr, size))
 		return false
 	}
+	r.extraRegionsMu.Lock()
 	r.extraRegions = append(r.extraRegions, struct{ addr, size uint32 }{addr, size})
+	r.extraRegionsMu.Unlock()
 
 	regs.Eip += uint32(call.insnLen)
 	if err := ptraceSetRegs32(r.pid, regs); err != nil {
