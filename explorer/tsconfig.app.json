@@ -27,5 +27,5 @@
 
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo"
   },
-  "include": ["src", "explorer.mjs"]
+  "include": ["src", "explorer.mjs", "backend.mjs"]
 }

@@ -30,8 +30,12 @@ test('Explorer renders the major panes', async ({ page }) => {
     // Initial state is llvm-mov (App.tsx default).
     await expect(page.getByTestId('ir-pane')).toBeVisible();
 
-    // movie86 panel + handover.
+    // movie86 panel + backend selector. movie86 is the default backend,
+    // so the turbo86 connection strip is hidden until it's selected.
     await expect(page.locator('text=Run · movie86').first()).toBeVisible();
+    await expect(page.getByTestId('backend-select')).toBeVisible();
+    await expect(page.getByTestId('turbo86-handover')).toHaveCount(0);
+    await page.getByTestId('backend-opt-turbo86').click();
     await expect(page.getByTestId('turbo86-handover')).toBeVisible();
 });
 

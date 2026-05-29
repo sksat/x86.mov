@@ -110,6 +110,10 @@ export interface Movie86Wrapper {
     makeLoadContextMessage(
         ctx: { regs: Record<string, number>; regions: { addr: number; bytes: Uint8Array }[] },
         mode?: 'host' | 'trap',
+        /** Ask turbo86 to emit `MemUpdate` Outbound events at this
+         *  cadence (ms) so the explorer can mirror in-flight guest memory
+         *  onto the local Vm and keep the canvas live. 0 = disabled. */
+        memUpdateIntervalMs?: number,
     ): string;
     parseOutboundMessage(text: string): { type: string; [k: string]: unknown };
 }
@@ -121,6 +125,13 @@ export interface Movie86Vm {
     drainStderr(): Uint8Array;
     disasmAt(addr: number): null | { bytes: Uint8Array; text: string; len: number; free(): void };
     readMem(addr: number, len: number): Uint8Array;
+    /** Write bytes into guest memory; returns the count actually written
+     *  (0 if the range is unmapped). Used to apply turbo86 `MemUpdate`
+     *  regions during a live handover. */
+    writeMem(addr: number, bytes: Uint8Array): number;
+    /** Force the active framebuffer mode (mirrors turbo86's `VideoMode`
+     *  Outbound so the canvas pane picks the right framebuffer). */
+    setActiveVideoMode(mode: number): void;
     readonly regs: Uint32Array;
     readonly eip: number;
     readonly steps: bigint;
