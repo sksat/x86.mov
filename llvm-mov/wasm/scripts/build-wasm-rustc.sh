@@ -110,15 +110,27 @@ exec "$wasi_sdk/bin/clang++" "\$@"
 EOF
 chmod +x "$linker_wrapper"
 
-# Tell x.py to install into our cache dir directly. The bjorn3 fork
-# honours --prefix.
+# config.toml — bootstrap shape:
+#   build = the box we're invoking x.py from (this dev machine).
+#   host  = where the produced rustc will *run*. We want it to run in
+#           WASI, so wasm32-wasip1-threads.
+#   target = which targets the produced rustc can *codegen for*. The
+#           load-bearing one is i686-unknown-linux-gnu (the gating
+#           sysroot for the mov-backend pipeline). The others match
+#           what rubrc ships so the registry row covers the same
+#           surface plus the i686 delta.
 cat > "$rust_src/config.toml" <<EOF
 profile = "compiler"
 change-id = 0
 
 [build]
-target = ["wasm32-wasip1-threads"]
 build = "x86_64-unknown-linux-gnu"
+host = ["wasm32-wasip1-threads"]
+target = [
+    "i686-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "wasm32-wasip1",
+]
 extended = false
 docs = false
 
