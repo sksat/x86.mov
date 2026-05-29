@@ -274,6 +274,11 @@ func handleSession(ctx context.Context, ws *websocket.Conn, slog *sessionLogger)
 			slog.logf("outbound Paused: signal=%d eip=%#x regions=%d reason=%q",
 				v.Signal, v.Regs.Eip, len(v.Regions), v.Reason)
 			emittedTerminal = true
+		case proto.VideoMode:
+			// Structural (mov-only ABI call) but not terminal: log so
+			// an operator can confirm the guest reached the BIOS-replacement
+			// path, then keep streaming.
+			slog.logf("outbound VideoMode: mode=%#x", v.Mode)
 		}
 		data, err := proto.MarshalOutbound(ev)
 		if err != nil {

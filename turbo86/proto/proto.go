@@ -263,6 +263,19 @@ type Paused struct {
 
 func (Paused) outboundKind() string { return "paused" }
 
+// VideoMode reports that the guest selected a video mode via the
+// mov-only ABI (see runner's abi page handling). Replaces the BIOS
+// `int 0x10 / AH=0 / AL=mode` convention: the guest writes the mode
+// byte to a magic address on the ABI page, the runner intercepts the
+// SIGSEGV that the unmapped write produces, surfaces the mode here,
+// and resumes the guest past the offending mov. Keeps the "everything
+// is a mov" narrative intact across both wasm and turbo86.
+type VideoMode struct {
+	Mode uint8 `json:"mode"`
+}
+
+func (VideoMode) outboundKind() string { return "video_mode" }
+
 // MarshalOutbound encodes an Outbound as a JSON object with a "type" field.
 func MarshalOutbound(msg Outbound) ([]byte, error) {
 	switch m := msg.(type) {
@@ -290,6 +303,11 @@ func MarshalOutbound(msg Outbound) ([]byte, error) {
 		return json.Marshal(struct {
 			Type string `json:"type"`
 			Paused
+		}{m.outboundKind(), m})
+	case VideoMode:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			VideoMode
 		}{m.outboundKind(), m})
 	default:
 		return nil, fmt.Errorf("proto: unknown Outbound type %T", msg)
@@ -334,6 +352,12 @@ func UnmarshalOutbound(data []byte) (Outbound, error) {
 		var m Paused
 		if err := json.Unmarshal(data, &m); err != nil {
 			return nil, fmt.Errorf("proto: parsing Paused payload: %w", err)
+		}
+		return m, nil
+	case "video_mode":
+		var m VideoMode
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, fmt.Errorf("proto: parsing VideoMode payload: %w", err)
 		}
 		return m, nil
 	default:

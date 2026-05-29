@@ -81,6 +81,10 @@ impl SysHost for CapturingHost {
 impl LibcHost for CapturingHost {}
 // Same story for BIOS (`int 0x10`): no expectations, trap on call.
 impl movie86::BiosHost for CapturingHost {}
+// And mov-only ABI: no expectations either; the default trap fires
+// on any call so a regression test that's expecting an ABI write
+// surfaces it explicitly.
+impl movie86::AbiHost for CapturingHost {}
 
 #[test]
 fn runs_minimal_exit_42_elf() {

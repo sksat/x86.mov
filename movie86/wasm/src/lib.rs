@@ -140,11 +140,7 @@ impl BiosHost for WasmHost {
     /// is therefore equivalent to "no canvas selected" in the demo,
     /// matching how real-mode BIOS treats unsupported mode numbers as
     /// a no-op without faulting.
-    fn bios_call(
-        &mut self,
-        args: &BiosArgs,
-        _mem: &mut dyn Memory,
-    ) -> Result<BiosResult, Fault> {
+    fn bios_call(&mut self, args: &BiosArgs, _mem: &mut dyn Memory) -> Result<BiosResult, Fault> {
         match args.ah() {
             0 => {
                 self.active_video_mode = Some(args.al());
@@ -153,6 +149,91 @@ impl BiosHost for WasmHost {
             }
             _ => Err(Fault::UnsupportedInterrupt(0x10)),
         }
+    }
+}
+
+/// mov-only ABI parity with turbo86. The wasm Vm catches writes to the
+/// ABI page in `Cpu::step` and routes them here:
+///
+/// - `CALL_SET_VIDEO_MODE` — `value` (low byte) is the mode, captured
+///   into `active_video_mode` the same way `int 0x10 / AH=0` already
+///   does. The JS demo reads `vm.activeVideoMode` to pick which
+///   canvas to render, so the two entry points produce identical
+///   browser-visible behaviour.
+/// - `CALL_MMAP_REQUEST` — no-op in wasm because the demo's canvas
+///   ELFs declare their FB regions as PT_LOAD entries that the
+///   loader already maps via `flatten_with_stack`. The guest still
+///   issues the request for portability to turbo86 (where the FB
+///   isn't pre-mapped); on wasm it's effectively a "we already have
+///   you covered" acknowledgement. Returns Ok so the guest proceeds
+///   straight to the FB write.
+/// - `CALL_EXIT` — same semantics as `int 0x80 / SYS_exit`: surface
+///   the value as `Fault::Exit`, which the existing run loop catches
+///   and reports as the final exit status. Lets canvas examples drop
+///   the trailing `int 0x80` epilogue entirely.
+impl movie86::AbiHost for WasmHost {
+    fn abi_call(
+        &mut self,
+        call_num: u16,
+        value: u32,
+        regs: &mut [u32; 8],
+        mem: &mut dyn Memory,
+    ) -> Result<(), Fault> {
+        match call_num {
+            movie86::CALL_SET_VIDEO_MODE => {
+                self.active_video_mode = Some((value & 0xFF) as u8);
+                Ok(())
+            }
+            movie86::CALL_MMAP_REQUEST => Ok(()),
+            movie86::CALL_EXIT => Err(Fault::Exit(value)),
+            movie86::CALL_WRITE => {
+                let fd = regs[Reg32::Ebx as usize];
+                let buf = regs[Reg32::Ecx as usize];
+                let len = regs[Reg32::Edx as usize];
+                let n = self.abi_write(fd, buf, len, mem);
+                regs[Reg32::Eax as usize] = n;
+                Ok(())
+            }
+            _ => Err(Fault::UnsupportedAbiCall(call_num)),
+        }
+    }
+}
+
+impl WasmHost {
+    /// Buffered write that mirrors the existing `write_syscall` flow:
+    /// stdout/stderr each get their own `Vec<u8>`, JS pulls the bytes
+    /// via `drainStdout` / `drainStderr`. Bad fd → -EBADF, unreadable
+    /// memory → partial count or -EFAULT (same as the int 0x80 path).
+    fn abi_write(&mut self, fd: u32, buf: u32, len: u32, mem: &mut dyn Memory) -> u32 {
+        const CHUNK: usize = 4096;
+        if fd != 1 && fd != 2 {
+            return 0u32.wrapping_sub(9);
+        }
+        let mut addr = buf;
+        let mut remaining = len as usize;
+        let mut written: u32 = 0;
+        let mut scratch = [0u8; CHUNK];
+        while remaining > 0 {
+            let this = remaining.min(CHUNK);
+            let slice = &mut scratch[..this];
+            if mem.read_bytes(addr, slice).is_err() {
+                if written > 0 {
+                    return written;
+                }
+                return 0u32.wrapping_sub(14);
+            }
+            let sink: &mut Vec<u8> = if fd == 1 {
+                &mut self.stdout
+            } else {
+                &mut self.stderr
+            };
+            sink.extend_from_slice(slice);
+            let n_u32 = u32::try_from(this).unwrap_or(u32::MAX);
+            written = written.saturating_add(n_u32);
+            addr = addr.wrapping_add(n_u32);
+            remaining = remaining.saturating_sub(this);
+        }
+        written
     }
 }
 

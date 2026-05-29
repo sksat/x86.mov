@@ -136,11 +136,13 @@ func TestRunOnce_NullDerefBecomesPaused(t *testing.T) {
 		t.Errorf("Regs.Eip: got 0x%x, want 0x%x (faulting mov [0], eax)", paused.Regs.Eip, want)
 	}
 
-	// The sparse snapshot should carry exactly one run — the 4 KiB
-	// page that holds our 11 bytes of guest code. Everything else in
-	// the 16 MiB code region and the 2 MiB stack region is demand-zero.
-	if len(paused.Regions) != 1 {
-		t.Fatalf("Regions: got %d entries, want 1: %#v", len(paused.Regions), paused.Regions)
+	// Two non-zero pages now: the entry-point page with the guest's
+	// 11 bytes of code, plus the runtime-installed trampoline page at
+	// 0x09040000 (CD 80 used for mov-only ABI mmap_request injection,
+	// and rt_sigreturn in trap mode). Everything else in the 16 MiB
+	// code region and the 2 MiB stack region is demand-zero.
+	if len(paused.Regions) != 2 {
+		t.Fatalf("Regions: got %d entries, want 2: %#v", len(paused.Regions), paused.Regions)
 	}
 	r := paused.Regions[0]
 	if r.Addr != entry {
@@ -151,5 +153,14 @@ func TestRunOnce_NullDerefBecomesPaused(t *testing.T) {
 	}
 	if !bytes.Equal(r.Bytes[:len(code)], code) {
 		t.Errorf("Regions[0].Bytes[:len(code)]:\n  got:  % x\n  want: % x", r.Bytes[:len(code)], code)
+	}
+	tramp := paused.Regions[1]
+	if tramp.Addr != 0x09040000 {
+		t.Errorf("Regions[1].Addr (trampoline): got 0x%x, want 0x09040000", tramp.Addr)
+	}
+	wantTramp := []byte{0xB8, 0xAD, 0x00, 0x00, 0x00, 0xCD, 0x80}
+	if !bytes.Equal(tramp.Bytes[:len(wantTramp)], wantTramp) {
+		t.Errorf("Regions[1].Bytes prefix (trampoline):\n  got:  % x\n  want: % x",
+			tramp.Bytes[:len(wantTramp)], wantTramp)
 	}
 }

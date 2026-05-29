@@ -44,10 +44,23 @@ fit for an in-browser run. The semantics match:
   and unknowns abort with `-1` per the smart-friend boundary the CLI
   also follows).
 - `int 0x10` BIOS video services: only `AH=0` (set video mode) is
-  implemented — guests select a framebuffer with `mov eax, 0x13` (or
-  `0x12`) + `int 0x10`. Other AH values trap. The CLI deliberately
-  doesn't implement this (no canvas to write to) and leaves the
-  `BiosHost` default-trap in place.
+  implemented — kept for the older committed canvas binaries
+  (`canvas_smile.elf`, `canvas_modes.elf`, `canvas_bars.elf`,
+  `canvas_mandelbrot_mov.elf`) whose sources we don't have. New
+  fixtures use the mov-only ABI's `CALL_SET_VIDEO_MODE` instead, but
+  the BIOS path stays so existing committed binaries don't break.
+- Mov-only ABI page (`AbiHost`): `mov [0x1FFE_00NN], al/eax`
+  triggers `set_video_mode` / `mmap_request` / `write` / `exit`
+  without an `int` ever firing. Same constants and semantics as
+  turbo86 (see `movie86::abi_host` + [turbo86/DESIGN.md
+  §Mov-only ABI page](../../turbo86/DESIGN.md)). `WasmHost::abi_call`
+  routes `CALL_SET_VIDEO_MODE` to the same `active_video_mode`
+  field the `int 0x10` path uses, so the JS demo doesn't care which
+  path the guest took. `CALL_MMAP_REQUEST` is a no-op on wasm (the
+  canvas ELFs declare their FB regions as PT_LOAD and
+  `flatten_with_stack` already maps them); `CALL_WRITE` mirrors
+  `int 0x80 SYS_write` (`ebx`=fd, `ecx`=buf, `edx`=len, writes
+  bytes-written back to `eax`); `CALL_EXIT` raises `Fault::Exit`.
 - Signal-handler auto-wiring: `dispatch` → SIGSEGV, `master_loop` →
   SIGILL, looked up from the ELF symbol table at run time.
 
@@ -233,24 +246,26 @@ slider — they answer different questions ("show me each step" vs
   introspection that *does* show up: `Vm::sigsegvHandler` /
   `Vm::sigillHandler` (populated by the loader from the ELF symbol
   table at load time — static post-load, but real, not a stub).
-- **The framebuffer convention is memory-mapped + BIOS-selected, not
+- **The framebuffer convention is memory-mapped + mov-selected, not
   syscall-driven.** `FRAMEBUFFER_MODES` in `movie86.mjs` lists
   `(modeNumber, addr, width, height)` quadruples; the guest:
-    1. Sets the active mode with `mov eax, 0x000000NN ; int 0x10`
-       (`AH=0`, `AL=NN` — the real BIOS video-mode-set call), routed
-       through `core::bios_host::BiosHost::bios_call` to
-       `WasmHost::active_video_mode`.
+    1. Sets the active mode by `mov`-ing the mode byte into the ABI
+       page (`mov [0x1FFE0010], al`), routed through
+       `core::abi_host::AbiHost::abi_call` to
+       `WasmHost::active_video_mode`. Older committed binaries that
+       use the legacy `int 0x10 / AH=0` form still work too — both
+       paths land at the same `active_video_mode` field.
     2. Draws by `mov`-ing 4-byte RGBA pixels into that mode's address
        range.
   The host renders only the **active** mode's canvas each frame
   (`vm.activeVideoMode` → `modeForNumber()` → blit `vm.readMem(addr,
-  byteLength)` via `putImageData`). ELFs that never call `int 0x10`
-  get no canvas at all — non-canvas examples don't clutter the UI
-  with empty placeholders. ELFs that want a canvas declare a second
+  byteLength)` via `putImageData`). ELFs that never set a mode get
+  no canvas at all — non-canvas examples don't clutter the UI with
+  empty placeholders. ELFs that want a canvas declare a second
   PT_LOAD covering the slot (`filesz=0, memsz=W*H*4`, `p_flags=RW`);
   the loader's `flatten_with_stack` already handles multiple PT_LOAD
-  segments, so the only core change needed was the new `BiosHost`
-  trait + the `int 0x10` arm in `Cpu::step`. Addresses echo real VGA
+  segments, so the only core changes needed were the `BiosHost` /
+  `AbiHost` traits + the dispatch in `Cpu::step`. Addresses echo real VGA
   (mode 13h at `0xA0000`, mode 12h at `0x100000`) but the encoding is
   straight RGBA, not paletted 8bpp / 4bpp planar — "spirit of VGA",
   not exact. Hand-written canvas demos are kept feasible by run-
@@ -265,6 +280,19 @@ slider — they answer different questions ("show me each step" vs
   canvas-flavoured ELF running under `movie86-cli` surfaces a fault
   the same way an unknown syscall would. WasmHost is the one place
   that actually implements `AH=0` (set mode).
+- **`AbiHost` is the mov-only counterpart**, also opt-in. WasmHost's
+  impl routes `CALL_SET_VIDEO_MODE` to `active_video_mode` (same
+  field the `int 0x10` path writes — JS code can't tell the two
+  apart), `CALL_MMAP_REQUEST` is a no-op (FB is PT_LOAD-mapped
+  already), `CALL_WRITE` mirrors `int 0x80 SYS_write` byte-for-byte
+  with `eax = bytes_written`, and `CALL_EXIT` raises `Fault::Exit`.
+  CLI's `StdHost::abi_call` accepts `set_video_mode` (silently
+  drops the mode), `exit` (raises Fault::Exit), `write` (forwards
+  to host stdout/stderr), and rejects `mmap_request` (the CLI's
+  FlatMemory is fixed-size at construction). Trait constants
+  (`ABI_BASE`, `CALL_*`) live in `core/src/abi_host.rs` and must
+  stay in lockstep with turbo86's matching numbers; the
+  cross-engine contract is byte-for-byte.
 - **`Vm::disasmAt` exists separately from the CPU's internal decode
   path** so the demo's disassembly pane can render rows without driving
   execution. Tolerates short reads at the end of the mapped region

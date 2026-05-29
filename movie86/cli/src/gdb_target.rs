@@ -272,7 +272,9 @@ fn fault_to_signal(f: Fault) -> GdbSignal {
         Fault::UnknownOpcode(_) | Fault::UnsupportedInterrupt(_) | Fault::DecodeTruncated => {
             GdbSignal::SIGILL
         }
-        Fault::UnimplementedMov | Fault::UnknownSyscall(_) => GdbSignal::SIGSYS,
+        Fault::UnimplementedMov | Fault::UnknownSyscall(_) | Fault::UnsupportedAbiCall(_) => {
+            GdbSignal::SIGSYS
+        }
         // The signum payload carries the actual guest signal that
         // fired without a handler — preserve it so gdb shows the
         // right reason. `Signal::Segv` (11) → SIGSEGV, `Signal::Ill`
