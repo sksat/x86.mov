@@ -1,11 +1,11 @@
-.PHONY: help build-wasm stage-deploy serve rebase-examples clean distclean
+.PHONY: help build-wasm stage-deploy serve examples clean distclean
 
 help:
 	@echo "Targets:"
 	@echo "  build-wasm        cargo build wasm32 + wasm-bindgen → build/browser/"
 	@echo "  stage-deploy      assemble ../dist/movie86-wasm/ for Cloudflare Pages"
 	@echo "  serve             python http.server on \$$PORT (default 8087)"
-	@echo "  rebase-examples   rerun examples/rebase.py on every examples/*.elf"
+	@echo "  examples          rebuild bundled examples/*.elf from their .s sources"
 	@echo "  clean             remove build/ + target/"
 	@echo "  distclean         remove build/ + target/ + Cargo.lock"
 
@@ -20,14 +20,13 @@ serve: build-wasm
 	@echo "open http://localhost:$(PORT)/"
 	python3 -m http.server $(PORT)
 
-# Rebase committed example ELFs to the 0x08048000 link base turbo86's
-# stub maps RWX guest memory at. Idempotent — running it on already-
-# rebased ELFs is a no-op (entries / vaddrs are already above OLD_BASE
-# so the scan finds nothing to shift). Used when adding a new example
-# fixture; the existing bundled .elf files were rebased once at
-# commit time and are checked in at the new base.
-rebase-examples:
-	python3 examples/rebase.py
+# Rebuild bundled example ELFs from their .s sources. Linker base is
+# pinned to 0x08048000 inside examples/Makefile + examples/link.ld so
+# the resulting binaries match the i386 SysV convention turbo86's stub
+# maps RWX at — no post-link rebasing needed. Run when you change a
+# .s source or add a new example fixture.
+examples:
+	$(MAKE) -C examples all
 
 clean:
 	rm -rf build target
