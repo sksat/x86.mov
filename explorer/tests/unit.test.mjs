@@ -47,6 +47,7 @@ test('compileWithCompiler uses injected wrappers (no real wasm load)', async () 
     const fakeIr = '; ModuleID = "in.c"\n';
     const fakeLlvmAsm = '/* llvm-mov asm */\n';
     const fakeObj = new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 0x01]);
+    const fakeStartObj = new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 0x02]);
     const fakeElf = new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 0x01, 0x01]);
 
     const wrappers = {
@@ -57,10 +58,12 @@ test('compileWithCompiler uses injected wrappers (no real wasm load)', async () 
             },
             assemble: async (asm) => {
                 calls.push(['assemble', asm]);
-                return fakeObj;
+                // Distinguish the _start.s asm so the llvm-mov path
+                // assertions below can confirm it's the auto-staged one.
+                return asm.includes('_start:') ? fakeStartObj : fakeObj;
             },
-            link: async (obj, libs, opts) => {
-                calls.push(['link', obj.length, opts?.name]);
+            link: async (objs, libs, opts) => {
+                calls.push(['link', objs, opts]);
                 return fakeElf;
             },
         },
@@ -93,6 +96,12 @@ test('compileWithCompiler uses injected wrappers (no real wasm load)', async () 
         ['mov-compile', 'assemble', 'link'],
         'movfuscator order: compile → assemble → link',
     );
+    // movfuscator path keeps the historical dynamic / movfuscator-CRT
+    // recipe — the explorer doesn't force static here because the
+    // movie86 master_loop fault is a separate investigation.
+    const movLinkCall = calls.find(c => c[0] === 'link');
+    assert.notEqual(movLinkCall[2]?.static, true,
+        'movfuscator path should stay dynamic until the master_loop fault is fixed');
 
     calls.length = 0;
     const llvmRes = await compileWithCompiler({
@@ -105,10 +114,15 @@ test('compileWithCompiler uses injected wrappers (no real wasm load)', async () 
     assert.equal(llvmRes.ir, fakeIr, 'llvm-mov exposes the IR pane');
     assert.equal(llvmRes.asm, fakeLlvmAsm);
     assert.equal(llvmRes.elf, fakeElf);
+    // llvm-mov calls `assemble` twice: once for the user asm, once for
+    // the auto-staged `_start.s` that drives main() then hits the
+    // mov-only ABI exit address. Link then receives both objects in a
+    // Record so the basenames land in the ELF's .symtab in a
+    // predictable order.
     assert.deepEqual(
         calls.map(c => c[0]),
-        ['cToIR', 'llvm-compile', 'assemble', 'link'],
-        'llvm-mov order: cToIR → compile (IR→asm) → assemble → link',
+        ['cToIR', 'llvm-compile', 'assemble', 'assemble', 'link'],
+        'llvm-mov order: cToIR → compile → assemble user → assemble _start → link',
     );
     // Opt level + clang flags must reach the C-frontend; mtriple must
     // override the i386 triple clang stamps into the IR otherwise
@@ -121,4 +135,54 @@ test('compileWithCompiler uses injected wrappers (no real wasm load)', async () 
         irCompileCall[2].mtriple?.startsWith('mov-'),
         'IR → asm must force a mov-* triple, not the clang default',
     );
+    // The link call must be the movie86-compatible flavour:
+    //   - static (no PT_INTERP / PT_DYNAMIC)
+    //   - runtime: 'none' (caller-supplied _start, no movfuscator CRT)
+    //   - inputs are a Record so both _start.o and the user .o end up
+    //     in the link command, with _start.o first so ld -static
+    //     pulls main from the user .o left-to-right.
+    const llvmLinkCall = calls.find(c => c[0] === 'link');
+    const [, llvmLinkObjs, llvmLinkOpts] = llvmLinkCall;
+    assert.equal(llvmLinkOpts?.static, true, 'llvm-mov path must link statically');
+    assert.equal(llvmLinkOpts?.runtime, 'none',
+        'llvm-mov path must use runtime: none (caller supplies _start)');
+    assert.equal(typeof llvmLinkObjs, 'object');
+    assert.ok(!(llvmLinkObjs instanceof Uint8Array),
+        'llvm-mov link inputs must be a Record so both _start.o and explorer.o stage');
+    const objNames = Object.keys(llvmLinkObjs);
+    assert.deepEqual(objNames, ['_start.o', 'explorer.o'],
+        '_start.o must come before the user object so ld -static resolves main()');
+    assert.equal(llvmLinkObjs['_start.o'], fakeStartObj);
+    assert.equal(llvmLinkObjs['explorer.o'], fakeObj);
+});
+
+test('compileWithCompiler — caller linkOpts override the llvm-mov defaults', async () => {
+    // The explorer's own UI doesn't surface a Static toggle, but the
+    // public API still lets a caller flip back to dynamic / movfuscator
+    // runtime if they want to inspect that variant. Spread order in
+    // explorer.mjs puts caller opts last, so the override actually wins.
+    const calls = [];
+    const wrappers = {
+        movfuscator: {
+            assemble: async () => new Uint8Array([0x7f]),
+            link: async (objs, libs, opts) => {
+                calls.push({ objs, opts });
+                return new Uint8Array([0x7f, 0x45]);
+            },
+        },
+        llvmMov: {
+            cToIR: async () => 'ir',
+            compile: async () => 'asm',
+        },
+    };
+    const { compileWithCompiler } = await import('../explorer.mjs');
+    await compileWithCompiler({
+        compiler: 'llvm-mov',
+        source: 'int main(){return 0;}',
+        opts: { linkOpts: { static: false, runtime: 'movfuscator' } },
+        wrappers,
+    });
+    assert.equal(calls[0].opts.static, false, 'caller can opt back to dynamic');
+    assert.equal(calls[0].opts.runtime, 'movfuscator',
+        'caller can opt back to the movfuscator CRT');
 });

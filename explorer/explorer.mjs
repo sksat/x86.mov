@@ -22,6 +22,24 @@
 // page is served from `make serve` or the deployed
 // `dist/explorer/index.html` (sibling subprojects).
 //
+// Link mode per compiler:
+//
+//  - **movfuscator** uses the wrapper's default `runtime: 'movfuscator'`
+//    dynamic link (PT_INTERP / PT_DYNAMIC present). The output is
+//    *inspectable* in the explorer's panes but movie86 still rejects
+//    it at `Vm::new` with `DynamicLinkingUnsupported`; the Movie86
+//    panel surfaces that gap in a banner. Closing it depends on a
+//    separate movie86 runtime-fault investigation around master_loop's
+//    dispatch table — out of scope for this module.
+//  - **llvm-mov** links statically with `runtime: 'none'`, supplying
+//    its own `_start` (calls `main` then writes `eax` to the mov-only
+//    ABI exit address). That recipe mirrors
+//    `movie86/wasm/examples/sources/build-mandelbrot.sh`'s
+//    `build_llvm` function and yields a movie86-loadable ELF
+//    end-to-end. The `_start.s` source is assembled on-demand using
+//    the same `as.wasm` the C side already needs, so we don't ship a
+//    pre-built `.o` static asset.
+//
 // Tests dependency-inject the wrappers via `opts.wrappers` so the unit
 // suite can exercise the orchestration without paying the ~80 MB
 // clang.wasm load. Production calls leave `wrappers` undefined and the
@@ -34,6 +52,23 @@ export const COMPILERS = Object.freeze(['movfuscator', 'llvm-mov']);
 // force the override every time. Same default the llvm-mov/wasm tests
 // and demo use.
 const MOV_TRIPLE = 'mov-unknown-linux-gnu';
+
+// _start for the llvm-mov pipeline. Calls `main()` then writes EAX
+// (main's return value) to the mov-only ABI exit address. movie86's
+// `WasmHost::abi_call` decodes that as `CALL_EXIT` and raises
+// `Fault::Exit(code)`. Mirrors
+// `movie86/wasm/examples/sources/_start_llvm.s` byte-for-byte (modulo
+// whitespace) — keeping the canonical recipe in one place would mean
+// shipping the asm as a static asset, which the explorer doesn't need
+// since we already have `as.wasm` warm for the user object anyway.
+export const LLVM_MOV_START_S = `\
+.intel_syntax noprefix
+.section .text
+.globl _start
+_start:
+    call main
+    mov [0x1FFE00FE], eax
+`;
 
 /**
  * Compile C source through the selected mov-only toolchain.
@@ -113,10 +148,35 @@ export async function compileWithCompiler(params) {
 
     onProgress('link');
     const tl = performance.now();
-    const elf = await w.movfuscator.link(obj, undefined, {
-        name: 'explorer.o',
-        ...(opts.linkOpts ?? {}),
-    });
+    let elf;
+    if (compiler === 'llvm-mov') {
+        // llvm-mov pipeline: link statically with no movfuscator runtime,
+        // supplying our own `_start.o` that calls main() then exits via
+        // the mov-only ABI. movie86 loads the resulting ELF (no
+        // PT_INTERP / PT_DYNAMIC) and steps through to Exit(eax).
+        // Assemble `_start.s` lazily through the same `as.wasm` we
+        // already loaded for the user object.
+        const startObj = await w.movfuscator.assemble(LLVM_MOV_START_S);
+        const linkInputs = {
+            '_start.o': startObj,
+            'explorer.o': obj,
+        };
+        const userLinkOpts = opts.linkOpts ?? {};
+        elf = await w.movfuscator.link(linkInputs, undefined, {
+            static: true,
+            runtime: 'none',
+            ...userLinkOpts,
+        });
+    } else {
+        // movfuscator pipeline: dynamic link via the historical CRT
+        // recipe (`runtime: 'movfuscator'` default). movie86 can't load
+        // the output today (DynamicLinkingUnsupported) — that gap is
+        // surfaced in the Movie86Panel banner, not papered over here.
+        elf = await w.movfuscator.link(obj, undefined, {
+            name: 'explorer.o',
+            ...(opts.linkOpts ?? {}),
+        });
+    }
     timings.link = performance.now() - tl;
 
     timings.total = performance.now() - t0;

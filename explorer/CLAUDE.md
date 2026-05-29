@@ -141,22 +141,29 @@ what you compiled".
 
 ## Known limitations
 
-- **Compile → Run is blocked by dynamic linking today.** Both in-
-  browser pipelines (movfuscator-wasm and llvm-mov clang) go through
-  the shared binutils-wasm `ld` with
-  `-dynamic-linker /lib/ld-linux.so.2`, so the produced ELF is
-  **dynamically linked**. movie86 only loads **static** ELFs
-  (PT_INTERP / PT_DYNAMIC → `LoadError: DynamicLinkingUnsupported`
-  at `Vm::new`). The Movie86Panel surfaces this in a red banner
-  (`data-testid="load-error"`) so the user understands the gap
-  rather than staring at a disabled Run button. Issue #36 tracks
-  adding a `static: true` option to
-  `movfuscator-wasm/movfuscator.mjs`'s `link()`; once that lands the
-  compile output will load cleanly and this section becomes a
-  historical footnote.
-- Until then, the optional **Upload** button is the only way to run a
-  user-supplied static ELF in-tab. The compiled output still feeds
-  the inspection panes (IR / asm / ELF hex / disasm) cleanly.
+- **llvm-mov path compiles → runs end-to-end.** With the static-link
+  primitive from PR #39 (`link({ static: true, runtime: 'none' })`)
+  the explorer's llvm-mov pipeline now links its output through
+  `_start.o + <user>.o` (no movfuscator CRT, no PT_INTERP / PT_DYNAMIC)
+  and the freshly-compiled ELF auto-loads into the embedded movie86.
+  Click Run → the mov-only ABI exit at the end of `_start` raises
+  `Fault::Exit(eax)` and the status row shows the exit code. The
+  Movie86Panel's red banner only fires now for the movfuscator path
+  (see next bullet).
+- **movfuscator path still surfaces a load-error banner.** The
+  movfuscator pipeline keeps the historical dynamic / movfuscator-CRT
+  link recipe because flipping it to `runtime: 'movfuscator', static:
+  true` is *necessary* but not sufficient: movie86 then accepts the
+  ELF but trips on an `Unmapped(0x88049309)` inside `master_loop`'s
+  dispatch table — a separate movie86 runtime investigation that's
+  tracked independently. Until that lands, the explorer keeps the
+  movfuscator path dynamic and surfaces the
+  `DynamicLinkingUnsupported` banner so the user understands the gap
+  rather than staring at a fault label they can't act on. The
+  inspection panes (IR / asm / ELF hex / disasm) keep working
+  regardless.
+- The optional **Upload** button still works for either path — useful
+  for inspecting / running a static ELF the explorer didn't produce.
 
 ## Things future Claude shouldn't relearn
 
