@@ -311,10 +311,42 @@ above sidesteps all of that.
       and conversions handle NaN explicitly).
     - Subnormal inputs flush to zero; the result also flushes to
       zero on underflow.
-    - `fmul` / `fdiv` and `f32 ↔ f64` conversions are not yet wired
-      up. `fmul` needs a 32×32→48-bit byte-split multiply on top of
-      the existing 32-bit `mul i32`; `fdiv` needs a 24-iter long
-      division.
+    - `fdiv` and `f32 ↔ f64` conversions are not yet wired up.
+      `fdiv` needs a 24-iter long division on the 24-bit mantissa.
+
+- **7g2** `f32 fmul` via SDAG soft-float → `call __mulsf3`, with the
+  body injected by `llvm-mov-llc` along the same path the earlier
+  7g1 helpers used. The straight-line IR shape and the SELECT →
+  bit-blend rewrite both apply unchanged.
+
+  Algorithm sketch:
+
+  ```
+  unpack {sa, ea, ma}, {sb, eb, mb} from ai / bi
+  ma = ma_raw | 0x800000 ; mb = mb_raw | 0x800000  (hidden 1)
+  // 24x24 → 48 bit product via 16-low + 8-high split
+  split ma into (a_lo : u16, a_hi : u8); same for b
+  p_ll, p_lh, p_hl, p_hh = four 32-bit mul i32 partials
+  mid = p_lh + p_hl
+  low  = p_ll + (mid_lo << 16)            // can carry
+  high = p_hh + mid_hi + (low < p_ll)     // carry detection
+  // Normalize: bit 47 of product = high[15]; pick case A (extract
+  // bits [47:24], exp += 1) vs case B (bits [46:23]).
+  round-to-nearest-ties-to-even with guard / sticky / lsb
+  pack {sr = sa XOR sb, er = ea+eb - 127 (+ carry), mant} → bitcast
+  ```
+
+  The 24×24 mantissa multiply is the only new piece — `mul i32` is
+  the existing stage-7f1 byte-table multiply, and every partial
+  product (16×16 ≤ 32 bits, 16×8 / 8×16 ≤ 24 bits, 8×8 ≤ 16 bits)
+  fits without truncation. Carry detection across the {low, high}
+  16-bit boundary uses the standard "sum < operand" unsigned
+  comparison.
+
+  Inf/NaN/denormal handling stays at the stage-7g1 level: either
+  operand is zero ⇒ signed zero; ErFinal ≤ 0 ⇒ signed zero (flush
+  to zero on underflow); ErFinal ≥ 255 ⇒ signed Inf. Real NaN
+  propagation is still a follow-up.
 
 ### Stage 7 gates
 

@@ -1,0 +1,4 @@
+# Stage 7g2 — the `call __mulsf3` libcall site is rewritten to the
+# 7d3 dispatcher-jmp shape; the only non-mov mnemonic that survives
+# is the dispatcher's `jmp`.
+jmp

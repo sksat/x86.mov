@@ -530,6 +530,185 @@ static void injectSubSf3Helper(Module &M, LLVMContext &Ctx) {
   B.CreateRet(R);
 }
 
+// Stage 7g2 — IEEE-754 single-precision multiply: `__mulsf3 (a, b)`.
+//
+// Shape:
+//   1. Extract sign / exp / mantissa fields from both inputs and add
+//      the implicit-1 to get 24-bit ma / mb.
+//   2. 24x24 -> 48-bit unsigned multiply via a 16-low + 8-high split:
+//      `mul i32` is restricted to 32-bit results, so each partial
+//      product (16x16, 16x8, 8x16, 8x8) fits and we sum them by hand
+//      into a {high16, low32} pair. The "low + (mid_lo << 16)" add
+//      can carry; carry detection is the standard "sum < operand"
+//      trick.
+//   3. Normalise: the 48-bit product sits in `[2^46, 2^48)`, so the
+//      MSB is either bit 47 ("case A", e.g. 3.0*3.0) or bit 46 ("case
+//      B", e.g. 2.0*3.0). Case A extracts bits [47:24] and bumps the
+//      exponent by 1; case B extracts bits [46:23].
+//   4. Round-to-nearest-ties-to-even with guard / sticky / lsb. Round
+//      may push the mantissa to `0x1000000`; if so, shift right by 1
+//      and bump the exponent again.
+//   5. Pack {sign, exp, mant}. Overflow (exp >= 255) -> signed Inf;
+//      underflow (exp <= 0) and either-input-zero -> signed zero.
+//      Inf / NaN propagation is deferred (matches the existing
+//      `__addsf3` scope).
+//
+// As with `__addsf3`, the body is straight-line IR with `select`
+// instead of branches. The SELECT -> bit-blend rewrite materialises
+// both arms of every `select`, so shift counts and mul operands are
+// pre-computed to stay in a defined range no matter which arm the
+// final blend picks (here we use only fixed-count shifts and unsigned
+// adds, so no further clamping is needed).
+static void injectMulSf3Helper(Module &M, LLVMContext &Ctx) {
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(F32, {F32, F32}, /*isVarArg=*/false);
+
+  Function *F = makeOrPromoteHelper(M, "__mulsf3", FnTy);
+  if (!F)
+    return;
+
+  F->getArg(0)->setName("a");
+  F->getArg(1)->setName("b");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+  auto C = [&](uint32_t V) { return B.getInt32(V); };
+
+  Value *AI = B.CreateBitCast(F->getArg(0), I32, "ai");
+  Value *BI = B.CreateBitCast(F->getArg(1), I32, "bi");
+
+  // Field extraction.
+  Value *SA = B.CreateLShr(AI, C(31), "sa");
+  Value *SB = B.CreateLShr(BI, C(31), "sb");
+  Value *EA = B.CreateAnd(B.CreateLShr(AI, C(23)), C(0xFFu), "ea");
+  Value *EB = B.CreateAnd(B.CreateLShr(BI, C(23)), C(0xFFu), "eb");
+  Value *MARaw = B.CreateAnd(AI, C(0x7FFFFFu), "ma_raw");
+  Value *MBRaw = B.CreateAnd(BI, C(0x7FFFFFu), "mb_raw");
+
+  // Result sign = XOR of input signs (works for +/- zero too).
+  Value *SR = B.CreateXor(SA, SB, "sr");
+
+  // Either-zero short-circuit. Treat denormals (exp == 0) as zero in
+  // line with the rest of our soft-float helpers' flush-to-zero scope.
+  Value *AIsZero = B.CreateICmpEQ(EA, C(0u));
+  Value *BIsZero = B.CreateICmpEQ(EB, C(0u));
+  Value *EitherZero = B.CreateOr(AIsZero, BIsZero, "either_zero");
+
+  // Add the implicit-1 to each mantissa. Both ma and mb are now 24 bits.
+  Value *MA = B.CreateOr(MARaw, C(0x800000u), "ma");
+  Value *MB = B.CreateOr(MBRaw, C(0x800000u), "mb");
+
+  // 24x24 -> 48-bit unsigned multiply via 16-low + 8-high split.
+  Value *ALo = B.CreateAnd(MA, C(0xFFFFu), "a_lo");
+  Value *AHi = B.CreateLShr(MA, C(16), "a_hi");
+  Value *BLo = B.CreateAnd(MB, C(0xFFFFu), "b_lo");
+  Value *BHi = B.CreateLShr(MB, C(16), "b_hi");
+
+  // Partial products — each fits in i32 unsigned.
+  //   p_ll: 16x16 <= 0xFFFE0001  (32 bits)
+  //   p_lh: 16x 8 <= 0x00FEFF01  (24 bits)
+  //   p_hl:  8x16 <= 0x00FEFF01
+  //   p_hh:  8x 8 <= 0x0000FE01  (16 bits)
+  Value *Pll = B.CreateMul(ALo, BLo, "p_ll");
+  Value *Plh = B.CreateMul(ALo, BHi, "p_lh");
+  Value *Phl = B.CreateMul(AHi, BLo, "p_hl");
+  Value *Phh = B.CreateMul(AHi, BHi, "p_hh");
+
+  // Mid lane: `(p_lh + p_hl)`, up to 25 bits. Split into bits [15:0]
+  // (contributed to `low`) and bits [24:16] (contributed to `high`).
+  Value *Mid = B.CreateAdd(Plh, Phl, "mid");
+  Value *MidLo = B.CreateAnd(Mid, C(0xFFFFu));
+  Value *MidHi = B.CreateLShr(Mid, C(16));
+
+  // Assemble the low 32 bits of the 48-bit product. The add can carry
+  // out (e.g. for ma == mb == 0xFFFFFF), so detect it via the
+  // "sum < addend" trick — `low < Pll` iff the unsigned add wrapped.
+  Value *MidLoShifted = B.CreateShl(MidLo, C(16));
+  Value *Low = B.CreateAdd(Pll, MidLoShifted, "low");
+  Value *CarryI1 = B.CreateICmpULT(Low, Pll);
+  Value *Carry = B.CreateZExt(CarryI1, I32, "carry");
+
+  // High 16 bits of the 48-bit product. Phh fits in 16 bits, MidHi
+  // fits in 9, plus the at-most-1 carry, so High fits in 17 bits but
+  // never overflows i32.
+  Value *High = B.CreateAdd(B.CreateAdd(Phh, MidHi), Carry, "high");
+
+  // Normalize. The 48-bit product is in `[2^46, 2^48)`; the MSB is
+  // bit 47 ("case A") or bit 46 ("case B"). `High & 0x8000` tells
+  // which one.
+  Value *TopBit47I1 = B.CreateICmpNE(B.CreateAnd(High, C(0x8000u)),
+                                     C(0u), "top_bit_47");
+
+  // Case A: product in [2^47, 2^48). Kept mantissa bits = [47:24].
+  // Guard = bit 23, sticky = bits [22:0].
+  Value *MantPreA = B.CreateOr(B.CreateShl(High, C(8)),
+                               B.CreateLShr(Low, C(24)), "mant_pre_a");
+  Value *GuardA = B.CreateAnd(B.CreateLShr(Low, C(23)), C(1u));
+  Value *StickyAI1 = B.CreateICmpNE(B.CreateAnd(Low, C(0x7FFFFFu)), C(0u));
+  Value *StickyA = B.CreateZExt(StickyAI1, I32);
+  Value *LsbA = B.CreateAnd(MantPreA, C(1u));
+  Value *RoundUpA = B.CreateAnd(GuardA, B.CreateOr(StickyA, LsbA));
+  Value *MantRoundedA = B.CreateAdd(MantPreA, RoundUpA);
+  Value *MantOvfA = B.CreateICmpEQ(MantRoundedA, C(0x1000000u));
+  Value *MantPostA = B.CreateSelect(MantOvfA,
+                                    B.CreateLShr(MantRoundedA, C(1)),
+                                    MantRoundedA, "mant_post_a");
+
+  // Case B: product in [2^46, 2^47). Kept mantissa bits = [46:23].
+  // Guard = bit 22, sticky = bits [21:0].
+  Value *MantPreB = B.CreateOr(B.CreateShl(High, C(9)),
+                               B.CreateLShr(Low, C(23)), "mant_pre_b");
+  Value *GuardB = B.CreateAnd(B.CreateLShr(Low, C(22)), C(1u));
+  Value *StickyBI1 = B.CreateICmpNE(B.CreateAnd(Low, C(0x3FFFFFu)), C(0u));
+  Value *StickyB = B.CreateZExt(StickyBI1, I32);
+  Value *LsbB = B.CreateAnd(MantPreB, C(1u));
+  Value *RoundUpB = B.CreateAnd(GuardB, B.CreateOr(StickyB, LsbB));
+  Value *MantRoundedB = B.CreateAdd(MantPreB, RoundUpB);
+  Value *MantOvfB = B.CreateICmpEQ(MantRoundedB, C(0x1000000u));
+  Value *MantPostB = B.CreateSelect(MantOvfB,
+                                    B.CreateLShr(MantRoundedB, C(1)),
+                                    MantRoundedB, "mant_post_b");
+
+  // Result exponent. ExpSum fits in i32 cleanly (each side <= 0xFF).
+  // Case A: er = expSum - 127 + 1; case B: er = expSum - 127.
+  Value *ExpSum = B.CreateAdd(EA, EB, "exp_sum");
+  Value *ErA = B.CreateSub(ExpSum, C(126u));
+  Value *ErAFinal = B.CreateSelect(MantOvfA,
+                                   B.CreateAdd(ErA, C(1u)), ErA);
+  Value *ErB = B.CreateSub(ExpSum, C(127u));
+  Value *ErBFinal = B.CreateSelect(MantOvfB,
+                                   B.CreateAdd(ErB, C(1u)), ErB);
+
+  // Pick the normalised case.
+  Value *MantPost = B.CreateSelect(TopBit47I1, MantPostA, MantPostB,
+                                   "mant_post");
+  Value *ErFinal = B.CreateSelect(TopBit47I1, ErAFinal, ErBFinal,
+                                  "er_final");
+
+  // Pack.
+  Value *MantField = B.CreateAnd(MantPost, C(0x7FFFFFu));
+  Value *ExpField = B.CreateAnd(B.CreateShl(ErFinal, C(23)),
+                                C(0x7F800000u));
+  Value *SignField = B.CreateShl(SR, C(31));
+  Value *Packed = B.CreateOr(SignField,
+                             B.CreateOr(ExpField, MantField));
+
+  // Underflow / overflow. ErFinal is signed: <= 0 -> flush to signed
+  // zero, >= 255 -> signed Inf. (Out-of-range exp values wrap into the
+  // high i32 range, so we use signed comparisons here.)
+  Value *Underflow = B.CreateICmpSLE(ErFinal, C(0), "underflow");
+  Value *Overflow = B.CreateICmpSGE(ErFinal, C(255), "overflow");
+  Value *SignedZero = SignField;
+  Value *SignedInf = B.CreateOr(SignField, C(0x7F800000u));
+
+  Value *Result = B.CreateSelect(Overflow, SignedInf, Packed);
+  Result = B.CreateSelect(Underflow, SignedZero, Result);
+  Result = B.CreateSelect(EitherZero, SignedZero, Result);
+
+  B.CreateRet(B.CreateBitCast(Result, F32));
+}
+
 // Stage 7g1 — IEEE-754 single-precision comparison helpers
 // (`__eqsf2`, `__nesf2`, `__ltsf2`, `__lesf2`, `__gtsf2`, `__gesf2`,
 // `__unordsf2`). The soft-float SDAG legalizer lowers each `fcmp
@@ -897,6 +1076,7 @@ static bool moduleNeedsF32Helpers(Module &M) {
       switch (I.getOpcode()) {
       case Instruction::FAdd:
       case Instruction::FSub:
+      case Instruction::FMul:
       case Instruction::FCmp:
         if (I.getOperand(0)->getType()->getScalarType()->isFloatTy())
           return true;
@@ -916,6 +1096,25 @@ static bool moduleNeedsF32Helpers(Module &M) {
       default:
         break;
       }
+    }
+  }
+  return false;
+}
+
+// Per-helper gate for `__mulsf3` so an `fadd`-only (or `fcmp`-only,
+// etc.) module does not pay for the 24x24 mantissa multiply body. The
+// other helpers stay on the broad `moduleNeedsF32Helpers` gate for
+// now: they pull each other in (e.g. fsub→fadd) or share a body
+// (fcmp set), and their generated size is materially smaller than
+// `__mulsf3`'s inlined byte-table multiplies.
+static bool moduleNeedsMulSf3(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if (I.getOpcode() == Instruction::FMul &&
+          I.getOperand(0)->getType()->getScalarType()->isFloatTy())
+        return true;
     }
   }
   return false;
@@ -1053,6 +1252,12 @@ int main(int argc, char **argv) {
     injectFloatsisfHelpers(*M, Ctx);
     injectFixsfsiHelpers(*M, Ctx);
   }
+  // `__mulsf3` is gated separately: its body is materially larger
+  // than the other helpers because the 24x24 mantissa multiply pulls
+  // in stage-7f1 byte-table multiplies for each of the four partials,
+  // so emitting it on every `fadd`-only module would regress size.
+  if (moduleNeedsMulSf3(*M))
+    injectMulSf3Helper(*M, Ctx);
 
   // Stage 6d2 — pre-Scalarizer lowering of `llvm.vector.reduce.*`.
   //
