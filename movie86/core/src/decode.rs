@@ -25,6 +25,22 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
 
     let opcode = *rest.first().ok_or(Fault::DecodeTruncated)?;
     let (insn, body_len) = match (operand_size_16, opcode) {
+        // mov r8, imm8 — opcode B0+rb ib. Per DESIGN.md, this encoding
+        // wasn't in movfuscator output (it widens byte moves to 32-bit)
+        // and used to trap; llvm-mov's CodeGen does emit it, so we
+        // accept the form here per DESIGN's "fill the gap when it
+        // actually fires" stance.
+        (false, 0xB0..=0xB7) => {
+            let dst = Reg8::from_index(opcode - 0xB0);
+            let imm = *rest.get(1).ok_or(Fault::DecodeTruncated)?;
+            (
+                Insn::Mov {
+                    dst: Operand::Reg8(dst),
+                    src: Operand::Imm8(imm),
+                },
+                2,
+            )
+        }
         // mov r32, imm32 — opcode B8+rd id (no 16-bit override path used)
         (false, 0xB8..=0xBF) => {
             let dst = Reg32::from_index(opcode - 0xB8);
@@ -41,6 +57,7 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
         (false, 0x89) => decode_mov_rm_r_32(rest, /* dir_to_reg */ false)?,
         (false, 0x8A) => decode_mov_rm_r_8(rest, /* dir_to_reg */ true)?,
         (false, 0x8B) => decode_mov_rm_r_32(rest, /* dir_to_reg */ true)?,
+        (false, 0xC6) => decode_mov_rm8_imm8(rest)?,
         (false, 0xC7) => decode_mov_rm32_imm32(rest)?,
         // moffs MOV forms (A0/A1/A2/A3, 5 bytes) — short encodings of
         // mov al/ax/eax to/from an absolute address. See decode_moffs.
@@ -224,6 +241,41 @@ fn decode_mov_rm_r_8(bytes: &[u8], dir_to_reg: bool) -> Result<(Insn, u8), Fault
         (rm_side, reg_side)
     };
     Ok((Insn::Mov { dst, src }, 2 + ea_extra))
+}
+
+/// `C6 /0` — `mov r/m8, imm8`. Same shape as `C7 /0 imm32` but with
+/// a 1-byte immediate and 8-bit operand. movfuscator output never
+/// hits this (it widens byte stores to 32-bit), but `llvm-mov` does
+/// emit it — see DESIGN.md's "fill the gap when it actually fires"
+/// stance on the `C6` opcode.
+fn decode_mov_rm8_imm8(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
+    let modrm_byte = *bytes.get(1).ok_or(Fault::DecodeTruncated)?;
+    let m = parse_modrm(modrm_byte);
+    if m.reg != 0 {
+        // /0 = mov; other digits are reserved (UD).
+        return Err(Fault::UnknownOpcode(0xC6));
+    }
+    if m.mod_ == 0b11 {
+        let imm = *bytes.get(2).ok_or(Fault::DecodeTruncated)?;
+        return Ok((
+            Insn::Mov {
+                dst: Operand::Reg8(Reg8::from_index(m.rm)),
+                src: Operand::Imm8(imm),
+            },
+            3,
+        ));
+    }
+    let (ea, ea_extra) = parse_effective_address_32(m.mod_, m.rm, &bytes[2..])?;
+    let imm_off = 2 + usize::from(ea_extra);
+    let imm = *bytes.get(imm_off).ok_or(Fault::DecodeTruncated)?;
+    let total_len = 2 + ea_extra + 1;
+    Ok((
+        Insn::Mov {
+            dst: Operand::Mem8(ea),
+            src: Operand::Imm8(imm),
+        },
+        total_len,
+    ))
 }
 
 fn decode_mov_rm32_imm32(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
@@ -786,6 +838,52 @@ mod tests {
         assert_eq!(
             decode(&[0xc7, 0xc8, 0x00, 0x00, 0x00, 0x00]).unwrap_err(),
             Fault::UnknownOpcode(0xC7),
+        );
+    }
+
+    #[test]
+    fn mov_r8_imm8_via_b0_through_b7() {
+        // b2 13 → mov dl, 0x13  (Reg8::Dl = index 2)
+        let (insn, len) = decode(&[0xB2, 0x13]).unwrap();
+        assert_eq!(len, 2);
+        match insn {
+            Insn::Mov {
+                dst: Operand::Reg8(r),
+                src: Operand::Imm8(v),
+            } => {
+                assert_eq!(r, Reg8::Dl);
+                assert_eq!(v, 0x13);
+            }
+            other => panic!("expected Mov Reg8 ← Imm8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mov_rm8_imm8_via_c6_with_disp8() {
+        // c6 40 04 04  →  mov BYTE PTR [eax+0x4], 0x4
+        // (modrm=40: mod=01 reg=000 r/m=000 = [EAX+disp8]; disp8=0x04; imm8=0x04)
+        let (insn, len) = decode(&[0xc6, 0x40, 0x04, 0x04]).unwrap();
+        assert_eq!(len, 4);
+        match insn {
+            Insn::Mov {
+                dst: Operand::Mem8(ea),
+                src: Operand::Imm8(v),
+            } => {
+                assert_eq!(v, 0x04);
+                assert_eq!(ea.base, Some(Reg32::Eax));
+                assert_eq!(ea.disp, 4);
+                assert!(ea.index.is_none());
+            }
+            other => panic!("expected Mov Mem8 ← Imm8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn c6_with_nonzero_reg_field_is_reserved() {
+        // c6 /1 — same /digit story as c7: only /0 is mov.
+        assert_eq!(
+            decode(&[0xc6, 0xc8, 0x00]).unwrap_err(),
+            Fault::UnknownOpcode(0xC6),
         );
     }
 

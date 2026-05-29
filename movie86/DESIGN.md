@@ -39,7 +39,8 @@ In scope: the instructions movfuscator + the planned mov-only LLVM backend actua
 
 **Deliberately not implemented even though they're valid x86:**
 
-- `mov r8, imm8` (B0+rb), `mov r/m8, imm8` (C6 /0), `mov r16, imm16` (66 B8+rw), `mov r/m16, imm16` (66 C7 /0 iw). The movfuscator goldens contain **zero** `movb $imm, ...` and zero `movw $imm, ...` instructions — movfuscator clears registers with `mov r32, imm32` and then byte-loads from memory, so it never materializes a sub-32-bit immediate. Adding these encodings before the LLVM backend exists would be pure speculation. If `Fault::UnknownOpcode(0xB0..=0xB7 | 0xC6)` ever fires in practice, fill the gap then with a test pinned to the input that exposed it.
+- `mov r8, imm8` (B0+rb), `mov r/m8, imm8` (C6 /0): **now supported** — `llvm-mov`'s codegen emits these for byte-granular stores (it doesn't widen byte moves to 32-bit the way movfuscator does), and the canvas Mandelbrot demo through that pipeline tripped both. Filled the gap per the original "add when it actually fires" stance, with unit tests pinned to the byte sequences that surfaced them (`mov dl, 0x13` from `set_video_mode` and `mov BYTE PTR [eax+4], 0x4` from clang's spill-init).
+- `mov r16, imm16` (66 B8+rw), `mov r/m16, imm16` (66 C7 /0 iw). Still not seen in practice — both pipelines either go through 32-bit moves or use byte stores. Add the same way (gap + pinned test) if they ever fire.
 - `ret imm16` (C2 iw) — the stdcall caller-pop variant. movfuscator is cdecl; callers pop their own args.
 
 Not in scope (yet): `PT_INTERP` / `PT_DYNAMIC` (dynamically-linked ELFs); FPU; `cmp` / `jcc` / EFLAGS for the guest's own control-flow (movfuscator only avoids them via the master_loop dispatch trick, which we model). cmp/jcc/EFLAGS *was* the gating issue for `printf` until the host-wrapper ABI made the in-guest strlen unnecessary — see "Library-stub generality (resolved)" below.
