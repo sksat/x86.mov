@@ -24,6 +24,21 @@ interface DisassemblyProps {
  */
 export function Disassembly({ vm, tick, rows = 16 }: DisassemblyProps) {
     const bodyRef = useRef<HTMLDivElement | null>(null);
+    // Hooks must run on every render in the same order — keep the
+    // scroll effect above any early returns. The effect guards
+    // internally on the panel actually being mounted with a cursor row.
+    useEffect(() => {
+        const body = bodyRef.current;
+        const cur = body?.querySelector<HTMLElement>('.dr-cur');
+        if (!body || !cur) return;
+        const top = cur.offsetTop;
+        const bot = top + cur.offsetHeight;
+        const vTop = body.scrollTop;
+        const vBot = vTop + body.clientHeight;
+        if (top < vTop) body.scrollTop = top;
+        else if (bot > vBot) body.scrollTop = bot - body.clientHeight;
+    });
+
     if (!vm || !tick) {
         return (
             <p className="text-xs text-muted-foreground">
@@ -46,18 +61,6 @@ export function Disassembly({ vm, tick, rows = 16 }: DisassemblyProps) {
         addr += d.len;
         d.free();
     }
-    // Keep the current row in view without nudging the document.
-    useEffect(() => {
-        const body = bodyRef.current;
-        const cur = body?.querySelector<HTMLElement>('.dr-cur');
-        if (!body || !cur) return;
-        const top = cur.offsetTop;
-        const bot = top + cur.offsetHeight;
-        const vTop = body.scrollTop;
-        const vBot = vTop + body.clientHeight;
-        if (top < vTop) body.scrollTop = top;
-        else if (bot > vBot) body.scrollTop = bot - body.clientHeight;
-    });
     return (
         <div
             ref={bodyRef}

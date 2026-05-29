@@ -42,14 +42,22 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
     const [stdout, setStdout] = useState('');
     const [stderr, setStderr] = useState('');
 
-    // Load the latest compiled ELF when it changes.
+    // Load the latest compiled ELF when it changes — but also re-fire
+    // once the movie86 wasm wrapper finishes loading. A fast compile
+    // path (movfuscator hits, no clang.wasm cold-start) can produce an
+    // ELF before `useMovie86Vm` has resolved the dynamic import, and
+    // `loadElf` rejects with `movie86 wasm not loaded yet`. Depending
+    // on `movie86Vm.movie86` here makes the effect re-run as soon as
+    // the wrapper handle becomes available, so the cached ELF lands
+    // without forcing the user to recompile.
+    const movie86Ready = movie86Vm.movie86;
     useEffect(() => {
-        if (!elf) return;
+        if (!elf || !movie86Ready) return;
         setStdout('');
         setStderr('');
         loadElf(elf).catch((e) => console.error('movie86 loadElf failed', e));
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [elf]);
+    }, [elf, movie86Ready]);
 
     // Drain stdout/stderr on every tick.
     useEffect(() => {

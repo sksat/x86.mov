@@ -122,18 +122,23 @@ export interface Movie86Vm {
 
 // Sibling subprojects are deployed alongside this page (so /explorer/
 // sees /movfuscator-wasm/, /movie86/, /llvm-mov/ as siblings on the
-// same origin). We resolve against `document.baseURI` instead of
-// `import.meta.url` so Rollup can't statically validate the URL at
-// build time — its build-stage resolver still tries to crawl
+// same origin — the per-subproject `stage-deploy.sh` files flatten
+// `<subproject>/wasm/` down to `dist/<subproject>/` for movie86 and
+// llvm-mov, while movfuscator-wasm already lives at its own root).
+//
+// We resolve against `document.baseURI` instead of `import.meta.url`
+// so Rollup can't statically validate the URL at build time — its
+// build-stage resolver still tries to crawl
 // `new URL(string-literal, import.meta.url)` even when the dynamic
 // import is marked `/* @vite-ignore */`, and the sibling wrappers
 // internally reference build artifacts that may not exist yet (each
 // subproject builds independently).
+//
+// Dev mode: `vite.config.ts` adds a middleware that maps the request
+// URLs below back to the source-tree layout (`../movie86/wasm/...`
+// etc.), so the same URLs work whether served by `vite dev` or by
+// Cloudflare Pages.
 function siblingUrl(subpath: string): string {
-    // Strip the trailing `/explorer/` (or `/explorer/index.html`) off
-    // the base, then append the requested sibling path. Wrapping the
-    // input in a runtime string indirection (the function call) +
-    // using `document.baseURI` keeps it dynamic for Rollup.
     const base = typeof document !== 'undefined'
         ? document.baseURI
         : 'http://localhost/';
@@ -165,8 +170,11 @@ export function loadMovfuscator(): Promise<MovfuscatorWrapper> {
 let _llvmMov: Promise<LlvmMovWrapper> | null = null;
 export function loadLlvmMov(): Promise<LlvmMovWrapper> {
     if (!_llvmMov) {
+        // Deploy URL is `/llvm-mov/llvm-mov.mjs` (stage-deploy flattens
+        // the `wasm/` segment). Vite dev middleware in vite.config.ts
+        // maps this back to `../llvm-mov/wasm/llvm-mov.mjs`.
         _llvmMov = dynamicImport(
-            siblingUrl('llvm-mov/wasm/llvm-mov.mjs'),
+            siblingUrl('llvm-mov/llvm-mov.mjs'),
         ) as Promise<LlvmMovWrapper>;
     }
     return _llvmMov;
@@ -175,8 +183,11 @@ export function loadLlvmMov(): Promise<LlvmMovWrapper> {
 let _movie86: Promise<Movie86Wrapper> | null = null;
 export function loadMovie86(): Promise<Movie86Wrapper> {
     if (!_movie86) {
+        // Deploy URL is `/movie86/movie86.mjs` (stage-deploy flattens
+        // the `wasm/` segment). Vite dev middleware maps this back to
+        // `../movie86/wasm/movie86.mjs`.
         _movie86 = dynamicImport(
-            siblingUrl('movie86/wasm/movie86.mjs'),
+            siblingUrl('movie86/movie86.mjs'),
         ) as Promise<Movie86Wrapper>;
     }
     return _movie86;
