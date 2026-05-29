@@ -24,6 +24,7 @@ const root = `${here}/..`;
 const wasm = await readFile(`${root}/build/browser/movie86_wasm_bg.wasm`);
 const mod  = await import(`${root}/build/browser/movie86_wasm.js`);
 await mod.default({ module_or_path: wasm });
+const wrapper = await import(`${root}/movie86.mjs`);
 
 const cases = [
     { name: 'return42',   expectExit: 42, expectStdout: ''         },
@@ -265,6 +266,103 @@ try {
     }
 } catch (e) {
     console.error(`FAIL canvas_mandelbrot: ${e.message}`);
+    failed++;
+}
+
+// --- Turbo86 handover surface ---
+//
+// The demo's "Send to local turbo86" button needs two things from the
+// wasm side:
+//   1. A canonical Context snapshot (regs + sparse memory regions) matching
+//      turbo86's proto.Context schema, so a peer engine can pick the session
+//      up via LoadContext.
+//   2. A wire-format-compatible JSON encoder so the browser can serialize
+//      that snapshot into a frame turbo86's UnmarshalInbound accepts
+//      byte-for-byte.
+//
+// Verify both on return42: snapshot at entry, check that regs.eip /
+// regs.esp track the Vm's getters, the first instruction bytes survive
+// into a non-empty region, and the wire JSON has the exact shape
+// turbo86 expects (`type=load_context`, lowercase keys, base64 bytes).
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/return42.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        const ctx = wrapper.snapshotContext(vm);
+
+        // Regs must reflect the live Vm: full GPR file + EIP, plus
+        // EFLAGS = 0 (movie86 doesn't model flags but the schema
+        // field is preserved for turbo86 parity).
+        assert.equal(ctx.regs.eip, vm.eip, 'snapshot eip != vm.eip');
+        const gprs = vm.regs;
+        assert.equal(ctx.regs.eax, gprs[0], 'snapshot eax');
+        assert.equal(ctx.regs.ecx, gprs[1], 'snapshot ecx');
+        assert.equal(ctx.regs.edx, gprs[2], 'snapshot edx');
+        assert.equal(ctx.regs.ebx, gprs[3], 'snapshot ebx');
+        assert.equal(ctx.regs.esp, gprs[4], 'snapshot esp');
+        assert.equal(ctx.regs.ebp, gprs[5], 'snapshot ebp');
+        assert.equal(ctx.regs.esi, gprs[6], 'snapshot esi');
+        assert.equal(ctx.regs.edi, gprs[7], 'snapshot edi');
+        assert.equal(ctx.regs.eflags, 0, 'snapshot eflags should be 0');
+
+        // Regions must be non-empty and sparse — return42 has at
+        // least one non-zero page (its code) at the loader's mem base.
+        assert.ok(Array.isArray(ctx.regions), 'regions is not an array');
+        assert.ok(ctx.regions.length >= 1,
+            `expected ≥1 sparse region, got ${ctx.regions.length}`);
+        // The first region must contain the entry-point code: the
+        // first 5 bytes of return42 are mov ebx, 42 (BB 2A 00 00 00).
+        const entryRegion = ctx.regions.find(r =>
+            r.addr <= vm.eip && vm.eip + 5 <= r.addr + r.bytes.length);
+        assert.ok(entryRegion, `no region covers EIP=${vm.eip.toString(16)}`);
+        const off = vm.eip - entryRegion.addr;
+        assert.deepEqual(
+            Array.from(entryRegion.bytes.subarray(off, off + 5)),
+            [0xbb, 0x2a, 0x00, 0x00, 0x00],
+            'entry-point bytes inside the snapshot region disagree with the ELF',
+        );
+
+        // Wire-format encoder: must match turbo86's proto.Inbound
+        // shape — lowercase `type`/keys, base64 bytes, mode string.
+        const frame = wrapper.makeLoadContextMessage(ctx, 'host');
+        const parsed = JSON.parse(frame);
+        assert.equal(parsed.type, 'load_context');
+        assert.equal(parsed.mode, 'host');
+        assert.equal(parsed.context.regs.eip, vm.eip);
+        assert.equal(parsed.context.regs.eflags, 0);
+        assert.ok(Array.isArray(parsed.context.regions));
+        assert.equal(parsed.context.regions.length, ctx.regions.length);
+        // Each region's bytes round-trip through base64.
+        for (let i = 0; i < parsed.context.regions.length; i++) {
+            const wireRegion = parsed.context.regions[i];
+            assert.equal(wireRegion.addr, ctx.regions[i].addr);
+            assert.equal(typeof wireRegion.bytes, 'string',
+                'wire `bytes` must be a base64 string, not an array');
+            const decoded = Buffer.from(wireRegion.bytes, 'base64');
+            assert.deepEqual(
+                Array.from(decoded),
+                Array.from(ctx.regions[i].bytes),
+                `region[${i}] base64 round-trip mismatch`,
+            );
+        }
+
+        // Mode defaults to host when omitted — matching turbo86's Go
+        // side `mode == ""` → ModeHost fallback (we emit it explicitly
+        // to keep the wire deterministic, but the caller can rely on
+        // the default).
+        const defaultFrame = JSON.parse(wrapper.makeLoadContextMessage(ctx));
+        assert.equal(defaultFrame.mode, 'host');
+
+        // Trap mode round-trips literally.
+        const trapFrame = JSON.parse(wrapper.makeLoadContextMessage(ctx, 'trap'));
+        assert.equal(trapFrame.mode, 'trap');
+
+        console.log('ok  handover snapshot + wire format (return42)');
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL handover surface: ${e.stack || e.message}`);
     failed++;
 }
 

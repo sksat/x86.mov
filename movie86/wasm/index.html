@@ -20,10 +20,32 @@
   select, input[type=text], input[type=number] { padding: 0.3rem 0.4rem; }
   input.addr { width: 11ch; font: inherit; }
   input.num  { width: 7ch;  font: inherit; }
+  input.wsurl { width: 22ch; font: inherit; }
   label { font-size: 0.85rem; color: #555; }
 
   .status { font-size: 0.85rem; color: #666; margin-left: auto; }
   .status.err { color: #b00; }
+  .status.ok  { color: #060; }
+
+  /* turbo86 handover pane — full-width below the live Vm panels.
+     Hidden until the user clicks "Send to local turbo86", then a
+     compact event log + stdout/stderr panes appear. */
+  .turbo86-pane {
+      margin-top: 1rem;
+      background: #fdfaf2;
+      border-color: #d9c97a;
+  }
+  .turbo86-pane h3 { font-size: 0.85rem; margin: 0 0 0.3rem; color: #333; }
+  .t86events {
+      margin-top: 0.5rem; font-size: 0.8rem; color: #444;
+      max-height: 12rem; overflow: auto;
+      background: #fff; border: 1px solid #e3d9a8; padding: 0.4rem;
+  }
+  .t86events .ev { font-variant-numeric: tabular-nums; line-height: 1.35; }
+  .t86events .ev.t-fault  { color: #b00; }
+  .t86events .ev.t-exit   { color: #060; font-weight: bold; }
+  .t86events .ev.t-paused { color: #946; }
+  .t86events .ev .ts { color: #999; margin-right: 0.4rem; }
 
   /* Status cards — each metric gets its own small panel with a big
      value and a short uppercase label underneath. The "total mov" card
@@ -222,6 +244,23 @@
   <span id="status" class="status">init…</span>
 </div>
 
+<!-- Handover row: pause the in-browser Vm and hand the live Context
+     (regs + sparse memory) to a local turbo86 over WebSocket. URL
+     default is the turbo86 stock listen address (cmd/turbo86/main.go);
+     mode mirrors proto.Mode — "trap" gives migration parity with
+     movie86's software signal model, "host" lets the kernel dispatch. -->
+<div class="controls">
+  <label>turbo86: <input type="text" id="turbo86-url" class="wsurl" value="ws://127.0.0.1:1234"></label>
+  <label>mode:
+    <select id="turbo86-mode">
+      <option value="trap" selected>trap</option>
+      <option value="host">host</option>
+    </select>
+  </label>
+  <button id="turbo86-send">Send to local turbo86</button>
+  <span id="turbo86-status" class="status">idle</span>
+</div>
+
 <div class="meta">
   <div class="card"><div class="v" id="m-steps">0</div><div class="k">total mov</div></div>
   <div class="card"><div class="v" id="m-rate">—</div><div class="k">mov / sec</div></div>
@@ -270,8 +309,38 @@
 
 <div class="canvases" id="canvases"></div>
 
+<!-- turbo86 handover output pane. Empty until the user clicks
+     "Send to local turbo86" — at that point we open a WS to the
+     configured URL, send `LoadContext`, then stream Outbound events
+     here. Kept separate from the local Vm's stdout/stderr panes so a
+     user can compare the two engines side by side after a handover. -->
+<div class="panel turbo86-pane" id="turbo86-pane" hidden>
+  <div class="panel-head">
+    <h2>turbo86 session</h2>
+    <span id="turbo86-summary" class="status">—</span>
+  </div>
+  <div class="io">
+    <div>
+      <h3>turbo86 stdout</h3>
+      <pre id="turbo86-stdout" class="out"></pre>
+    </div>
+    <div>
+      <h3>turbo86 stderr</h3>
+      <pre id="turbo86-stderr" class="out err"></pre>
+    </div>
+  </div>
+  <div id="turbo86-events" class="t86events" aria-label="turbo86 event log"></div>
+</div>
+
 <script type="module">
-import { loadVm, FRAMEBUFFER_MODES, modeForNumber } from './movie86.mjs';
+import {
+    loadVm,
+    FRAMEBUFFER_MODES,
+    modeForNumber,
+    snapshotContext,
+    makeLoadContextMessage,
+    parseOutboundMessage,
+} from './movie86.mjs';
 
 const $ = (id) => document.getElementById(id);
 
@@ -767,6 +836,182 @@ async function doReset() {
     await loadFromBytes(state.elfBytes, 'reset');
 }
 
+// --- turbo86 handover ---
+//
+// Stop the in-browser Vm at its current instruction boundary, snapshot
+// (regs + sparse memory), open a WebSocket to the configured turbo86
+// URL, send the snapshot as a `LoadContext` Inbound, then stream events
+// (Stdout / Stderr / Exit / Fault / Paused) back into the turbo86 pane.
+//
+// The Vm and the WS are independent: the local Vm stays paused at
+// whatever EIP the snapshot was taken from; the user can resume it
+// after disconnecting, or just compare the turbo86 events with the
+// local stdout/stderr from the same point. We do NOT proxy the events
+// back into the Vm — the two engines have diverged once handed off,
+// and reconciling output streams from both sides is out of scope.
+
+const turbo86 = {
+    ws: null,
+    stdoutBuf: '',
+    stderrBuf: '',
+};
+
+function setT86Status(text, kind = '') {
+    const s = $('turbo86-status');
+    s.className = 'status' + (kind ? ' ' + kind : '');
+    s.textContent = text;
+}
+
+function appendT86Event(label, detail, klass = '') {
+    const ts = new Date().toLocaleTimeString();
+    const row = document.createElement('div');
+    row.className = `ev ${klass}`;
+    row.innerHTML =
+        `<span class="ts">${ts}</span>` +
+        `<strong>${label}</strong>` +
+        (detail ? ` ${escapeHtml(detail)}` : '');
+    $('turbo86-events').appendChild(row);
+    $('turbo86-events').scrollTop = $('turbo86-events').scrollHeight;
+}
+
+function resetT86Pane() {
+    turbo86.stdoutBuf = '';
+    turbo86.stderrBuf = '';
+    $('turbo86-stdout').textContent = '';
+    $('turbo86-stderr').textContent = '';
+    $('turbo86-events').textContent = '';
+    $('turbo86-summary').textContent = '—';
+    $('turbo86-summary').className = 'status';
+}
+
+function closeT86() {
+    if (turbo86.ws) {
+        try { turbo86.ws.close(); } catch { /* already closing */ }
+        turbo86.ws = null;
+    }
+}
+
+async function doSendToTurbo86() {
+    const vm = state.vm;
+    if (!vm) return;
+    if (turbo86.ws) {
+        setT86Status('already connected — closing', 'err');
+        closeT86();
+        return;
+    }
+    // Stop any in-progress local Run so the snapshot is taken at a
+    // stable instruction boundary; the user can resume locally after
+    // the handover by clicking Run again.
+    doStop();
+
+    const url = $('turbo86-url').value.trim();
+    const mode = $('turbo86-mode').value;
+    if (!url) {
+        setT86Status('turbo86 URL is empty', 'err');
+        return;
+    }
+
+    let ctx;
+    try {
+        ctx = snapshotContext(vm);
+    } catch (err) {
+        setT86Status(`snapshot failed: ${err.message || err}`, 'err');
+        return;
+    }
+    const totalBytes = ctx.regions.reduce((n, r) => n + r.bytes.length, 0);
+
+    // Reveal the output pane and reset its contents — every connect
+    // attempt starts from a clean slate so previous sessions don't
+    // bleed into the new one's log.
+    $('turbo86-pane').hidden = false;
+    resetT86Pane();
+    appendT86Event(`connect`,
+        `${url} (mode=${mode}, EIP=${fmt32(ctx.regs.eip)}, ` +
+        `${ctx.regions.length} region(s), ${totalBytes.toLocaleString()} B)`);
+    setT86Status('connecting…');
+
+    let ws;
+    try {
+        ws = new WebSocket(url);
+    } catch (err) {
+        setT86Status(`bad URL: ${err.message || err}`, 'err');
+        appendT86Event('error', String(err), 't-fault');
+        return;
+    }
+    turbo86.ws = ws;
+
+    ws.onopen = () => {
+        setT86Status('connected — sending Context', 'ok');
+        try {
+            const frame = makeLoadContextMessage(ctx, mode);
+            ws.send(frame);
+            appendT86Event('sent', `LoadContext (${frame.length.toLocaleString()} B JSON)`);
+            setT86Status('waiting for events…', 'ok');
+        } catch (err) {
+            setT86Status(`send failed: ${err.message || err}`, 'err');
+            appendT86Event('error', String(err), 't-fault');
+            closeT86();
+        }
+    };
+
+    ws.onmessage = (e) => {
+        let msg;
+        try {
+            msg = parseOutboundMessage(e.data);
+        } catch (err) {
+            appendT86Event('parse error', err.message || String(err), 't-fault');
+            return;
+        }
+        switch (msg.type) {
+            case 'stdout': {
+                turbo86.stdoutBuf += dec.decode(msg.bytes);
+                appendAndAutoscroll($('turbo86-stdout'), turbo86.stdoutBuf);
+                break;
+            }
+            case 'stderr': {
+                turbo86.stderrBuf += dec.decode(msg.bytes);
+                appendAndAutoscroll($('turbo86-stderr'), turbo86.stderrBuf);
+                break;
+            }
+            case 'exit':
+                appendT86Event('exit', `code=${msg.code}`, 't-exit');
+                $('turbo86-summary').textContent = `exit ${msg.code}`;
+                $('turbo86-summary').className = 'status ok';
+                break;
+            case 'fault':
+                appendT86Event('fault', msg.reason, 't-fault');
+                $('turbo86-summary').textContent = `fault: ${msg.reason}`;
+                $('turbo86-summary').className = 'status err';
+                break;
+            case 'paused':
+                appendT86Event('paused',
+                    `signal=${msg.signal} reason=${msg.reason} EIP=${fmt32(msg.regs.eip)}`,
+                    't-paused');
+                $('turbo86-summary').textContent = `paused (sig ${msg.signal})`;
+                break;
+        }
+    };
+
+    ws.onerror = () => {
+        // The browser doesn't surface WS error details to JS for
+        // security reasons; the most actionable hint is "turbo86 not
+        // running at that URL?" which is the common case.
+        appendT86Event('error', '(WebSocket error — is turbo86 listening?)', 't-fault');
+        setT86Status('connection error', 'err');
+    };
+
+    ws.onclose = (e) => {
+        const tag = `code=${e.code}` + (e.reason ? ` reason=${e.reason}` : '');
+        appendT86Event('closed', tag);
+        if ($('turbo86-summary').textContent === '—') {
+            $('turbo86-summary').textContent = 'session closed';
+        }
+        setT86Status(`closed (${e.code})`,
+            e.code === 1000 || e.code === 1005 ? 'ok' : 'err');
+        if (turbo86.ws === ws) turbo86.ws = null;
+    };
+}
+
 // --- URL query param sync ---
 //
 // Parameter selections (preset, follow toggles, delay / batch / refresh,
@@ -776,7 +1021,8 @@ async function doReset() {
 // configuration.
 const URL_PARAMS = ['preset', 'follow', 'delay', 'batch', 'refresh',
                     'disasm-follow', 'disasm-addr',
-                    'mem-follow', 'mem-addr'];
+                    'mem-follow', 'mem-addr',
+                    'turbo86-url', 'turbo86-mode'];
 
 function syncUrlFromControls() {
     const p = new URLSearchParams();
@@ -794,6 +1040,11 @@ function syncUrlFromControls() {
     if (!$('disasm-follow').checked) p.set('disasm-addr', $('disasm-addr').value);
     p.set('mem-follow', $('mem-follow').checked ? '1' : '0');
     if (!$('mem-follow').checked) p.set('mem-addr', $('mem-addr').value);
+    // turbo86 handover: persist URL + mode so reload keeps the user's
+    // chosen target host. The Send button itself is imperative and
+    // stays out of the URL (same rule as Run/Step/Reset).
+    p.set('turbo86-url',  $('turbo86-url').value);
+    p.set('turbo86-mode', $('turbo86-mode').value);
     const url = new URL(window.location.href);
     url.search = p.toString();
     history.replaceState(null, '', url.toString());
@@ -811,6 +1062,10 @@ function applyUrlToControls() {
     apply('disasm-addr',   (v) => { $('disasm-addr').value = v; });
     apply('mem-follow',    (v) => { $('mem-follow').checked = v === '1'; });
     apply('mem-addr',      (v) => { $('mem-addr').value = v; });
+    apply('turbo86-url',   (v) => { $('turbo86-url').value = v; });
+    apply('turbo86-mode',  (v) => {
+        if (v === 'host' || v === 'trap') $('turbo86-mode').value = v;
+    });
 }
 
 // --- UI wiring ---
@@ -858,6 +1113,10 @@ $('run').addEventListener('click', () => {
     else doRun();
 });
 $('reset').addEventListener('click', doReset);
+
+$('turbo86-send').addEventListener('click', doSendToTurbo86);
+$('turbo86-url').addEventListener('input', syncUrlFromControls);
+$('turbo86-mode').addEventListener('change', syncUrlFromControls);
 
 $('mem-addr').addEventListener('change', () => {
     // Hand-edit means the user wants to pin this address — turn off

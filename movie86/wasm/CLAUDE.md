@@ -76,6 +76,39 @@ Both ship today; pick by what you want from the call.
   formatter is a future polish step. Tolerates short reads at the end
   of the segment so a 1-byte `ret` at the last address still decodes.
 
+## Engine handoff to local turbo86
+
+The demo's "Send to local turbo86" button packages the live Vm state
+as the canonical `movie86::context::Context` schema (same shape the
+CLI's handover uses) and ships it over WebSocket to a local turbo86
+process. Three pieces:
+
+- **`vm.snapshotContext()`** — Rust-side. Builds a `ContextSnapshot`
+  by combining `Regs::from_cpu(&self.cpu)` with
+  `capture_sparse_regions(&self.mem, base, len)` from the core crate.
+  EFLAGS is captured as 0 (movie86 doesn't model flags) but the field
+  is preserved so the wire payload matches turbo86's `proto.Regs`
+  byte-for-byte. Region storage is parallel `Vec<u32>` /
+  `Vec<Vec<u8>>` rather than `Vec<exported_struct>` — avoids a wrapper
+  type per region with its own `free`, at the cost of one extra
+  cross-boundary getter call per region.
+- **`movie86.mjs` wrappers** — `snapshotContext(vm)` flattens the
+  Rust struct into a plain JS `{regs, regions}` (frees the wasm
+  handle before returning so callers don't manage `.free()`).
+  `makeLoadContextMessage(ctx, mode)` produces the JSON frame turbo86
+  accepts — lowercase `type` / field names, base64-encoded `bytes`,
+  matches `turbo86/proto/proto.go` exactly. `parseOutboundMessage`
+  decodes the reverse direction (Stdout / Stderr / Exit / Fault /
+  Paused), with `bytes` fields lifted back to `Uint8Array`.
+- **`tests/turbo86_handover.mjs`** — env-gated real-turbo86 E2E.
+  `TURBO86_BIN=/path/to/turbo86 node tests/turbo86_handover.mjs` runs
+  against an existing binary; with the env unset, tries `go build`
+  from source; with `go` also missing, skips cleanly. Verifies the
+  full round-trip (exit + write) against a live turbo86 so a wire
+  drift on either side breaks loudly. The Rust CLI side has its own
+  equivalent (`movie86/cli/tests/handover_turbo86.rs`); the JS test
+  pins the browser code path specifically.
+
 ## Display strategy: follow vs periodic
 
 The demo's "Follow execution" checkbox switches between two loop shapes.
@@ -179,10 +212,10 @@ slider — they answer different questions ("show me each step" vs
   `min-height` so EIP movement doesn't visibly jitter the layout.
 - **URL query params mirror parameter controls, not action buttons.**
   preset / follow / delay / batch / refresh / disasm-follow /
-  disasm-addr / mem-follow / mem-addr round-trip via
-  `history.replaceState`. Reset / Step / Run are imperative actions
-  and intentionally stay out of the URL — they'd just confuse the
-  shareable-state mental model.
+  disasm-addr / mem-follow / mem-addr / turbo86-url / turbo86-mode
+  round-trip via `history.replaceState`. Reset / Step / Run / Send-
+  to-turbo86 are imperative actions and intentionally stay out of the
+  URL — they'd just confuse the shareable-state mental model.
 - **Mandelbrot ships in two flavours from the same C source.**
   `examples/canvas_mandelbrot.elf` is `clang -O2` → `llvm-mov-llc`
   (~1.4 MB, ~90 s on a typical browser tab);
@@ -203,6 +236,15 @@ slider — they answer different questions ("show me each step" vs
   through that pipeline tripped both at `set_video_mode`'s
   `mov dl, 0x13` and at clang's byte-granular spill init. Filled
   the gap with unit tests pinned to those exact byte sequences.
+
+- **Handover takes a snapshot, it does not migrate ownership.** After
+  "Send to local turbo86" succeeds, the local Vm stays paused at the
+  same EIP — the user can `Run` it again and the two engines diverge.
+  We deliberately do not proxy turbo86's events back into the Vm; the
+  semantics of "merge two divergent stdout streams" aren't worth the
+  complexity for a demo. If you want a single canonical session, send
+  the snapshot then `vm.free()`; that's a UI-policy decision the
+  button intentionally leaves to the user.
 
 ## CI
 

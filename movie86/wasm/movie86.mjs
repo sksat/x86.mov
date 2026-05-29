@@ -141,3 +141,139 @@ export async function loadVm(bytes) {
     await ensureInit();
     return new VmRaw(bytes);
 }
+
+/**
+ * Plain-JS view of a Context snapshot. Shape mirrors the core crate's
+ * `movie86::context::Context` and turbo86's `proto.Context`:
+ *
+ *     {
+ *       regs: { eax, ebx, ecx, edx, esi, edi, ebp, esp, eip, eflags },
+ *       regions: [ { addr: number, bytes: Uint8Array }, ... ]
+ *     }
+ *
+ * Capture the live state of `vm` as such a snapshot. Frees the
+ * underlying wasm-bindgen handle before returning so callers only deal
+ * with plain JS values (no `.free()` to remember). Region byte arrays
+ * are owned copies — safe to keep across subsequent `vm.stepN` calls.
+ *
+ * @param {Vm} vm
+ * @returns {{regs: object, regions: Array<{addr: number, bytes: Uint8Array}>}}
+ */
+export function snapshotContext(vm) {
+    const s = vm.snapshotContext();
+    try {
+        const regs = {
+            eax: s.eax, ebx: s.ebx, ecx: s.ecx, edx: s.edx,
+            esi: s.esi, edi: s.edi, ebp: s.ebp, esp: s.esp,
+            eip: s.eip, eflags: s.eflags,
+        };
+        const regions = [];
+        const n = s.regionCount;
+        for (let i = 0; i < n; i++) {
+            regions.push({
+                addr: s.regionAddrAt(i),
+                bytes: s.regionBytesAt(i),
+            });
+        }
+        return { regs, regions };
+    } finally {
+        s.free();
+    }
+}
+
+// Base64-encode a Uint8Array. Browsers and Node 16+ both expose
+// `btoa`, but it takes a binary string, not a byte array — so we walk
+// the bytes in 0x8000-byte chunks to avoid the "maximum call stack
+// size" trap from `String.fromCharCode(...largeArray)`. For the
+// snapshot payload sizes we care about (single MiB at the very high
+// end), this is more than fast enough; a future optimization could
+// drop down to a manual encoder if it ever shows up in a profile.
+function bytesToBase64(u8) {
+    const CHUNK = 0x8000;
+    let s = '';
+    for (let i = 0; i < u8.length; i += CHUNK) {
+        s += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+    }
+    return btoa(s);
+}
+
+function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+/**
+ * Build the turbo86 `LoadContext` Inbound frame for `ctx`. The result
+ * is a JSON string ready to drop into `ws.send(...)`.
+ *
+ * Schema matches `turbo86/proto/proto.go`:
+ *
+ *     { "type": "load_context",
+ *       "context": { "regs": {...}, "regions": [ { "addr", "bytes" }, ... ] },
+ *       "mode": "host" | "trap" }
+ *
+ * `bytes` are emitted as base64 strings — Go's `encoding/json`
+ * round-trips `[]byte` that way. The lowercase `type` discriminator
+ * + lowercase field names are how the Go side spells them; any drift
+ * would silently break the handshake.
+ *
+ * Mode defaults to `"host"` (turbo86 runs the kernel signal path —
+ * matches the Go side's empty-string fallback). Pass `"trap"` when
+ * the guest depends on the same software signal model movie86 uses
+ * (movfuscator-style `mov cs, ax` → SIGILL dispatch).
+ *
+ * @param {{regs: object, regions: Array<{addr: number, bytes: Uint8Array}>}} ctx
+ * @param {'host'|'trap'} [mode='host']
+ * @returns {string} JSON-encoded frame, ready for WebSocket.send().
+ */
+export function makeLoadContextMessage(ctx, mode = 'host') {
+    return JSON.stringify({
+        type: 'load_context',
+        context: {
+            regs: ctx.regs,
+            regions: ctx.regions.map(r => ({
+                addr: r.addr,
+                bytes: bytesToBase64(r.bytes),
+            })),
+        },
+        mode,
+    });
+}
+
+/**
+ * Decode a turbo86 Outbound frame. Returns a tagged JS object:
+ *
+ *   { type: 'stdout', bytes: Uint8Array }
+ *   { type: 'stderr', bytes: Uint8Array }
+ *   { type: 'exit',   code:  number }
+ *   { type: 'fault',  reason: string }
+ *   { type: 'paused', regs, regions, signal, reason }
+ *
+ * `bytes` fields are decoded from base64 back into `Uint8Array`. The
+ * UI can treat them the same way it treats `vm.drainStdout()` output.
+ * Unknown discriminators throw — the WS code is paired with a turbo86
+ * head, not a forward-compat reader.
+ *
+ * @param {string|Uint8Array} data  WS frame body.
+ */
+export function parseOutboundMessage(data) {
+    const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
+    const m = JSON.parse(text);
+    switch (m.type) {
+        case 'stdout': return { type: 'stdout', bytes: base64ToBytes(m.bytes) };
+        case 'stderr': return { type: 'stderr', bytes: base64ToBytes(m.bytes) };
+        case 'exit':   return { type: 'exit',   code: m.code };
+        case 'fault':  return { type: 'fault',  reason: m.reason };
+        case 'paused': {
+            const regions = (m.regions ?? []).map(r => ({
+                addr: r.addr,
+                bytes: base64ToBytes(r.bytes),
+            }));
+            return { type: 'paused', regs: m.regs, regions, signal: m.signal, reason: m.reason };
+        }
+        default:
+            throw new Error(`unknown turbo86 outbound type ${JSON.stringify(m.type)}`);
+    }
+}
