@@ -186,3 +186,95 @@ test('compileWithCompiler — caller linkOpts override the llvm-mov defaults', a
     assert.equal(calls[0].opts.runtime, 'movfuscator',
         'caller can opt back to the movfuscator CRT');
 });
+
+test("compileWithCompiler — linkProfile 'canvas13h' wires the framebuffer stubs (llvm-mov)", async () => {
+    // The explorer's canvas presets (mode-13h mandelbrot) need three
+    // things the plain llvm-mov path doesn't: the mov-only ABI stubs
+    // (`set_video_mode` / `mmap_request` / `exit`) plus a `.fb13h` BSS
+    // section pinned at the VGA base 0xA0000. `opts.linkProfile:
+    // 'canvas13h'` is the declarative switch that assembles the stubs
+    // object, threads it into the link inputs, and injects the two raw
+    // ld flags (`--section-start` + `--undefined`). The mov-only-ABI asm
+    // lives in explorer.mjs, not in the preset data, so presets stay
+    // pure source strings.
+    const calls = [];
+    const wrappers = {
+        movfuscator: {
+            assemble: async (asm) => {
+                calls.push(['assemble', asm]);
+                // Tag each assembled object by which recipe it came from
+                // so the link assertions can identify them.
+                if (asm.includes('_start:')) return new Uint8Array([1]);
+                if (asm.includes('set_video_mode')) return new Uint8Array([2]);
+                return new Uint8Array([3]);
+            },
+            link: async (objs, libs, opts) => {
+                calls.push(['link', objs, opts]);
+                return new Uint8Array([0x7f, 0x45]);
+            },
+        },
+        llvmMov: {
+            cToIR: async () => 'ir',
+            compile: async () => 'asm',
+        },
+    };
+    const { compileWithCompiler } = await import('../explorer.mjs');
+    await compileWithCompiler({
+        compiler: 'llvm-mov',
+        source: 'int main(void){ return 0; }',
+        opts: { linkProfile: 'canvas13h' },
+        wrappers,
+    });
+
+    // The stubs source must be assembled (in addition to user asm +
+    // _start.s), so `assemble` runs three times for the canvas profile.
+    const assembleCalls = calls.filter((c) => c[0] === 'assemble');
+    assert.ok(
+        assembleCalls.some((c) => c[1].includes('set_video_mode')),
+        'canvas13h must assemble the mov-only ABI framebuffer stubs',
+    );
+
+    const [, linkObjs, linkOpts] = calls.find((c) => c[0] === 'link');
+    assert.ok(!(linkObjs instanceof Uint8Array), 'link inputs must be a Record');
+    assert.deepEqual(
+        Object.keys(linkObjs),
+        ['_start.o', 'explorer.o', 'stubs.o'],
+        'stubs.o must join _start.o + the user object in the link inputs',
+    );
+    assert.equal(linkOpts.static, true, 'canvas13h still links statically');
+    assert.equal(linkOpts.runtime, 'none', 'canvas13h keeps runtime: none');
+    assert.deepEqual(
+        linkOpts.extraLdArgs,
+        ['--section-start=.fb13h=0xA0000', '--undefined=_fb13h_region'],
+        'canvas13h must pin .fb13h at 0xA0000 and keep its region symbol live',
+    );
+});
+
+test('compileWithCompiler — no linkProfile leaves the llvm-mov link inputs minimal', async () => {
+    // Regression guard: the default (profile-less) llvm-mov path must
+    // NOT link the canvas stubs or inject section-start flags — every
+    // existing preset (return42, hello, …) links just `_start.o` + the
+    // user object, with no extraLdArgs.
+    const calls = [];
+    const wrappers = {
+        movfuscator: {
+            assemble: async () => new Uint8Array([1]),
+            link: async (objs, libs, opts) => {
+                calls.push({ objs, opts });
+                return new Uint8Array([0x7f]);
+            },
+        },
+        llvmMov: { cToIR: async () => 'ir', compile: async () => 'asm' },
+    };
+    const { compileWithCompiler } = await import('../explorer.mjs');
+    await compileWithCompiler({
+        compiler: 'llvm-mov',
+        source: 'int main(void){ return 0; }',
+        wrappers,
+    });
+    const { objs, opts } = calls[0];
+    assert.deepEqual(Object.keys(objs), ['_start.o', 'explorer.o'],
+        'default path links no stubs.o');
+    assert.equal(opts.extraLdArgs, undefined,
+        'default path injects no raw ld flags');
+});

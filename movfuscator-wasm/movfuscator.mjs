@@ -279,6 +279,7 @@ function assertSafeExtraInputPath(p, userObjPaths) {
  *   extraLibs?: string[],
  *   searchPaths?: string[],
  *   extraInputs?: Record<string,Uint8Array>,
+ *   extraLdArgs?: string[],
  * }} [opts]
  *   - `name`: only used when `objs` is a single Uint8Array. Default `a.out.o`.
  *   - `static`: link statically (see above). Default `false`.
@@ -290,6 +291,15 @@ function assertSafeExtraInputPath(p, userObjPaths) {
  *   - `extraInputs`: absolute MEMFS path → bytes, written before ld runs.
  *     Use this to stage caller-supplied `.a` files / link scripts that
  *     `extraLibs` and `searchPaths` then resolve.
+ *   - `extraLdArgs`: raw `ld` flags spliced in right after the mode
+ *     switch (before `-L`/objects), for position-independent options the
+ *     wrapper has no dedicated knob for — e.g. canvas demos that pin a
+ *     framebuffer BSS section with `--section-start=.fb13h=0xA0000` and
+ *     keep it live with `--undefined=_fb13h_region`. Each entry is passed
+ *     to `ld` verbatim (one argv slot per array element, so write
+ *     `'--section-start=.fb13h=0xA0000'` as a single string, not two).
+ *     Defaults to `[]`, which leaves every existing link command — and
+ *     thus every byte-identical golden — unchanged.
  * @returns {Promise<Uint8Array>} ELF32 executable bytes
  */
 export async function link(objs, libs, opts = {}) {
@@ -300,6 +310,7 @@ export async function link(objs, libs, opts = {}) {
         extraLibs = [],
         searchPaths = [],
         extraInputs = {},
+        extraLdArgs = [],
     } = opts;
     assertSafeName(name, 'opts.name');
     const userObjs = normalizeObjs(objs, name);
@@ -310,6 +321,9 @@ export async function link(objs, libs, opts = {}) {
     }
     if (!Array.isArray(extraLibs) || !Array.isArray(searchPaths)) {
         throw new TypeError('extraLibs / searchPaths must be arrays');
+    }
+    if (!Array.isArray(extraLdArgs) || extraLdArgs.some(a => typeof a !== 'string')) {
+        throw new TypeError('extraLdArgs must be an array of strings');
     }
     if (typeof staticLink !== 'boolean') {
         throw new TypeError('opts.static must be boolean');
@@ -408,6 +422,7 @@ export async function link(objs, libs, opts = {}) {
     const cmd = [
         '-m', 'elf_i386', '--hash-style=gnu',
         ...modeArgs,
+        ...extraLdArgs,
         '-L/movfuscator', '-L/usr/lib32', '-L/lib32',
         ...searchPaths.map(p => `-L${p}`),
         ...headerLibArgs,

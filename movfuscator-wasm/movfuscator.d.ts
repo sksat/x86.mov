@@ -53,6 +53,13 @@ export interface LinkOptions {
    *  `searchPaths` then resolve. Paths must be absolute and outside the
    *  directories the wrapper relies on (e.g., `/movfuscator/`). */
   extraInputs?: Record<string, Uint8Array>;
+  /** Raw `ld` flags spliced in right after the mode switch (before
+   *  `-L`/objects), for position-independent options with no dedicated
+   *  knob — e.g. `'--section-start=.fb13h=0xA0000'` and
+   *  `'--undefined=_fb13h_region'` to pin + retain a canvas framebuffer
+   *  BSS section. One argv slot per array element. Defaults to `[]`,
+   *  leaving every existing link command byte-identical. */
+  extraLdArgs?: string[];
 }
 
 /** Run the LCC C preprocessor on `source`. Returns the post-`#include`

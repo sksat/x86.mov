@@ -70,6 +70,72 @@ _start:
     mov [0x1FFE00FE], eax
 `;
 
+// mov-only ABI stubs + framebuffer BSS for the `canvas13h` link
+// profile. Mirrors `movie86/wasm/examples/sources/stubs_llvm.s`. A
+// canvas program (mode-13h mandelbrot) reaches three host services
+// purely by writing into the unmapped ABI page at 0x1FFE_0000 —
+// movie86's AbiHost decodes the page offset as the call number and the
+// stored value as the argument:
+//
+//   set_video_mode(mode) → [0x1FFE0010] = mode   (CALL_SET_VIDEO_MODE)
+//   mmap_request(packed)  → [0x1FFE0020] = packed (CALL_MMAP_REQUEST)
+//   exit(code)            → [0x1FFE00FE] = code   (CALL_EXIT)
+//
+// `ret` becomes `pop ecx ; jmp ecx` so the linked .text carries no
+// `ret` opcode (upstream "100% mov+jmp" goal); `exit` needs no tail at
+// all — the ABI store unmaps the process before the next fetch, which
+// is also why a `main` that tail-calls `exit` never returns to the
+// `_start` above.
+//
+// The `.fb13h` nobits section is 320*200*4 B at guest 0xA0000. The
+// matching `--section-start=.fb13h=0xA0000` ld flag (from the
+// canvas13h profile) makes the linker emit a PT_LOAD there, which
+// movie86's loader pre-maps — so the guest's pixel stores land in the
+// framebuffer the embedded Canvas pane reads via `vm.readMem(0xA0000,
+// …)`. `_fb13h_region` is held live with `--undefined=` so a GC pass
+// can't drop the otherwise-unreferenced section.
+export const STUBS_CANVAS13H_S = `\
+.intel_syntax noprefix
+.section .text
+
+.globl set_video_mode
+set_video_mode:
+    mov eax, [esp + 4]
+    mov [0x1FFE0010], al
+    pop ecx
+    jmp ecx
+
+.globl mmap_request
+mmap_request:
+    mov eax, [esp + 4]
+    mov [0x1FFE0020], eax
+    pop ecx
+    jmp ecx
+
+.globl exit
+exit:
+    mov eax, [esp + 4]
+    mov [0x1FFE00FE], eax
+
+.section .fb13h, "aw", @nobits
+.globl _fb13h_region
+_fb13h_region:
+.skip 256000
+`;
+
+// Declarative link profiles. A preset that needs more than the bare
+// `_start.o + <user>.o` static link names a profile; the llvm-mov
+// branch expands it into (extra assembled object, raw ld flags).
+// Keeping the recipe here — not in the preset data — lets presets stay
+// pure C source strings and keeps the mov-only ABI asm in one place.
+export const LINK_PROFILES = Object.freeze({
+    canvas13h: {
+        stubsName: 'stubs.o',
+        stubsAsm: STUBS_CANVAS13H_S,
+        extraLdArgs: ['--section-start=.fb13h=0xA0000', '--undefined=_fb13h_region'],
+    },
+});
+
 /**
  * Compile C source through the selected mov-only toolchain.
  *
@@ -85,7 +151,16 @@ _start:
  *   mounted in MEMFS root so source can `#include "name.h"`
  *   (movfuscator only — clang already embeds the resource-dir headers)
  * @param {object} [params.opts.linkOpts] — forwarded to
- *   `movfuscator.link()` (extraLibs / searchPaths / extraInputs)
+ *   `movfuscator.link()` (extraLibs / searchPaths / extraInputs /
+ *   extraLdArgs)
+ * @param {'canvas13h'} [params.opts.linkProfile] — named link recipe
+ *   for presets that need more than the bare static link (llvm-mov path
+ *   only). `'canvas13h'` links the mov-only ABI framebuffer stubs and
+ *   pins a `.fb13h` BSS section at the VGA base 0xA0000 so a mode-13h
+ *   program renders in the embedded Canvas pane. Ignored on the
+ *   movfuscator path (its externs stay undefined dynamic symbols — the
+ *   output is inspectable but, like every movfuscator-path ELF today,
+ *   not movie86-runnable).
  * @param {(stage: string) => void} [params.opts.onProgress]
  * @param {object} [params.wrappers] — dependency injection for tests
  * @returns {Promise<{
@@ -161,10 +236,25 @@ export async function compileWithCompiler(params) {
             '_start.o': startObj,
             'explorer.o': obj,
         };
+        // Expand a named link profile (e.g. canvas13h) into its extra
+        // assembled object + raw ld flags. The profile's flags merge
+        // *before* the caller's linkOpts so an explicit caller override
+        // still wins the spread below.
+        const profileLinkOpts = {};
+        const profile = opts.linkProfile ? LINK_PROFILES[opts.linkProfile] : undefined;
+        if (opts.linkProfile && !profile) {
+            throw new Error(`unknown linkProfile: ${opts.linkProfile} (want one of: ${Object.keys(LINK_PROFILES).join(', ')})`);
+        }
+        if (profile) {
+            onProgress('assemble-stubs');
+            linkInputs[profile.stubsName] = await w.movfuscator.assemble(profile.stubsAsm);
+            profileLinkOpts.extraLdArgs = profile.extraLdArgs;
+        }
         const userLinkOpts = opts.linkOpts ?? {};
         elf = await w.movfuscator.link(linkInputs, undefined, {
             static: true,
             runtime: 'none',
+            ...profileLinkOpts,
             ...userLinkOpts,
         });
     } else {
