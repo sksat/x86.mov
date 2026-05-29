@@ -14,9 +14,17 @@
 # movfuscator-coarse exists as a slow side-by-side comparison;
 # movfuscator-hires/max would take many hours / days, so we skip them.
 #
-# All three flavours are statically linked, ship a `.fb13h` BSS region
-# at guest address 0xA0000 (mode 13h), and rely on a small
-# `set_video_mode` stub wrapping `int 0x10` (AH=0, AL=mode).
+# All four flavours are statically linked and rely on a small
+# `set_video_mode` stub wrapping `int 0x10` (AH=0, AL=mode). The
+# framebuffer BSS region is per-variant:
+#
+#   - coarse / hires / mov:  `.fb13h` @ guest 0xA0000      (mode 13h, 320×200)
+#   - max:                   `.fb6Ah` @ guest 0x00400000   (VESA 6Ah, 800×600)
+#
+# Each variant's `--section-start=...` + `--undefined=...` link args
+# pin the right section to the right guest address; per-pipeline
+# stub objects (`stubs_llvm.o` vs `stubs_llvm_max.o`) provide the
+# matching section declaration.
 #
 # **Don't `--strip-all` the movfuscator binary.** movie86 relies on the
 # ELF symbol table to auto-wire `dispatch` (SIGSEGV) and `master_loop`
