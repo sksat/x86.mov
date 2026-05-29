@@ -16,6 +16,7 @@ sub="$dist/movie86"
 required=(
     "$here/index.html"
     "$here/movie86.mjs"
+    "$here/runloop.mjs"
     "$here/build/browser/movie86_wasm_bg.wasm"
     "$here/build/browser/movie86_wasm.js"
 )
@@ -35,6 +36,7 @@ mkdir -p "$sub/build/browser"
 
 cp "$here/index.html"   "$sub/"
 cp "$here/movie86.mjs"  "$sub/"
+cp "$here/runloop.mjs"  "$sub/"
 
 cp "$here/build/browser/movie86_wasm_bg.wasm" \
    "$here/build/browser/movie86_wasm.js" \
