@@ -1067,6 +1067,21 @@ private:
         const DebugLoc DL = PopMI.getDebugLoc();
         auto Insert = MachineBasicBlock::iterator(&PopMI);
 
+        // Stage 7h1 — preserve caller-EDX before we clobber it as the
+        // RA-load scratch. For i64 / EDX:EAX multi-value returns the
+        // RetCC_Mov assignment lands the high half in EDX, and the
+        // implicit-use list on RET (mirrored onto JMP32m below)
+        // promises EDX stays live through to function exit. The
+        // original rewrite used `mov edx, [esp + 4]` here for the
+        // RA load, then later stomped SaveEdxDisp with Undef and
+        // reloaded that Undef into EDX — which silently destroyed
+        // the i64 hi half. The fix: stash caller-EDX into
+        // SaveEdxDisp up-front so the post-chain reload at the
+        // bottom restores the right value. (caller-ECX is cdecl-
+        // volatile, so it's fine to keep its Undef spill below.)
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+
         // Step 1: stash RA in __mov_return_addr_slot.
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
             .addReg(Mov::ESP).addImm(4);
@@ -1075,11 +1090,11 @@ private:
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
             .addReg(Mov::ECX).addImm(0).addReg(Mov::EDX);
 
-        // Step 2: byte-chain ADD ESP, 8.
+        // Step 2: byte-chain ADD ESP, 8. SaveEdxDisp is already loaded
+        // with the caller-EDX from the new pre-step above; only
+        // SaveEcxDisp / SrcDstDisp need (re-)setup here.
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
             .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
             .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Mov::ESP);
 

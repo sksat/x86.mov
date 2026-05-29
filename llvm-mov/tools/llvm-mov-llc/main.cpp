@@ -101,6 +101,16 @@ static bool moduleNeedsDivRemHelpers(Module &M) {
 }
 
 
+// Stage 7h1 — "bit-blend safe" marker for the i64 SELECT rewrite
+// below. Every helper we inject is straight-line bit-arithmetic with
+// no poison-introducing arms (we never emit `nsw` / `nuw` flags or
+// other UB-bearing ops in helper bodies), so it's safe to rewrite
+// their i64 `select`s into branchless `(a & m) | (b & ~m)` form. The
+// rewrite is intentionally NOT applied to user-authored i64 selects,
+// where a poison-arm select could be miscompiled by the bit-blend
+// (codex-review P2 on stage 7h1 bring-up).
+static constexpr llvm::StringLiteral kBitBlendAttr = "llvm-mov-bit-blend-safe";
+
 static Function *makeOrPromoteHelper(Module &M, StringRef Name,
                                      FunctionType *Ty) {
   if (Function *Existing = M.getFunction(Name)) {
@@ -111,10 +121,12 @@ static Function *makeOrPromoteHelper(Module &M, StringRef Name,
     // Pure declaration left by SDAG-Expand prep. Upgrade to a
     // definition we own.
     Existing->setLinkage(GlobalValue::LinkOnceODRLinkage);
+    Existing->addFnAttr(kBitBlendAttr);
     return Existing;
   }
   Function *F = Function::Create(Ty, GlobalValue::LinkOnceODRLinkage, Name, &M);
   F->setCallingConv(CallingConv::C);
+  F->addFnAttr(kBitBlendAttr);
   return F;
 }
 
@@ -1347,6 +1359,186 @@ static void injectFixsfsiHelpers(Module &M, LLVMContext &Ctx) {
     emitFloatToInt32Body(F, Ctx, /*IsSigned=*/false);
 }
 
+// Stage 7h1 — `__extendsfdf2 (float a) -> double`. Lossless f32 → f64
+// conversion. Algorithm:
+//   - decode {sign, exp32, mant32_raw} from the f32 bit pattern
+//   - exp64 = (exp32 == 0xFF)        ? 0x7FF                  (Inf/NaN)
+//             : exp32 + 896          (= 1023 - 127 + exp32)   (normal)
+//   - mant64 = mant32_raw << 29      (align bit 22 ↦ bit 51)
+//   - pack (sign << 63) | (exp64 << 52) | mant64 as i64
+//   - if exp32 == 0 (f32 zero or denormal) → flush to signed-zero f64
+//
+// The 7g0 flush-to-zero scope is preserved here: f32 denormal inputs
+// land as f64 zero. Real IEEE would re-normalize (f32 denormals are
+// all f64 normals since the exponent range is much wider) — out of
+// scope alongside the f32 helpers.
+//
+// All i64 shifts are by *constant* amounts, so this body stays inside
+// the current backend without needing a runtime i64 shift libcall
+// (see `Cannot select shl_parts` probe).
+static void injectExtendSfDf2Helper(Module &M, LLVMContext &Ctx) {
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *F64 = Type::getDoubleTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(F64, {F32}, /*isVarArg=*/false);
+
+  Function *F = makeOrPromoteHelper(M, "__extendsfdf2", FnTy);
+  if (!F)
+    return;
+  F->getArg(0)->setName("a");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+  auto C32 = [&](uint32_t V) { return B.getInt32(V); };
+  auto C64 = [&](uint64_t V) { return B.getInt64(V); };
+
+  Value *AI = B.CreateBitCast(F->getArg(0), I32, "ai");
+  Value *Sign32 = B.CreateLShr(AI, C32(31), "sign32");
+  Value *Exp32 = B.CreateAnd(B.CreateLShr(AI, C32(23)), C32(0xFFu), "exp32");
+  Value *MantRaw = B.CreateAnd(AI, C32(0x7FFFFFu), "mant_raw");
+
+  Value *Sign64 = B.CreateZExt(Sign32, I64);
+  Value *Mant64 = B.CreateShl(B.CreateZExt(MantRaw, I64), C64(29), "mant64");
+
+  // Normal exp rebias: f64 = f32 + (1023 - 127) = f32 + 896. Inf/NaN
+  // jumps the rebias and writes 0x7FF directly.
+  Value *Exp32IsMax = B.CreateICmpEQ(Exp32, C32(0xFFu));
+  Value *Exp64Normal = B.CreateZExt(B.CreateAdd(Exp32, C32(896u)), I64);
+  Value *Exp64 = B.CreateSelect(Exp32IsMax, C64(0x7FFull), Exp64Normal,
+                                "exp64");
+
+  // Pack {sign(63), exp(62..52), mant(51..0)}.
+  Value *SignField = B.CreateShl(Sign64, C64(63));
+  Value *ExpField = B.CreateShl(Exp64, C64(52));
+  Value *Packed = B.CreateOr(SignField,
+                             B.CreateOr(ExpField, Mant64));
+
+  // Flush zero / denormal to signed zero (no re-normalize).
+  Value *Exp32IsZero = B.CreateICmpEQ(Exp32, C32(0u));
+  Value *SignedZero = SignField;
+  Value *Result = B.CreateSelect(Exp32IsZero, SignedZero, Packed);
+
+  B.CreateRet(B.CreateBitCast(Result, F64));
+}
+
+// Stage 7h1 — `__truncdfsf2 (double a) -> float`. f64 → f32 truncation
+// with round-to-nearest-ties-to-even. Algorithm:
+//   - decode {sign, exp64, mant_top, mant_bot} from the i64 bit
+//     pattern, splitting the 52-bit f64 mantissa across an upper
+//     20-bit half (in di_hi[19:0]) and a lower 32-bit half (in di_lo).
+//   - exp32 = exp64 - 896                    (rebias)
+//   - mant_f32_raw_24 = (mant_top << 3) | (mant_bot >> 29)    (top 23
+//                                                              bits +
+//                                                              one
+//                                                              extra
+//                                                              for the
+//                                                              implicit
+//                                                              1)
+//   - guard = (mant_bot >> 28) & 1
+//   - sticky = (mant_bot & 0x0FFFFFFF) != 0
+//   - round-to-nearest-ties-to-even, with mantissa-overflow bump
+//   - special cases:
+//       exp64 == 0x7FF  → mant_nonzero ? canonical qNaN f32 : signed Inf
+//       exp64 == 0      → signed zero f32
+//       exp32 ≤ 0       → flush to signed zero (no f32 denormal output)
+//       exp32 ≥ 255     → signed Inf
+//
+// All i64 shifts are by 32 (constant), so this body also stays inside
+// the current backend without a runtime i64 shift libcall.
+static void injectTruncDfSf2Helper(Module &M, LLVMContext &Ctx) {
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *F64 = Type::getDoubleTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(F32, {F64}, /*isVarArg=*/false);
+
+  Function *F = makeOrPromoteHelper(M, "__truncdfsf2", FnTy);
+  if (!F)
+    return;
+  F->getArg(0)->setName("a");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+  auto C32 = [&](uint32_t V) { return B.getInt32(V); };
+
+  Value *DI = B.CreateBitCast(F->getArg(0), I64, "di");
+  Value *DHi64 = B.CreateLShr(DI, B.getInt64(32));
+  Value *DHi = B.CreateTrunc(DHi64, I32, "di_hi");
+  Value *DLo = B.CreateTrunc(DI, I32, "di_lo");
+
+  // Field extraction from di_hi: bit 31 sign, bits 30..20 exp,
+  // bits 19..0 top-20-bits of the 52-bit mantissa.
+  Value *Sign = B.CreateLShr(DHi, C32(31));
+  Value *Exp64 = B.CreateAnd(B.CreateLShr(DHi, C32(20)), C32(0x7FFu));
+  Value *MantTop = B.CreateAnd(DHi, C32(0xFFFFFu));   // bits 51..32
+  Value *MantBot = DLo;                                // bits 31..0
+
+  // f32 mantissa = top 23 bits of the 52-bit mantissa, with the
+  // implicit-1 conceptually at bit 23 of the resulting 24-bit value.
+  // Build the 24-bit "mantissa with implicit-1" first:
+  //   m24 = 1<<23 | (top 23 bits)
+  //       = ((MantTop | 0x100000) << 3) | (MantBot >> 29)
+  Value *MantTopHidden = B.CreateOr(MantTop, C32(0x100000u));
+  Value *M24 = B.CreateOr(B.CreateShl(MantTopHidden, C32(3)),
+                          B.CreateLShr(MantBot, C32(29)));
+
+  // Rounding bits live in the dropped low region: bit 28 of MantBot
+  // is the guard, bits 27..0 of MantBot are the sticky source.
+  Value *Guard = B.CreateAnd(B.CreateLShr(MantBot, C32(28)), C32(1u));
+  Value *StickyNZ = B.CreateICmpNE(B.CreateAnd(MantBot, C32(0x0FFFFFFFu)),
+                                   C32(0u));
+  Value *Sticky = B.CreateZExt(StickyNZ, I32);
+  Value *Lsb = B.CreateAnd(M24, C32(1u));
+  Value *RoundUp = B.CreateAnd(Guard, B.CreateOr(Sticky, Lsb));
+  Value *M24Rounded = B.CreateAdd(M24, RoundUp);
+  // Rounding may push m24 to 0x1000000 ⇒ shift right and bump exp.
+  Value *RoundOvf = B.CreateICmpEQ(M24Rounded, C32(0x1000000u));
+  Value *M24Final = B.CreateSelect(RoundOvf,
+                                   B.CreateLShr(M24Rounded, C32(1)),
+                                   M24Rounded);
+
+  // Exponent rebias. f32 = f64 - (1023 - 127) = f64 - 896. Tracked as
+  // signed i32 so the underflow gate works on negative values.
+  Value *Exp32Pre = B.CreateSub(Exp64, C32(896u));
+  Value *Exp32 = B.CreateSelect(RoundOvf,
+                                B.CreateAdd(Exp32Pre, C32(1u)),
+                                Exp32Pre);
+
+  // Pack the normal f32 result.
+  Value *MantField = B.CreateAnd(M24Final, C32(0x7FFFFFu));
+  Value *ExpField = B.CreateAnd(B.CreateShl(Exp32, C32(23)),
+                                C32(0x7F800000u));
+  Value *SignField = B.CreateShl(Sign, C32(31));
+  Value *Packed = B.CreateOr(SignField,
+                             B.CreateOr(ExpField, MantField));
+
+  Value *SignedZero = SignField;
+  Value *SignedInf = B.CreateOr(SignField, C32(0x7F800000u));
+
+  // Overflow / underflow on the f32 side. Use signed comparisons so
+  // out-of-range f64 values (which wrap exp32 around into the high
+  // unsigned range) trigger the right gate.
+  Value *Overflow = B.CreateICmpSGE(Exp32, C32(255u));
+  Value *Underflow = B.CreateICmpSLE(Exp32, C32(0u));
+  Value *Result = B.CreateSelect(Overflow, SignedInf, Packed);
+  Result = B.CreateSelect(Underflow, SignedZero, Result);
+
+  // f64 special cases override the rebias/rounding path.
+  Value *MantNonzero = B.CreateOr(B.CreateICmpNE(MantTop, C32(0u)),
+                                  B.CreateICmpNE(MantBot, C32(0u)));
+  Value *Exp64IsMax = B.CreateICmpEQ(Exp64, C32(0x7FFu));
+  Value *AIsNaN = B.CreateAnd(Exp64IsMax, MantNonzero);
+  Value *AIsInf = B.CreateAnd(Exp64IsMax, B.CreateNot(MantNonzero));
+  Value *Exp64IsZero = B.CreateICmpEQ(Exp64, C32(0u));
+
+  Result = B.CreateSelect(AIsInf, SignedInf, Result);
+  Result = B.CreateSelect(AIsNaN, C32(0x7FC00000u), Result);
+  Result = B.CreateSelect(Exp64IsZero, SignedZero, Result);
+
+  B.CreateRet(B.CreateBitCast(Result, F32));
+}
+
 // Convenience scan over the entire f32 operation set this stage
 // covers. Mirrors `moduleNeedsAddSf3Helper` but is permissive over
 // any FP / int↔FP IR construct that's expected to lower into one of
@@ -1415,6 +1607,37 @@ static bool moduleNeedsDivSf3(Module &M) {
     for (Instruction &I : instructions(F)) {
       if (I.getOpcode() == Instruction::FDiv &&
           I.getOperand(0)->getType()->getScalarType()->isFloatTy())
+        return true;
+    }
+  }
+  return false;
+}
+
+// Stage 7h1 — fpext / fptrunc gates. Each is independent of the
+// other f32 helpers and only fires when the corresponding cast
+// appears in the module.
+static bool moduleNeedsExtendSfDf2(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if (I.getOpcode() == Instruction::FPExt &&
+          I.getOperand(0)->getType()->getScalarType()->isFloatTy() &&
+          I.getType()->getScalarType()->isDoubleTy())
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool moduleNeedsTruncDfSf2(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if (I.getOpcode() == Instruction::FPTrunc &&
+          I.getOperand(0)->getType()->getScalarType()->isDoubleTy() &&
+          I.getType()->getScalarType()->isFloatTy())
         return true;
     }
   }
@@ -1564,6 +1787,13 @@ int main(int argc, char **argv) {
   // scan.
   if (moduleNeedsDivSf3(*M))
     injectDivSf3Helper(*M, Ctx);
+  // Stage 7h1 — fpext / fptrunc helpers. Independent of the f32
+  // arithmetic gates; each fires only when the corresponding cast
+  // actually appears in the module.
+  if (moduleNeedsExtendSfDf2(*M))
+    injectExtendSfDf2Helper(*M, Ctx);
+  if (moduleNeedsTruncDfSf2(*M))
+    injectTruncDfSf2Helper(*M, Ctx);
 
   // Stage 6d2 — pre-Scalarizer lowering of `llvm.vector.reduce.*`.
   //
@@ -1690,13 +1920,30 @@ int main(int argc, char **argv) {
     // graph is straight-line — DAG-ISel handles it in
     // milliseconds.
     //
-    // Only i32 SELECTs are rewritten; i1 / pointer / aggregate
-    // SELECTs (e.g. ones SROA leaves around for control flow
-    // synthesis) keep going through the default Expand path.
+    // Only i32 (always) and i64 (helper-only) SELECTs are rewritten;
+    // i1 / pointer / aggregate SELECTs (e.g. ones SROA leaves around
+    // for control flow synthesis) keep going through the default
+    // Expand path.
+    //
+    // Stage 7h1 — i64 added so the `__extendsfdf2` body's i64-typed
+    // selects (zero / Inf / NaN overrides at the tail) stay branchless.
+    // Without this, a single `select i64` pushes DAG-ISel into the same
+    // multi-minute pathology that motivated the i32 rewrite (observed
+    // 3.7-hour hang on `f64_extend_inf.ll` during 7h1 bring-up). The
+    // bit-blend operations (and/or/not/sub) all have native i64-to-i32-
+    // pair lowerings, so the rewrite is functionally identical at i64.
+    //
+    // The i64 case is gated on the `llvm-mov-bit-blend-safe` function
+    // attribute (set by `makeOrPromoteHelper` for every injected
+    // helper). User-authored i64 selects keep default Expand because
+    // bit-blend is unsafe when an unchosen arm is poison (e.g. from
+    // an `nsw` overflow) — codex-review P2 on this stage's bring-up.
+    const bool BitBlendSafe = F.hasFnAttribute(kBitBlendAttr);
     SmallVector<SelectInst *, 32> SelectList;
     for (Instruction &I : instructions(F))
       if (auto *S = dyn_cast<SelectInst>(&I))
-        if (S->getType()->isIntegerTy(32))
+        if (S->getType()->isIntegerTy(32) ||
+            (BitBlendSafe && S->getType()->isIntegerTy(64)))
           SelectList.push_back(S);
     for (SelectInst *S : SelectList) {
       IRBuilder<> B(S);

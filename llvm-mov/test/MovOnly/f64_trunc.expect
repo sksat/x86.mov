@@ -1,0 +1,2 @@
+# Stage 7h1 — `call __truncdfsf2` rewritten to dispatcher-jmp shape.
+jmp
