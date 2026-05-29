@@ -362,12 +362,16 @@ export function parseOutboundMessage(data) {
             // but no regs/signal/reason. Frontend applies the regions to
             // its local Vm via `vm.writeMem`, so the canvas pane keeps
             // up with the in-flight guest without waiting for terminal
-            // Paused / Exit.
+            // Paused / Exit. `insns` is the cumulative retired-instruction
+            // count from turbo86's perf_event_open on the guest PID;
+            // 0 when the kernel denied the counter. Frontend uses it
+            // to drive the `total mov / mov per sec` cards with native
+            // instruction rate instead of Outbound event count.
             const regions = (m.regions ?? []).map(r => ({
                 addr: r.addr,
                 bytes: base64ToBytes(r.bytes),
             }));
-            return { type: 'mem_update', regions };
+            return { type: 'mem_update', regions, insns: m.insns ?? 0 };
         }
         default:
             throw new Error(`unknown turbo86 outbound type ${JSON.stringify(m.type)}`);

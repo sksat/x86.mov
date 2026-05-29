@@ -477,7 +477,35 @@ async function main() {
             } finally {
                 vm.free();
             }
-            console.log(`ok  real turbo86 handover (MemUpdate ×${memUpdates.length} → writeMem applies bytes)`);
+
+            // Insns field check: turbo86 samples
+            // perf_event_open(PERF_COUNT_HW_INSTRUCTIONS) on each
+            // tick and embeds the cumulative count in MemUpdate.
+            // jmp-self retires the same instruction over and over so
+            // the counter should march forward steadily. Soft-skip
+            // the actual assertion when the kernel denied the counter
+            // (`insns: 0` on every event) — locked-down CI / paranoid
+            // sandboxes default to perf_event_paranoid=3 which
+            // refuses unprivileged perf_event_open, and the runtime
+            // path is already designed to fall back to "frontend
+            // shows event count" there.
+            const nonZero = memUpdates.filter(u => u.insns > 0);
+            if (nonZero.length === 0) {
+                console.log(`skip MemUpdate.insns assertion: perf_event_open unavailable (paranoid kernel?)`);
+            } else {
+                assert.ok(nonZero.length >= 2,
+                    `expected ≥2 MemUpdates with insns>0, got ${nonZero.length}/${memUpdates.length}`);
+                // Counts must be monotonically non-decreasing for a
+                // tight loop. (Equal would only happen if perf gave us
+                // the same sample twice — fine; strictly less is a bug.)
+                for (let i = 1; i < nonZero.length; i++) {
+                    assert.ok(nonZero[i].insns >= nonZero[i - 1].insns,
+                        `MemUpdate.insns went backwards: ${nonZero[i - 1].insns} → ${nonZero[i].insns}`);
+                }
+                assert.ok(nonZero[nonZero.length - 1].insns > nonZero[0].insns,
+                    `MemUpdate.insns did not advance across ${nonZero.length} ticks (final=${nonZero[nonZero.length - 1].insns} initial=${nonZero[0].insns}) — perf counter stuck?`);
+            }
+            console.log(`ok  real turbo86 handover (MemUpdate ×${memUpdates.length} → writeMem applies bytes + insns ${nonZero.length > 0 ? '✓' : 'unavailable'})`);
         } catch (e) {
             console.error(`FAIL MemUpdate E2E: ${e.stack || e.message}`);
             failed++;

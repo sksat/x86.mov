@@ -317,8 +317,20 @@ func (VideoMode) outboundKind() string { return "video_mode" }
 // non-zero pages, emits one MemUpdate, and resumes. The guest never
 // sees the stop — `SIGSTOP` is non-forwardable and the snapshot path
 // doesn't dispatch into the guest's signal table.
+//
+// Insns is the cumulative retired-instruction count for the guest
+// process up to the snapshot point, sampled from a
+// `perf_event_open(PERF_COUNT_HW_INSTRUCTIONS)` fd opened on the
+// child at spawn time. 0 means "counter unavailable" — the runner
+// emits 0 when the perf counter never opened (e.g. tight kernel
+// `perf_event_paranoid` setting or unprivileged container) so the
+// field is always present but optionally meaningful. The frontend
+// uses this to display real native instruction counts instead of
+// substituting Outbound event counts (which were off by orders of
+// magnitude — a guest running at 10⁸ insn/s emitted ~10 events/s).
 type MemUpdate struct {
 	Regions []MemRegion `json:"regions"`
+	Insns   uint64      `json:"insns,omitempty"`
 }
 
 func (MemUpdate) outboundKind() string { return "mem_update" }
