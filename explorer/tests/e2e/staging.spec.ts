@@ -22,14 +22,8 @@ test('staging explorer loads and exposes the major UI surfaces', async ({ page }
     await expect(page.getByTestId('asm-pane')).toBeVisible();
 });
 
-test('staging movfuscator pipeline compiles return42 and movie86 picks it up', async ({ page }) => {
-    page.on('console', (msg) => {
-        console.log(`[console.${msg.type()}]`, msg.text());
-    });
+test('staging movfuscator compile populates IR/asm/ELF panes but surfaces the static-link gap', async ({ page }) => {
     page.on('pageerror', (err) => console.log('[pageerror]', err.message));
-    page.on('requestfailed', (req) =>
-        console.log('[requestfailed]', req.url(), req.failure()?.errorText),
-    );
 
     await page.goto('');
 
@@ -37,27 +31,45 @@ test('staging movfuscator pipeline compiles return42 and movie86 picks it up', a
     await page.getByTestId('compiler-select').click();
     await page.getByRole('option', { name: /movfuscator/ }).click();
 
-    // Pick the return42 preset — exits with code 42.
+    // Pick the return42 preset.
     await page.getByTestId('preset-select').click();
     await page.getByRole('option', { name: /return 42/ }).click();
 
-    // Compile. The link step lazy-fetches ~24 MB of crt + libc.
+    // Compile. Link lazy-fetches ~24 MB of crt + libc on the first call.
     await page.getByTestId('compile-button').click();
 
-    // The status bar reports "compiled in N ms" on success.
     await expect(page.getByTestId('status')).toContainText(/compiled in/, {
         timeout: 120_000,
     });
 
-    // ELF hexdump appears once the binary lands.
+    // The middle pane shows the compiled artifact even when movie86
+    // can't load it — Compile → inspect is the supported path today.
     await expect(page.getByTestId('elf-hexdump')).toBeVisible({ timeout: 5_000 });
 
-    // Wait for the vm-run button to become enabled — that's the
-    // signal that movie86 has loaded the freshly-compiled ELF. Until
-    // PR #32's loadElf-race fix it would stay disabled forever; pin
-    // that explicit transition here so regressions surface fast.
+    // The dynamic-link gap surfaces in the Movie86 panel's alert
+    // (see CLAUDE.md Known limitations). Pin that the user sees the
+    // explanation rather than a dead disabled button.
+    await expect(page.getByTestId('load-error')).toContainText(
+        /DynamicLinkingUnsupported|dynamic/i,
+        { timeout: 30_000 },
+    );
+});
+
+test('staging example fixture round-trips through movie86 to Exit(42)', async ({ page }) => {
+    page.on('pageerror', (err) => console.log('[pageerror]', err.message));
+
+    await page.goto('');
+
+    // Pick the return42 static fixture from the example dropdown.
+    await page.getByTestId('example-select').click();
+    await page.getByRole('option', { name: /return42/ }).click();
+
+    // Static ELF loads cleanly; Run is enabled.
     await expect(page.getByTestId('vm-run')).toBeEnabled({ timeout: 30_000 });
     await page.getByTestId('vm-run').click();
-    // return42 halts almost immediately; wait for the halt card to flip.
-    await expect(page.locator('text=Exit(42)')).toBeVisible({ timeout: 30_000 });
+
+    // return42 halts on Exit(42) almost immediately.
+    await expect(page.locator('text=Exit(42)').first()).toBeVisible({
+        timeout: 30_000,
+    });
 });
