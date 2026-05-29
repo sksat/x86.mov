@@ -1,0 +1,13 @@
+diff --git a/compiler/rustc_target/src/spec/targets/wasm32_wasip1_threads.rs b/compiler/rustc_target/src/spec/targets/wasm32_wasip1_threads.rs
+index 7f5d795e..5eec56e7 100644
+--- a/compiler/rustc_target/src/spec/targets/wasm32_wasip1_threads.rs
++++ b/compiler/rustc_target/src/spec/targets/wasm32_wasip1_threads.rs
+@@ -64,7 +64,7 @@ pub(crate) fn target() -> Target {
+     options.features = "+atomics,+bulk-memory,+mutable-globals".into();
+ 
+     Target {
+-        llvm_target: "wasm32-wasi".into(),
++        llvm_target: "wasm32-wasi-threads".into(),
+         metadata: TargetMetadata {
+             description: None,
+             tier: Some(2),

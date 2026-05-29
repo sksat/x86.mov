@@ -105,15 +105,26 @@ if [ ! -f "$rust_src/wild/libwild/Cargo.toml" ]; then
         && git checkout "$wild_sha" )
 fi
 
-# Apply local patches (none yet — placeholder hook). Keeps the
-# vendor tree intact so the next distclean→setup cycle replays
-# any patches.
+# Apply local patches. `git apply --reverse --check` test detects an
+# already-applied patch so re-running the script across cached vendor
+# trees doesn't die. Order matters lexicographically; current set:
+#
+#   0001-llvm_target-wasm32-wasi-threads.patch
+#       wasm32-wasip1-threads target spec: switch llvm_target from
+#       "wasm32-wasi" (no threads) to "wasm32-wasi-threads". Without
+#       this the LLVM-for-wasm32-wasip1-threads build's CMake
+#       try-compile passes -pthread + --target=wasm32-wasi and
+#       wasm-ld trips on errno.o "not compiled with atomics".
 patch_dir="$root/patches/wasm-rustc"
 if [ -d "$patch_dir" ]; then
     for p in "$patch_dir"/*.patch; do
         [ -f "$p" ] || continue
-        echo "==> applying $(basename "$p")"
-        ( cd "$rust_src" && git apply --check "$p" 2>/dev/null && git apply "$p" )
+        if ( cd "$rust_src" && git apply --reverse --check "$p" 2>/dev/null ); then
+            echo "==> skip $(basename "$p") — already applied"
+        else
+            echo "==> applying $(basename "$p")"
+            ( cd "$rust_src" && git apply --check "$p" && git apply "$p" )
+        fi
     done
 fi
 
