@@ -232,6 +232,24 @@ const (
 	// related sub-calls (e.g. a "query video mode" pair next to
 	// "set video mode") without renumbering downstream consumers.
 	abiCallSetVideoMode uint16 = 0x010
+	abiCallMmapRequest  uint16 = 0x020
+)
+
+// i386 mmap2 args / packing for the mov-only ABI mmap_request call.
+//
+// `eax[31:12]` = page-aligned target addr (top 20 bits), `eax[11:0]` =
+// pages - 1 (so max 4096 pages = 16 MiB per single request). The
+// resulting region is mapped PROT_RWX, MAP_FIXED|MAP_ANONYMOUS|
+// MAP_PRIVATE — same shape the stub uses for its static regions, so
+// dynamic and static regions are indistinguishable on the wire.
+const (
+	sysMmap2 uint32 = 192 // __NR_mmap2 on i386 — not exposed via stdlib
+
+	mmapProtRWX    uint32 = 0x7  // PROT_READ | PROT_WRITE | PROT_EXEC
+	mmapFlagsFixed uint32 = 0x32 // MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE
+	mmapAddrMask   uint32 = 0xFFFFF000
+	mmapSizeMask   uint32 = 0xFFF
+	mmapMaxRegions        = 32 // soft cap on dynamic regions per session
 )
 
 // pageSize is the smallest snapshot granule. Anonymous mmap mappings
@@ -246,32 +264,45 @@ const pageSize = 4096
 //
 // The child MUST be stopped before this is called (otherwise pages can
 // race under your read); the runner only invokes it at ptrace stops.
-func snapshotMemory(mem *procMem) ([]proto.MemRegion, error) {
+func (r *Runner) snapshotMemory() ([]proto.MemRegion, error) {
 	var out []proto.MemRegion
 
-	for _, gr := range guestRegions {
-		buf := make([]byte, gr.size)
-		if err := mem.ReadAt(gr.addr, buf); err != nil {
-			return nil, fmt.Errorf("snapshot region 0x%x..0x%x: %w", gr.addr, gr.addr+gr.size, err)
+	// Walk static guestRegions plus any runtime-mmap'd regions
+	// (mov-only ABI mmap_request, call 0x020). Both kinds are
+	// indistinguishable from `proto.MemRegion` consumers' point of
+	// view — the wire format only carries (addr, bytes).
+	walk := func(addr, size uint32) error {
+		buf := make([]byte, size)
+		if err := r.mem.ReadAt(addr, buf); err != nil {
+			return fmt.Errorf("snapshot region 0x%x..0x%x: %w", addr, addr+size, err)
 		}
 		var i uint32
-		for i < gr.size {
-			// Skip zero pages.
-			for i < gr.size && allZero(buf[i:i+pageSize]) {
+		for i < size {
+			for i < size && allZero(buf[i:i+pageSize]) {
 				i += pageSize
 			}
-			if i >= gr.size {
+			if i >= size {
 				break
 			}
-			// Walk the run of non-zero pages.
 			runStart := i
-			for i < gr.size && !allZero(buf[i:i+pageSize]) {
+			for i < size && !allZero(buf[i:i+pageSize]) {
 				i += pageSize
 			}
 			out = append(out, proto.MemRegion{
-				Addr:  gr.addr + runStart,
+				Addr:  addr + runStart,
 				Bytes: append([]byte(nil), buf[runStart:i]...),
 			})
+		}
+		return nil
+	}
+	for _, gr := range guestRegions {
+		if err := walk(gr.addr, gr.size); err != nil {
+			return nil, err
+		}
+	}
+	for _, gr := range r.extraRegions {
+		if err := walk(gr.addr, gr.size); err != nil {
+			return nil, err
 		}
 	}
 	return out, nil
@@ -369,6 +400,14 @@ type Runner struct {
 	mode       proto.Mode       // host (default) or trap
 	handlers   map[uint8]uint32 // signum → handler addr (trap mode only)
 	signalRegs []regs32         // saved regs stack for rt_sigreturn (trap mode only)
+
+	// extraRegions is the runtime-mmap'd regions added on top of the
+	// static `guestRegions` set, one per successful mov-only ABI
+	// `mmap_request` (call 0x020). snapshotMemory walks these too so
+	// guests that grow their address space mid-session don't have to
+	// pre-declare every region; the Pause / Fault snapshot stays
+	// accurate. Only touched from the tracer goroutine.
+	extraRegions []struct{ addr, size uint32 }
 }
 
 type startMsg struct {
@@ -543,11 +582,14 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 	// kernel will dispatch into the guest's handler and the child
 	// stays alive.
 	r.handlers = make(map[uint8]uint32)
-	if r.mode == proto.ModeTrap {
-		if err := r.mem.WriteAt(trapTrampolineAddr, trapTrampolineBytes); err != nil {
-			r.emitFault(fmt.Sprintf("write trap-mode restorer trampoline: %v", err))
-			return
-		}
+	// Always materialise the trampoline. trap mode uses it as the
+	// rt_sigreturn landing pad; both modes need the CD 80 at offset 5
+	// as the syscall site for mov-only ABI mmap_request injection.
+	// Writing it unconditionally keeps the two callers honest about
+	// the trampoline's presence (no mode-conditional foot-gun).
+	if err := r.mem.WriteAt(trapTrampolineAddr, trapTrampolineBytes); err != nil {
+		r.emitFault(fmt.Sprintf("write syscall/restorer trampoline: %v", err))
+		return
 	}
 
 	// Apply setup (memory + regs) from the start command.
@@ -758,6 +800,8 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 	switch call.num {
 	case abiCallSetVideoMode:
 		r.eventsCh <- proto.VideoMode{Mode: uint8(call.arg)}
+	case abiCallMmapRequest:
+		return r.handleMmapRequest(call, regs)
 	default:
 		r.emitFault(fmt.Sprintf("unknown mov-only ABI call 0x%03x at EIP=0x%x", call.num, regs.Eip))
 		return false
@@ -770,13 +814,127 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 	return true
 }
 
+// handleMmapRequest unpacks the (addr, size) pair the guest packed into
+// EAX, injects an `mmap2` syscall via ptrace, records the new region so
+// snapshots include it, and advances EIP past the faulting mov.
+//
+// On any failure (cap reached, syscall rejected, mmap returned a
+// different addr than requested), emits a Fault — the guest can't make
+// progress without the region it asked for, and silent partial success
+// would let the next mov into that range fault confusingly.
+func (r *Runner) handleMmapRequest(call abiCall, regs *regs32) bool {
+	if len(r.extraRegions) >= mmapMaxRegions {
+		r.emitFault(fmt.Sprintf(
+			"mov-only ABI mmap_request: too many dynamic regions (cap=%d)", mmapMaxRegions))
+		return false
+	}
+	addr := call.arg & mmapAddrMask
+	pages := (call.arg & mmapSizeMask) + 1
+	size := pages << 12
+	ret, err := r.injectSyscall(regs, sysMmap2,
+		addr, size, mmapProtRWX, mmapFlagsFixed, ^uint32(0), 0)
+	if err != nil {
+		r.emitFault(fmt.Sprintf("mmap_request inject: %v", err))
+		return false
+	}
+	if ret != addr {
+		r.emitFault(fmt.Sprintf(
+			"mmap_request: kernel mapped 0x%x, asked for 0x%x (size=0x%x)", ret, addr, size))
+		return false
+	}
+	r.extraRegions = append(r.extraRegions, struct{ addr, size uint32 }{addr, size})
+
+	regs.Eip += uint32(call.insnLen)
+	if err := ptraceSetRegs32(r.pid, regs); err != nil {
+		r.emitFault(fmt.Sprintf("set regs after mmap_request: %v", err))
+		return false
+	}
+	return true
+}
+
+// injectSyscall executes an i386 syscall in the stopped child by
+// hijacking EIP onto the existing `int 0x80` site inside the trap
+// trampoline (`trapTrampolineAddr + 5`), driving the ptrace
+// entry/exit-stop pair, and restoring the pre-injection register
+// state. Returns the syscall return value (kernel writes it back
+// into EAX at the exit stop).
+//
+// Caller's `*regs` is restored to the pre-injection values; the
+// caller is responsible for advancing EIP / writing any post-call
+// state via ptraceSetRegs32.
+//
+// Must be called only from inside an existing ptrace stop on the
+// tracer goroutine — driving PTRACE_SYSCALL from anywhere else would
+// race with the outer syscallLoop.
+func (r *Runner) injectSyscall(regs *regs32, num uint32, args ...uint32) (uint32, error) {
+	saved := *regs
+
+	regs.Eip = trapTrampolineAddr + 5 // points at the CD 80 in the trampoline
+	regs.Eax = num
+	regs.OrigEax = num
+	if len(args) > 0 {
+		regs.Ebx = args[0]
+	}
+	if len(args) > 1 {
+		regs.Ecx = args[1]
+	}
+	if len(args) > 2 {
+		regs.Edx = args[2]
+	}
+	if len(args) > 3 {
+		regs.Esi = args[3]
+	}
+	if len(args) > 4 {
+		regs.Edi = args[4]
+	}
+	if len(args) > 5 {
+		regs.Ebp = args[5]
+	}
+	if err := ptraceSetRegs32(r.pid, regs); err != nil {
+		return 0, fmt.Errorf("set regs (syscall inject): %w", err)
+	}
+
+	// Drive the entry/exit-stop pair. PTRACE_O_TRACESYSGOOD is on, so
+	// stops arrive with (SIGTRAP | 0x80); anything else here is a
+	// surprise we abort on.
+	var ws syscall.WaitStatus
+	for stop := 0; stop < 2; stop++ {
+		if err := syscall.PtraceSyscall(r.pid, 0); err != nil {
+			return 0, fmt.Errorf("PTRACE_SYSCALL during inject: %w", err)
+		}
+		if _, err := syscall.Wait4(r.pid, &ws, 0, nil); err != nil {
+			return 0, fmt.Errorf("wait during inject: %w", err)
+		}
+		if !ws.Stopped() {
+			return 0, fmt.Errorf("inject: child not stopped: %v", ws)
+		}
+		if sig := ws.StopSignal(); sig != syscallTrap {
+			return 0, fmt.Errorf("inject: expected syscall-stop, got signal %d", sig)
+		}
+	}
+
+	if err := ptraceGetRegs32(r.pid, regs); err != nil {
+		return 0, fmt.Errorf("get regs (syscall return): %w", err)
+	}
+	ret := regs.Eax
+
+	// Restore caller's regs (kernel-side) so the post-inject state is
+	// indistinguishable from "we were never here". The caller is
+	// responsible for any deliberate state changes (EIP advance, etc.).
+	*regs = saved
+	if err := ptraceSetRegs32(r.pid, regs); err != nil {
+		return 0, fmt.Errorf("set regs (syscall restore): %w", err)
+	}
+	return ret, nil
+}
+
 func (r *Runner) capturePausedSnapshot(sig syscall.Signal) (pausedSnapshot, error) {
 	var snap pausedSnapshot
 	var rs regs32
 	if err := ptraceGetRegs32(r.pid, &rs); err != nil {
 		return snap, err
 	}
-	regions, err := snapshotMemory(r.mem)
+	regions, err := r.snapshotMemory()
 	if err != nil {
 		return snap, err
 	}
