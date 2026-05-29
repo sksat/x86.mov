@@ -152,6 +152,13 @@ impl Cpu {
                 let off_bits = u32::from_ne_bytes(off.to_ne_bytes());
                 Ok(next_eip_default.wrapping_add(off_bits))
             }
+            Insn::JmpRel8(off) => {
+                // Same as JmpRel32 but with the 8-bit displacement
+                // sign-extended; relative to the next instruction (the
+                // address right after the 2-byte EB jmp).
+                let off_bits = u32::from_ne_bytes(i32::from(off).to_ne_bytes());
+                Ok(next_eip_default.wrapping_add(off_bits))
+            }
             Insn::Int(0x80) => {
                 let args = SyscallArgs::from_regs(&self.regs);
                 match host.syscall(&args, mem)? {
@@ -922,6 +929,27 @@ mod tests {
         let mut cpu = Cpu::new(0x1005);
         cpu.step(&mut mem, &mut PanicHost).unwrap();
         assert_eq!(cpu.eip, 0x1000);
+    }
+
+    #[test]
+    fn step_jmp_rel8_targets_eip_relative_to_next_insn() {
+        // 1000: eb 0a   → jmp +10
+        // Next-insn address is 0x1002; target is 0x1002 + 10 = 0x100c.
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x100);
+        mem.write_bytes(0x1000, &[0xeb, 0x0a]).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0x100c);
+    }
+
+    #[test]
+    fn step_jmp_rel8_negative_loops_back() {
+        // 1005: eb fe  → jmp -2  (next-insn is 0x1007; target 0x1005 — self-loop)
+        let mut mem = FlatMemory::new_zeroed(0x1000, 0x100);
+        mem.write_bytes(0x1005, &[0xeb, 0xfe]).unwrap();
+        let mut cpu = Cpu::new(0x1005);
+        cpu.step(&mut mem, &mut PanicHost).unwrap();
+        assert_eq!(cpu.eip, 0x1005);
     }
 
     #[test]

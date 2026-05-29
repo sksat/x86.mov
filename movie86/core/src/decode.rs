@@ -70,6 +70,11 @@ pub fn decode(bytes: &[u8]) -> Result<(Insn, u8), Fault> {
             let off = read_i32_le(rest, 1)?;
             (Insn::JmpRel32(off), 5)
         }
+        // jmp rel8 — opcode EB cb (short form the assembler relaxes to)
+        (false, 0xEB) => {
+            let off = i8::from_ne_bytes([*rest.get(1).ok_or(Fault::DecodeTruncated)?]);
+            (Insn::JmpRel8(off), 2)
+        }
         // int imm8 — opcode CD ib
         (false, 0xCD) => {
             let n = *rest.get(1).ok_or(Fault::DecodeTruncated)?;
@@ -912,6 +917,24 @@ mod tests {
         // e9 fb ff ff ff → jmp -5 (i.e. an infinite loop on a 5-byte jmp)
         let (insn, _) = decode(&[0xe9, 0xfb, 0xff, 0xff, 0xff]).unwrap();
         assert_eq!(insn, Insn::JmpRel32(-5));
+    }
+
+    #[test]
+    fn jmp_rel8_positive() {
+        // eb 05 → jmp +5 (short form). The assembler relaxes in-range
+        // `jmp label` to this 2-byte EB form; llvm-mov-generated mov-only
+        // ELFs hit it on the dispatcher jumps, so movie86 must decode it.
+        let (insn, len) = decode(&[0xeb, 0x05]).unwrap();
+        assert_eq!(len, 2);
+        assert_eq!(insn, Insn::JmpRel8(5));
+    }
+
+    #[test]
+    fn jmp_rel8_negative_disp() {
+        // eb fe → jmp -2 (a 2-byte self-loop).
+        let (insn, len) = decode(&[0xeb, 0xfe]).unwrap();
+        assert_eq!(len, 2);
+        assert_eq!(insn, Insn::JmpRel8(-2));
     }
 
     #[test]

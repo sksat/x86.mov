@@ -182,6 +182,13 @@ pub enum Insn {
     /// `jmp rel32` (opcode `E9 cd`) — unconditional near jump. The
     /// displacement is added to the address of the **next** instruction.
     JmpRel32(i32),
+    /// `jmp rel8` (opcode `EB cb`) — short unconditional jump, an 8-bit
+    /// signed displacement from the next instruction. Same semantics as
+    /// [`Insn::JmpRel32`], just the encoding the assembler picks when a
+    /// `jmp label` target is within `rel8` range. mov-only output from
+    /// llvm-mov hits this on its dispatcher jumps (gas relaxes them to
+    /// the 2-byte EB form), so the emulator has to decode both widths.
+    JmpRel8(i8),
     /// `int n` (opcode `CD ib`) — software interrupt. Only `int 0x80`
     /// (Linux syscall) is wired to a handler; other vectors trap.
     Int(u8),
@@ -382,6 +389,10 @@ impl core::fmt::Display for Insn {
             Self::JmpRel32(off) => {
                 f.write_str("jmp ")?;
                 fmt_rel(f, *off)
+            }
+            Self::JmpRel8(off) => {
+                f.write_str("jmp ")?;
+                fmt_rel(f, i32::from(*off))
             }
             Self::CallRel32(off) => {
                 f.write_str("call ")?;
