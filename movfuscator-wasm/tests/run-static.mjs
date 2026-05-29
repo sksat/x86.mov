@@ -473,6 +473,101 @@ await runTest('static-linked return42.elf reaches movfuscator SIGILL without pri
     );
 });
 
+// --- Test 6: extraLdArgs splices raw ld flags (byte-matches host) ---
+//
+// The explorer's canvas presets pin a framebuffer BSS section at the
+// mode-13h base (0xA0000) and keep it from being garbage-collected,
+// using two position-independent ld flags the wrapper has no dedicated
+// knob for:
+//
+//   --section-start=.fb13h=0xA0000   (place the section)
+//   --undefined=_fb13h_region        (retain its only symbol)
+//
+// `opts.extraLdArgs` passes them verbatim, spliced in right after the
+// mode switch (`-static`) and before `-L`/objects. This pins that
+// layout byte-for-byte against host /usr/bin/ld given the same flags —
+// the recipe `movie86/wasm/examples/sources/build-mandelbrot.sh` uses.
+const FB_STUB_S = `
+.text
+.globl _start
+_start:
+    movl $0, %ebx
+    movl $1, %eax
+    int $0x80
+
+.section .fb13h, "aw", @nobits
+.globl _fb13h_region
+_fb13h_region:
+.skip 256000
+`;
+
+await runTest('extraLdArgs splices --section-start / --undefined (byte-matches host)', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'movfuscator-extraldargs-'));
+    const sPath = join(tmp, 'fbstub.s');
+    const oPath = join(tmp, 'fbstub.o');
+    writeFileSync(sPath, FB_STUB_S);
+    const asRes = spawnSync('/usr/bin/as', [
+        '--32', '-mx86-used-note=no', '-o', oPath, sPath,
+    ], { encoding: 'buffer' });
+    if (asRes.status !== 0) {
+        throw new Error(`as failed: ${asRes.stderr?.toString() || ''}`);
+    }
+    const fbObj = readFileSync(oPath);
+
+    const ldArgs = ['--section-start=.fb13h=0xA0000', '--undefined=_fb13h_region'];
+    const wasmElf = await link(
+        { 'fbstub.o': new Uint8Array(fbObj) },
+        libs,
+        { static: true, runtime: 'none', extraLdArgs: ldArgs },
+    );
+
+    // Host baseline: same flags, same position (after `-static`, before
+    // `-L`/objects) so the byte comparison is meaningful.
+    const hostOut = join(tmp, 'out.elf');
+    const B = join(root, 'vendor/movfuscator/build');
+    const args = [
+        '-m', 'elf_i386', '--hash-style=gnu',
+        '-static',
+        ...ldArgs,
+        '-L', B, '-L', `${B}/gcc/32`, '-L', '/usr/lib32', '-L', '/lib32',
+        oPath,
+        '-o', hostOut,
+    ];
+    const res = spawnSync('/usr/bin/ld', args, { encoding: 'buffer' });
+    if (res.status !== 0) {
+        throw new Error(`host ld (extraLdArgs) failed: ${res.stderr?.toString() || ''}`);
+    }
+    const hostElf = readFileSync(hostOut);
+    if (!bytesEqual(wasmElf, hostElf)) {
+        throw new Error(
+            `extraLdArgs ELF drift: wasm ${wasmElf.length} B vs host ${hostElf.length} B`,
+        );
+    }
+    // The section-start must actually have placed the framebuffer so
+    // that *some* PT_LOAD covers guest 0xA0000 — that's what lets
+    // movie86 pre-map it. The covering segment's VirtAddr is page-
+    // aligned *below* 0xA0000 (ld folds the ELF header + alignment in,
+    // so the real working canvas_mandelbrot.elf shows vaddr 0x9f000,
+    // MemSiz 0x3f800), with `.fb13h` itself landing at 0xA0000 inside
+    // it. So check range coverage, not an exact VirtAddr match.
+    const dv = new DataView(wasmElf.buffer, wasmElf.byteOffset, wasmElf.byteLength);
+    const phoff = dv.getUint32(28, true);
+    const phentsize = dv.getUint16(42, true);
+    const phnum = dv.getUint16(44, true);
+    const FB = 0xA0000;
+    let foundFb = false;
+    for (let i = 0; i < phnum; i++) {
+        const base = phoff + i * phentsize;
+        const ptype = dv.getUint32(base, true);
+        const vaddr = dv.getUint32(base + 8, true);
+        const memsz = dv.getUint32(base + 20, true);
+        if (ptype === 1 /* PT_LOAD */ && vaddr <= FB && FB < vaddr + memsz) foundFb = true;
+    }
+    if (!foundFb) {
+        throw new Error('no PT_LOAD covers guest 0xA0000 — --section-start did not take effect');
+    }
+});
+
 console.log();
 console.log(`results: ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ''}`);
 process.exit(fail ? 1 : 0);

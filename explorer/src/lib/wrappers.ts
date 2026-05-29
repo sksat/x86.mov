@@ -33,6 +33,10 @@ export interface MovfuscatorWrapper {
             extraLibs?: string[];
             searchPaths?: string[];
             extraInputs?: Record<string, Uint8Array>;
+            /** Raw `ld` flags spliced in after the mode switch, before
+             *  `-L`/objects. Used by the canvas13h profile for
+             *  `--section-start` / `--undefined`. */
+            extraLdArgs?: string[];
         },
     ): Promise<Uint8Array>;
     compileToElf(

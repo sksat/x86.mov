@@ -93,12 +93,18 @@ export function App() {
                 .split(/\s+/)
                 .map((s) => s.trim())
                 .filter(Boolean);
+            // The selected preset can carry a link profile (e.g. the
+            // mandelbrot's canvas13h, which wires the framebuffer stubs
+            // + pins .fb13h at 0xA0000). It follows the preset, not the
+            // (possibly hand-edited) source text.
+            const linkProfile = PRESETS.find((p) => p.id === presetId)?.linkProfile;
             const res = await compile({
                 compiler,
                 source,
                 opts: {
                     optLevel,
                     clangFlags: flags,
+                    linkProfile,
                     onProgress: (stage) =>
                         setStatusBar({ kind: 'busy', text: `compiling — ${stage}` }),
                 },
@@ -116,7 +122,7 @@ export function App() {
         } finally {
             setBusy(false);
         }
-    }, [compiler, source, optLevel, extraFlags]);
+    }, [compiler, source, optLevel, extraFlags, presetId]);
 
     const elf = useMemo(() => result?.elf ?? null, [result]);
 

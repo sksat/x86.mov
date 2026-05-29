@@ -159,9 +159,14 @@ turbo86. Everything else is supporting cast.
 There is exactly one optional escape hatch: the **Upload** button in
 the Movie86 panel header (`data-testid="elf-upload"`), for the case
 where the user wants to drop in an arbitrary static ELF instead of
-the just-compiled one. **Do not** reintroduce pre-built "example"
-preset dropdowns — that would push the page's intent away from "run
-what you compiled".
+the just-compiled one. **Do not** reintroduce a pre-built *fixture*
+dropdown that loads compiled ELFs and skips the toolchain — that's the
+thing PR-era commit `5580b7e` removed, and it pushes the page away from
+"run what you compiled". The **source** preset menu (`presets.ts`) is
+the opposite and stays: it drops editable C into the editor that the
+user then compiles + runs themselves. Adding source presets — even a
+heavyweight one like the mode-13h `mandelbrot` that renders in the
+Canvas pane — is in-intent.
 
 ## Known limitations
 
@@ -191,6 +196,24 @@ what you compiled".
 
 ## Things future Claude shouldn't relearn
 
+- **Canvas presets ride a *link profile*, not a special pipeline.** A
+  preset that needs more than the bare `_start.o + <user>.o` static
+  link names a `linkProfile` (today only `'canvas13h'`); `explorer.mjs`
+  expands it (`LINK_PROFILES`) into an extra assembled stubs object +
+  raw `ld` flags. `canvas13h` links the mov-only ABI stubs
+  (`set_video_mode` / `mmap_request` / `exit`) and pins a `.fb13h` BSS
+  section at the VGA base `0xA0000` via
+  `--section-start=.fb13h=0xA0000 --undefined=_fb13h_region`. Those raw
+  flags reach `ld` through `movfuscator-wasm` `link()`'s `extraLdArgs`
+  (added alongside this profile; defaults to `[]` so every byte-
+  identical golden is unchanged). The embedded movie86 needs **no**
+  changes — `Canvas.tsx` already reads `vm.activeVideoMode` + the
+  framebuffer, and the loader pre-maps the `PT_LOAD` at `0xA0000`.
+  Canvas presets only *run* on the **llvm-mov** path (the movfuscator
+  path's externs stay undefined dynamic symbols — inspectable, not
+  runnable, like every movfuscator-path ELF today). The mov-only ABI
+  asm lives in `explorer.mjs`, never in the preset data, so presets
+  stay pure source strings.
 - **Don't bundle the sibling wrappers** (see Operating model #2). If
   TypeScript starts complaining that the runtime import URL can't be
   resolved, the fix is to keep the dynamic `import()` and refine the

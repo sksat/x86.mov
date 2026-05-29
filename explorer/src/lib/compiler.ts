@@ -32,7 +32,17 @@ export interface CompileParams {
             extraLibs?: string[];
             searchPaths?: string[];
             extraInputs?: Record<string, Uint8Array>;
+            /** Raw `ld` flags spliced in verbatim (one slot per entry).
+             *  The canvas13h link profile uses this for
+             *  `--section-start` / `--undefined`; callers rarely set it
+             *  directly. */
+            extraLdArgs?: string[];
         };
+        /** Named link recipe (llvm-mov path only). `'canvas13h'` links
+         *  the mov-only ABI framebuffer stubs + pins `.fb13h` at the VGA
+         *  base so a mode-13h program renders in the Canvas pane. Driven
+         *  by the selected preset's `linkProfile`. */
+        linkProfile?: 'canvas13h';
         onProgress?: (stage: string) => void;
     };
 }
