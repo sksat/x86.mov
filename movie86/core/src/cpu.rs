@@ -5,6 +5,7 @@
 //! to a per-instruction executor. Decoding stays in `decode.rs` so the same
 //! decoder remains usable by tracing / disassembly callers.
 
+use crate::bios_host::{BiosArgs, BiosHost, BiosResult};
 use crate::decode::decode;
 use crate::insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
 use crate::libc_host::{LibcCall, LibcHost, LibcResult};
@@ -85,7 +86,7 @@ impl Cpu {
     pub fn step<M, H>(&mut self, mem: &mut M, host: &mut H) -> Result<(), Fault>
     where
         M: Memory,
-        H: SysHost + LibcHost,
+        H: SysHost + LibcHost + BiosHost,
     {
         let mut buf = [0u8; MAX_INSN_LEN];
         let (n, partial_fault) = fetch(mem, self.eip, &mut buf)?;
@@ -137,7 +138,7 @@ impl Cpu {
     ) -> Result<u32, Fault>
     where
         M: Memory,
-        H: SysHost + LibcHost,
+        H: SysHost + LibcHost + BiosHost,
     {
         match insn {
             Insn::Mov { dst, src } => {
@@ -154,6 +155,19 @@ impl Cpu {
                 let args = SyscallArgs::from_regs(&self.regs);
                 match host.syscall(&args, mem)? {
                     SyscallResult::Return(v) => {
+                        self.set_reg(Reg32::Eax, v);
+                        Ok(next_eip_default)
+                    }
+                }
+            }
+            Insn::Int(0x10) => {
+                // BIOS video services. The host implements whichever
+                // function it cares about (typically `AH=0` mode-set);
+                // unknown subfunctions trap through `bios_call`'s
+                // default impl as `UnsupportedInterrupt(0x10)`.
+                let args = BiosArgs::from_regs(&self.regs);
+                match host.bios_call(&args, mem)? {
+                    BiosResult::Return(v) => {
                         self.set_reg(Reg32::Eax, v);
                         Ok(next_eip_default)
                     }
@@ -440,6 +454,7 @@ mod tests {
         }
     }
     impl LibcHost for PanicHost {}
+    impl BiosHost for PanicHost {}
 
     /// Test host that records the last syscall and returns a fixed value.
     struct RecordingHost {
@@ -465,6 +480,7 @@ mod tests {
         }
     }
     impl LibcHost for RecordingHost {}
+    impl BiosHost for RecordingHost {}
 
     /// Build a memory region and encode `mov r32, imm32` at its base.
     fn make_mov_r32_imm32(reg_idx: u8, imm: u32, base: u32) -> FlatMemory {
@@ -901,6 +917,55 @@ mod tests {
     }
 
     #[test]
+    fn step_int_0x10_invokes_bios_host_with_register_snapshot() {
+        // cd 10 → int 0x10 (BIOS video services)
+        struct RecordingBios {
+            last: Option<BiosArgs>,
+            return_value: u32,
+        }
+        impl SysHost for RecordingBios {
+            fn syscall(
+                &mut self,
+                args: &SyscallArgs,
+                _mem: &mut dyn Memory,
+            ) -> Result<SyscallResult, Fault> {
+                panic!("unexpected syscall {:#x}", args.eax);
+            }
+        }
+        impl LibcHost for RecordingBios {}
+        impl BiosHost for RecordingBios {
+            fn bios_call(
+                &mut self,
+                args: &BiosArgs,
+                _mem: &mut dyn Memory,
+            ) -> Result<BiosResult, Fault> {
+                self.last = Some(*args);
+                Ok(BiosResult::Return(self.return_value))
+            }
+        }
+        let mut mem = FlatMemory::new_zeroed(0x1000, 16);
+        mem.write_bytes(0x1000, &[0xcd, 0x10]).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        // AH=0 (set mode), AL=0x13 (mode 13h) → eax = 0x00000013.
+        cpu.set_reg(Reg32::Eax, 0x0000_0013);
+        let mut host = RecordingBios {
+            last: None,
+            return_value: 0xdead_beef,
+        };
+        cpu.step(&mut mem, &mut host).unwrap();
+        let args = host.last.expect("host saw the BIOS call");
+        assert_eq!(args.eax, 0x0000_0013);
+        assert_eq!(args.ah(), 0);
+        assert_eq!(args.al(), 0x13);
+        assert_eq!(
+            cpu.reg(Reg32::Eax),
+            0xdead_beef,
+            "BIOS return value should land in EAX",
+        );
+        assert_eq!(cpu.eip, 0x1002);
+    }
+
+    #[test]
     fn step_int_non_syscall_vector_traps() {
         let mut mem = FlatMemory::new_zeroed(0x1000, 16);
         mem.write_bytes(0x1000, &[0xcd, 0x03]).unwrap();
@@ -945,6 +1010,7 @@ mod tests {
             Ok(LibcResult::Return(self.return_value))
         }
     }
+    impl BiosHost for RecordingLibcHost {}
 
     #[test]
     fn step_int_0x81_invokes_libc_host_with_trap_addr_and_cdecl_args() {

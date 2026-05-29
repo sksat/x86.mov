@@ -140,12 +140,131 @@ try {
         assert.equal(vm.sigsegvHandler, undefined, `sigsegvHandler expected undefined, got ${vm.sigsegvHandler}`);
         assert.equal(vm.sigillHandler,  undefined, `sigillHandler expected undefined, got ${vm.sigillHandler}`);
 
+        // return42 also doesn't `int 0x10`, so no video mode is active.
+        // Run to completion and check the getter stays undefined.
+        while (!vm.haltReason) vm.stepN(100n);
+        assert.equal(vm.activeVideoMode, undefined,
+            `return42 shouldn't touch BIOS — activeVideoMode expected undefined, got ${vm.activeVideoMode}`);
+
         console.log('ok  Vm introspection (return42)');
     } finally {
         vm.free();
     }
 } catch (e) {
     console.error(`FAIL Vm introspection: ${e.message}`);
+    failed++;
+}
+
+// --- Canvas pipeline smoke ---
+//
+// canvas_smile draws a yellow filled circle at (160, 100) in mode 13h
+// (320×200 RGBA mapped at 0xA0000). Run to completion, then verify
+// that (a) a known-yellow pixel landed where we expect, and (b) a
+// corner pixel stayed BSS-zero. This is the only test that exercises
+// the multi-PT_LOAD loader path + the demo's memory-mapped framebuffer
+// convention end-to-end.
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/canvas_smile.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        while (!vm.haltReason) vm.stepN(20000n);
+        assert.equal(vm.exitCode, 0,
+            `canvas_smile should exit 0, got ${vm.exitCode} (halt=${vm.haltReason})`);
+
+        // FB layout: mode 13h base 0xA0000, RGBA, stride = 320 * 4.
+        const FB_ADDR = 0x000A_0000;
+        const FB_W = 320;
+        const centerOffset = (100 * FB_W + 160) * 4;
+        const center = vm.readMem(FB_ADDR + centerOffset, 4);
+        // The face fill is rgba(255, 220, 60, 255).
+        assert.deepEqual(Array.from(center), [255, 220, 60, 255],
+            `canvas_smile center pixel = ${Array.from(center).join(',')} (expected 255,220,60,255)`);
+
+        // Top-left corner should still be BSS-zeroed (face doesn't reach here).
+        const corner = vm.readMem(FB_ADDR, 4);
+        assert.deepEqual(Array.from(corner), [0, 0, 0, 0],
+            `canvas_smile (0,0) = ${Array.from(corner).join(',')} (expected all-zero BSS)`);
+
+        // The example's prologue is `mov eax, 0x13 ; int 0x10` (set
+        // VGA mode 13h). After running, the host should have recorded
+        // that mode as active.
+        assert.equal(vm.activeVideoMode, 0x13,
+            `canvas_smile should set VGA mode 13h — activeVideoMode = ${vm.activeVideoMode}`);
+
+        console.log(`ok  canvas_smile  exit=0 mode=0x13 center=yellow corner=zero`);
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL canvas_smile: ${e.message}`);
+    failed++;
+}
+
+// --- Mode-switch smoke ---
+//
+// canvas_modes sets VGA mode 13h, paints a red rect, then `int 0x10`-
+// switches to mode 12h, paints a blue rect, exits. After the run:
+//   - vm.activeVideoMode must be 0x12 (the *last* mode set)
+//   - mode 13h's region must show red at its drawing center
+//   - mode 12h's region must show blue at its drawing center
+// Catches bios_call mode-set being a one-shot, the wrong region
+// getting written, or a stale `active_video_mode` after a second
+// `int 0x10`.
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/canvas_modes.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        while (!vm.haltReason) vm.stepN(50000n);
+        assert.equal(vm.exitCode, 0,
+            `canvas_modes should exit 0, got ${vm.exitCode} (halt=${vm.haltReason})`);
+        assert.equal(vm.activeVideoMode, 0x12,
+            `canvas_modes ends with mode 12h set — activeVideoMode = ${vm.activeVideoMode}`);
+        // Mode 13h center (320×200, red rect at (160,100)).
+        const m13 = vm.readMem(0xA0000 + (100 * 320 + 160) * 4, 4);
+        assert.deepEqual(Array.from(m13), [220, 60, 60, 255],
+            `canvas_modes mode-13h center = ${Array.from(m13).join(',')} (expected 220,60,60,255)`);
+        // Mode 12h center (640×480, blue rect at (320,240)).
+        const m12 = vm.readMem(0x100000 + (240 * 640 + 320) * 4, 4);
+        assert.deepEqual(Array.from(m12), [60, 120, 240, 255],
+            `canvas_modes mode-12h center = ${Array.from(m12).join(',')} (expected 60,120,240,255)`);
+        console.log('ok  canvas_modes  active=0x12 red@13h blue@12h');
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL canvas_modes: ${e.message}`);
+    failed++;
+}
+
+// --- llvm-mov Mandelbrot smoke (partial run) ---
+//
+// canvas_mandelbrot.elf is real C compiled through clang -O2 → llvm-mov-llc;
+// a full run takes ~90 s, way too long for CI. So we step a fixed budget
+// and verify that (a) the new 0xB0..0xB7 + 0xC6 decoders didn't trap on
+// the way in, (b) the `int 0x10` mode-set ran, and (c) at least one
+// FB pixel got written (i.e. the loop body is actually executing).
+// Catches: decoder regressions, BIOS dispatch breaking, or a silent loop
+// where execution stalls before reaching the framebuffer-paint phase.
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/canvas_mandelbrot.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        vm.stepN(30_000_000n);
+        assert.equal(vm.haltReason, undefined,
+            `canvas_mandelbrot unexpected early halt: ${vm.haltReason}`);
+        assert.equal(vm.activeVideoMode, 0x13,
+            `canvas_mandelbrot should set VGA mode 13h — activeVideoMode = ${vm.activeVideoMode}`);
+        const fb = vm.readMem(0xA0000, 320 * 200 * 4);
+        let colored = 0;
+        for (let i = 3; i < fb.length; i += 4) if (fb[i] === 255) colored++;
+        assert.ok(colored > 0,
+            `canvas_mandelbrot should have written at least one pixel after 30M steps (got ${colored})`);
+        console.log(`ok  canvas_mandelbrot (partial)  steps=${vm.steps} pixels=${colored}/64000`);
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL canvas_mandelbrot: ${e.message}`);
     failed++;
 }
 

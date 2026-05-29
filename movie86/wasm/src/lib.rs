@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use movie86::bios_host::{BiosArgs, BiosHost, BiosResult};
 use movie86::decode::decode as decode_insn;
 use movie86::elf::{flatten_with_stack, parse, LoadedElf};
 use movie86::libc_host::{LibcCall, LibcHost, LibcResult};
@@ -36,6 +37,10 @@ struct WasmHost {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     libc_stubs: BTreeMap<u32, LibcFn>,
+    /// VGA-style video mode set by the guest via `int 0x10 ; AH=0`.
+    /// `None` until the guest sets a mode (so the demo UI knows to
+    /// show "no mode selected" rather than picking a default canvas).
+    active_video_mode: Option<u8>,
 }
 
 impl SysHost for WasmHost {
@@ -120,6 +125,32 @@ impl LibcHost for WasmHost {
             if b0 == Some(0xCD) && b1 == Some(0x81) {
                 self.libc_stubs.insert(addr, which);
             }
+        }
+    }
+}
+
+impl BiosHost for WasmHost {
+    /// BIOS video services (`int 0x10`). Only `AH=0` (set video mode)
+    /// is implemented; other subfunctions trap via the default impl.
+    ///
+    /// The mode number lives in `AL`. We don't validate it here — the
+    /// JS side keeps the catalogue (`FRAMEBUFFER_MODES`) and just
+    /// ignores any mode it doesn't recognise. Setting an unknown mode
+    /// is therefore equivalent to "no canvas selected" in the demo,
+    /// matching how real-mode BIOS treats unsupported mode numbers as
+    /// a no-op without faulting.
+    fn bios_call(
+        &mut self,
+        args: &BiosArgs,
+        _mem: &mut dyn Memory,
+    ) -> Result<BiosResult, Fault> {
+        match args.ah() {
+            0 => {
+                self.active_video_mode = Some(args.al());
+                // Real BIOS returns 0 in AL on success — we follow.
+                Ok(BiosResult::Return(0))
+            }
+            _ => Err(Fault::UnsupportedInterrupt(0x10)),
         }
     }
 }
@@ -490,6 +521,16 @@ impl Vm {
     #[wasm_bindgen(getter, js_name = sigillHandler)]
     pub fn sigill_handler(&self) -> Option<u32> {
         self.cpu.signal_handler(Signal::Ill)
+    }
+
+    /// VGA-style video mode set by the guest via `int 0x10 ; AH=0`
+    /// (mode number from `AL`). `None` until the guest sets one; the
+    /// demo uses this to decide which canvas to show — examples that
+    /// never call `int 0x10` get no canvas, mirroring real BIOS where
+    /// "no mode set yet" means there's nothing to draw.
+    #[wasm_bindgen(getter, js_name = activeVideoMode)]
+    pub fn active_video_mode(&self) -> Option<u8> {
+        self.host.active_video_mode
     }
 
     #[wasm_bindgen(getter, js_name = memBase)]

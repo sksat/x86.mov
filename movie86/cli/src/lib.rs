@@ -4,6 +4,7 @@
 
 use std::io::{self, Write};
 
+use movie86::bios_host::BiosHost;
 use movie86::elf::{flatten_with_stack, parse, ElfError, LoadedElf};
 use movie86::libc_host::{LibcCall, LibcHost, LibcResult};
 use movie86::syscall::{SysHost, SyscallArgs, SyscallResult};
@@ -158,6 +159,13 @@ impl LibcHost for StdHost {
         }
     }
 }
+
+/// The CLI doesn't have a canvas to write to, so we don't implement
+/// any `int 0x10` BIOS subfunctions — the default impl traps with
+/// `Fault::UnsupportedInterrupt(0x10)`, which a CLI-driven test that
+/// runs a canvas-flavoured ELF will surface as a fault, just like an
+/// unknown syscall would.
+impl BiosHost for StdHost {}
 
 /// Maximum length of a guest-supplied format string or `%s` argument.
 /// Bounds the scan so an unterminated string from a buggy or hostile
@@ -388,7 +396,10 @@ pub fn run_elf(bytes: &[u8]) -> RunOutcome {
 /// Same as [`run_elf`] but with a caller-supplied host. Lets integration
 /// tests substitute a recording host (capture stdout, assert no syscall
 /// happens, etc.) without spawning a subprocess.
-pub fn run_elf_with_host<H: SysHost + LibcHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
+pub fn run_elf_with_host<H: SysHost + LibcHost + BiosHost>(
+    bytes: &[u8],
+    host: &mut H,
+) -> RunOutcome {
     run_elf_with_debug(bytes, host, &DebugConfig::default())
 }
 
@@ -455,7 +466,7 @@ pub enum DebugStop {
 /// Like [`run_elf_with_host`] but also accepts a `DebugConfig`. This
 /// is the entry the `movie86 --watch ...` CLI uses, exposed for tests.
 #[allow(clippy::too_many_lines)] // single-narrative run loop — splitting just spreads the state-machine across helpers
-pub fn run_elf_with_debug<H: SysHost + LibcHost>(
+pub fn run_elf_with_debug<H: SysHost + LibcHost + BiosHost>(
     bytes: &[u8],
     host: &mut H,
     cfg: &DebugConfig,

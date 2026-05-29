@@ -126,6 +126,27 @@
   .dr.cur .db { color: #333; }
   .dr.cur .dt { font-weight: bold; }
 
+  /* Canvas row — one panel per framebuffer mode. Each canvas is
+     internally w×h but scaled up via CSS pixelated rendering so the
+     hand-encoded pixels stay crisp. */
+  .canvases {
+      display: flex; gap: 1rem; flex-wrap: wrap;
+      margin-bottom: 1rem;
+  }
+  .canvases .panel { flex: 0 1 auto; }
+  .canvases canvas {
+      display: block;
+      image-rendering: pixelated;
+      background: #000;
+      border: 1px solid #888;
+      max-width: 100%;
+  }
+  .canvases .panel-head { margin-bottom: 0.3rem; }
+  .canvases .canv-info {
+      font-size: 0.7rem; color: #777; margin-top: 0.2rem;
+      font-variant-numeric: tabular-nums;
+  }
+
   /* Console — sits full-width at the bottom so vertical content has
      room to autoscroll. Side-by-side stdout/stderr on wide screens
      uses the horizontal real estate the bottom row gets. */
@@ -180,6 +201,13 @@
       <option value="hello">hello — write(1, "Hello\n") + exit</option>
       <option value="call_greet">call_greet — direct CALL/RET</option>
       <option value="cycle">cycle — print "1 2 3 4 5" forever (CALL/RET loop)</option>
+      <option value="canvas_bars">canvas_bars — mode 13h SMPTE-ish color bars</option>
+      <option value="canvas_smile">canvas_smile — mode 13h smiley face</option>
+      <option value="canvas_modes">canvas_modes — switch mode 13h → 12h mid-run</option>
+      <option value="canvas_mandelbrot">canvas_mandelbrot — real-compute Mandelbrot (clang -O2 → llvm-mov, ~90 s)</option>
+      <option value="canvas_mandelbrot_hires">canvas_mandelbrot_hires — same, native 320×200 + MAX_ITER=24 (~40 min)</option>
+      <option value="canvas_mandelbrot_max">canvas_mandelbrot_max — VESA 6Ah 800×600 native (~8 hours, overnight)</option>
+      <option value="canvas_mandelbrot_mov">canvas_mandelbrot_mov — same C, movfuscator pipeline (~10 min, for comparison)</option>
       <option value="upload">(upload your own ELF)</option>
     </select>
   </label>
@@ -240,16 +268,25 @@
   </div>
 </div>
 
+<div class="canvases" id="canvases"></div>
+
 <script type="module">
-import { loadVm } from './movie86.mjs';
+import { loadVm, FRAMEBUFFER_MODES, modeForNumber } from './movie86.mjs';
 
 const $ = (id) => document.getElementById(id);
 
 const EXAMPLES = {
-    return42:   './examples/return42.elf',
-    hello:      './examples/hello.elf',
-    call_greet: './examples/call_greet.elf',
-    cycle:      './examples/cycle.elf',
+    return42:     './examples/return42.elf',
+    hello:        './examples/hello.elf',
+    call_greet:   './examples/call_greet.elf',
+    cycle:        './examples/cycle.elf',
+    canvas_bars:       './examples/canvas_bars.elf',
+    canvas_smile:      './examples/canvas_smile.elf',
+    canvas_modes:             './examples/canvas_modes.elf',
+    canvas_mandelbrot:        './examples/canvas_mandelbrot.elf',
+    canvas_mandelbrot_hires:  './examples/canvas_mandelbrot_hires.elf',
+    canvas_mandelbrot_max:    './examples/canvas_mandelbrot_max.elf',
+    canvas_mandelbrot_mov:    './examples/canvas_mandelbrot_mov.elf',
 };
 
 // Register file order matches movie86's `Reg32`: EAX, ECX, EDX, EBX,
@@ -450,12 +487,23 @@ function renderDisasm() {
         d.free();
     }
     state.disasmEnd = last;
-    $('disasm').innerHTML = rows.join('') ||
+    const body = $('disasm');
+    body.innerHTML = rows.join('') ||
         `<div class="memrow">(no decodable instructions at ${fmt32(start)})</div>`;
-    // Scroll the current row into view so it stays visible as it
-    // progresses down the listing.
-    const cur = $('disasm').querySelector('.dr.cur');
-    if (cur) cur.scrollIntoView({ block: 'nearest' });
+    // Keep the current row in view by adjusting **only** the disasm
+    // pane's own scrollTop. `element.scrollIntoView({ block: 'nearest' })`
+    // can also nudge the document on mobile when the pane is partially
+    // below the fold, which makes the whole page jitter on every Run
+    // tick. Doing it manually scopes the scroll strictly to the pane.
+    const cur = body.querySelector('.dr.cur');
+    if (cur) {
+        const top = cur.offsetTop;
+        const bot = top + cur.offsetHeight;
+        const vTop = body.scrollTop;
+        const vBot = vTop + body.clientHeight;
+        if (top < vTop) body.scrollTop = top;
+        else if (bot > vBot) body.scrollTop = bot - body.clientHeight;
+    }
 }
 
 function renderMem() {
@@ -567,6 +615,74 @@ function pumpOutput() {
     }
 }
 
+// One <canvas> per framebuffer mode, plus a placeholder shown when
+// no mode has been set. Each handle caches the 2D context + a
+// reusable ImageData backed by a single Uint8ClampedArray to avoid
+// allocating per render.
+const canvasHandles = new Map();   // modeNumber → { wrap, ctx, imageData, mode }
+let canvasPlaceholder = null;
+
+function setupCanvases() {
+    const host = $('canvases');
+    // Placeholder shown until the guest sets a video mode. Mirrors
+    // real BIOS: "no mode set yet" means there's nothing to draw.
+    canvasPlaceholder = document.createElement('div');
+    canvasPlaceholder.className = 'panel canv-placeholder';
+    canvasPlaceholder.innerHTML =
+        '<div class="panel-head"><h2>canvas</h2></div>' +
+        '<div class="canv-info">no video mode set — guest must call ' +
+        '<code>mov ax, NN ; int 0x10</code> (AH=0, AL=mode) first.<br>' +
+        'available modes: ' +
+        FRAMEBUFFER_MODES.map(m => `<code>0x${m.modeNumber.toString(16)}</code> (${m.id}, ${m.width}×${m.height})`).join(', ') +
+        '.</div>';
+    host.appendChild(canvasPlaceholder);
+
+    for (const m of FRAMEBUFFER_MODES) {
+        const wrap = document.createElement('div');
+        wrap.className = 'panel';
+        wrap.hidden = true;
+        wrap.innerHTML =
+            `<div class="panel-head"><h2>canvas ${m.id} <small style="color:#888;font-weight:normal">(0x${m.modeNumber.toString(16)})</small></h2></div>` +
+            `<canvas width="${m.width}" height="${m.height}"></canvas>` +
+            `<div class="canv-info">@ 0x${m.addr.toString(16).padStart(8, '0')} · ${m.byteLength.toLocaleString()} B</div>`;
+        host.appendChild(wrap);
+        const canvas = wrap.querySelector('canvas');
+        // Scale up visually so the chunky pixels read clearly. Pick a
+        // target ~240 px on the long side, but never below 1:1.
+        const scale = Math.max(1, Math.floor(240 / Math.max(m.width, m.height)));
+        canvas.style.width  = `${m.width * scale}px`;
+        canvas.style.height = `${m.height * scale}px`;
+        canvasHandles.set(m.modeNumber, {
+            wrap,
+            mode: m,
+            ctx: canvas.getContext('2d'),
+            imageData: new ImageData(m.width, m.height),
+        });
+    }
+}
+
+function renderCanvases() {
+    const vm = state.vm; if (!vm) return;
+    const active = vm.activeVideoMode;
+    // Hide every mode's panel except the active one (if any).
+    for (const [num, h] of canvasHandles) h.wrap.hidden = num !== active;
+    canvasPlaceholder.hidden = active != null && modeForNumber(active) != null;
+
+    if (active == null) return;
+    const h = canvasHandles.get(active);
+    if (!h) return;  // guest set a mode we don't render — keep placeholder shown
+    const bytes = vm.readMem(h.mode.addr, h.mode.byteLength);
+    if (bytes.length === h.mode.byteLength) {
+        h.imageData.data.set(bytes);
+        h.ctx.putImageData(h.imageData, 0, 0);
+    } else {
+        // Region not mapped — paint black so a stale image from a
+        // previous program doesn't linger.
+        h.ctx.fillStyle = '#000';
+        h.ctx.fillRect(0, 0, h.mode.width, h.mode.height);
+    }
+}
+
 function render() {
     renderRegs();
     renderInsnPreview();
@@ -574,6 +690,7 @@ function render() {
     renderMem();
     renderMeta();
     pumpOutput();
+    renderCanvases();
 }
 
 function doStep() {
@@ -767,9 +884,11 @@ $('disasm-follow').addEventListener('change', () => {
     renderDisasm();
 });
 
-// Boot: apply URL params to the controls (so the deep-linked state
-// takes effect before the first example load), then fetch the chosen
-// preset and seed the panes.
+// Boot: build the canvas panels (one per framebuffer mode), apply
+// URL params to the controls so a deep-linked state takes effect
+// before the first example load, then fetch the chosen preset and
+// seed the panes.
+setupCanvases();
 (async () => {
     applyUrlToControls();
     const initialPreset = EXAMPLES[$('preset').value] ? $('preset').value : 'return42';
