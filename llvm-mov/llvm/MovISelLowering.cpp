@@ -253,17 +253,21 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setLibcallImpl(RTLIB::FPTOSINT_F64_I32, RTLIB::impl___fixdfsi);
   setLibcallImpl(RTLIB::FPTOUINT_F64_I32, RTLIB::impl___fixunsdfsi);
 
-  // Stage 7h4 / 7h5 — f64 fadd / fsub / fmul. Helper bodies emulate
-  // variable-amount i64 shifts via the i32-pair clamped-arm split
-  // technique established by stage-7h3's `__floatsidf` / `__fixdfsi`.
-  // fmul layers a 53×53 → 106-bit mantissa multiply via four 32×32
-  // sub-multiplies on top.
+  // Stage 7h4 / 7h5 / 7h6 — f64 fadd / fsub / fmul / fdiv. Helper
+  // bodies emulate variable-amount i64 shifts via the i32-pair
+  // clamped-arm split technique established by stage-7h3's
+  // `__floatsidf` / `__fixdfsi`. fmul layers a 53×53 → 106-bit
+  // mantissa multiply via four 32×32 sub-multiplies on top; fdiv
+  // is a 52-iter restoring long-division loop on i64 values (same
+  // shape as stage-7g3 `__divsf3`).
   setOperationAction(ISD::FADD, MVT::f64, LibCall);
   setOperationAction(ISD::FSUB, MVT::f64, LibCall);
   setOperationAction(ISD::FMUL, MVT::f64, LibCall);
+  setOperationAction(ISD::FDIV, MVT::f64, LibCall);
   setLibcallImpl(RTLIB::ADD_F64, RTLIB::impl___adddf3);
   setLibcallImpl(RTLIB::SUB_F64, RTLIB::impl___subdf3);
   setLibcallImpl(RTLIB::MUL_F64, RTLIB::impl___muldf3);
+  setLibcallImpl(RTLIB::DIV_F64, RTLIB::impl___divdf3);
 
   // No `bswap` opcode either. Rust idioms like `u32::from_be(x)` or
   // `x.swap_bytes()` lower to ISD::BSWAP. Expand re-spells it as

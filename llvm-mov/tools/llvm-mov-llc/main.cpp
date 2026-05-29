@@ -2367,6 +2367,233 @@ static void injectMulDf3Helper(Module &M, LLVMContext &Ctx) {
   B.CreateRet(B.CreateBitCast(Result, F64));
 }
 
+// Stage 7h6 — `__divdf3 (a, b) -> double`. IEEE-754 double-precision
+// divide. Mirrors stage-7g3 `__divsf3` widened to f64's 53-bit
+// mantissa: a 52-iter restoring long-division loop with real
+// CondBr / PHI control flow, operating over i64 values.
+//
+// Algorithm:
+//   1. Extract sign / exp / mant from both inputs; result sign =
+//      sa XOR sb; either-zero detection (exp == 0 ⇒ flush-to-zero
+//      treatment of the input).
+//   2. Initial renormalize: if ma < mb, shift ma left by 1 (so
+//      ma_norm ∈ [mb, 2*mb)) and decrement the result exponent.
+//   3. Long-division loop, 52 iterations producing 52 fractional
+//      bits below the implicit-1:
+//        r = ma_norm - mb        // residue in [0, mb)
+//        q = 1                   // implicit-1
+//        for i in 52..1:
+//          r <<= 1
+//          q <<= 1
+//          if r >= mb: r -= mb; q |= 1
+//   4. One extra guard step, sticky from residue, RNTE round, exp
+//      bump on rounding overflow.
+//   5. Pack {sr, er, mant}; special cases: a == 0 ⇒ signed zero,
+//      b == 0 ⇒ signed Inf, 0/0 ⇒ NaN, Inf/Inf ⇒ NaN, Inf/finite
+//      ⇒ signed Inf, finite/Inf ⇒ signed zero, NaN input ⇒ qNaN.
+//
+// The loop-body i64 selects (r / q updates) get rewritten to bit-
+// blends by the SELECT → bit-blend pass (helper-safe attribute);
+// the loop control itself (CondBr / PHI) survives into the lowered
+// MIR with coarse-grained branching, matching `__divsf3`'s shape.
+// i64 compares inside the body use the manual {hi, lo} i32-pair
+// pattern from stage-7h4 to avoid DAG-ISel multi-minute pathology
+// with `icmp uge i64`.
+static void injectDivDf3Helper(Module &M, LLVMContext &Ctx) {
+  Type *F64 = Type::getDoubleTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(F64, {F64, F64}, /*isVarArg=*/false);
+
+  Function *F = makeOrPromoteHelper(M, "__divdf3", FnTy);
+  if (!F)
+    return;
+
+  F->getArg(0)->setName("a");
+  F->getArg(1)->setName("b");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "loop", F);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", F);
+
+  // === entry ===
+  IRBuilder<> B(Entry);
+  auto C64 = [&](uint64_t V) { return ConstantInt::get(I64, V); };
+  auto C32 = [&](uint32_t V) { return ConstantInt::get(I32, V); };
+
+  Value *AI = B.CreateBitCast(F->getArg(0), I64, "ai");
+  Value *BI = B.CreateBitCast(F->getArg(1), I64, "bi");
+
+  // i32-pair compare helpers (same shape as 7h4 / 7h5).
+  auto SplitLoHi = [&](IRBuilder<> &Bld, Value *X)
+      -> std::pair<Value *, Value *> {
+    Value *Hi = Bld.CreateTrunc(Bld.CreateLShr(X, C64(32)), I32);
+    Value *Lo = Bld.CreateTrunc(X, I32);
+    return {Lo, Hi};
+  };
+  auto IsNonZeroI64 = [&](IRBuilder<> &Bld, Value *X) {
+    auto [Lo, Hi] = SplitLoHi(Bld, X);
+    return Bld.CreateOr(Bld.CreateICmpNE(Lo, C32(0)),
+                        Bld.CreateICmpNE(Hi, C32(0)));
+  };
+  auto UltI64 = [&](IRBuilder<> &Bld, Value *Av, Value *Bv) {
+    auto [aLo, aHi] = SplitLoHi(Bld, Av);
+    auto [bLo, bHi] = SplitLoHi(Bld, Bv);
+    Value *HiLt = Bld.CreateICmpULT(aHi, bHi);
+    Value *HiEq = Bld.CreateICmpEQ(aHi, bHi);
+    Value *LoLt = Bld.CreateICmpULT(aLo, bLo);
+    return Bld.CreateOr(HiLt, Bld.CreateAnd(HiEq, LoLt));
+  };
+  auto UgeI64 = [&](IRBuilder<> &Bld, Value *Av, Value *Bv) {
+    return Bld.CreateNot(UltI64(Bld, Av, Bv));
+  };
+
+  // Field extraction.
+  Value *SA = B.CreateLShr(AI, C64(63));
+  Value *SB = B.CreateLShr(BI, C64(63));
+  Value *EA64 = B.CreateAnd(B.CreateLShr(AI, C64(52)), C64(0x7FFull));
+  Value *EB64 = B.CreateAnd(B.CreateLShr(BI, C64(52)), C64(0x7FFull));
+  Value *EA = B.CreateTrunc(EA64, I32, "ea");
+  Value *EB = B.CreateTrunc(EB64, I32, "eb");
+  Value *MARaw = B.CreateAnd(AI, C64(0xFFFFFFFFFFFFFull));
+  Value *MBRaw = B.CreateAnd(BI, C64(0xFFFFFFFFFFFFFull));
+
+  // Result sign.
+  Value *SR = B.CreateXor(SA, SB);
+
+  // Special-case detection.
+  Value *AIsZero = B.CreateICmpEQ(EA, C32(0));
+  Value *BIsZero = B.CreateICmpEQ(EB, C32(0));
+
+  // Implicit-1.
+  Value *MA = B.CreateOr(MARaw, C64(0x10000000000000ull));
+  Value *MB = B.CreateOr(MBRaw, C64(0x10000000000000ull));
+
+  // Initial renormalize. If ma < mb: ma_norm = ma << 1, er -= 1.
+  Value *InitialRenorm = UltI64(B, MA, MB);
+  Value *MANorm = B.CreateSelect(InitialRenorm, B.CreateShl(MA, C64(1)), MA);
+
+  // Result exponent. ER = EA - EB + 1023 (- 1 if renormed).
+  Value *ER0 = B.CreateAdd(B.CreateSub(EA, EB), C32(1023u));
+  Value *ER = B.CreateSelect(InitialRenorm,
+                             B.CreateSub(ER0, C32(1u)), ER0, "er");
+
+  // Initial loop state: r0 = ma_norm - mb (in [0, mb)), q0 = 1.
+  Value *R0 = B.CreateSub(MANorm, MB);
+  Value *Q0 = C64(1);
+
+  B.CreateBr(Loop);
+
+  // === loop ===
+  B.SetInsertPoint(Loop);
+  PHINode *IPhi = B.CreatePHI(I32, 2, "i");
+  PHINode *RPhi = B.CreatePHI(I64, 2, "r");
+  PHINode *QPhi = B.CreatePHI(I64, 2, "q");
+  IPhi->addIncoming(C32(52u), Entry);
+  RPhi->addIncoming(R0, Entry);
+  QPhi->addIncoming(Q0, Entry);
+
+  Value *RShifted = B.CreateShl(RPhi, C64(1));
+  Value *QShifted = B.CreateShl(QPhi, C64(1));
+  Value *Take = UgeI64(B, RShifted, MB);
+  Value *RSub = B.CreateSub(RShifted, MB);
+  Value *QSet = B.CreateOr(QShifted, C64(1));
+  Value *RNext = B.CreateSelect(Take, RSub, RShifted);
+  Value *QNext = B.CreateSelect(Take, QSet, QShifted);
+  Value *INext = B.CreateSub(IPhi, C32(1));
+  Value *Done = B.CreateICmpEQ(INext, C32(0));
+  B.CreateCondBr(Done, Exit, Loop);
+  IPhi->addIncoming(INext, Loop);
+  RPhi->addIncoming(RNext, Loop);
+  QPhi->addIncoming(QNext, Loop);
+
+  // === exit ===
+  B.SetInsertPoint(Exit);
+  PHINode *RExit = B.CreatePHI(I64, 1, "r_out");
+  PHINode *QExit = B.CreatePHI(I64, 1, "q_out");
+  RExit->addIncoming(RNext, Loop);
+  QExit->addIncoming(QNext, Loop);
+
+  // Guard bit: one extra long-division step on the residue.
+  Value *RGuardRaw = B.CreateShl(RExit, C64(1));
+  Value *GuardTake = UgeI64(B, RGuardRaw, MB);
+  Value *GuardBit = B.CreateZExt(GuardTake, I64);
+  Value *RAfterGuard = B.CreateSelect(GuardTake,
+                                      B.CreateSub(RGuardRaw, MB),
+                                      RGuardRaw);
+  Value *StickyI1 = IsNonZeroI64(B, RAfterGuard);
+  Value *Sticky = B.CreateZExt(StickyI1, I64);
+
+  Value *Lsb = B.CreateAnd(QExit, C64(1u));
+  Value *RoundUp = B.CreateAnd(GuardBit, B.CreateOr(Sticky, Lsb));
+  Value *QRounded = B.CreateAdd(QExit, RoundUp);
+  // RoundedOvf check via i32-pair compare for `q_rounded == 1 << 53`.
+  auto EqI64Const = [&](Value *X, uint64_t K) {
+    auto [Lo, Hi] = SplitLoHi(B, X);
+    return B.CreateAnd(
+        B.CreateICmpEQ(Hi, C32(static_cast<uint32_t>(K >> 32))),
+        B.CreateICmpEQ(Lo, C32(static_cast<uint32_t>(K))));
+  };
+  Value *RoundOvf = EqI64Const(QRounded, 1ULL << 53);
+  Value *QFinal = B.CreateSelect(RoundOvf,
+                                 B.CreateLShr(QRounded, C64(1)),
+                                 QRounded, "q_final");
+  Value *ERFinal = B.CreateSelect(RoundOvf,
+                                  B.CreateAdd(ER, C32(1u)), ER, "er_final");
+
+  // Pack.
+  Value *MantField = B.CreateAnd(QFinal, C64(0xFFFFFFFFFFFFFull));
+  Value *ERFinal64 = B.CreateZExt(ERFinal, I64);
+  Value *ExpField = B.CreateAnd(B.CreateShl(ERFinal64, C64(52)),
+                                C64(0x7FF0000000000000ull));
+  Value *SignField = B.CreateShl(SR, C64(63));
+  Value *Packed = B.CreateOr(SignField,
+                             B.CreateOr(ExpField, MantField));
+
+  // Result-exponent gates.
+  Value *Underflow = B.CreateICmpSLE(ERFinal, C32(0), "underflow");
+  Value *Overflow = B.CreateICmpSGE(ERFinal, C32(2047), "overflow");
+  Value *SignedZero = SignField;
+  Value *SignedInf = B.CreateOr(SignField, C64(0x7FF0000000000000ull));
+
+  Value *Result = B.CreateSelect(Overflow, SignedInf, Packed);
+  Result = B.CreateSelect(Underflow, SignedZero, Result);
+  // Divisor-zero wins over dividend-zero (so 0/0 starts as Inf;
+  // the NaN gate below upgrades it to qNaN).
+  Result = B.CreateSelect(AIsZero, SignedZero, Result);
+  Result = B.CreateSelect(BIsZero, SignedInf, Result);
+
+  // Stage 7g4 / 7h2 / 7h4-style Inf / NaN propagation:
+  //   - NaN input             → canonical qNaN
+  //   - Inf / Inf, 0 / 0      → NaN
+  //   - Inf / finite (≠ 0)    → signed Inf with sr
+  //   - finite / Inf          → signed zero with sr
+  Value *EAMax = B.CreateICmpEQ(EA, C32(0x7FFu));
+  Value *EBMax = B.CreateICmpEQ(EB, C32(0x7FFu));
+  Value *MANonZero = IsNonZeroI64(B, MARaw);
+  Value *MBNonZero = IsNonZeroI64(B, MBRaw);
+  Value *AIsNaN = B.CreateAnd(EAMax, MANonZero);
+  Value *BIsNaN = B.CreateAnd(EBMax, MBNonZero);
+  Value *AIsInf = B.CreateAnd(EAMax, B.CreateNot(MANonZero));
+  Value *BIsInf = B.CreateAnd(EBMax, B.CreateNot(MBNonZero));
+  Value *BothInf = B.CreateAnd(AIsInf, BIsInf);
+  Value *BothZero = B.CreateAnd(AIsZero, BIsZero);
+  Value *EitherNaN = B.CreateOr(AIsNaN, BIsNaN);
+  Value *NaNCase = B.CreateOr(EitherNaN,
+                              B.CreateOr(BothInf, BothZero));
+
+  Value *AInfBFinite = B.CreateAnd(AIsInf,
+                                   B.CreateNot(B.CreateOr(BIsInf, BIsNaN)));
+  Value *BInfAFinite = B.CreateAnd(BIsInf,
+                                   B.CreateNot(B.CreateOr(AIsInf, AIsNaN)));
+
+  Result = B.CreateSelect(AInfBFinite, SignedInf, Result);
+  Result = B.CreateSelect(BInfAFinite, SignedZero, Result);
+  Result = B.CreateSelect(NaNCase, C64(0x7FF8000000000000ull), Result);
+
+  B.CreateRet(B.CreateBitCast(Result, F64));
+}
+
 // Stage 7h1 — `__extendsfdf2 (float a) -> double`. Lossless f32 → f64
 // conversion. Algorithm:
 //   - decode {sign, exp32, mant32_raw} from the f32 bit pattern
@@ -2728,6 +2955,20 @@ static bool moduleNeedsMulDf3(Module &M) {
   return false;
 }
 
+// Stage 7h6 — scan for `fdiv double`.
+static bool moduleNeedsDivDf3(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if (I.getOpcode() == Instruction::FDiv &&
+          I.getOperand(0)->getType()->getScalarType()->isDoubleTy())
+        return true;
+    }
+  }
+  return false;
+}
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
 
@@ -2897,6 +3138,10 @@ int main(int argc, char **argv) {
   // module shouldn't pay for it.
   if (moduleNeedsMulDf3(*M))
     injectMulDf3Helper(*M, Ctx);
+  // Stage 7h6 — `__divdf3` (52-iter loop body, gated separately
+  // like the f32 7g3 `__divsf3`).
+  if (moduleNeedsDivDf3(*M))
+    injectDivDf3Helper(*M, Ctx);
   if (moduleNeedsAddDf3(*M)) {
     injectAddDf3Helper(*M, Ctx);
     injectSubDf3Helper(*M, Ctx);
