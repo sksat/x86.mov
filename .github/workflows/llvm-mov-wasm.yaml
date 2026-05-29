@@ -154,3 +154,12 @@ jobs:
       # only ever fires under that codepath.
       - name: test-e2e-dist (staged deploy + Content-Encoding: zstd)
         run: make test-e2e-dist
+
+      # And once more with the server stripping Content-Encoding so
+      # the wrapper has to fall back to its bundled fzstd decoder.
+      # Playwright's Chromium handles zstd natively, so without this
+      # step the JS-decompression path is uncovered on CI and a
+      # regression there would only show up for Safari users in
+      # production.
+      - name: test-e2e-dist-fzstd (forced JS-side decompression)
+        run: make test-e2e-dist-fzstd

@@ -20,6 +20,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 // tests/ → wasm/ → llvm-mov/ → repo root → dist/
 const distRoot = resolve(here, '..', '..', '..', 'dist');
 const port = parseInt(process.env.PORT || '8089', 10);
+// `SERVE_DIST_STRIP_ENCODING=1` drops `Content-Encoding` from every
+// applied _headers rule. We use it to fake a browser that lacks
+// native `Content-Encoding: zstd` support: the raw zstd bytes flow
+// through, and the wrapper's magic-byte check has to route them
+// through fzstd. Without this knob the production-shape E2E never
+// exercises the JS-decompression path on a CI runner whose Chromium
+// natively decodes zstd.
+const stripEncoding = process.env.SERVE_DIST_STRIP_ENCODING === '1';
 
 const MIME = {
     '.html': 'text/html; charset=utf-8',
@@ -98,6 +106,7 @@ createServer((req, res) => {
     for (const rule of headerRules) {
         if (matchPattern(req.url || '/', rule.pattern)) {
             for (const [k, v] of Object.entries(rule.headers)) {
+                if (stripEncoding && k.toLowerCase() === 'content-encoding') continue;
                 headers[k] = v;
             }
         }
@@ -109,5 +118,6 @@ createServer((req, res) => {
     res.writeHead(200, headers);
     res.end(body);
 }).listen(port, '127.0.0.1', () => {
-    console.log(`serve-dist on http://127.0.0.1:${port}/ (root=${distRoot}, _headers rules=${headerRules.length})`);
+    const enc = stripEncoding ? ', stripping Content-Encoding (fzstd path)' : '';
+    console.log(`serve-dist on http://127.0.0.1:${port}/ (root=${distRoot}, _headers rules=${headerRules.length}${enc})`);
 });

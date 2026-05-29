@@ -10,7 +10,8 @@ BUILD_DIR     ?= build
 
 .PHONY: help setup build build-wasm-llvm build-wasm-clang \
         build-wasm-llvm-mov-llc build-native-llvm-mov-llc \
-        test test-e2e test-e2e-dist stage-deploy serve clean distclean
+        test test-e2e test-e2e-dist test-e2e-dist-fzstd \
+        stage-deploy serve clean distclean
 
 help:
 	@echo "Targets:"
@@ -25,6 +26,8 @@ help:
 	@echo "                              and diff the rendered .s against native (needs npm + browsers)"
 	@echo "  test-e2e-dist               same as test-e2e but against the staged ../../dist/ via a"
 	@echo "                              _headers-respecting Node server — exercises the zstd path"
+	@echo "  test-e2e-dist-fzstd         same as test-e2e-dist but the server drops Content-Encoding"
+	@echo "                              so the wrapper falls back to fzstd — covers non-zstd browsers"
 	@echo "  stage-deploy                stage ../../dist/llvm-mov/ for Cloudflare Pages"
 	@echo "  serve                       static-serve the demo on \$$PORT (default 8087)"
 	@echo "  clean                       remove $(BUILD_DIR)"
@@ -95,6 +98,23 @@ test-e2e-dist: stage-deploy
 	@if [ ! -d node_modules/@playwright ]; then npm install; fi
 	@npx playwright install chromium >/dev/null 2>&1 || true
 	E2E_SERVE_DIST=1 npx playwright test
+
+# Same as test-e2e-dist but the dist server drops `Content-Encoding:
+# zstd`, so the wrapper sees the raw zstd bytes and has to fall
+# through to its in-browser fzstd decoder. Without this target the
+# default Chromium that ships with Playwright handles zstd natively
+# at the network layer and the fzstd fallback path is never
+# exercised on CI — a regression in fzstd integration would only
+# surface for Safari users in production. The spec asserts a
+# `decompress clang` label appears in the timing breakdown when
+# `E2E_FZSTD_EXPECTED` is set, so a future change that breaks the
+# magic-byte router and accidentally takes the native path again is
+# caught here.
+test-e2e-dist-fzstd: stage-deploy
+	@if [ ! -d node_modules/@playwright ]; then npm install; fi
+	@npx playwright install chromium >/dev/null 2>&1 || true
+	E2E_SERVE_DIST=1 SERVE_DIST_STRIP_ENCODING=1 E2E_FZSTD_EXPECTED=1 \
+	    npx playwright test
 
 # Same shape as ../../movfuscator-wasm/scripts/stage-deploy.sh — copies
 # the browser-loadable artifacts + the demo index.html into
