@@ -5,6 +5,7 @@
 //! to a per-instruction executor. Decoding stays in `decode.rs` so the same
 //! decoder remains usable by tracing / disassembly callers.
 
+use crate::abi_host::{is_abi_addr, AbiHost, ABI_BASE};
 use crate::bios_host::{BiosArgs, BiosHost, BiosResult};
 use crate::decode::decode;
 use crate::insn::{EffectiveAddress, Insn, Operand, Reg16, Reg32, Reg8};
@@ -86,7 +87,7 @@ impl Cpu {
     pub fn step<M, H>(&mut self, mem: &mut M, host: &mut H) -> Result<(), Fault>
     where
         M: Memory,
-        H: SysHost + LibcHost + BiosHost,
+        H: SysHost + LibcHost + BiosHost + AbiHost,
     {
         let mut buf = [0u8; MAX_INSN_LEN];
         let (n, partial_fault) = fetch(mem, self.eip, &mut buf)?;
@@ -138,11 +139,11 @@ impl Cpu {
     ) -> Result<u32, Fault>
     where
         M: Memory,
-        H: SysHost + LibcHost + BiosHost,
+        H: SysHost + LibcHost + BiosHost + AbiHost,
     {
         match insn {
             Insn::Mov { dst, src } => {
-                self.exec_mov(dst, src, mem)?;
+                self.exec_mov(dst, src, mem, host)?;
                 Ok(next_eip_default)
             }
             Insn::JmpRel32(off) => {
@@ -262,12 +263,41 @@ impl Cpu {
     /// Execute a `mov dst, src`. The decoder guarantees `dst` and `src`
     /// have matching widths. We dispatch on the *destination* width and
     /// fault if `src` doesn't agree.
-    fn exec_mov<M: Memory>(
+    fn exec_mov<M, H>(
         &mut self,
         dst: Operand,
         src: Operand,
         mem: &mut M,
-    ) -> Result<(), Fault> {
+        host: &mut H,
+    ) -> Result<(), Fault>
+    where
+        M: Memory,
+        H: AbiHost,
+    {
+        // mov-only ABI gate: writes whose computed destination falls in
+        // the ABI page get routed through AbiHost.abi_call instead of
+        // the underlying Memory. The store doesn't actually land; it's
+        // entirely host-mediated. Matches turbo86's SIGSEGV-driven
+        // dispatch byte-for-byte (same ABI_BASE / call numbers) so
+        // ELFs are portable across the two engines without re-binding.
+        if let Operand::Mem32(ea) = dst {
+            let addr = self.compute_ea(ea);
+            if is_abi_addr(addr) {
+                let v = self.read_operand_u32(src, mem)?;
+                // ABI_PAGE_SIZE = 0x1000 < u16::MAX, so the offset
+                // within the page always fits.
+                let call = u16::try_from(addr - ABI_BASE).expect("ABI page offset fits in u16");
+                return host.abi_call(call, v, mem);
+            }
+        }
+        if let Operand::Mem8(ea) = dst {
+            let addr = self.compute_ea(ea);
+            if is_abi_addr(addr) {
+                let v = self.read_operand_u8(src, mem)?;
+                let call = u16::try_from(addr - ABI_BASE).expect("ABI page offset fits in u16");
+                return host.abi_call(call, u32::from(v), mem);
+            }
+        }
         match dst {
             Operand::Reg32(_) | Operand::Mem32(_) => {
                 let v = self.read_operand_u32(src, mem)?;
@@ -455,6 +485,7 @@ mod tests {
     }
     impl LibcHost for PanicHost {}
     impl BiosHost for PanicHost {}
+    impl AbiHost for PanicHost {}
 
     /// Test host that records the last syscall and returns a fixed value.
     struct RecordingHost {
@@ -481,6 +512,7 @@ mod tests {
     }
     impl LibcHost for RecordingHost {}
     impl BiosHost for RecordingHost {}
+    impl AbiHost for RecordingHost {}
 
     /// Build a memory region and encode `mov r32, imm32` at its base.
     fn make_mov_r32_imm32(reg_idx: u8, imm: u32, base: u32) -> FlatMemory {
@@ -933,6 +965,7 @@ mod tests {
             }
         }
         impl LibcHost for RecordingBios {}
+        impl AbiHost for RecordingBios {}
         impl BiosHost for RecordingBios {
             fn bios_call(
                 &mut self,
@@ -963,6 +996,93 @@ mod tests {
             "BIOS return value should land in EAX",
         );
         assert_eq!(cpu.eip, 0x1002);
+    }
+
+    #[test]
+    fn step_mov_to_abi_page_routes_through_abi_host() {
+        // `mov [0x1FFE_0010], al` (A2 imm32) — set_video_mode.
+        // The store must NOT land in memory (the page is unmapped by
+        // design); instead AbiHost::abi_call should see the call.
+        struct RecordingAbi {
+            last: Option<(u16, u32)>,
+        }
+        impl SysHost for RecordingAbi {
+            fn syscall(
+                &mut self,
+                args: &SyscallArgs,
+                _mem: &mut dyn Memory,
+            ) -> Result<SyscallResult, Fault> {
+                panic!("unexpected syscall {:#x}", args.eax);
+            }
+        }
+        impl LibcHost for RecordingAbi {}
+        impl BiosHost for RecordingAbi {}
+        impl AbiHost for RecordingAbi {
+            fn abi_call(
+                &mut self,
+                call_num: u16,
+                value: u32,
+                _mem: &mut dyn Memory,
+            ) -> Result<(), Fault> {
+                self.last = Some((call_num, value));
+                Ok(())
+            }
+        }
+        // mov al, 0x13 ; mov [0x1FFE_0010], al
+        let bytes = [0xB0, 0x13, 0xA2, 0x10, 0x00, 0xFE, 0x1F];
+        let mut mem = FlatMemory::new_zeroed(0x1000, 16);
+        mem.write_bytes(0x1000, &bytes).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        let mut host = RecordingAbi { last: None };
+        cpu.step(&mut mem, &mut host).unwrap(); // mov al, 0x13
+        assert_eq!(cpu.reg(Reg32::Eax) & 0xFF, 0x13);
+        cpu.step(&mut mem, &mut host).unwrap(); // mov [0x1FFE_0010], al
+        let (call, val) = host.last.expect("AbiHost saw the call");
+        assert_eq!(call, 0x010);
+        assert_eq!(val, 0x13);
+        // EIP must be past the A2 instruction (entry + 7 bytes total).
+        assert_eq!(cpu.eip, 0x1007);
+    }
+
+    #[test]
+    fn step_mov32_to_abi_page_routes_through_abi_host() {
+        // `mov [0x1FFE_0020], eax` (A3 imm32) — mmap_request packed arg.
+        struct RecordingAbi {
+            last: Option<(u16, u32)>,
+        }
+        impl SysHost for RecordingAbi {
+            fn syscall(
+                &mut self,
+                args: &SyscallArgs,
+                _mem: &mut dyn Memory,
+            ) -> Result<SyscallResult, Fault> {
+                panic!("unexpected syscall {:#x}", args.eax);
+            }
+        }
+        impl LibcHost for RecordingAbi {}
+        impl BiosHost for RecordingAbi {}
+        impl AbiHost for RecordingAbi {
+            fn abi_call(
+                &mut self,
+                call_num: u16,
+                value: u32,
+                _mem: &mut dyn Memory,
+            ) -> Result<(), Fault> {
+                self.last = Some((call_num, value));
+                Ok(())
+            }
+        }
+        // mov eax, 0x00100003 ; mov [0x1FFE_0020], eax
+        let bytes = [0xB8, 0x03, 0x00, 0x10, 0x00, 0xA3, 0x20, 0x00, 0xFE, 0x1F];
+        let mut mem = FlatMemory::new_zeroed(0x1000, 16);
+        mem.write_bytes(0x1000, &bytes).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        let mut host = RecordingAbi { last: None };
+        cpu.step(&mut mem, &mut host).unwrap(); // mov eax, …
+        cpu.step(&mut mem, &mut host).unwrap(); // mov [0x1FFE_0020], eax
+        let (call, val) = host.last.expect("AbiHost saw the call");
+        assert_eq!(call, 0x020);
+        assert_eq!(val, 0x0010_0003);
     }
 
     #[test]
@@ -1011,6 +1131,7 @@ mod tests {
         }
     }
     impl BiosHost for RecordingLibcHost {}
+    impl AbiHost for RecordingLibcHost {}
 
     #[test]
     fn step_int_0x81_invokes_libc_host_with_trap_addr_and_cdecl_args() {

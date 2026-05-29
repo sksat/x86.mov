@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod abi_host;
 pub mod bios_host;
 pub mod context;
 pub mod cpu;
@@ -12,6 +13,10 @@ pub mod libc_host;
 pub mod mem;
 pub mod syscall;
 
+pub use abi_host::{
+    is_abi_addr, unpack_mmap_request, AbiHost, ABI_BASE, ABI_PAGE_SIZE, CALL_MMAP_REQUEST,
+    CALL_SET_VIDEO_MODE,
+};
 pub use bios_host::{BiosArgs, BiosHost, BiosResult};
 pub use context::{capture_sparse_regions, load_context, Context, MemRegion, Regs};
 pub use cpu::{Cpu, Signal};
@@ -51,4 +56,8 @@ pub enum Fault {
     /// was registered for it. The numeric signal number is the value
     /// of [`crate::cpu::Signal`] cast to `u32`.
     SignalHandlerUnregistered(u32),
+    /// A guest write into the mov-only ABI page targeted a call number
+    /// the host doesn't implement. The numeric value is the call
+    /// (page-offset) the guest used.
+    UnsupportedAbiCall(u16),
 }

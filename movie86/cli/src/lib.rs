@@ -4,6 +4,7 @@
 
 use std::io::{self, Write};
 
+use movie86::abi_host::AbiHost;
 use movie86::bios_host::BiosHost;
 use movie86::elf::{flatten_with_stack, parse, ElfError, LoadedElf};
 use movie86::libc_host::{LibcCall, LibcHost, LibcResult};
@@ -166,6 +167,21 @@ impl LibcHost for StdHost {
 /// runs a canvas-flavoured ELF will surface as a fault, just like an
 /// unknown syscall would.
 impl BiosHost for StdHost {}
+
+/// The CLI host has no canvas to render into, so `set_video_mode` is
+/// silently ignored and `mmap_request` is rejected — the CLI's
+/// `FlatMemory` is sized at construction and can't grow. Anything else
+/// falls through to the default trap so typos in the guest's ABI use
+/// surface loudly.
+impl AbiHost for StdHost {
+    fn abi_call(&mut self, call_num: u16, _value: u32, _mem: &mut dyn Memory) -> Result<(), Fault> {
+        use movie86::abi_host::CALL_SET_VIDEO_MODE;
+        match call_num {
+            CALL_SET_VIDEO_MODE => Ok(()),
+            _ => Err(Fault::UnsupportedAbiCall(call_num)),
+        }
+    }
+}
 
 /// Maximum length of a guest-supplied format string or `%s` argument.
 /// Bounds the scan so an unterminated string from a buggy or hostile
@@ -396,7 +412,7 @@ pub fn run_elf(bytes: &[u8]) -> RunOutcome {
 /// Same as [`run_elf`] but with a caller-supplied host. Lets integration
 /// tests substitute a recording host (capture stdout, assert no syscall
 /// happens, etc.) without spawning a subprocess.
-pub fn run_elf_with_host<H: SysHost + LibcHost + BiosHost>(
+pub fn run_elf_with_host<H: SysHost + LibcHost + BiosHost + AbiHost>(
     bytes: &[u8],
     host: &mut H,
 ) -> RunOutcome {
@@ -466,7 +482,7 @@ pub enum DebugStop {
 /// Like [`run_elf_with_host`] but also accepts a `DebugConfig`. This
 /// is the entry the `movie86 --watch ...` CLI uses, exposed for tests.
 #[allow(clippy::too_many_lines)] // single-narrative run loop — splitting just spreads the state-machine across helpers
-pub fn run_elf_with_debug<H: SysHost + LibcHost + BiosHost>(
+pub fn run_elf_with_debug<H: SysHost + LibcHost + BiosHost + AbiHost>(
     bytes: &[u8],
     host: &mut H,
     cfg: &DebugConfig,
@@ -676,6 +692,7 @@ fn fault_detail(f: Fault) -> u32 {
         // one u32 scalar that maps to detail directly.
         Fault::Exit(s) | Fault::UnknownSyscall(s) | Fault::SignalHandlerUnregistered(s) => s,
         Fault::UnknownOpcode(b) | Fault::UnsupportedInterrupt(b) => u32::from(b),
+        Fault::UnsupportedAbiCall(n) => u32::from(n),
         Fault::DecodeTruncated | Fault::UnimplementedMov => 0,
     }
 }

@@ -140,11 +140,7 @@ impl BiosHost for WasmHost {
     /// is therefore equivalent to "no canvas selected" in the demo,
     /// matching how real-mode BIOS treats unsupported mode numbers as
     /// a no-op without faulting.
-    fn bios_call(
-        &mut self,
-        args: &BiosArgs,
-        _mem: &mut dyn Memory,
-    ) -> Result<BiosResult, Fault> {
+    fn bios_call(&mut self, args: &BiosArgs, _mem: &mut dyn Memory) -> Result<BiosResult, Fault> {
         match args.ah() {
             0 => {
                 self.active_video_mode = Some(args.al());
@@ -152,6 +148,34 @@ impl BiosHost for WasmHost {
                 Ok(BiosResult::Return(0))
             }
             _ => Err(Fault::UnsupportedInterrupt(0x10)),
+        }
+    }
+}
+
+/// mov-only ABI parity with turbo86. The wasm Vm catches writes to the
+/// ABI page in `Cpu::step` and routes them here:
+///
+/// - `CALL_SET_VIDEO_MODE` — `value` (low byte) is the mode, captured
+///   into `active_video_mode` the same way `int 0x10 / AH=0` already
+///   does. The JS demo reads `vm.activeVideoMode` to pick which
+///   canvas to render, so the two entry points produce identical
+///   browser-visible behaviour.
+/// - `CALL_MMAP_REQUEST` — no-op in wasm because the demo's canvas
+///   ELFs declare their FB regions as PT_LOAD entries that the
+///   loader already maps via `flatten_with_stack`. The guest still
+///   issues the request for portability to turbo86 (where the FB
+///   isn't pre-mapped); on wasm it's effectively a "we already have
+///   you covered" acknowledgement. Returns Ok so the guest proceeds
+///   straight to the FB write.
+impl movie86::AbiHost for WasmHost {
+    fn abi_call(&mut self, call_num: u16, value: u32, _mem: &mut dyn Memory) -> Result<(), Fault> {
+        match call_num {
+            movie86::CALL_SET_VIDEO_MODE => {
+                self.active_video_mode = Some((value & 0xFF) as u8);
+                Ok(())
+            }
+            movie86::CALL_MMAP_REQUEST => Ok(()),
+            _ => Err(Fault::UnsupportedAbiCall(call_num)),
         }
     }
 }
