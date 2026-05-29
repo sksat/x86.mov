@@ -297,11 +297,18 @@ impl core::fmt::Display for EffectiveAddress {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let has_addr_part = self.base.is_some() || self.index.is_some();
 
-        // Displacement: signed-hex. Negative values render as `-0xNN`
-        // (gas accepts both `-0x4` and `0xfffffffc` but the negative
-        // form matches what objdump prints).
+        // Displacement.
+        //
+        // - Pure absolute (`disp32`-only) operands: render unsigned —
+        //   `0x80000000` reads as an address, never `-0x80000000`. The
+        //   decoder packs the disp into an `i32` so the top half of the
+        //   address space arrives sign-extended; the cast lifts it back
+        //   to the original 32-bit pattern.
+        // - Memory operands with a base / index: the disp is a signed
+        //   relative offset (`-0x4(%ebp)` for a local), so emit the
+        //   signed form — matching objdump.
         if self.disp != 0 || !has_addr_part {
-            if self.disp < 0 {
+            if has_addr_part && self.disp < 0 {
                 let mag = i64::from(self.disp).unsigned_abs();
                 write!(f, "-{mag:#x}")?;
             } else {
@@ -621,5 +628,37 @@ mod display_tests {
             disp: 0x2000,
         };
         assert_eq!(format!("{ea}"), "0x2000");
+    }
+
+    #[test]
+    fn ea_pure_disp32_high_address_renders_unsigned() {
+        // disp32 ≥ 0x8000_0000 packs into i32 as a negative value
+        // (the decoder doesn't widen, since the operand is 32 bits on
+        // the wire). Absolute addresses must render unsigned all the
+        // same — `mov eax, 0x80000000` reads as a high address, not
+        // `-0x80000000`. Codex review on the introduction PR flagged
+        // this; pin the behaviour so any future refactor keeps it.
+        let ea = EffectiveAddress {
+            base: None,
+            index: None,
+            scale: 1,
+            disp: 0x8000_0000_u32.cast_signed(),
+        };
+        assert_eq!(format!("{ea}"), "0x80000000");
+    }
+
+    #[test]
+    fn ea_base_plus_negative_disp_renders_signed() {
+        // The signed form is the right one when there's a base — a
+        // local at `[ebp - 4]` reads as `-0x4(%ebp)`. Pinning the
+        // contrast against the unsigned-disp32 case above so the
+        // two branches don't drift.
+        let ea = EffectiveAddress {
+            base: Some(Reg32::Ebp),
+            index: None,
+            scale: 1,
+            disp: -0x4,
+        };
+        assert_eq!(format!("{ea}"), "-0x4(%ebp)");
     }
 }
