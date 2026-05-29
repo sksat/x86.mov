@@ -23,6 +23,8 @@
 #   run.sh --example=qoi_decode --run     # 2x2 RGBA QOI decode; exit = 8
 #   run.sh --example=aes --run            # AES-128 (RustCrypto); blocked
 #                                          # on stage 6d3b — see aes/src/main.rs
+#   run.sh --example=mandelbrot --run     # f64 mandelbrot escape-iter sum
+#                                          # along the real axis; exit = 81
 #
 # Each example is an independent Cargo crate. Cargo's discovery of
 # the shared .cargo/config.toml here (the parent dir) routes the link
@@ -45,7 +47,7 @@ for arg in "$@"; do
     case "$arg" in
         --example=*) EXAMPLE="${arg#--example=}" ;;
         --run)       DO_RUN=1 ;;
-        *) echo "usage: $0 [--example={main,fib,dep_mov_add,png_header,jpeg_header,bmp_decode,base64_decode,qoi_decode,aes}] [--run]" 1>&2; exit 2 ;;
+        *) echo "usage: $0 [--example={main,fib,dep_mov_add,png_header,jpeg_header,bmp_decode,base64_decode,qoi_decode,aes,indirect_call,mandelbrot}] [--run]" 1>&2; exit 2 ;;
     esac
 done
 
@@ -72,6 +74,12 @@ case "$EXAMPLE" in
     # round-trip through llvm-mov-llc — see aes/src/main.rs. EXPECTED is
     # a placeholder until the encrypt path can be compiled.
     aes)           ENTRY="aes_main";           EXPECTED=0;   CRATE="rust-mov-aes" ;;
+    # Stage-7h7 f64 demo: mandelbrot escape-iter sum along the real
+    # axis at 16 evenly-spaced cx values. 10 in-set points × 32 +
+    # escape counts {5, 3, 3, 2, 2, 2} = 337; (337 mod 256) = 81.
+    # Exercises the full 7g / 7h f64 surface (sitofp / fmul / fadd /
+    # fsub / fcmp / fptosi) end to end through real Rust f64 ops.
+    mandelbrot)    ENTRY="mandelbrot_main";    EXPECTED=81;  CRATE="rust-mov-mandelbrot" ;;
     *) echo "error: unknown --example=$EXAMPLE" 1>&2; exit 2 ;;
 esac
 

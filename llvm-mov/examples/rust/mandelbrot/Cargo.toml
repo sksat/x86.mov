@@ -1,0 +1,30 @@
+# Stage-7h7 f64 Rust example. Computes the sum of mandelbrot escape
+# iteration counts along the real axis, exercising __floatsidf,
+# __muldf3, __adddf3, __subdf3, __ledf2 (f64 fcmp), and __fixdfsi via
+# real Rust f64 ops. Returns a deterministic i32 modulo 256.
+
+[package]
+name = "rust-mov-mandelbrot"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "rust-mov-mandelbrot"
+path = "src/main.rs"
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = 0
+overflow-checks = false
+debug = false
+strip = false
+lto = false
+
+[profile.dev]
+panic = "abort"
+overflow-checks = false
