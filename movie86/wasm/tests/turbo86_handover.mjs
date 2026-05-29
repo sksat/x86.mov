@@ -133,6 +133,97 @@ async function main() {
             regions: [{ addr: 0x08048000, bytes: code }],
         };
 
+        // Round-trip: send a snapshot of a tight-loop guest, let it
+        // run for a bit, send Pause, receive Paused, restore back
+        // into the local Vm. Verifies the full reverse-handoff loop
+        // including the Pause Inbound + turbo86's Paused with sparse
+        // Regions + `loadContextInto` absorbing it. The guest is
+        // `jmp $` (EB FE — 2-byte tight loop) at entry; turbo86 will
+        // be stuck in wait4 until Pause is sent.
+        try {
+            const entry = 0x08048000;
+            const jmpSelf = new Uint8Array([0xEB, 0xFE]);
+            const snapshotIntoVm = {
+                regs: {
+                    eax: 0, ebx: 0, ecx: 0, edx: 0,
+                    esi: 0, edi: 0, ebp: 0,
+                    esp: 0x701FFFF0, eip: entry, eflags: 0,
+                },
+                regions: [{ addr: entry, bytes: jmpSelf }],
+            };
+
+            const url = `ws://127.0.0.1:${port}/`;
+            const ws = new WebSocket(url);
+            const events = [];
+            const pauseEvent = new Promise((resolve, reject) => {
+                ws.addEventListener('open', () => {
+                    ws.send(wrapper.makeLoadContextMessage(snapshotIntoVm, 'host'));
+                    // Let the guest spin briefly so we're exercising
+                    // the "no-syscall tight loop, Pause via SIGSTOP"
+                    // path that turbo86's server tests already pin.
+                    setTimeout(() => ws.send(JSON.stringify({ type: 'pause' })), 100);
+                }, { once: true });
+                ws.addEventListener('message', (e) => {
+                    const msg = wrapper.parseOutboundMessage(e.data);
+                    events.push(msg);
+                    if (msg.type === 'paused') resolve(msg);
+                });
+                ws.addEventListener('close', () => {
+                    if (!events.some(e => e.type === 'paused')) {
+                        reject(new Error('WS closed without Paused'));
+                    }
+                });
+                ws.addEventListener('error', reject, { once: true });
+            });
+            const paused = await pauseEvent;
+            ws.close();
+
+            // turbo86's Paused must carry a non-empty `regions`
+            // array (sparse stack snapshot etc.) and `regs.eip`
+            // pointing at the jmp instruction.
+            assert.equal(paused.regs.eip, entry,
+                `paused EIP ${paused.regs.eip.toString(16)} != entry ${entry.toString(16)}`);
+            assert.ok(paused.regions.length >= 1,
+                `paused.regions should be non-empty, got ${paused.regions.length}`);
+
+            // Restore into a fresh local Vm that has the jmp ELF
+            // loaded — same entry address, so the in-range region
+            // (code) lands and any stack-region in the snapshot is
+            // skipped. After restore, vm.eip must match what turbo86
+            // sent back.
+            //
+            // To get a Vm at the jmp's base, we synthesize a one-
+            // page ELF in code rather than building one on disk —
+            // simpler than maintaining a "jmp $" fixture.
+            //
+            // Actually simpler: load the bundled return42 ELF (which
+            // is at 0x08048000 too), then loadContextInto with the
+            // paused snapshot. The restored EIP / regs / code at
+            // entry will all match turbo86's Paused.
+            const elfBytes = new Uint8Array(
+                await readFile(`${root}/examples/return42.elf`),
+            );
+            const vm = new wasmMod.Vm(elfBytes);
+            try {
+                const { applied, skipped } = wrapper.loadContextInto(vm, paused);
+                assert.ok(applied >= 1,
+                    `expected ≥1 region applied, got applied=${applied} skipped=${skipped}`);
+                assert.equal(vm.eip, entry,
+                    `restored EIP ${vm.eip.toString(16)} != ${entry.toString(16)}`);
+                // The jmp-self bytes must be at entry (turbo86's
+                // snapshot included the code region).
+                const at = vm.readMem(entry, 2);
+                assert.deepEqual(Array.from(at), [0xEB, 0xFE],
+                    `restored bytes at entry != jmp-self`);
+            } finally {
+                vm.free();
+            }
+            console.log('ok  full round-trip (snapshot → turbo86 → Pause → loadContextInto)');
+        } catch (e) {
+            console.error(`FAIL full round-trip: ${e.stack || e.message}`);
+            failed++;
+        }
+
         async function runHandover(handoverCtx, mode) {
             const events = [];
             const url = `ws://127.0.0.1:${port}/`;

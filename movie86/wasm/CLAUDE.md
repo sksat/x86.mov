@@ -81,7 +81,8 @@ Both ship today; pick by what you want from the call.
 The demo's "Send to local turbo86" button packages the live Vm state
 as the canonical `movie86::context::Context` schema (same shape the
 CLI's handover uses) and ships it over WebSocket to a local turbo86
-process. Four pieces:
+process. A subsequent "Pause turbo86" + "Restore Vm from Paused"
+pair brings the session back into the local Vm. Six pieces:
 
 - **turbo86 `--allow-origin`** is what makes the cross-origin browser
   handshake actually succeed. The frontend is served from
@@ -115,10 +116,36 @@ process. Four pieces:
   `TURBO86_BIN=/path/to/turbo86 node tests/turbo86_handover.mjs` runs
   against an existing binary; with the env unset, tries `go build`
   from source; with `go` also missing, skips cleanly. Verifies the
-  full round-trip (exit + write) against a live turbo86 so a wire
-  drift on either side breaks loudly. The Rust CLI side has its own
-  equivalent (`movie86/cli/tests/handover_turbo86.rs`); the JS test
-  pins the browser code path specifically.
+  full round-trip (exit + write + full Pause → loadContextInto loop)
+  against a live turbo86 so a wire drift on either side breaks
+  loudly. The Rust CLI side has its own equivalent
+  (`movie86/cli/tests/handover_turbo86.rs`); the JS test pins the
+  browser code path specifically.
+
+- **`Vm::loadContext(snapshot) -> { applied, skipped }`** is the
+  reverse of `snapshotContext`. Writes each region into guest
+  memory, loads the regs, clears the halt cache so `stepN` re-
+  evaluates from the restored EIP. Lossy by design: regions outside
+  the Vm's mapped extent (typically turbo86's stack snapshot at
+  0x70000000+ when the local Vm only sized memory for a small ELF)
+  are silently skipped — the `skipped` count is surfaced in the
+  event log so the user knows stack-resident bits were lost.
+
+- **`loadContextInto(vm, ctx)`** is the JS wrapper. Builds a
+  `ContextSnapshot` via `setRegs` + `addRegion(...)`, calls
+  `vm.loadContext`, returns `{ applied, skipped }`. Used by the
+  "Restore Vm from Paused" button after a turbo86 `Paused` event.
+
+- **Unified console + engine-aware cards.** turbo86's stdout/stderr
+  feed the SAME `#stdout` / `#stderr` panes the local Vm uses
+  (prefixed `[turbo86] ` so the two streams are visually separable
+  without splitting them spatially — the user reads one continuous
+  output transcript). The meta cards (`total mov` / `mov per sec` /
+  …) switch their data source AND their labels when a turbo86
+  session is active: while engine == 'turbo86' the cards report
+  `turbo86 events` / `events / sec` / `status` / `exit` / `session
+  time` / `paused regions`. `setEngine('local')` (called by Reset,
+  doRun, and doRestoreFromTurbo86) flips them back.
 
 ## Display strategy: follow vs periodic
 

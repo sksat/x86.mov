@@ -309,25 +309,19 @@
 
 <div class="canvases" id="canvases"></div>
 
-<!-- turbo86 handover output pane. Empty until the user clicks
-     "Send to local turbo86" — at that point we open a WS to the
-     configured URL, send `LoadContext`, then stream Outbound events
-     here. Kept separate from the local Vm's stdout/stderr panes so a
-     user can compare the two engines side by side after a handover. -->
+<!-- turbo86 handover event log. Empty until the user clicks
+     "Send to local turbo86". stdout/stderr from the turbo86 session
+     stream into the existing #stdout / #stderr panes above (the
+     unified-console doctrine — both engines share one console so the
+     user reads one continuous output transcript), and only the
+     metadata events (LoadContext sent, Exit/Fault/Paused, etc.)
+     surface here. -->
 <div class="panel turbo86-pane" id="turbo86-pane" hidden>
   <div class="panel-head">
     <h2>turbo86 session</h2>
     <span id="turbo86-summary" class="status">—</span>
-  </div>
-  <div class="io">
-    <div>
-      <h3>turbo86 stdout</h3>
-      <pre id="turbo86-stdout" class="out"></pre>
-    </div>
-    <div>
-      <h3>turbo86 stderr</h3>
-      <pre id="turbo86-stderr" class="out err"></pre>
-    </div>
+    <button id="turbo86-pause" hidden>Pause turbo86</button>
+    <button id="turbo86-restore" hidden>Restore Vm from Paused</button>
   </div>
   <div id="turbo86-events" class="t86events" aria-label="turbo86 event log"></div>
 </div>
@@ -338,6 +332,7 @@ import {
     FRAMEBUFFER_MODES,
     modeForNumber,
     snapshotContext,
+    loadContextInto,
     makeLoadContextMessage,
     parseOutboundMessage,
 } from './movie86.mjs';
@@ -369,6 +364,10 @@ const state = {
     elfBytes: null,
     prevRegs: null,
     prevEip: null,
+    // Which engine drives the meta cards / instruction preview right
+    // now: 'local' = wasm Vm, 'turbo86' = remote session. Flipped by
+    // doSendToTurbo86 / doRestoreFromTurbo86 / doReset.
+    engine: 'local',
     // Bumping runId cancels any in-flight Run loop without needing
     // shared mutable state to flip — the loop notices its id is stale
     // and bails out cleanly.
@@ -629,14 +628,30 @@ function renderMem() {
 }
 
 function renderMeta() {
+    if (state.engine === 'turbo86') {
+        renderMetaTurbo86();
+    } else {
+        renderMetaLocal();
+    }
+}
+
+// Cards in local-Vm mode: total mov / mov per sec / halt / exit /
+// wall time / memory range — the original labels and the original
+// data source (`state.vm`).
+function renderMetaLocal() {
+    setMetaLabels({
+        steps: 'total mov',
+        rate:  'mov / sec',
+        halt:  'halt',
+        exit:  'exit',
+        wall:  'wall time',
+        mem:   'memory',
+    });
     const vm = state.vm; if (!vm) return;
     const halt = vm.haltReason;
 
     $('m-steps').textContent = fmtCount(vm.steps);
 
-    // mov/sec — sample steps + wall clock over a ~250 ms window so the
-    // displayed rate is smooth. Halted guests show the last rate so the
-    // user can read "how fast was it going before it stopped".
     if (!halt) {
         const now = performance.now();
         const dt = now - state.rateSampleTime;
@@ -658,6 +673,65 @@ function renderMeta() {
     haltCard.classList.toggle('exit', !!isExit);
     haltCard.classList.toggle('fault', !!halt && !isExit);
     $('m-exit').textContent = vm.exitCode ?? '—';
+}
+
+// Cards in turbo86-session mode: the live ptrace-driven session
+// doesn't report instruction counts (no `vm.steps` analogue), so we
+// surface the closest things turbo86 *does* tell us — Outbound event
+// count + their rate, session status, exit code, wall time since
+// LoadContext was sent, and the bytes-in-last-Paused for the memory
+// card. Sampling shape mirrors the local rate: 250 ms windows so the
+// number stays readable.
+function renderMetaTurbo86() {
+    setMetaLabels({
+        steps: 'turbo86 events',
+        rate:  'events / sec',
+        halt:  'status',
+        exit:  'exit',
+        wall:  'session time',
+        mem:   'paused regions',
+    });
+    const s = turbo86.stats;
+    $('m-steps').textContent = fmtCount(s.events);
+
+    if (turbo86.ws && s.halt == null) {
+        const now = performance.now();
+        const dt = now - s.rateSampleAt;
+        if (dt >= 250 && s.rateSampleAt !== 0) {
+            s.lastRate = (s.events - s.rateSampleEvents) / (dt / 1000);
+            s.rateSampleAt = now;
+            s.rateSampleEvents = s.events;
+        }
+    }
+    $('m-rate').textContent = s.lastRate == null ? '—' : fmtRate(s.lastRate);
+
+    const haltCard = $('card-halt');
+    const haltText = s.halt ?? 'running';
+    $('m-halt').textContent = haltText;
+    haltCard.classList.toggle('exit', s.halt === 'exit');
+    haltCard.classList.toggle('fault', s.halt === 'fault');
+    $('m-exit').textContent = s.exit ?? '—';
+
+    if (s.startWall) {
+        const endWall = s.endWall || performance.now();
+        $('m-wall').textContent = `${Math.round(endWall - s.startWall)} ms`;
+    }
+    if (s.memBytes != null) {
+        $('m-memrange').textContent = `${s.memBytes.toLocaleString()} B`;
+    }
+}
+
+// Update the small uppercase label under each card's value. The keys
+// match the card ids (m-{key}) so wiring stays unambiguous.
+function setMetaLabels({ steps, rate, halt, exit, wall, mem }) {
+    const labels = document.querySelectorAll('.meta .card .k');
+    if (labels.length < 6) return;  // boot before DOM ready
+    labels[0].textContent = steps;
+    labels[1].textContent = rate;
+    labels[2].textContent = halt;
+    labels[3].textContent = exit;
+    labels[4].textContent = wall;
+    labels[5].textContent = mem;
 }
 
 // Snap-to-bottom only when the user was already there — if they
@@ -787,6 +861,10 @@ function setRunButton(running) {
 async function doRun() {
     const vm = state.vm;
     if (!vm || vm.haltReason) return;
+    // Starting a local Run flips the cards back to local semantics —
+    // a previous turbo86 session may have left them showing turbo86
+    // labels (events / status / session time).
+    setEngine('local');
     const myRun = ++state.runId;
     setRunButton(true);
     const follow = $('follow').checked;
@@ -833,6 +911,14 @@ async function doReset() {
     if (!state.elfBytes) return;
     state.runId++;
     setRunButton(false);
+    // Reset always returns the user to a clean local-Vm view — drop
+    // any in-flight turbo86 session and wipe the session pane so the
+    // cards and console go back to local-Vm semantics from scratch.
+    closeT86();
+    resetT86Pane();
+    resetT86Stats();
+    $('turbo86-pane').hidden = true;
+    setEngine('local');
     await loadFromBytes(state.elfBytes, 'reset');
 }
 
@@ -840,20 +926,46 @@ async function doReset() {
 //
 // Stop the in-browser Vm at its current instruction boundary, snapshot
 // (regs + sparse memory), open a WebSocket to the configured turbo86
-// URL, send the snapshot as a `LoadContext` Inbound, then stream events
-// (Stdout / Stderr / Exit / Fault / Paused) back into the turbo86 pane.
+// URL, send the snapshot as a `LoadContext` Inbound, then stream
+// Outbound events into the unified console + a turbo86 event log.
 //
-// The Vm and the WS are independent: the local Vm stays paused at
-// whatever EIP the snapshot was taken from; the user can resume it
-// after disconnecting, or just compare the turbo86 events with the
-// local stdout/stderr from the same point. We do NOT proxy the events
-// back into the Vm — the two engines have diverged once handed off,
-// and reconciling output streams from both sides is out of scope.
+// Console policy: turbo86's stdout/stderr feed the SAME `#stdout` /
+// `#stderr` panes the local Vm uses — one console, two engines. A
+// `[turbo86]` prefix separates the streams visually without splitting
+// them spatially. This matches the user's mental model better than
+// dual panes (you read execution output linearly, not engine-by-engine).
+//
+// Cards policy: while a turbo86 session is active or recently closed,
+// the meta cards (steps / rate / halt / exit / wall / memory) source
+// their values from `turbo86.stats` instead of the local Vm. When the
+// user clicks Reset or starts another local Run, cards switch back.
+// Labels swap to reflect the new meaning (`total mov` → `events`,
+// `mov / sec` → `events / sec`, etc.) so it's obvious which engine
+// the numbers describe. See `renderMeta` for the switch.
+//
+// Round-trip: while a session is open, the user can click Pause; the
+// server sends back a `Paused` Outbound carrying a Context. Storing
+// the Paused locally lets the user click "Restore Vm from Paused"
+// afterward to absorb turbo86's state back into the wasm Vm and
+// resume from there.
 
 const turbo86 = {
     ws: null,
-    stdoutBuf: '',
-    stderrBuf: '',
+    // Live session stats — what the meta cards read while engine == 'turbo86'.
+    stats: {
+        events: 0,
+        startWall: 0,
+        endWall: 0,
+        rateSampleAt: 0,
+        rateSampleEvents: 0,
+        lastRate: null,
+        halt: null,          // null while open; 'exit' | 'fault' | 'paused' | 'closed'
+        exit: null,          // exit code if a `exit` event arrived
+        memBytes: null,      // bytes summed from the last Paused regions
+    },
+    // Last received Paused — keeps the regs + regions around so the
+    // user can Restore even after the WS closes.
+    lastPaused: null,
 };
 
 function setT86Status(text, kind = '') {
@@ -874,14 +986,38 @@ function appendT86Event(label, detail, klass = '') {
     $('turbo86-events').scrollTop = $('turbo86-events').scrollHeight;
 }
 
+// Switch which engine the meta cards / instruction-preview describe.
+// 'local' (default) reads `state.vm`; 'turbo86' reads `turbo86.stats`.
+// Bumping the engine triggers a re-render so labels and values update
+// in lockstep — never leave the labels saying "total mov" while the
+// number is actually turbo86's event count.
+function setEngine(name) {
+    if (state.engine === name) return;
+    state.engine = name;
+    render();
+}
+
+function resetT86Stats() {
+    turbo86.stats = {
+        events: 0,
+        startWall: 0,
+        endWall: 0,
+        rateSampleAt: 0,
+        rateSampleEvents: 0,
+        lastRate: null,
+        halt: null,
+        exit: null,
+        memBytes: null,
+    };
+}
+
 function resetT86Pane() {
-    turbo86.stdoutBuf = '';
-    turbo86.stderrBuf = '';
-    $('turbo86-stdout').textContent = '';
-    $('turbo86-stderr').textContent = '';
     $('turbo86-events').textContent = '';
     $('turbo86-summary').textContent = '—';
     $('turbo86-summary').className = 'status';
+    $('turbo86-pause').hidden = true;
+    $('turbo86-restore').hidden = true;
+    turbo86.lastPaused = null;
 }
 
 function closeT86() {
@@ -920,15 +1056,16 @@ async function doSendToTurbo86() {
     }
     const totalBytes = ctx.regions.reduce((n, r) => n + r.bytes.length, 0);
 
-    // Reveal the output pane and reset its contents — every connect
-    // attempt starts from a clean slate so previous sessions don't
-    // bleed into the new one's log.
     $('turbo86-pane').hidden = false;
     resetT86Pane();
+    resetT86Stats();
+    turbo86.stats.startWall = performance.now();
+    turbo86.stats.rateSampleAt = turbo86.stats.startWall;
     appendT86Event(`connect`,
         `${url} (mode=${mode}, EIP=${fmt32(ctx.regs.eip)}, ` +
         `${ctx.regions.length} region(s), ${totalBytes.toLocaleString()} B)`);
     setT86Status('connecting…');
+    setEngine('turbo86');
 
     let ws;
     try {
@@ -946,7 +1083,8 @@ async function doSendToTurbo86() {
             const frame = makeLoadContextMessage(ctx, mode);
             ws.send(frame);
             appendT86Event('sent', `LoadContext (${frame.length.toLocaleString()} B JSON)`);
-            setT86Status('waiting for events…', 'ok');
+            setT86Status('running…', 'ok');
+            $('turbo86-pause').hidden = false;
         } catch (err) {
             setT86Status(`send failed: ${err.message || err}`, 'err');
             appendT86Event('error', String(err), 't-fault');
@@ -962,34 +1100,51 @@ async function doSendToTurbo86() {
             appendT86Event('parse error', err.message || String(err), 't-fault');
             return;
         }
+        turbo86.stats.events++;
         switch (msg.type) {
             case 'stdout': {
-                turbo86.stdoutBuf += dec.decode(msg.bytes);
-                appendAndAutoscroll($('turbo86-stdout'), turbo86.stdoutBuf);
+                // Unified console: turbo86's stdout flows into the
+                // same #stdout pane the Vm uses. A `[turbo86] ` prefix
+                // tags the source without splitting the visual
+                // transcript — the user reads one stream from both
+                // engines.
+                const text = '[turbo86] ' + dec.decode(msg.bytes);
+                state.stdoutBuf += text;
+                appendAndAutoscroll($('stdout'), state.stdoutBuf);
                 break;
             }
             case 'stderr': {
-                turbo86.stderrBuf += dec.decode(msg.bytes);
-                appendAndAutoscroll($('turbo86-stderr'), turbo86.stderrBuf);
+                const text = '[turbo86] ' + dec.decode(msg.bytes);
+                state.stderrBuf += text;
+                appendAndAutoscroll($('stderr'), state.stderrBuf);
                 break;
             }
             case 'exit':
                 appendT86Event('exit', `code=${msg.code}`, 't-exit');
                 $('turbo86-summary').textContent = `exit ${msg.code}`;
                 $('turbo86-summary').className = 'status ok';
+                turbo86.stats.halt = 'exit';
+                turbo86.stats.exit = msg.code;
                 break;
             case 'fault':
                 appendT86Event('fault', msg.reason, 't-fault');
                 $('turbo86-summary').textContent = `fault: ${msg.reason}`;
                 $('turbo86-summary').className = 'status err';
+                turbo86.stats.halt = 'fault';
                 break;
             case 'paused':
                 appendT86Event('paused',
                     `signal=${msg.signal} reason=${msg.reason} EIP=${fmt32(msg.regs.eip)}`,
                     't-paused');
                 $('turbo86-summary').textContent = `paused (sig ${msg.signal})`;
+                turbo86.stats.halt = 'paused';
+                turbo86.stats.memBytes = (msg.regions || [])
+                    .reduce((n, r) => n + r.bytes.length, 0);
+                turbo86.lastPaused = msg;
+                $('turbo86-restore').hidden = false;
                 break;
         }
+        render();
     };
 
     ws.onerror = () => {
@@ -1003,13 +1158,54 @@ async function doSendToTurbo86() {
     ws.onclose = (e) => {
         const tag = `code=${e.code}` + (e.reason ? ` reason=${e.reason}` : '');
         appendT86Event('closed', tag);
+        if (turbo86.stats.halt == null) turbo86.stats.halt = 'closed';
+        turbo86.stats.endWall = performance.now();
         if ($('turbo86-summary').textContent === '—') {
             $('turbo86-summary').textContent = 'session closed';
         }
         setT86Status(`closed (${e.code})`,
             e.code === 1000 || e.code === 1005 ? 'ok' : 'err');
+        $('turbo86-pause').hidden = true;
         if (turbo86.ws === ws) turbo86.ws = null;
+        render();
     };
+}
+
+function doPauseTurbo86() {
+    if (!turbo86.ws) return;
+    try {
+        turbo86.ws.send(JSON.stringify({ type: 'pause' }));
+        appendT86Event('sent', 'Pause (waiting for Paused snapshot…)');
+    } catch (err) {
+        appendT86Event('error', `pause send failed: ${err.message || err}`, 't-fault');
+    }
+}
+
+function doRestoreFromTurbo86() {
+    const vm = state.vm;
+    if (!vm || !turbo86.lastPaused) return;
+    try {
+        const { applied, skipped } = loadContextInto(vm, turbo86.lastPaused);
+        appendT86Event('restored',
+            `${applied} region(s) applied${skipped ? `, ${skipped} skipped (outside Vm mapping)` : ''}`,
+            't-paused');
+        // Hand the cards back to the local Vm — its state is now what
+        // turbo86 had at the Paused boundary.
+        setEngine('local');
+        // Wipe the rate sampler so the next mov/sec sample starts
+        // clean from the restored boundary.
+        state.rateSampleSteps = 0n;
+        state.rateSampleTime = 0;
+        state.lastRate = null;
+        $('m-wall').textContent = '—';
+        // Render once so the regs / disasm pane reflect the new state
+        // before any Step is taken.
+        state.prevRegs = null;
+        state.prevEip = null;
+        render();
+    } catch (err) {
+        appendT86Event('error', `restore failed: ${err.message || err}`, 't-fault');
+    }
 }
 
 // --- URL query param sync ---
@@ -1115,6 +1311,8 @@ $('run').addEventListener('click', () => {
 $('reset').addEventListener('click', doReset);
 
 $('turbo86-send').addEventListener('click', doSendToTurbo86);
+$('turbo86-pause').addEventListener('click', doPauseTurbo86);
+$('turbo86-restore').addEventListener('click', doRestoreFromTurbo86);
 $('turbo86-url').addEventListener('input', syncUrlFromControls);
 $('turbo86-mode').addEventListener('change', syncUrlFromControls);
 

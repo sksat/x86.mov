@@ -5,7 +5,11 @@
 // per page and returns a plain JS object — callers don't deal with
 // `init()` themselves.
 
-import init, { runElf as runElfRaw, Vm as VmRaw } from './build/browser/movie86_wasm.js';
+import init, {
+    runElf as runElfRaw,
+    Vm as VmRaw,
+    ContextSnapshot as ContextSnapshotRaw,
+} from './build/browser/movie86_wasm.js';
 
 /**
  * Memory-mapped framebuffer modes — loosely styled after real-mode
@@ -240,6 +244,54 @@ export function makeLoadContextMessage(ctx, mode = 'host') {
         },
         mode,
     });
+}
+
+/**
+ * Apply a plain-JS Context (the same shape `snapshotContext` returns,
+ * or the `regs` + `regions` pair carried by a turbo86 `Paused`
+ * Outbound) to `vm`. Restores regs + memory and clears the Vm's halt
+ * state so subsequent `stepN` calls re-evaluate from the restored
+ * EIP. The reverse of `snapshotContext` — the "Restore Vm from
+ * turbo86 Paused" UI flow calls this.
+ *
+ * Returns `{ applied, skipped }`: how many regions landed inside the
+ * Vm's mapped memory and how many had to be dropped (turbo86's stack
+ * snapshot at 0x70000000+ doesn't fit in a movie86 FlatMemory sized
+ * for a small ELF). The UI surfaces `skipped` so the user knows
+ * stack-resident bits of the snapshot were lost; for movfuscator-
+ * style programs whose hot state is code+regs, that's typically
+ * sufficient.
+ *
+ * @param {Vm} vm
+ * @param {{regs: object, regions: Array<{addr: number, bytes: Uint8Array}>}} ctx
+ * @returns {{applied: number, skipped: number}}
+ */
+export function loadContextInto(vm, ctx) {
+    const snap = new ContextSnapshotRaw();
+    try {
+        const r = ctx.regs;
+        snap.setRegs(
+            r.eax >>> 0, r.ebx >>> 0, r.ecx >>> 0, r.edx >>> 0,
+            r.esi >>> 0, r.edi >>> 0, r.ebp >>> 0, r.esp >>> 0,
+            r.eip >>> 0, (r.eflags ?? 0) >>> 0,
+        );
+        for (const region of ctx.regions) {
+            // wasm-bindgen Vec<u8> takes a Uint8Array; copy if the
+            // caller handed us something other (e.g. Buffer in Node).
+            const bytes = region.bytes instanceof Uint8Array
+                ? region.bytes
+                : new Uint8Array(region.bytes);
+            snap.addRegion(region.addr >>> 0, bytes);
+        }
+        const summary = vm.loadContext(snap);
+        try {
+            return { applied: summary.applied, skipped: summary.skipped };
+        } finally {
+            summary.free();
+        }
+    } finally {
+        snap.free();
+    }
 }
 
 /**
