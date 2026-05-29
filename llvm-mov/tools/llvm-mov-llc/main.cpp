@@ -2202,6 +2202,273 @@ static void injectFixsfdiHelpers(Module &M, LLVMContext &Ctx) {
     emitFloatToInt64Body(F, Ctx, /*IsSigned=*/false);
 }
 
+// Stage 7h11 — `floor` / `ceil` / `trunc` / `round` for f32 and f64.
+// All four share an IEEE-754 bit-twiddling algorithm:
+//
+//   1. extract sign, biased exp, mantissa
+//   2. if exp < bias: |v| < 1, the integer part is 0
+//        - trunc: ±0 (preserve sign)
+//        - floor: -1 if negative non-zero else +0 (preserve sign of zero)
+//        - ceil:  +1 if positive non-zero else -0 (preserve sign of zero)
+//        - round: |v| < 0.5 (exp < bias-1) → ±0; 0.5 ≤ |v| < 1 → ±1
+//   3. if exp ≥ bias + mantissa_bits: |v| ≥ 2^mant — already integer,
+//      or Inf / NaN — return as-is
+//   4. otherwise: frac_bits = bias + mantissa_bits - exp
+//        - frac_mask = (1 << frac_bits) - 1
+//        - has_frac  = (bits & frac_mask) != 0
+//        - trunc_bits = bits & ~frac_mask        (always)
+//        - floor / ceil: bump magnitude by 1 ULP when sign matches
+//          (`has_frac && sign` for floor, `has_frac && !sign` for ceil)
+//        - round: bump when guard bit (bit at frac_bits-1) is set
+//        - bump = trunc_bits + (1 << frac_bits)  (adds to mantissa,
+//          can cascade into exp; that's the correct overflow behaviour)
+//
+// The f32 variant uses i32 throughout; the f64 variant uses i64 with
+// the 7h4 clamped-arm shift utilities so SDAG doesn't materialise an
+// `icmp i64` cascade for the comparisons / has_frac checks.
+enum class FRoundKind { Trunc, Floor, Ceil, Round };
+
+static void emitFRoundF32Body(Function *F, LLVMContext &Ctx, FRoundKind Kind) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *F32 = Type::getFloatTy(Ctx);
+  const uint32_t MantBits = 23;
+  const uint32_t ExpBias = 127;
+  const uint32_t ExpMask = 0xFF;
+  const uint32_t MantMask = 0x7FFFFFu;
+  const uint32_t SignBitMask = 0x80000000u;
+
+  Argument *V = F->getArg(0); V->setName("v");
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  auto C = [&](uint32_t X) { return B.getInt32(X); };
+
+  Value *Bits = B.CreateBitCast(V, I32);
+  Value *Sign = B.CreateLShr(Bits, C(31));                       // 0 or 1
+  Value *Exp  = B.CreateAnd(B.CreateLShr(Bits, C(MantBits)), C(ExpMask));
+  Value *MantNZ = B.CreateICmpNE(B.CreateAnd(Bits, C(MantMask)), C(0));
+  // "|v| > 0" via the union of MantNZ and Exp > 0; covers normal,
+  // denormal, and the ±Inf / NaN paths (which are short-circuited
+  // by IsAlreadyInt below).
+  Value *IsNonZero = B.CreateOr(B.CreateICmpNE(Exp, C(0)), MantNZ);
+
+  // Case 1: exp ≥ bias + mant_bits ⇒ |v| ≥ 2^mant, already integer
+  // or Inf / NaN. Return bits unchanged.
+  Value *IsAlreadyInt = B.CreateICmpUGE(Exp, C(ExpBias + MantBits));
+
+  // Case 2: |v| < 1 (exp < bias). Each op picks a different result.
+  Value *IsBelowOne = B.CreateICmpULT(Exp, C(ExpBias));
+  Value *SignedZero = B.CreateAnd(Bits, C(SignBitMask));
+  // For round: |v| < 0.5 ⇒ ±0; 0.5 ≤ |v| < 1 ⇒ ±1
+  Value *IsBelowHalf = B.CreateICmpULT(Exp, C(ExpBias - 1));
+  Value *OnePos = B.CreateBitCast(ConstantFP::get(F32, 1.0), I32);
+  Value *OneNeg = B.CreateBitCast(ConstantFP::get(F32, -1.0), I32);
+  Value *SignedOne = B.CreateSelect(B.CreateICmpEQ(Sign, C(1)),
+                                    OneNeg, OnePos);
+  Value *BelowResult = nullptr;
+  switch (Kind) {
+  case FRoundKind::Trunc:
+    BelowResult = SignedZero;
+    break;
+  case FRoundKind::Floor:
+    // floor(neg non-zero <1) = -1 ; everything else preserves sign of 0.
+    // "non-zero" = MantNZ || Exp != 0 (handles denormals where Mant = 0
+    // but Exp > 0, like 0.5 = 1.0 × 2^-1).
+    BelowResult = B.CreateSelect(
+        B.CreateAnd(B.CreateICmpEQ(Sign, C(1)), IsNonZero),
+        OneNeg, SignedZero);
+    break;
+  case FRoundKind::Ceil:
+    BelowResult = B.CreateSelect(
+        B.CreateAnd(B.CreateICmpEQ(Sign, C(0)), IsNonZero),
+        OnePos, SignedZero);
+    break;
+  case FRoundKind::Round:
+    // |v| < 0.5 → ±0 ; 0.5 ≤ |v| < 1 → ±1.
+    BelowResult = B.CreateSelect(IsBelowHalf, SignedZero, SignedOne);
+    break;
+  }
+
+  // Case 3: normal path — clear fractional bits, optionally bump
+  // magnitude by 1 ULP.
+  // frac_bits = (bias + mant_bits) - exp, in [1, mant_bits] when
+  // we're in the normal branch (bias ≤ exp < bias + mant_bits).
+  // Codex-review P1 (stage 7h11): outside that branch, exp can sit
+  // anywhere in [0, 0xFF] (denormals / Inf / NaN), so the raw
+  // subtract underflows or overshoots and the derived shift counts
+  // fall outside [0, 31]. The outer Select picks IsAlreadyInt /
+  // IsBelowOne in those cases, but stage-7c1 rewrites every i32
+  // Select into a bit-blend (AND + OR), which propagates the
+  // out-of-range shift's `poison` through the unused arm. Mask the
+  // shift counts to 5 bits so each `shl` / `lshr` stays
+  // well-defined regardless of input.
+  Value *FracBits = B.CreateSub(C(ExpBias + MantBits), Exp);
+  Value *FracBitsSafe = B.CreateAnd(FracBits, C(31u));
+  Value *OneShl = B.CreateShl(C(1u), FracBitsSafe);
+  Value *FracMask = B.CreateSub(OneShl, C(1u));
+  Value *FracPart = B.CreateAnd(Bits, FracMask);
+  Value *HasFrac = B.CreateICmpNE(FracPart, C(0u));
+  Value *TruncBits = B.CreateAnd(Bits, B.CreateNot(FracMask));
+
+  Value *Bump = nullptr;
+  switch (Kind) {
+  case FRoundKind::Trunc:
+    Bump = B.getFalse();
+    break;
+  case FRoundKind::Floor:
+    Bump = B.CreateAnd(HasFrac, B.CreateICmpEQ(Sign, C(1)));
+    break;
+  case FRoundKind::Ceil:
+    Bump = B.CreateAnd(HasFrac, B.CreateICmpEQ(Sign, C(0)));
+    break;
+  case FRoundKind::Round: {
+    // guard bit at bit (frac_bits - 1). Same clamp as above.
+    Value *GuardShift = B.CreateAnd(B.CreateSub(FracBits, C(1u)),
+                                     C(31u));
+    Value *GuardBit = B.CreateAnd(B.CreateLShr(Bits, GuardShift), C(1u));
+    Bump = B.CreateICmpEQ(GuardBit, C(1u));
+    break;
+  }
+  }
+
+  Value *Bumped = B.CreateAdd(TruncBits, OneShl);
+  Value *NormalResult = B.CreateSelect(Bump, Bumped, TruncBits);
+
+  // Pick: above-int → Bits ; below-1 → BelowResult ; normal → NormalResult.
+  Value *Result = B.CreateSelect(IsAlreadyInt, Bits,
+                  B.CreateSelect(IsBelowOne, BelowResult, NormalResult));
+  B.CreateRet(B.CreateBitCast(Result, F32));
+}
+
+static void emitFRoundF64Body(Function *F, LLVMContext &Ctx,
+                              FRoundKind Kind) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Type *F64 = Type::getDoubleTy(Ctx);
+  const uint32_t MantBits = 52;
+  const uint32_t ExpBias = 1023;
+  const uint32_t ExpMask = 0x7FF;
+
+  Argument *V = F->getArg(0); V->setName("v");
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  auto C32 = [&](uint32_t X) { return B.getInt32(X); };
+  auto C64 = [&](uint64_t X) { return ConstantInt::get(I64, X); };
+
+  auto SplitLoHi = [&](Value *X) -> std::pair<Value *, Value *> {
+    Value *Hi = B.CreateTrunc(B.CreateLShr(X, C64(32)), I32);
+    Value *Lo = B.CreateTrunc(X, I32);
+    return {Lo, Hi};
+  };
+  auto IsZeroI64 = [&](Value *X) {
+    auto [Lo, Hi] = SplitLoHi(X);
+    return B.CreateAnd(B.CreateICmpEQ(Lo, C32(0)),
+                       B.CreateICmpEQ(Hi, C32(0)));
+  };
+
+  Value *Bits = B.CreateBitCast(V, I64);
+  auto [BLo, BHi] = SplitLoHi(Bits);
+  Value *Sign = B.CreateLShr(BHi, C32(31));                  // i32 0/1
+  Value *Exp  = B.CreateAnd(B.CreateLShr(BHi, C32(20)),
+                            C32(ExpMask));                    // i32 0..2047
+  // mant non-zero from (BHi & 0xFFFFF) | BLo
+  Value *MantTop20 = B.CreateAnd(BHi, C32(0xFFFFFu));
+  Value *MantNZ = B.CreateOr(B.CreateICmpNE(MantTop20, C32(0)),
+                             B.CreateICmpNE(BLo, C32(0)));
+
+  Value *IsAlreadyInt = B.CreateICmpUGE(Exp, C32(ExpBias + MantBits));
+  Value *IsBelowOne   = B.CreateICmpULT(Exp, C32(ExpBias));
+  Value *SignedZero = B.CreateAnd(Bits, C64(0x8000000000000000ull));
+
+  Value *IsBelowHalf = B.CreateICmpULT(Exp, C32(ExpBias - 1));
+  Value *OnePos = B.CreateBitCast(ConstantFP::get(F64, 1.0), I64);
+  Value *OneNeg = B.CreateBitCast(ConstantFP::get(F64, -1.0), I64);
+  Value *NegSignI1 = B.CreateICmpEQ(Sign, C32(1));
+  Value *PosSignI1 = B.CreateICmpEQ(Sign, C32(0));
+  Value *NonZeroI1 = B.CreateOr(MantNZ, B.CreateICmpNE(Exp, C32(0)));
+  Value *SignedOne = B.CreateSelect(NegSignI1, OneNeg, OnePos);
+
+  Value *BelowResult = nullptr;
+  switch (Kind) {
+  case FRoundKind::Trunc:
+    BelowResult = SignedZero;
+    break;
+  case FRoundKind::Floor:
+    BelowResult = B.CreateSelect(B.CreateAnd(NegSignI1, NonZeroI1),
+                                 OneNeg, SignedZero);
+    break;
+  case FRoundKind::Ceil:
+    BelowResult = B.CreateSelect(B.CreateAnd(PosSignI1, NonZeroI1),
+                                 OnePos, SignedZero);
+    break;
+  case FRoundKind::Round:
+    BelowResult = B.CreateSelect(IsBelowHalf, SignedZero, SignedOne);
+    break;
+  }
+
+  // Normal path.
+  Value *FracBits = B.CreateSub(C32(ExpBias + MantBits), Exp);  // 1..52
+  // 1 << frac_bits  (i64).
+  Value *OneShl = emitShlI64ByI32(B, C64(1), FracBits);
+  Value *FracMask = B.CreateSub(OneShl, C64(1));
+  Value *FracPart = B.CreateAnd(Bits, FracMask);
+  Value *HasFrac = B.CreateNot(IsZeroI64(FracPart));
+  Value *TruncBits = B.CreateAnd(Bits, B.CreateNot(FracMask));
+
+  Value *Bump = nullptr;
+  switch (Kind) {
+  case FRoundKind::Trunc:
+    Bump = B.getFalse();
+    break;
+  case FRoundKind::Floor:
+    Bump = B.CreateAnd(HasFrac, NegSignI1);
+    break;
+  case FRoundKind::Ceil:
+    Bump = B.CreateAnd(HasFrac, PosSignI1);
+    break;
+  case FRoundKind::Round: {
+    Value *GuardShift = B.CreateSub(FracBits, C32(1u));
+    Value *GuardBitI64 = B.CreateAnd(emitLshrI64ByI32(B, Bits, GuardShift),
+                                     C64(1));
+    Bump = B.CreateNot(IsZeroI64(GuardBitI64));
+    break;
+  }
+  }
+
+  Value *Bumped = B.CreateAdd(TruncBits, OneShl);
+  Value *NormalResult = B.CreateSelect(Bump, Bumped, TruncBits);
+
+  Value *Result = B.CreateSelect(IsAlreadyInt, Bits,
+                  B.CreateSelect(IsBelowOne, BelowResult, NormalResult));
+  B.CreateRet(B.CreateBitCast(Result, F64));
+}
+
+static void injectFloorCeilTruncRoundHelpers(Module &M, LLVMContext &Ctx) {
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *F64 = Type::getDoubleTy(Ctx);
+  FunctionType *F32FnTy =
+      FunctionType::get(F32, {F32}, /*isVarArg=*/false);
+  FunctionType *F64FnTy =
+      FunctionType::get(F64, {F64}, /*isVarArg=*/false);
+
+  struct Entry {
+    const char *Name32;
+    const char *Name64;
+    FRoundKind Kind;
+  };
+  static const Entry Entries[] = {
+      {"floorf", "floor", FRoundKind::Floor},
+      {"ceilf",  "ceil",  FRoundKind::Ceil},
+      {"truncf", "trunc", FRoundKind::Trunc},
+      {"roundf", "round", FRoundKind::Round},
+  };
+  for (const auto &E : Entries) {
+    if (Function *F = makeOrPromoteHelper(M, E.Name32, F32FnTy))
+      emitFRoundF32Body(F, Ctx, E.Kind);
+    if (Function *F = makeOrPromoteHelper(M, E.Name64, F64FnTy))
+      emitFRoundF64Body(F, Ctx, E.Kind);
+  }
+}
+
 // Stage 7h4 — variable-amount i64 shift utilities. The backend can't
 // select `shl_parts` directly, so we emulate variable-amount i64
 // shifts via clamped i32-pair operations (same technique as stage
@@ -3457,6 +3724,28 @@ static bool moduleNeedsFixsfdi(Module &M) {
   return false;
 }
 
+// Stage 7h11 — scan for `llvm.{floor,ceil,trunc,round}.{f32,f64}`.
+// All 8 helpers share an injection function (their bodies differ
+// only by op-kind and FP type) so a single boolean gate suffices.
+static bool moduleNeedsFRoundHelpers(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+        Intrinsic::ID Id = II->getIntrinsicID();
+        if (Id == Intrinsic::floor || Id == Intrinsic::ceil ||
+            Id == Intrinsic::trunc || Id == Intrinsic::round) {
+          Type *T = II->getType()->getScalarType();
+          if (T->isFloatTy() || T->isDoubleTy())
+            return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 // Stage 7h4 — scan for `fadd double` / `fsub double`.
 static bool moduleNeedsAddDf3(Module &M) {
   for (Function &F : M) {
@@ -3732,6 +4021,10 @@ int main(int argc, char **argv) {
     injectFloatdisfHelpers(*M, Ctx);
   if (moduleNeedsFixsfdi(*M))
     injectFixsfdiHelpers(*M, Ctx);
+  // Stage 7h11 — floor / ceil / trunc / round (f32 + f64). Single
+  // injection covers all 8 helpers; gate sees any of the 4 intrinsics.
+  if (moduleNeedsFRoundHelpers(*M))
+    injectFloorCeilTruncRoundHelpers(*M, Ctx);
   // Stage 7h4 — f64 fadd / fsub. `__adddf3` first since `__subdf3`
   // tail-calls it.
   // Stage 7h5 — `__muldf3` gated separately like 7g2 `__mulsf3`. The
