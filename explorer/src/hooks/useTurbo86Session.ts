@@ -3,6 +3,17 @@ import type { Movie86Vm, Movie86Wrapper } from '@/lib/wrappers';
 
 export type HandoverMode = 'host' | 'trap';
 
+export interface UseTurbo86SessionParams {
+    /** Called after the session mutates the local Vm's memory / video
+     *  mode (applying a turbo86 `MemUpdate` / `VideoMode`) so the caller
+     *  can re-sample the Vm and repaint the canvas. */
+    onVmRefresh?: () => void;
+    /** Cadence (ms) to ask turbo86 for `MemUpdate` events on forward, so
+     *  the canvas stays live while the guest runs natively. 0 disables.
+     *  Default 250. */
+    memUpdateIntervalMs?: number;
+}
+
 export interface UseTurbo86SessionReturn {
     url: string;
     setUrl: (u: string) => void;
@@ -56,7 +67,10 @@ type PausedCtx = {
  * `movie86/wasm/tests/turbo86_handover.mjs`; this hook only sequences
  * them against React state.
  */
-export function useTurbo86Session(): UseTurbo86SessionReturn {
+export function useTurbo86Session(
+    params: UseTurbo86SessionParams = {},
+): UseTurbo86SessionReturn {
+    const { onVmRefresh, memUpdateIntervalMs = 250 } = params;
     const [url, setUrl] = useState('ws://127.0.0.1:1234');
     const [mode, setMode] = useState<HandoverMode>('trap');
     const [status, setStatus] = useState('idle');
@@ -67,6 +81,14 @@ export function useTurbo86Session(): UseTurbo86SessionReturn {
 
     const wsRef = useRef<WebSocket | null>(null);
     const movie86Ref = useRef<Movie86Wrapper | null>(null);
+    // The live Vm the session mirrors MemUpdate/VideoMode onto, plus the
+    // latest refresh callback — both read inside the long-lived message
+    // handler.
+    const vmRef = useRef<Movie86Vm | null>(null);
+    const onVmRefreshRef = useRef(onVmRefresh);
+    onVmRefreshRef.current = onVmRefresh;
+    const memUpdateIntervalRef = useRef(memUpdateIntervalMs);
+    memUpdateIntervalRef.current = memUpdateIntervalMs;
     // Resolver for the in-flight reverse handover, fulfilled when the
     // `Paused` outbound arrives.
     const pausedResolverRef = useRef<((ctx: PausedCtx) => void) | null>(null);
@@ -110,8 +132,31 @@ export function useTurbo86Session(): UseTurbo86SessionReturn {
                 });
                 break;
             }
-            // video_mode / mem_update arrive mid-run; live canvas mirroring
-            // is a follow-up (see Turbo86Handover history). Ignore for now.
+            // Mid-run mirroring: apply turbo86's in-flight memory / video
+            // mode onto the local Vm so the canvas pane keeps up while the
+            // guest runs natively. No regs — execution still belongs to
+            // turbo86 until a Paused reverse handover.
+            case 'mem_update': {
+                const vm = vmRef.current;
+                if (vm) {
+                    for (const r of msg.regions as {
+                        addr: number;
+                        bytes: Uint8Array;
+                    }[]) {
+                        vm.writeMem(r.addr >>> 0, r.bytes);
+                    }
+                    onVmRefreshRef.current?.();
+                }
+                break;
+            }
+            case 'video_mode': {
+                const vm = vmRef.current;
+                if (vm) {
+                    vm.setActiveVideoMode(msg.mode as number);
+                    onVmRefreshRef.current?.();
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -166,10 +211,17 @@ export function useTurbo86Session(): UseTurbo86SessionReturn {
     const forward = useCallback(
         async (vm: Movie86Vm, movie86: Movie86Wrapper) => {
             movie86Ref.current = movie86;
+            vmRef.current = vm;
             setStatus('connecting…');
             const ws = await ensureOpen(url);
             const ctx = movie86.snapshotContext(vm);
-            ws.send(movie86.makeLoadContextMessage(ctx, mode));
+            ws.send(
+                movie86.makeLoadContextMessage(
+                    ctx,
+                    mode,
+                    memUpdateIntervalRef.current,
+                ),
+            );
             setRunning(true);
             setStatus(`forwarded: ${ctx.regions.length} regions, mode=${mode}`);
         },

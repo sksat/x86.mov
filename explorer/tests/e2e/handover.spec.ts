@@ -176,6 +176,28 @@ test('explorer forwards on backend-select+Run and reverses on switch-back', asyn
         { timeout: 2_000 },
     );
 
+    // Live mirroring: a `video_mode` + `mem_update` Outbound pair should
+    // be absorbed into the local Vm (setActiveVideoMode + writeMem) so
+    // the canvas keeps up while turbo86 runs. We echo a forward region so
+    // writeMem targets a mapped address; the assertion is just that the
+    // round-trip raises no errors (checked at the end).
+    await page.evaluate((forward) => {
+        const ctx = JSON.parse(forward).context;
+        const inst = (
+            globalThis as unknown as {
+                __t86Spy: { instance: { emit: (ev: object) => void } };
+            }
+        ).__t86Spy.instance;
+        inst.emit({
+            type: 'message',
+            data: JSON.stringify({ type: 'video_mode', mode: 0x13 }),
+        });
+        inst.emit({
+            type: 'message',
+            data: JSON.stringify({ type: 'mem_update', regions: ctx.regions }),
+        });
+    }, sent[0]!);
+
     // Reverse handover: switch back to movie86 *while turbo86 runs*.
     // The page must send a `{type:'pause'}` Inbound and then absorb the
     // `Paused` Outbound back into the local Vm. We echo the captured

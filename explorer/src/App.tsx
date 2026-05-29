@@ -62,7 +62,9 @@ export function App() {
     }>({ kind: 'idle', text: 'ready' });
 
     const movie86Vm = useMovie86Vm();
-    const turbo86 = useTurbo86Session();
+    // Mirror turbo86's in-flight MemUpdate / VideoMode onto the local Vm
+    // so the canvas stays live during a forward handover.
+    const turbo86 = useTurbo86Session({ onVmRefresh: movie86Vm.refresh });
     const exec = useExecBackend(movie86Vm, turbo86);
 
     // Lazy-load the ELF parser when the page first renders so the
