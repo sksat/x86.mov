@@ -151,6 +151,20 @@ try {
         assert.equal(vm.activeVideoMode, undefined,
             `return42 shouldn't touch BIOS — activeVideoMode expected undefined, got ${vm.activeVideoMode}`);
 
+        // setActiveVideoMode is the seam the demo's turbo86 handover
+        // uses when a VideoMode Outbound arrives — turbo86 caught the
+        // ABI write on the native side, the local Vm needs the same
+        // mode reflected so `renderCanvases()` flips to the right
+        // canvas. Writing to the ABI page via writeMem would no-op
+        // (page is unmapped in FlatMemory), so we expose this direct
+        // setter and pin its semantics here.
+        vm.setActiveVideoMode(0x13);
+        assert.equal(vm.activeVideoMode, 0x13,
+            `setActiveVideoMode(0x13) didn't flip activeVideoMode — got ${vm.activeVideoMode}`);
+        vm.setActiveVideoMode(0x12);
+        assert.equal(vm.activeVideoMode, 0x12,
+            `setActiveVideoMode(0x12) didn't overwrite — got ${vm.activeVideoMode}`);
+
         console.log('ok  Vm introspection (return42)');
     } finally {
         vm.free();

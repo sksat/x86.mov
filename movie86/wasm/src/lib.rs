@@ -615,6 +615,21 @@ impl Vm {
         self.host.active_video_mode
     }
 
+    /// Externally set `active_video_mode` — used by the demo when a
+    /// turbo86 `VideoMode` Outbound arrives during handover. The
+    /// guest-driven paths (`int 0x10 / AH=0`, mov-only
+    /// `CALL_SET_VIDEO_MODE`) both update `host.active_video_mode`
+    /// directly inside `Cpu::step`; an Outbound event from turbo86
+    /// can't replay through those because it doesn't run guest
+    /// instructions on the local Vm. Writing the mode byte to the
+    /// ABI page via `writeMem` won't work either — the ABI page is
+    /// unmapped in `FlatMemory` (the CPU intercepts writes there at
+    /// dispatch time, not in memory), so the write silently no-ops.
+    #[wasm_bindgen(js_name = setActiveVideoMode)]
+    pub fn set_active_video_mode(&mut self, mode: u8) {
+        self.host.active_video_mode = Some(mode);
+    }
+
     #[wasm_bindgen(getter, js_name = memBase)]
     pub fn mem_base(&self) -> u32 {
         self.mem.base()

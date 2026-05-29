@@ -1243,12 +1243,13 @@ async function doSendToTurbo86() {
                 break;
             case 'video_mode':
                 // turbo86 surfaced a mov-only ABI set_video_mode write.
-                // movie86.mjs's `FRAMEBUFFER_MODES` lookup uses
-                // `vm.activeVideoMode`; writing the mode byte into the
-                // local Vm's ABI page (via vm.writeMem at the same
-                // address turbo86 caught) flips that getter so the
-                // canvas pane starts polling the right FB region.
-                state.vm.writeMem(0x1FFE_0010, new Uint8Array([msg.mode & 0xff]));
+                // `vm.activeVideoMode` is what `renderCanvases()` keys
+                // on to pick the active FB region. Use the dedicated
+                // setter — writeMem(0x1FFE_0010, ...) would silently
+                // no-op because the ABI page is intercepted by the CPU
+                // at dispatch time and isn't part of FlatMemory, so
+                // host-side writes there fall outside the mapped range.
+                state.vm.setActiveVideoMode(msg.mode & 0xff);
                 break;
             case 'mem_update': {
                 // Periodic in-flight memory snapshot from turbo86.
