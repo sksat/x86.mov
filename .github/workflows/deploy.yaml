@@ -14,17 +14,13 @@ concurrency:
   group: cloudflare-pages-${{ github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    working-directory: movfuscator-wasm
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 180   # cold llvm-mov-wasm build is ~90 min; cache hits drop us to <10 min
     permissions:
       contents: read
-      pull-requests: write   # for sticking the preview URL on the PR
+      pull-requests: write     # for sticking the preview URL on the PR
     # Skip deploys triggered by PRs from forks — they don't carry the
     # secrets and would only ever fail. Same-repo PRs (our current
     # workflow) and pushes to mov still run.
@@ -64,11 +60,21 @@ jobs:
         run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
 
       - name: install host packages
-        working-directory: .
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
               gcc-multilib libc6-dev-i386 time make patch
+
+      # llvm-22-dev provides llvm-tblgen-22 (used by the emcmake LLVM
+      # build) and the native llvm-mov-llc reference (via the sibling
+      # ../llvm-mov build). clang-22 isn't strictly needed for deploy
+      # but installs cheaply alongside.
+      - name: install LLVM 22 from apt.llvm.org
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
+          sudo apt-get install -y --no-install-recommends \
+              llvm-22-dev clang-22 lld-22 \
+              ninja-build cmake
 
       - name: cache emsdk
         uses: actions/cache@v5.0.5
@@ -79,28 +85,31 @@ jobs:
 
       - name: install emsdk
         if: steps.emsdk-cache.outputs.cache-hit != 'true'
-        working-directory: .
         run: |
           git clone --depth 1 https://github.com/emscripten-core/emsdk.git $HOME/emsdk
           $HOME/emsdk/emsdk install latest
           $HOME/emsdk/emsdk activate latest
 
+      # ----------------------- movfuscator-wasm side -----------------------
+
       # Shares the same cache key shape as the test workflow so the
       # heavy binutils build is reused across the two pipelines.
-      - name: cache vendor + binutils-as build
+      - name: cache movfuscator-wasm vendor + binutils-as build
         uses: actions/cache@v5.0.5
-        id: vendor-cache
+        id: mfw-vendor-cache
         with:
           path: |
             movfuscator-wasm/vendor
             movfuscator-wasm/build/binutils-as
           key: vendor-${{ runner.os }}-${{ hashFiles('movfuscator-wasm/scripts/fetch.sh', 'movfuscator-wasm/scripts/build-native.sh', 'movfuscator-wasm/scripts/build-wasm-as.sh', 'movfuscator-wasm/patches/**') }}-v1
 
-      - name: setup
-        if: steps.vendor-cache.outputs.cache-hit != 'true'
+      - name: movfuscator-wasm setup
+        if: steps.mfw-vendor-cache.outputs.cache-hit != 'true'
+        working-directory: movfuscator-wasm
         run: make setup
 
-      - name: build everything needed for the demo
+      - name: movfuscator-wasm build (browser + link-libs)
+        working-directory: movfuscator-wasm
         run: |
           make build-native
           make build-wasm-as
@@ -109,16 +118,100 @@ jobs:
           make build-wasm-ld-browser
           make stage-link-libs
 
+      - name: stage movfuscator-wasm into dist/
+        working-directory: movfuscator-wasm
+        run: make stage-deploy
+
+      # ----------------------- movie86/wasm side ---------------------------
+
       - name: build movie86/wasm
         working-directory: movie86/wasm
         run: make build-wasm
 
-      - name: stage dist/
-        run: make stage-deploy
-
       - name: stage movie86/wasm into dist/movie86/
         working-directory: movie86/wasm
         run: make stage-deploy
+
+      # ----------------------- llvm-mov/wasm side --------------------------
+      #
+      # The emcmake LLVM+clang build is the slowest part of the deploy
+      # pipeline by far. Same two-layer cache shape as the test workflow:
+      # vendor (the cloned llvm-project, ~2.7 GB) and the build dir's
+      # lib/bin/include/tools subset (the .a files + cmake config) keyed
+      # on the build scripts. Cache hits drop the cold-build cost from
+      # ~90 min to a few minutes of relink time.
+
+      - name: cache llvm-mov/wasm vendor/llvm-project
+        uses: actions/cache@v5.0.5
+        id: lmw-vendor-cache
+        with:
+          path: llvm-mov/wasm/vendor
+          key: llvm-mov-wasm-vendor-${{ runner.os }}-${{ hashFiles('llvm-mov/wasm/scripts/fetch.sh') }}-v1
+
+      - name: cache llvm-mov/wasm build/llvm-wasm
+        uses: actions/cache@v5.0.5
+        id: lmw-build-cache
+        with:
+          path: |
+            llvm-mov/wasm/build/llvm-wasm/lib
+            llvm-mov/wasm/build/llvm-wasm/bin
+            llvm-mov/wasm/build/llvm-wasm/include
+            llvm-mov/wasm/build/llvm-wasm/tools
+            llvm-mov/wasm/build/llvm-wasm/CMakeCache.txt
+            llvm-mov/wasm/build/llvm-wasm/build.ninja
+            llvm-mov/wasm/build/llvm-wasm/rules.ninja
+            llvm-mov/wasm/build/llvm-wasm/.ninja_log
+            llvm-mov/wasm/build/llvm-wasm/.ninja_deps
+          key: llvm-mov-wasm-llvm-${{ runner.os }}-${{ hashFiles('llvm-mov/wasm/scripts/build-wasm-llvm.sh', 'llvm-mov/wasm/scripts/fetch.sh') }}-v1
+          # The cached .a/.o files are a function of the vendored LLVM
+          # source + the cmake flags, not the post-build short-circuit
+          # logic. Falling back to any previous cache lets unrelated
+          # script tweaks land without forcing a 90-min cold rebuild.
+          restore-keys: |
+            llvm-mov-wasm-llvm-${{ runner.os }}-
+
+      - name: llvm-mov/wasm setup (fetch llvm-project)
+        if: steps.lmw-vendor-cache.outputs.cache-hit != 'true'
+        working-directory: llvm-mov/wasm
+        run: make setup
+
+      - name: llvm-mov/wasm build (LLVM+clang static libs)
+        working-directory: llvm-mov/wasm
+        run: make build-wasm-llvm
+
+      # clang.{js,wasm} is purely a function of the vendored llvm-project
+      # source (already keyed by fetch.sh) + the two link/build scripts.
+      # When it cache-hits we skip ~15 min of wasm-opt on the em++ link;
+      # llvm-mov-llc.wasm is built separately below so the backend
+      # iteration loop is unaffected.
+      - name: cache llvm-mov/wasm clang.wasm artifact
+        uses: actions/cache@v5.0.5
+        id: lmw-clang-cache
+        with:
+          path: |
+            llvm-mov/wasm/build/clang.js
+            llvm-mov/wasm/build/clang.wasm
+            llvm-mov/wasm/build/clang.wasm.part-*
+            llvm-mov/wasm/build/clang.wasm.hash
+            llvm-mov/wasm/build/package.json
+          key: clang-wasm-${{ runner.os }}-${{ hashFiles('llvm-mov/wasm/scripts/build-wasm-clang.sh', 'llvm-mov/wasm/scripts/build-wasm-llvm.sh', 'llvm-mov/wasm/scripts/fetch.sh') }}-v1
+
+      - name: llvm-mov/wasm build (clang driver wasm)
+        if: steps.lmw-clang-cache.outputs.cache-hit != 'true'
+        working-directory: llvm-mov/wasm
+        run: make build-wasm-clang
+
+      - name: llvm-mov/wasm build (native llvm-mov-llc + wasm driver)
+        working-directory: llvm-mov/wasm
+        run: |
+          make build-native-llvm-mov-llc
+          make build-wasm-llvm-mov-llc
+
+      - name: stage llvm-mov/wasm into dist/llvm-mov/
+        working-directory: llvm-mov/wasm
+        run: make stage-deploy
+
+      # ----------------------- upload + comment ----------------------------
 
       - name: upload to Cloudflare Pages
         id: deploy
@@ -133,8 +226,7 @@ jobs:
           # events, github.ref_name on push / workflow_dispatch.
           # NB: keep on one line — wrangler-action splits multi-line
           # command: blocks and silently drops anything after the first.
-          command: pages deploy ../dist --project-name=x86-mov --branch=${{ github.head_ref || github.ref_name }}
-          workingDirectory: movfuscator-wasm
+          command: pages deploy dist --project-name=x86-mov --branch=${{ github.head_ref || github.ref_name }}
 
       - name: comment preview URL on PR
         if: github.event_name == 'pull_request' && steps.deploy.outputs.deployment-url
@@ -148,7 +240,7 @@ jobs:
             // thread from accumulating one comment per push.
             const marker = '<!-- cloudflare-pages-preview -->';
             const url = process.env.URL;
-            const body = `${marker}\n🚀 **Preview deployed**: ${url}\n\n- Root: ${url}/\n- movfuscator-wasm demo: ${url}/movfuscator-wasm/\n- movie86 demo: ${url}/movie86/\n`;
+            const body = `${marker}\n🚀 **Preview deployed**: ${url}\n\n- Root: ${url}/\n- movfuscator-wasm demo: ${url}/movfuscator-wasm/\n- movie86 demo: ${url}/movie86/\n- llvm-mov demo: ${url}/llvm-mov/\n`;
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
             const comments = await github.paginate(

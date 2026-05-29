@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llvm-mov-wasm</title>
+<style>
+  :root { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; line-height: 1.4; }
+  body { margin: 0; padding: 1.5rem; }
+  h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
+  p.intro { margin: 0 0 1rem; color: #555; font-size: 0.9rem; }
+  p.intro a { color: #06c; }
+  .controls { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; flex-wrap: wrap; }
+  button, select { font: inherit; padding: 0.35rem 0.7rem; }
+  label { font-size: 0.85rem; color: #555; }
+  button.primary { background: #1d6; border: 1px solid #0a5; color: white; cursor: pointer; }
+  button.primary:disabled { background: #aaa; border-color: #888; cursor: wait; }
+  textarea.in, pre.out {
+    box-sizing: border-box;
+    width: 100%;
+    font: inherit;
+    border: 1px solid #ccc;
+    padding: 0.5rem;
+    background: #fafafa;
+    min-height: 22rem;
+    max-height: 60vh;
+    overflow: auto;
+    white-space: pre;
+    margin: 0;
+    font-size: 0.85rem;
+    resize: vertical;
+  }
+  pre.out { background: #f7f7f7; }
+  .status { font-size: 0.85rem; color: #666; }
+  .status.err { color: #b00; }
+  .timing {
+      font-size: 0.8rem;
+      color: #888;
+      margin: 0.1rem 0 0.5rem;
+      font-variant-numeric: tabular-nums;
+  }
+  .timing .stage { color: #555; }
+  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 700px)  { .grid { grid-template-columns: minmax(0, 1fr); } }
+  h2 { font-size: 0.95rem; margin: 0.5rem 0 0.25rem; color: #333; }
+</style>
+</head>
+<body>
+<h1>llvm-mov / wasm</h1>
+<p class="intro">
+  An out-of-tree LLVM backend
+  (<a href="https://github.com/sksat/x86.mov/tree/mov/llvm-mov">llvm-mov</a>)
+  ported to WebAssembly. Paste C on the left, see the LLVM IR clang
+  produces in the middle, and the mov-target x86-32 assembly
+  llvm-mov-llc emits on the right — all running in your browser. See
+  also <a href="../movfuscator-wasm/">movfuscator-wasm</a> (the
+  LCC-based sibling).
+</p>
+
+<div class="controls">
+  <button id="run" class="primary">Compile (.c → .ll → .s)</button>
+  <select id="example">
+    <option value="ret_42">ret 42</option>
+    <option value="add_one">add_one(int)</option>
+    <option value="bitand">bitand(int, int)</option>
+  </select>
+  <label for="optLevel">opt:</label>
+  <select id="optLevel">
+    <option value="0">-O0</option>
+    <option value="1">-O1</option>
+    <option value="2" selected>-O2</option>
+    <option value="3">-O3</option>
+    <option value="s">-Os</option>
+    <option value="z">-Oz</option>
+  </select>
+  <span class="status" id="status"></span>
+</div>
+<div class="timing" id="timing"></div>
+
+<div class="grid">
+  <div>
+    <h2>C source (input)</h2>
+    <textarea id="in" class="in" spellcheck="false"></textarea>
+  </div>
+  <div>
+    <h2>LLVM IR (clang)</h2>
+    <pre id="ll" class="out"></pre>
+  </div>
+  <div>
+    <h2>mov-target x86-32 assembly (llvm-mov-llc)</h2>
+    <pre id="out" class="out"></pre>
+  </div>
+</div>
+
+<script type="module">
+import { cToIR, compile } from './llvm-mov.mjs';
+
+const EXAMPLES = {
+    ret_42: `int main(void) {
+    return 42;
+}
+`,
+    add_one: `int add_one(int x) {
+    return x + 1;
+}
+`,
+    bitand: `int bitand(int a, int b) {
+    return a & b;
+}
+`,
+};
+
+const $in     = document.getElementById('in');
+const $ll     = document.getElementById('ll');
+const $out    = document.getElementById('out');
+const $run    = document.getElementById('run');
+const $status = document.getElementById('status');
+const $ex     = document.getElementById('example');
+const $opt    = document.getElementById('optLevel');
+
+function loadExample() {
+    $in.value = EXAMPLES[$ex.value] ?? '';
+}
+$ex.addEventListener('change', loadExample);
+loadExample();
+
+const $timing = document.getElementById('timing');
+
+function setStatus(text) {
+    $status.className = 'status';
+    $status.textContent = text;
+}
+
+// Labels for stage breakdown rendered below the status line. Order
+// matters: it's the visual order in the timing element.
+const STAGE_LABEL = {
+    'fetch-clang':       'fetch clang',
+    'instantiate-clang': 'instantiate clang',
+    'compile-c':         'compile c→ir',
+    'instantiate-llc':   'instantiate llc',
+    'compile-ir':        'compile ir→asm',
+};
+
+function makeStageTracker() {
+    const durations = new Map(); // preserves insertion order — first-seen stage order
+    let last = null;             // { stage, t }
+    return {
+        onEvent(stage) {
+            const now = performance.now();
+            if (last && last.stage !== stage) {
+                durations.set(last.stage, (durations.get(last.stage) || 0) + (now - last.t));
+                last = { stage, t: now };
+            } else if (!last) {
+                last = { stage, t: now };
+            }
+            // Same-stage events (e.g. successive fetch-clang chunks)
+            // don't reset the timer.
+        },
+        finish() {
+            if (last) {
+                durations.set(last.stage, (durations.get(last.stage) || 0) + (performance.now() - last.t));
+            }
+            return durations;
+        },
+    };
+}
+
+function renderTimingHTML(durations) {
+    const parts = [];
+    for (const [stage, ms] of durations) {
+        if (ms < 1) continue;
+        const label = STAGE_LABEL[stage] ?? stage;
+        parts.push(
+            `<span class="stage">${label}</span> ${Math.round(ms)} ms`,
+        );
+    }
+    return parts.join(' · ');
+}
+
+// Translate wrapper stage events into UI status text. The clang.wasm
+// fetch dominates the first compile after a cold load (~80 MB across
+// 4 chunks); subsequent compiles in the same tab skip straight to
+// instantiate-clang because the merged buffer is cached in the
+// wrapper. Across page loads the browser's HTTP cache reuses the
+// hashed chunk files via the `Cache-Control: immutable` _headers.
+function fmtMB(bytes) {
+    return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+function statusFor(ev) {
+    switch (ev.stage) {
+        case 'fetch-clang': {
+            // The chunk-count line ticks slowly (4 chunks total); the
+            // bytes line ticks ~20 Hz with progress info from each
+            // active stream. Pre-header (totalBytes === 0) we just show
+            // the chunk count so the user sees motion immediately.
+            if (ev.totalBytes > 0) {
+                const pct = ((ev.bytes / ev.totalBytes) * 100).toFixed(0);
+                return `fetching clang.wasm chunks ${ev.done}/${ev.total} — ${fmtMB(ev.bytes)} / ${fmtMB(ev.totalBytes)} MiB (${pct}%)…`;
+            }
+            return `fetching clang.wasm chunks ${ev.done}/${ev.total}…`;
+        }
+        case 'instantiate-clang': return 'instantiating clang…';
+        case 'compile-c':         return 'compiling C → LLVM IR…';
+        case 'instantiate-llc':   return 'instantiating llvm-mov-llc…';
+        case 'compile-ir':        return 'compiling LLVM IR → mov-target asm…';
+    }
+    return null;
+}
+
+$run.addEventListener('click', async () => {
+    $run.disabled = true;
+    $timing.textContent = '';
+    setStatus('starting…');
+    const t0 = performance.now();
+    const tracker = makeStageTracker();
+    const onProgress = (ev) => {
+        tracker.onEvent(ev.stage);
+        const s = statusFor(ev);
+        if (s !== null) setStatus(s);
+    };
+    try {
+        // Two stages so the IR appears in its own pane: cToIR runs the
+        // wasm clang, compile runs the wasm llvm-mov-llc on its output.
+        const ir = await cToIR($in.value, { optLevel: $opt.value, onProgress });
+        $ll.textContent = ir;
+        const asm = await compile(ir, {
+            name: 'in.ll',
+            // clang IR carries an i386 triple; force-retarget to mov.
+            mtriple: 'mov-unknown-linux-gnu',
+            onProgress,
+        });
+        $out.textContent = asm;
+        const dt = (performance.now() - t0).toFixed(0);
+        setStatus(`compiled in ${dt} ms (-O${$opt.value})`);
+        $timing.innerHTML = renderTimingHTML(tracker.finish());
+    } catch (e) {
+        $out.textContent = '';
+        $ll.textContent = '';
+        $status.className = 'status err';
+        $status.textContent = String(e.message || e);
+        $timing.textContent = '';
+    } finally {
+        $run.disabled = false;
+    }
+});
+</script>
+</body>
+</html>

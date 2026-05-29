@@ -1,0 +1,13 @@
+{
+  "name": "llvm-mov-wasm",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WebAssembly port of the llvm-mov out-of-tree LLVM backend.",
+  "scripts": {
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}
