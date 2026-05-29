@@ -32,9 +32,9 @@ const sysPerfEventOpen = 298
 
 // perf_event constants we use. Names mirror `<linux/perf_event.h>`.
 const (
-	perfTypeHardware         = 0
-	perfCountHwInstructions  = 1
-	perfAttrSizeVer3  uint32 = 96
+	perfTypeHardware               = 0
+	perfCountHwInstructions        = 1
+	perfAttrSizeVer3        uint32 = 96
 )
 
 // Bit positions inside the packed `bits` field of perf_event_attr.
