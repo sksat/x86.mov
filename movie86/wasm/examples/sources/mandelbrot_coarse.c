@@ -26,6 +26,14 @@
 typedef int fp_t;   /* Q16.16 */
 
 extern void set_video_mode(unsigned mode);
+extern void mmap_request(unsigned packed);
+
+/* Pack (addr, pages) for the mov-only ABI mmap_request call. */
+#define ABI_MMAP_PACK(addr, pages) ((unsigned)(addr) | (unsigned)((pages) - 1))
+
+/* mode 13h FB: 0xA0000 + ceil(256000 / 4096) = 63 pages.
+ * Round up to 64 = next power of two for human-readable packing. */
+#define FB13H_MMAP ABI_MMAP_PACK(0x000A0000U, 64)
 
 static fp_t fmul(fp_t a, fp_t b)
 {
@@ -41,6 +49,7 @@ int main(void)
     fp_t cx, cy, x, y, xx, yy, xy;
     unsigned color, t;
 
+    mmap_request(FB13H_MMAP);
     set_video_mode(0x13);
     fb = (unsigned *)FB_ADDR;
 

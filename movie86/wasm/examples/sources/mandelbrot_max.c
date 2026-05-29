@@ -21,6 +21,12 @@
 typedef int fp_t;
 
 extern void set_video_mode(unsigned mode);
+extern void mmap_request(unsigned packed);
+
+#define ABI_MMAP_PACK(addr, pages) ((unsigned)(addr) | (unsigned)((pages) - 1))
+/* VESA 6Ah FB: 0x00400000 + 800*600*4 / 4096 = 469 pages.
+ * Round up to 480 — leaves a tiny tail slack at no real cost. */
+#define FB6AH_MMAP ABI_MMAP_PACK(0x00400000U, 480)
 
 static fp_t fmul(fp_t a, fp_t b)
 {
@@ -36,6 +42,7 @@ int main(void)
     fp_t cx, cy, x, y, xx, yy, xy;
     unsigned color, t;
 
+    mmap_request(FB6AH_MMAP);
     set_video_mode(0x6A);
     fb = (unsigned *)FB_ADDR;
 

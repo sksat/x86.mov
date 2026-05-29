@@ -10,10 +10,19 @@
  *                    [esp+4] = status.
  *
  * set_video_mode(mode)
- *                  — BIOS int 0x10 with AH=0, AL=mode. Same cdecl
- *                    convention as exit. movie86's BiosHost::bios_call
- *                    records the mode number; the demo only renders the
- *                    canvas matching that mode.
+ *                  — mov-only ABI call 0x010. Writes mode to the
+ *                    unmapped page at 0x1FFE_0010; movie86 routes
+ *                    that to AbiHost::abi_call → active_video_mode,
+ *                    turbo86 catches the SIGSEGV and emits a
+ *                    VideoMode outbound event. Replaces the older
+ *                    int 0x10 / AH=0 BIOS convention.
+ *
+ * mmap_request(packed)
+ *                  — mov-only ABI call 0x020. packed encodes
+ *                    (addr | (pages - 1)). On movie86 wasm this is
+ *                    a no-op (FB is pre-mapped via PT_LOAD); on
+ *                    turbo86 it actually ptrace-injects an mmap2 so
+ *                    subsequent FB writes don't EFAULT.
  *
  * The `.fb13h` section is `aw` (alloc + write) and `@nobits` (no bytes
  * in the file image), placed at 0xA0000 via `--section-start=.fb13h=0xA0000`
@@ -40,7 +49,14 @@ exit:
 .type set_video_mode, @function
 set_video_mode:
     movl 4(%esp), %eax
-    int  $0x10
+    movb %al, 0x1FFE0010
+    ret
+
+.globl mmap_request
+.type mmap_request, @function
+mmap_request:
+    movl 4(%esp), %eax
+    movl %eax, 0x1FFE0020
     ret
 
 /* 320 × 200 × 4 bytes RGBA framebuffer, BSS-like. */
