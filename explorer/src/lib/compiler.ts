@@ -21,8 +21,17 @@ export interface CompileParams {
         headers?: Record<string, string>;
         linkOpts?: {
             name?: string;
+            /** Link statically (drops `-dynamic-linker`, adds `-static`).
+             *  movie86 needs this; the explorer's llvm-mov path defaults to
+             *  `true` in explorer.mjs. movfuscator stays dynamic until the
+             *  movie86 master_loop dispatch-table fault is resolved. */
+            static?: boolean;
+            /** Which CRT objects the wrapper auto-wraps the inputs in.
+             *  `'none'` = caller supplies `_start.o` (llvm-mov default). */
+            runtime?: 'movfuscator' | 'none';
             extraLibs?: string[];
             searchPaths?: string[];
+            extraInputs?: Record<string, Uint8Array>;
         };
         onProgress?: (stage: string) => void;
     };

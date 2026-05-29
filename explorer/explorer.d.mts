@@ -13,7 +13,14 @@ export interface CompileWrappers {
         link(
             objs: Uint8Array | Uint8Array[] | Record<string, Uint8Array>,
             libs?: Record<string, Uint8Array> | undefined,
-            opts?: { name?: string; extraLibs?: string[]; searchPaths?: string[] },
+            opts?: {
+                name?: string;
+                static?: boolean;
+                runtime?: 'movfuscator' | 'none';
+                extraLibs?: string[];
+                searchPaths?: string[];
+                extraInputs?: Record<string, Uint8Array>;
+            },
         ): Promise<Uint8Array>;
     };
     llvmMov?: {
@@ -38,7 +45,19 @@ export interface CompileParams {
         optLevel?: '0' | '1' | '2' | '3' | 's' | 'z';
         clangFlags?: string[];
         headers?: Record<string, string>;
-        linkOpts?: { name?: string; extraLibs?: string[]; searchPaths?: string[] };
+        linkOpts?: {
+            name?: string;
+            /** Drops `-dynamic-linker`; adds `-static`. movie86 requires
+             *  this. Defaults to `true` on the llvm-mov path inside
+             *  explorer.mjs; caller can override either way. */
+            static?: boolean;
+            /** Which CRT objects the wrapper auto-wraps the inputs in.
+             *  `'movfuscator'` (default) or `'none'`. */
+            runtime?: 'movfuscator' | 'none';
+            extraLibs?: string[];
+            searchPaths?: string[];
+            extraInputs?: Record<string, Uint8Array>;
+        };
         onProgress?: (stage: string) => void;
     };
     wrappers?: CompileWrappers;

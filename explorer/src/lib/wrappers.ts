@@ -20,7 +20,20 @@ export interface MovfuscatorWrapper {
     link(
         objs: Uint8Array | Uint8Array[] | Record<string, Uint8Array>,
         libs?: Record<string, Uint8Array>,
-        opts?: { name?: string; extraLibs?: string[]; searchPaths?: string[] },
+        opts?: {
+            name?: string;
+            /** Drop `-dynamic-linker`, add `-static`. Required for
+             *  movie86-loadable output. */
+            static?: boolean;
+            /** Which CRT objects the wrapper auto-wraps the inputs in.
+             *  `'movfuscator'` (default) is the historical
+             *  `crt0 ... crtf crtd softfloat32` recipe. `'none'` emits
+             *  only the user inputs (the llvm-mov pipeline shape). */
+            runtime?: 'movfuscator' | 'none';
+            extraLibs?: string[];
+            searchPaths?: string[];
+            extraInputs?: Record<string, Uint8Array>;
+        },
     ): Promise<Uint8Array>;
     compileToElf(
         source: string | Record<string, string>,
