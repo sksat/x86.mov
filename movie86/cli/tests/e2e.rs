@@ -79,6 +79,8 @@ impl SysHost for CapturingHost {
 // CapturingHost has no libc-wrapper expectations — empty impl picks
 // up the trait's default `Fault::UnsupportedInterrupt(0x81)` trap.
 impl LibcHost for CapturingHost {}
+// Same story for BIOS (`int 0x10`): no expectations, trap on call.
+impl movie86::BiosHost for CapturingHost {}
 
 #[test]
 fn runs_minimal_exit_42_elf() {

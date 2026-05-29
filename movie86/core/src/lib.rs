@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod bios_host;
 pub mod context;
 pub mod cpu;
 pub mod decode;
@@ -11,6 +12,7 @@ pub mod libc_host;
 pub mod mem;
 pub mod syscall;
 
+pub use bios_host::{BiosArgs, BiosHost, BiosResult};
 pub use context::{capture_sparse_regions, load_context, Context, MemRegion, Regs};
 pub use cpu::{Cpu, Signal};
 pub use decode::decode;
