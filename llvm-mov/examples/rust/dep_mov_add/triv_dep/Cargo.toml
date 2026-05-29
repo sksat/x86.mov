@@ -1,0 +1,16 @@
+# Path-local dep crate consumed by the parent fixture. Lives one level
+# down so cargo treats it as a normal upstream dep: rustc compiles it
+# separately, drops a `libtriv_dep-<hash>.rlib` under
+# ../target/<triple>/release/deps/, and the cargo-link.sh driver in
+# the parent gets that rlib in its link inputs. That's the dep
+# object issue #11 / Option C wants to push through llvm-mov-llc.
+
+[package]
+name = "triv_dep"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "triv_dep"
+path = "src/lib.rs"

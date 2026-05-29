@@ -45,6 +45,7 @@ export LLVM_MOV_LLC="$(cd "$BUILD_DIR/bin" && pwd)/llvm-mov-llc"
 declare -A EXPECTED=(
     [main]=42
     [fib]=32
+    [dep_mov_add]=42
     [png_header]=8
     [jpeg_header]=16
     [bmp_decode]=104

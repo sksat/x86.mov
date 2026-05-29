@@ -10,13 +10,25 @@
 #      target/<triple>/release/deps/<crate>-<hash>.ll
 #   2. Run llvm-mov-llc to produce mov-only x86-32 asm.
 #   3. Assemble that asm + the crate's _start.s with `as --32`.
-#   4. Pull native .o files out of any .rlib that rustc handed us as a
-#      link input — these are the dependency crates that we *don't*
-#      try to push through llvm-mov-llc (deps frequently use IR shapes
-#      the backend can't lower yet; the existing run.sh hybrid does the
-#      same thing).
+#   4. For each dep rlib (issue #11 / Option C):
+#      a. Look for a sibling `<crate>-<hash>.ll` next to the rlib —
+#         present for any dep rustc compiled fresh under our
+#         `--emit=llvm-ir` rustflags (path deps, crates.io, etc.).
+#      b. If present, try `llvm-mov-llc` + `as --32` on it. On
+#         success use that mov-only .o for the link.
+#      c. On any failure (no sibling IR, llc abort, as error) fall
+#         back to the rlib's native .o member(s) extracted via
+#         `ar x` — same hybrid path this script shipped originally.
+#      Granularity is per-rlib (= per dep crate): if a crate doesn't
+#      round-trip we keep its whole .o native rather than mixing
+#      mov / native fragments inside one crate's symbols.
 #   5. `ld -m elf_i386 -static -e _start` everything together, writing
 #      to the `-o <output>` path cargo asked for.
+#
+# A per-build status report of which dep crates went mov-only vs
+# fell back is written next to the binary as `<OUTPUT>.deps-status`,
+# one line per rlib (`mov <crate>` / `native(<reason>) <crate>`).
+# That's what the bench's "mov-able deps / total deps" column reads.
 #
 # Env vars (for development; defaults assume a `make build` checkout):
 #   LLVM_MOV_LLC          — path to the driver binary
@@ -109,19 +121,67 @@ START_O="$WORK/_start.o"
 as --32 -o "$O" "$S"
 as --32 -o "$START_O" "$START_S"
 
-# Extract native .o members from each dep rlib so `ld` can resolve
-# externally-referenced symbols (RustCrypto, base64, qoi, ...). Each
-# rlib is an `ar` archive; rustc embeds at least one native .o member.
+# ---- per-dep mov-or-native loop --------------------------------------
+# Each rlib is treated as one crate (with rustflags
+# `-Ccodegen-units=1` in our .cargo/config.toml that's also one .o
+# member). If rustc dropped a sibling `<crate>-<hash>.ll` next to
+# the rlib we try to drive *that* through llvm-mov-llc; otherwise
+# (or on any failure) we use the native .o from the rlib via
+# `ar x` — the same hybrid path this driver shipped before issue
+# #11. The status of each rlib is logged to <OUTPUT>.deps-status.
 EXTRA_OBJS=()
+STATUS="$OUTPUT.deps-status"
+: > "$STATUS"
+
+# Try to mov-lower one rlib. Echoes the path to a mov-only .o on
+# success, empty string on failure (with a reason written to STATUS).
+try_mov_lower_rlib() {
+    local rlib="$1" outdir="$2"
+    local rlib_dir base crate hash sibling_ll
+    rlib_dir="$(dirname "$rlib")"
+    base="$(basename "$rlib" .rlib)"        # libtriv_dep-<hash>
+    base="${base#lib}"                       # triv_dep-<hash>
+    crate="${base%-*}"
+    hash="${base##*-}"
+    sibling_ll="$rlib_dir/${crate}-${hash}.ll"
+
+    if ! [ -f "$sibling_ll" ]; then
+        printf 'native(no-ir) %s\n' "$crate" >> "$STATUS"
+        return 1
+    fi
+
+    local dep_s="$outdir/${crate}.mov.s"
+    local dep_o="$outdir/${crate}.mov.o"
+    local llc_log="$outdir/${crate}.llc.log"
+    local as_log="$outdir/${crate}.as.log"
+    if ! "$DRIVER" $DRIVER_FLAGS -mtriple=mov-unknown-linux-gnu \
+            "$sibling_ll" -o "$dep_s" 2>"$llc_log"; then
+        printf 'native(llc-fail) %s\n' "$crate" >> "$STATUS"
+        return 1
+    fi
+    if ! as --32 -o "$dep_o" "$dep_s" 2>"$as_log"; then
+        printf 'native(as-fail) %s\n' "$crate" >> "$STATUS"
+        return 1
+    fi
+    printf 'mov %s\n' "$crate" >> "$STATUS"
+    printf '%s' "$dep_o"
+}
+
 i=0
 for rlib in "${RLIBS[@]}"; do
     [ -f "$rlib" ] || continue
     dir="$WORK/rlib-$i"
     mkdir -p "$dir"
-    (cd "$dir" && ar x "$rlib" 2>/dev/null || true)
-    while IFS= read -r -d '' obj; do
-        EXTRA_OBJS+=("$obj")
-    done < <(find "$dir" -maxdepth 1 -name '*.o' -print0)
+
+    if mov_obj="$(try_mov_lower_rlib "$rlib" "$dir")" && [ -n "$mov_obj" ]; then
+        EXTRA_OBJS+=("$mov_obj")
+    else
+        # Native fallback: extract every .o member from the rlib.
+        (cd "$dir" && ar x "$rlib" 2>/dev/null || true)
+        while IFS= read -r -d '' obj; do
+            EXTRA_OBJS+=("$obj")
+        done < <(find "$dir" -maxdepth 1 -name '*.o' -print0)
+    fi
     i=$((i+1))
 done
 

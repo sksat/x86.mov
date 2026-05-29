@@ -22,6 +22,7 @@ project with its own deps:
 |---|---|---|---:|
 | [`main/`](main/) | `rust_main` | 6.5 (trivial scalar return) | 42 |
 | [`fib/`](fib/) | `fib_main` | 7d1 + 7d3 (recursion through global return-addr slot) | 32 |
+| [`dep_mov_add/`](dep_mov_add/) | `dep_mov_add_main` | issue #11 deps-mov (path-local lib dep routed through llvm-mov-llc) | 42 |
 | [`png_header/`](png_header/) | `png_header_main` | 6d3a (`load i32, align 1`) | 8 |
 | [`jpeg_header/`](jpeg_header/) | `jpeg_header_main` | 6d3a + marker walk | 16 |
 | [`bmp_decode/`](bmp_decode/) | `bmp_decode_main` | 6d3a full 32bpp decode | 104 |

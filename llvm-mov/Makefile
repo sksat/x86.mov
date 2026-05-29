@@ -12,7 +12,8 @@ BUILD_TYPE   ?= Release
 LLVM_CMAKE_DIR := $(shell $(LLVM_CONFIG) --cmakedir 2>/dev/null)
 
 .PHONY: all build configure test test-exec test-codegen test-mov-only \
-        test-rust-example test-cargo-build bench bench-check clean distclean help
+        test-rust-example test-cargo-build test-deps-mov \
+        bench bench-check clean distclean help
 
 all: build
 
@@ -27,6 +28,9 @@ help:
 	@echo "  test-rust-example  — plain 'cargo build' per examples/rust/<crate>"
 	@echo "                       (alias: test-cargo-build); stage 6.5; needs"
 	@echo "                       'rustup target add i686-unknown-linux-gnu'"
+	@echo "  test-deps-mov      — issue #11 gate: a Rust dep crate's .o must"
+	@echo "                       also disassemble mov-only (cargo-link.sh"
+	@echo "                       routes each rlib's IR through llvm-mov-llc)"
 	@echo "  bench              — side-by-side ELF comparison vs movfuscator on the"
 	@echo "                       shared .c fixtures; writes bench/results.md"
 	@echo "                       (needs 'make -C ../movfuscator-wasm setup build-native')"
@@ -82,6 +86,15 @@ test-codegen: build
 # if the i686 rust-std rlibs aren't installed.
 test-rust-example test-cargo-build: build
 	@./test/CargoBuild/run.sh $(BUILD_DIR)
+
+# Issue #11 / Option C gate. `test/DepsMov/run.sh` cargo-builds
+# the examples/rust/dep_mov_add fixture (a tiny bin crate with a
+# path-local lib dep) and asserts the linked ELF's .text is mov-
+# only end to end — i.e. the dep crate's code also went through
+# llvm-mov-llc, not just the user's. Opt-in; passes only after the
+# cargo-link.sh deps-mov path lands.
+test-deps-mov: build
+	@./test/DepsMov/run.sh $(BUILD_DIR)
 
 # Stage-7+ gate. `test/MovOnly/run.sh` builds every fixture under
 # test/MovOnly/ and asserts the disassembly contains only mov-family
