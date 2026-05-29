@@ -121,6 +121,7 @@ DEFAULT_FIXTURES=(
 RUST_FIXTURES=(
     rust_main
     rust_fib
+    rust_dep_mov_add
     rust_png_header
     rust_jpeg_header
     rust_bmp_decode
@@ -322,6 +323,7 @@ resolve_rust_fixture() {
     case "$1" in
         rust_main)          printf '%s|rust_mov_main'          "$LLVM_MOV_DIR/examples/rust/main" ;;
         rust_fib)           printf '%s|rust_mov_fib'           "$LLVM_MOV_DIR/examples/rust/fib"  ;;
+        rust_dep_mov_add)   printf '%s|rust_mov_dep_mov_add'   "$LLVM_MOV_DIR/examples/rust/dep_mov_add" ;;
         rust_png_header)    printf '%s|rust_mov_png_header'    "$LLVM_MOV_DIR/examples/rust/png_header" ;;
         rust_jpeg_header)   printf '%s|rust_mov_jpeg_header'   "$LLVM_MOV_DIR/examples/rust/jpeg_header" ;;
         rust_bmp_decode)    printf '%s|rust_mov_bmp_decode'    "$LLVM_MOV_DIR/examples/rust/bmp_decode" ;;
@@ -364,6 +366,37 @@ build_llvm_mov_rust() {
     s="$(ls -t "$crate_dir/target/$triple/release/deps/${cargo_name}-"*.s 2>/dev/null | head -1)"
     if [ -n "$s" ] && [ -f "$s" ]; then
         cp "$s" "$out_dir/elf.s"
+    fi
+    # cargo-link.sh's per-rlib mov-or-native status report (issue #11
+    # Option C). Same lookup shape as the .s above.
+    local ds
+    ds="$(ls -t "$crate_dir/target/$triple/release/deps/${cargo_name}-"*.deps-status 2>/dev/null | head -1)"
+    if [ -n "$ds" ] && [ -f "$ds" ]; then
+        cp "$ds" "$out_dir/deps-status"
+    fi
+}
+
+# Format the `.deps-status` log written by cargo-link.sh as a single
+# table cell: `<mov>/<total> mov`, plus a parenthesised tail listing
+# the crates that fell back native (with reason). Empty status → "—"
+# (the fixture has no rlibs at all — the trivial rust_main case).
+deps_status_cell() {
+    local ds="$1"
+    if [ ! -f "$ds" ] || [ ! -s "$ds" ]; then
+        printf '—'
+        return
+    fi
+    local total mov natives mov_list native_list
+    total="$(wc -l < "$ds")"
+    mov="$(awk '$1=="mov"{n++} END{print n+0}' "$ds")"
+    mov_list="$(awk '$1=="mov"{print $2}' "$ds" | paste -sd, -)"
+    native_list="$(awk '$1!="mov"{printf "%s %s, ", $2, $1}' "$ds" | sed 's/, $//')"
+    if [ -n "$mov_list" ] && [ -n "$native_list" ]; then
+        printf '%d / %d (mov: %s; native: %s)' "$mov" "$total" "$mov_list" "$native_list"
+    elif [ -n "$mov_list" ]; then
+        printf '%d / %d (mov: %s)' "$mov" "$total" "$mov_list"
+    else
+        printf '%d / %d (native: %s)' "$mov" "$total" "$native_list"
     fi
 }
 
@@ -532,6 +565,14 @@ for name in "${FIXTURE_NAMES[@]}"; do
                 "$(nonmov_cell ${r_ok[1]} "${r_dir[1]}/elf")" \
                 "$(nonmov_cell ${r_ok[2]} "${r_dir[2]}/elf")" \
                 "$(nonmov_cell ${r_ok[3]} "${r_dir[3]}/elf")"
+
+            # Issue #11 / Option C — per-rlib lower outcome. rustc
+            # columns are N/A (their `.text` is native by definition).
+            deps_text="—"
+            if [ "$lm_ok" -eq 1 ]; then
+                deps_text="$(deps_status_cell "$lm_dir/deps-status")"
+            fi
+            printf '| deps mov-lowered | %s | — | — | — | — | — |\n' "$deps_text"
 
             printf '| wall-clock runtime (hyperfine mean) | %s | — | %s | %s | %s | %s |\n' \
                 "$(rt_cell $lm_ok "$lm_dir/elf")" \

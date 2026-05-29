@@ -5,7 +5,7 @@ ELF artifact of compiling the same C source through both
 back-ends. Sizes are in bytes (`stat`/`readelf`); mov ratio is
 `mov-family mnemonic count` / `total mnemonic count` in `.text`._
 
-Generated 2026-05-28T23:43:43Z on x86_64 (Linux).
+Generated 2026-05-29T00:24:57Z on x86_64 (Linux).
 
 ## return0
 
@@ -20,7 +20,7 @@ int main(void) { return 0; }
 | .rodata size | 524288 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 120 / 123 (97.6%) | 775 / 777 (99.7%) | 4 / 13 (30.8%) | 2 / 7 (28.6%) | 2 / 7 (28.6%) | 2 / 7 (28.6%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call int pop push ret xchg xor` | `call int ret xchg xor` | `call int ret xchg xor` | `call int ret xchg xor` |
-| wall-clock runtime (hyperfine mean) | 2.795 ms | 2.875 ms | 2.439 ms | 1.473 ms | 1.112 ms | 1.197 ms |
+| wall-clock runtime (hyperfine mean) | 0.181 ms | 0.539 ms | 0.164 ms | 0.152 ms | 0.151 ms | 0.153 ms |
 
 ## return42
 
@@ -35,7 +35,7 @@ int main(void) { return 42; }
 | .rodata size | 524288 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 120 / 123 (97.6%) | 775 / 777 (99.7%) | 5 / 13 (38.5%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call int pop push ret xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.176 ms | 3.771 ms | 1.626 ms | 2.958 ms | 2.787 ms | 3.311 ms |
+| wall-clock runtime (hyperfine mean) | 0.793 ms | 1.996 ms | 0.932 ms | 0.932 ms | 1.574 ms | 0.934 ms |
 
 ## eq42
 
@@ -59,7 +59,7 @@ int main(void) {
 | .rodata size | 721152 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 274 / 281 (97.5%) | 1050 / 1052 (99.8%) | 8 / 19 (42.1%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jmp jne pop push ret sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 2.423 ms | 1.511 ms | 2.276 ms | 1.219 ms | 0.979 ms | 1.053 ms |
+| wall-clock runtime (hyperfine mean) | 0.194 ms | 3.665 ms | 1.629 ms | 0.984 ms | 0.158 ms | 3.199 ms |
 
 ## lt_unsigned
 
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 | .rodata size | 721152 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 304 / 311 (97.7%) | 1045 / 1047 (99.8%) | 9 / 20 (45.0%) | 2 / 9 (22.2%) | 2 / 9 (22.2%) | 2 / 9 (22.2%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jae jmp pop push ret xchg` | `call cmp int ret setb xchg xor` | `call cmp int ret setb xchg xor` | `call cmp int ret setb xchg xor` |
-| wall-clock runtime (hyperfine mean) | 1.522 ms | 2.370 ms | 3.490 ms | 1.643 ms | 3.511 ms | 2.631 ms |
+| wall-clock runtime (hyperfine mean) | 0.457 ms | 0.749 ms | 0.364 ms | 0.341 ms | 1.786 ms | 1.787 ms |
 
 ## bitops
 
@@ -134,7 +134,7 @@ int main(void) {
 | .rodata size | 589824 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 164 / 167 (98.2%) | 922 / 924 (99.8%) | 8 / 19 (42.1%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add and call int or pop push ret sub xchg xor` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 2.508 ms | 4.328 ms | 2.942 ms | 1.831 ms | 1.109 ms | 1.582 ms |
+| wall-clock runtime (hyperfine mean) | 1.110 ms | 2.606 ms | 0.583 ms | 0.182 ms | 1.478 ms | 0.795 ms |
 
 ## sum10
 
@@ -154,7 +154,7 @@ int main(void) {
 | .rodata size | 721408 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 421 / 429 (98.1%) | 1225 / 1227 (99.8%) | 11 / 24 (45.8%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jg jmp pop push ret sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.387 ms | 2.383 ms | 1.121 ms | 0.559 ms | 0.854 ms | 1.586 ms |
+| wall-clock runtime (hyperfine mean) | 0.971 ms | 1.992 ms | 3.578 ms | 2.990 ms | 0.728 ms | 1.457 ms |
 
 ## fib10
 
@@ -191,7 +191,7 @@ int main(void) {
 | .rodata size | 721408 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 426 / 434 (98.2%) | 1267 / 1269 (99.8%) | 16 / 29 (55.2%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jge jmp pop push ret sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.990 ms | 3.139 ms | 2.698 ms | 0.820 ms | 0.725 ms | 1.552 ms |
+| wall-clock runtime (hyperfine mean) | 2.585 ms | 2.718 ms | 1.109 ms | 1.378 ms | 2.913 ms | 1.895 ms |
 
 ## shifts
 
@@ -228,7 +228,7 @@ int main(int argc, char **argv) {
 | .rodata size | 657152 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 458 / 461 (99.3%) | 1423 / 1425 (99.9%) | 14 / 28 (50.0%) | 3 / 9 (33.3%) | 3 / 9 (33.3%) | 3 / 9 (33.3%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add and call int or pop push ret sar shl sub xchg` | `call int or ret shl xchg` | `call int or ret shl xchg` | `call int or ret shl xchg` |
-| wall-clock runtime (hyperfine mean) | 0.503 ms | 3.138 ms | 1.731 ms | 1.879 ms | 1.195 ms | 1.721 ms |
+| wall-clock runtime (hyperfine mean) | 1.160 ms | 3.368 ms | 2.393 ms | 2.318 ms | 1.567 ms | 1.983 ms |
 
 ## shift_reg
 
@@ -278,7 +278,7 @@ int main(int argc, char **argv) {
 | .rodata size | 723968 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 2378 / 2381 (99.9%) | 1542 / 1544 (99.9%) | 21 / 37 (56.8%) | 7 / 20 (35.0%) | 7 / 20 (35.0%) | 7 / 20 (35.0%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add and call int or pop push ret sar shl shr sub xchg xor` | `and call int or pop push ret sar shl shr xchg xor` | `and call int or pop push ret sar shl shr xchg xor` | `and call int or pop push ret sar shl shr xchg xor` |
-| wall-clock runtime (hyperfine mean) | 0.753 ms | 4.494 ms | 2.417 ms | 2.992 ms | 0.709 ms | 0.527 ms |
+| wall-clock runtime (hyperfine mean) | 3.795 ms | 3.759 ms | 2.594 ms | 2.391 ms | 3.378 ms | 2.059 ms |
 
 ## fib_rec
 
@@ -325,7 +325,7 @@ int main(void) {
 | .rodata size | 721408 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 873 / 884 (98.8%) | 2248 / 2250 (99.9%) | 21 / 54 (38.9%) | 6 / 43 (14.0%) | 7 / 57 (12.3%) | 7 / 57 (12.3%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call cmp int jge jmp nop pop push ret sub xchg` | `add call cmp int jge jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` |
-| wall-clock runtime (hyperfine mean) | 176.172 ms | 2369.006 ms | 3.012 ms | 2.092 ms | 0.876 ms | 0.865 ms |
+| wall-clock runtime (hyperfine mean) | 111.934 ms | 1874.435 ms | 2.209 ms | 3.561 ms | 2.565 ms | 2.096 ms |
 
 ## multi_call
 
@@ -366,7 +366,7 @@ int main(int argc, char **argv) {
 | .rodata size | 524288 | 0 | 0 | 0 | 0 | 0 |
 | mov count / total | 704 / 711 (99.0%) | 2036 / 2038 (99.9%) | 22 / 46 (47.8%) | 4 / 22 (18.2%) | 4 / 22 (18.2%) | 4 / 22 (18.2%) |
 | non-mov mnemonics | `call int jmp` | `call` | `add call int nop pop push ret sub xchg` | `add call inc int lea nop ret xchg` | `add call inc int lea nop ret xchg` | `add call inc int lea nop ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.604 ms | 2.405 ms | 1.033 ms | 2.193 ms | 2.154 ms | 0.995 ms |
+| wall-clock runtime (hyperfine mean) | 1.300 ms | 1.304 ms | 1.600 ms | 1.376 ms | 0.914 ms | 0.172 ms |
 
 ## rust_main
 
@@ -403,7 +403,8 @@ pub extern "C" fn rust_main() -> i32 {
 | .rodata size | 524288 | — | 0 | 0 | 0 | 0 |
 | mov count / total | 193 / 199 (97.0%) | — | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | — | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 0.784 ms | — | 0.219 ms | 0.844 ms | 0.374 ms | 0.606 ms |
+| deps mov-lowered | — | — | — | — | — | — |
+| wall-clock runtime (hyperfine mean) | 2.419 ms | — | 1.385 ms | 1.309 ms | 3.182 ms | 0.398 ms |
 
 ## rust_fib
 
@@ -455,7 +456,42 @@ pub extern "C" fn fib_main() -> i32 {
 | .rodata size | 721408 | — | 0 | 0 | 0 | 0 |
 | mov count / total | 939 / 953 (98.5%) | — | 20 / 50 (40.0%) | 6 / 41 (14.6%) | 7 / 50 (14.0%) | 7 / 50 (14.0%) |
 | non-mov mnemonics | `call int jmp` | — | `add call cmp int jl jmp pop push ret sub xchg` | `add call cmp int jge jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` | `add call cmp int ja jl lea nop pop push ret sub xchg xor` |
-| wall-clock runtime (hyperfine mean) | 242.903 ms | — | 1.625 ms | 2.580 ms | 2.541 ms | 2.603 ms |
+| deps mov-lowered | 0 / 2 (native: core native(no-ir), compiler_builtins native(no-ir)) | — | — | — | — | — |
+| wall-clock runtime (hyperfine mean) | 167.937 ms | — | 1.792 ms | 4.005 ms | 2.504 ms | 1.916 ms |
+
+## rust_dep_mov_add
+
+```rust
+//! Smallest possible "user crate + path dep" demo for issue #11
+//! Option C. Body of the work lives in `triv_dep::triv_add` so the
+//! dep's `.o` is what we want to drive through llvm-mov-llc; the
+//! user crate is reduced to a single cross-crate call.
+//!
+//! Returns 42 → `_start.s` puts it into `ebx` and `int 0x80`s.
+
+#![no_std]
+#![no_main]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dep_mov_add_main() -> i32 {
+    triv_dep::triv_add(40, 2) as i32
+}
+```
+
+| metric | llvm-mov (Rust) | movfuscator | rustc -O0 | rustc -O1 | rustc -O2 | rustc -O3 |
+|---|---:|---:|---:|---:|---:|---:|
+| total ELF (bytes) | 2269992 | — | — | — | — | — |
+| .text size | 1745 | — | — | — | — | — |
+| .rodata size | 1048576 | — | — | — | — | — |
+| mov count / total | 430 / 438 (98.2%) | — | — | — | — | — |
+| non-mov mnemonics | `call int jmp` | — | — | — | — | — |
+| deps mov-lowered | 1 / 3 (mov: triv_dep; native: core native(no-ir), compiler_builtins native(no-ir)) | — | — | — | — | — |
+| wall-clock runtime (hyperfine mean) | 0.589 ms | — | — | — | — | — |
 
 ## rust_png_header
 
@@ -552,7 +588,8 @@ pub extern "C" fn png_header_main() -> i32 {
 | .rodata size | 721232 | — | 45 | 0 | 0 | 0 |
 | mov count / total | 1077 / 1094 (98.4%) | — | 39 / 91 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | — | `add and call cmp int je jmp jne lea nop or pop push ret shl shr sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 1.872 ms | — | 1.481 ms | 3.388 ms | 0.495 ms | 3.199 ms |
+| deps mov-lowered | 0 / 2 (native: core native(no-ir), compiler_builtins native(no-ir)) | — | — | — | — | — |
+| wall-clock runtime (hyperfine mean) | 1.893 ms | — | 2.843 ms | 0.633 ms | 2.266 ms | 2.793 ms |
 
 ## rust_jpeg_header
 
@@ -680,7 +717,8 @@ pub extern "C" fn jpeg_header_main() -> i32 {
 | .rodata size | 721236 | — | 51 | 0 | 0 | 0 |
 | mov count / total | 1888 / 1908 (99.0%) | — | 45 / 114 (39.5%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | — | `add and call cmp int jb je jmp jne lea nop or pop push ret shl shr sub xchg` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 2.420 ms | — | 2.571 ms | 1.395 ms | 0.618 ms | 2.051 ms |
+| deps mov-lowered | 0 / 2 (native: core native(no-ir), compiler_builtins native(no-ir)) | — | — | — | — | — |
+| wall-clock runtime (hyperfine mean) | 0.795 ms | — | 0.368 ms | 0.534 ms | 2.902 ms | 0.398 ms |
 
 ## rust_bmp_decode
 
@@ -836,7 +874,8 @@ pub extern "C" fn bmp_decode_main() -> i32 {
 | .rodata size | 721812 | — | 82 | 0 | 0 | 0 |
 | mov count / total | 2004 / 2028 (98.8%) | — | 65 / 130 (50.0%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) | 3 / 7 (42.9%) |
 | non-mov mnemonics | `call int jmp` | — | `add and call cmp int jb je jmp jne lea nop or pop push ret shl shr sub xchg xor` | `call int ret xchg` | `call int ret xchg` | `call int ret xchg` |
-| wall-clock runtime (hyperfine mean) | 2.343 ms | — | 2.126 ms | 2.090 ms | 1.191 ms | 1.618 ms |
+| deps mov-lowered | 0 / 2 (native: core native(no-ir), compiler_builtins native(no-ir)) | — | — | — | — | — |
+| wall-clock runtime (hyperfine mean) | 2.985 ms | — | 2.454 ms | 2.385 ms | 1.354 ms | 1.990 ms |
 
 ## rust_base64_decode
 
@@ -892,7 +931,8 @@ pub extern "C" fn base64_decode_main() -> i32 {
 | .rodata size | 729144 | — | — | 4888 | 4888 | 4888 |
 | mov count / total | 8299 / 9451 (87.8%) | — | — | 669 / 1862 (35.9%) | 671 / 1893 (35.4%) | 671 / 1893 (35.4%) |
 | non-mov mnemonics | `add and bswap call cmovae cmovb cmove cmovne cmp dec imul inc int ja jae jb jbe je jmp jne lea movd movdqa movdqu mul neg nop not or paddd pand pcmpeqd pcmpgtb pinsrw pop por pshufd psrld punpckhdq punpckhqdq punpcklbw punpckldq punpcklqdq punpcklwd push pxor ret setae setb sete setge setne shl shld shr sub test xchg xor` | — | — | `add and bswap call cmovae cmovb cmove cmovne cmp dec imul inc int ja jae jb jbe je jmp jne lea movaps movd movdqa movdqu mul neg nop not or paddd pand pcmpeqd pcmpgtb pinsrw pop por pshufd psrld punpckhdq punpckhqdq punpcklbw punpckldq punpcklqdq punpcklwd push pxor ret setae setb sete setge setne shl shld shr sub test xchg xor xorps` | `add and bswap call cmovae cmovb cmove cmovne cmp dec imul inc int ja jae jb jbe je jmp jne lea movd movdqa movdqu mul neg nop not or paddd pand pcmpeqd pcmpgtb pinsrw pop por pshufd psrld punpckhdq punpckhqdq punpcklbw punpckldq punpcklqdq punpcklwd push pxor ret setae setb sete setge setne shl shld shr sub test xchg xor` | `add and bswap call cmovae cmovb cmove cmovne cmp dec imul inc int ja jae jb jbe je jmp jne lea movd movdqa movdqu mul neg nop not or paddd pand pcmpeqd pcmpgtb pinsrw pop por pshufd psrld punpckhdq punpckhqdq punpcklbw punpckldq punpcklqdq punpcklwd push pxor ret setae setb sete setge setne shl shld shr sub test xchg xor` |
-| wall-clock runtime (hyperfine mean) | 2.082 ms | — | — | 0.849 ms | 1.716 ms | 0.691 ms |
+| deps mov-lowered | 0 / 3 (native: base64 native(llc-fail), core native(no-ir), compiler_builtins native(no-ir)) | — | — | — | — | — |
+| wall-clock runtime (hyperfine mean) | 3.009 ms | — | — | 0.941 ms | 3.535 ms | 1.311 ms |
 
 ## rust_qoi_decode
 
@@ -965,5 +1005,6 @@ pub extern "C" fn qoi_decode_main() -> i32 {
 | .rodata size | 855594 | — | — | 42 | 42 | 42 |
 | mov count / total | 23365 / 23412 (99.8%) | — | — | 78 / 246 (31.7%) | 111 / 342 (32.5%) | 111 / 334 (33.2%) |
 | non-mov mnemonics | `call int jmp` | — | — | `add and call cmovb cmp dec imul inc int jae jb jbe je jmp jne js lea movaps mul nop or pop push ret shl shr sub test xchg xor xorps` | `add and call cmovb cmp dec imul inc int ja jae jb jbe je jmp jne js lea movd movdqa movdqu mul nop or pop pshufd pshuflw punpcklbw push pxor ret shl shr sub test xchg xor` | `add and call cmovb cmp dec imul inc int ja jae jb jbe je jmp jne js lea movd movdqa movdqu mul nop or paddb pop psadbw pshufd pshuflw punpcklbw push pxor ret shl shr sub test xchg xor` |
-| wall-clock runtime (hyperfine mean) | 3.054 ms | — | — | 2.340 ms | 0.166 ms | 0.349 ms |
+| deps mov-lowered | 1 / 4 (mov: bytemuck; native: qoi native(llc-fail), core native(no-ir), compiler_builtins native(no-ir)) | — | — | — | — | — |
+| wall-clock runtime (hyperfine mean) | 3.562 ms | — | — | 2.034 ms | 1.217 ms | 0.381 ms |
 

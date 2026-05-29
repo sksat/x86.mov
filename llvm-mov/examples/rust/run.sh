@@ -45,13 +45,18 @@ for arg in "$@"; do
     case "$arg" in
         --example=*) EXAMPLE="${arg#--example=}" ;;
         --run)       DO_RUN=1 ;;
-        *) echo "usage: $0 [--example={main,fib,png_header,jpeg_header,bmp_decode,base64_decode,qoi_decode,aes}] [--run]" 1>&2; exit 2 ;;
+        *) echo "usage: $0 [--example={main,fib,dep_mov_add,png_header,jpeg_header,bmp_decode,base64_decode,qoi_decode,aes}] [--run]" 1>&2; exit 2 ;;
     esac
 done
 
 case "$EXAMPLE" in
     main)          ENTRY="rust_main";          EXPECTED=42;  CRATE="rust-mov-main" ;;
     fib)           ENTRY="fib_main";           EXPECTED=32;  CRATE="rust-mov-fib" ;;
+    # Issue #11 / Option C demo: tiny user crate whose body lives in a
+    # path-local `triv_dep` lib. cargo-link.sh routes the dep's IR
+    # through llvm-mov-llc too, so the linked ELF's .text is mov-only
+    # end to end (gated by test/DepsMov/run.sh). triv_add(40, 2) = 42.
+    dep_mov_add)   ENTRY="dep_mov_add_main";   EXPECTED=42;  CRATE="rust-mov-dep-mov-add" ;;
     png_header)    ENTRY="png_header_main";    EXPECTED=8;   CRATE="rust-mov-png-header" ;;
     jpeg_header)   ENTRY="jpeg_header_main";   EXPECTED=16;  CRATE="rust-mov-jpeg-header" ;;
     bmp_decode)    ENTRY="bmp_decode_main";    EXPECTED=104; CRATE="rust-mov-bmp-decode" ;;
