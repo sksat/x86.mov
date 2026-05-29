@@ -373,12 +373,36 @@ export async function link(objs, libs, opts = {}) {
     const trailerLibArgs = staticLink
         ? extraLibs.map(l => `-l${l}`)
         : [];
-    // Runtime selection: 'movfuscator' wraps user inputs in the
-    // historical `crt0 ... crtf crtd softfloat32` recipe; 'none' just
-    // emits the user inputs, leaving _start / runtime symbols to the
-    // caller (the llvm-mov pipeline's pattern).
-    const runtimePrefix = runtime === 'movfuscator' ? ['/movfuscator/crt0.o'] : [];
-    const runtimeSuffix = runtime === 'movfuscator'
+    // Runtime selection:
+    //   - 'movfuscator': wraps user inputs in the historical
+    //     `crt0 ... crtf crtd softfloat32` recipe.
+    //   - 'none': just emits the user inputs.
+    //
+    // Caller-object placement depends on link mode:
+    //   - dynamic (default): user inputs sit *between* crt0 and crtf/
+    //     crtd/softfloat32, matching the historical link command this
+    //     subproject's byte-identical goldens were pinned to. ld.so
+    //     resolves symbols at runtime so adjacency between user and
+    //     runtime `.text` is harmless.
+    //   - static + 'movfuscator': user inputs must follow softfloat32.
+    //     master_loop's body is split across `crt0.o.text` and
+    //     `crtf.o.text` (the head — ~1.4 KiB of mov dispatch — lives
+    //     in crt0; the 8-byte tail `mov esp, [&sesp]; mov cs, ax`
+    //     lives in crtf). With user inputs in between, the user object's
+    //     own `.text` (typically a `ret`-bearing stub for `sigaction` /
+    //     `exit`) lands on master_loop's fallthrough path; the `c3` byte
+    //     gets executed, pops a movfuscator-encoded label off the shadow
+    //     stack (with bit 31 set as the runtime's `MOV_OFFSET` marker),
+    //     and movie86 traps with `Unmapped(0x88...)`. PR #49 pins this
+    //     invariant on the movie86 side as a regression-pin e2e test.
+    //   - static + 'none': no movfuscator runtime objects, so placement
+    //     is moot — user inputs are the only inputs.
+    const movfuscatorRuntime = runtime === 'movfuscator';
+    const callerBetween = movfuscatorRuntime && !staticLink;
+    const callerAfter   = movfuscatorRuntime && staticLink;
+    const userArgs = userObjs.map(({ name: n }) => `/${n}`);
+    const runtimePrefix = movfuscatorRuntime ? ['/movfuscator/crt0.o'] : [];
+    const runtimeSuffix = movfuscatorRuntime
         ? ['/movfuscator/crtf.o', '/movfuscator/crtd.o', '/movfuscator/softfloat32.o']
         : [];
     const cmd = [
@@ -388,8 +412,10 @@ export async function link(objs, libs, opts = {}) {
         ...searchPaths.map(p => `-L${p}`),
         ...headerLibArgs,
         ...runtimePrefix,
-        ...userObjs.map(({ name: n }) => `/${n}`),
+        ...(callerBetween ? userArgs : []),
         ...runtimeSuffix,
+        ...(callerAfter ? userArgs : []),
+        ...(!movfuscatorRuntime ? userArgs : []),
         ...trailerLibArgs,
         '-o', '/out.elf',
     ];

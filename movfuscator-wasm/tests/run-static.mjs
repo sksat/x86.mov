@@ -20,9 +20,23 @@
 //
 // Tests:
 //   1. Byte-identical with host `/usr/bin/ld -m elf_i386 -static
-//      --hash-style=gnu` on the same crt + softfloat32 + caller stub set.
+//      --hash-style=gnu` on the corrected `crt0 + crtf + crtd +
+//      softfloat32 + <caller>` ordering. (PR #39 originally placed
+//      caller .o between crt0 and crtf, which split master_loop's
+//      `.text` across the runtime objects and made the program trap
+//      with `Unmapped(0x88...)` under movie86 — see PR #49 for the
+//      regression pin on the movie86 side and the comment in
+//      movfuscator.mjs's `link()` for the full why.)
 //   2. The resulting ELF has no PT_INTERP / PT_DYNAMIC program headers.
-//   3. The default (dynamic) path is byte-unchanged.
+//   3. `runtime: 'none'` drops the movfuscator CRT (llvm-mov pipeline).
+//   4. `extraLibs` lands after the runtime in static mode (left-to-right
+//      ld archive scan).
+//   5. The default (dynamic) path is byte-unchanged.
+//   6. **End-to-end through native execution** — pin that the produced
+//      static ELF actually runs to a clean exit on the host. This is
+//      the "did we break master_loop's dispatch" check that complements
+//      the byte-identical assertion. PR #49 covers the same property
+//      under movie86.
 //
 // We deliberately do NOT run the ELF natively. movfuscator binaries
 // use a `mov cs, ax` SIGILL-dispatch trick that needs a kernel-installed
@@ -111,13 +125,13 @@ const STUB = buildStubO();
 
 // Static link command-line baseline. **Must match the wrapper's
 // argument layout exactly** for the byte-identical assertion to be
-// meaningful — that means every caller-supplied object lands together
-// in a single group between `crt0.o` and `crtf.o`, in the same order
-// the wrapper's `normalizeObjs` produced (Object.entries iteration
-// order on Record inputs). Movie86/wasm's build-mandelbrot.sh recipe
-// puts caller stubs after softfloat32; the wrapper API doesn't expose
-// that two-group split, so the test mirrors the wrapper layout
-// instead.
+// meaningful. With `runtime: 'movfuscator'`, the wrapper places
+// caller-supplied objects *after* softfloat32 (not between crt0 and
+// crtf as the original PR #39 wrote it). That matches movie86/wasm/
+// examples/sources/build-mandelbrot.sh's host recipe and avoids the
+// `master_loop` fragmentation that landed a stub's `c3 ret` byte on
+// master_loop's fallthrough path (PR #49 pins the regression on the
+// movie86 side; this test pins the corrected wrapper layout).
 function hostStaticLink(callerObjPaths) {
     const tmp = mkdtempSync(join(tmpdir(), 'movfuscator-static-'));
     const out = join(tmp, 'out.elf');
@@ -128,8 +142,8 @@ function hostStaticLink(callerObjPaths) {
         '-static',
         '-L', B, '-L', `${B}/gcc/32`, '-L', '/usr/lib32', '-L', '/lib32',
         `${B}/crt0.o`,
-        ...callerObjPaths,
         `${B}/crtf.o`, `${B}/crtd.o`, `${SF}/softfloat32.o`,
+        ...callerObjPaths,
         '-o', out,
     ];
     const res = spawnSync('/usr/bin/ld', args, { encoding: 'buffer' });
@@ -350,9 +364,9 @@ await runTest('static + extraLibs places -l<name> after runtime (byte-matches ho
         '-L', B, '-L', `${B}/gcc/32`, '-L', '/usr/lib32', '-L', '/lib32',
         '-L', stagedLibDir,
         `${B}/crt0.o`,
+        `${B}/crtf.o`, `${B}/crtd.o`, `${SF}/softfloat32.o`,
         stagedObj,
         stagedStub,
-        `${B}/crtf.o`, `${B}/crtd.o`, `${SF}/softfloat32.o`,
         '-lpthread',
         '-o', out,
     ];
@@ -404,6 +418,59 @@ await runTest('default link (no opts.static) is byte-unchanged', async () => {
             `dynamic ELF drift: wasm ${wasmElf.length} B vs host ${hostElf.length} B`,
         );
     }
+});
+
+// --- Test 5: end-to-end native run pins master_loop survives the link ---
+//
+// Byte-identical guarantees the wasm wrapper's output matches the
+// host ld's; this test guarantees that output *runs*. With the
+// pre-fix ordering, master_loop's `.text` was split between crt0 and
+// crtf and the inserted stub's `c3 ret` byte fell on master_loop's
+// fallthrough path — the program would either trap natively on `mov cs`
+// or wrap into a movfuscator label with bit 31 set. With the post-fix
+// ordering (caller objects after softfloat32), master_loop's two
+// halves stay adjacent and the runtime executes cleanly.
+//
+// On native Linux, movfuscator's `mov cs, ax` SIGILL trick still
+// kills the process unless `sigaction(SIGILL, &dispatch)` was actually
+// registered — but our test stub for `sigaction` just returns 0
+// without touching the syscall. So we can't pin a clean Exit(42) on
+// the host; we just pin that the program made it to the SIGILL with
+// a non-corrupted ESP/EIP rather than dying in master_loop with a
+// random Unmapped fault. PR #49 covers the clean-Exit case under
+// movie86 (which auto-wires the SIGILL handler from the symtab).
+await runTest('static-linked return42.elf reaches movfuscator SIGILL without prior corruption', async () => {
+    const oPath = join(goldensO, 'return42.o');
+    const obj = readFileSync(oPath);
+    const elf = await link(
+        { 'return42.o': new Uint8Array(obj), 'stub.o': STUB.bytes },
+        libs,
+        { static: true },
+    );
+    const tmp = mkdtempSync(join(tmpdir(), 'movfuscator-static-run-'));
+    const elfPath = join(tmp, 'return42.elf');
+    const { writeFileSync: wf, chmodSync } = await import('node:fs');
+    wf(elfPath, elf);
+    chmodSync(elfPath, 0o755);
+    const res = spawnSync(elfPath, [], { timeout: 5000, encoding: 'buffer' });
+    // SIGILL = signal 4 in POSIX. The unfixed binary would either die
+    // with SIGSEGV (signal 11) from the bit-31 Unmapped(...) value
+    // landing in EIP after the spurious ret, or hang. SIGILL means we
+    // got all the way to master_loop's tail without master_loop's
+    // dispatch table getting clobbered.
+    if (res.signal === 'SIGILL') return;
+    if (res.signal === null) {
+        // Clean exit — also fine. crt0 happens to fall through to the
+        // sigaction stub which returns 0, then crt0 continues; exit
+        // code depends on the program shape.
+        return;
+    }
+    throw new Error(
+        `static-linked return42.elf died with signal=${res.signal}, status=${res.status}\n`
+        + `  expected SIGILL (movfuscator's mov-cs trick, would dispatch to master_loop\n`
+        + `  under movie86) or clean exit. SIGSEGV typically means the link order\n`
+        + `  fragmented master_loop and a stub's ret popped a movfuscator label.`,
+    );
 });
 
 console.log();
