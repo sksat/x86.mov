@@ -86,7 +86,28 @@ if [ ! -d "$wasi_sdk" ]; then
     rm "$tarball"
 fi
 
-# ── 3. Apply local patches (none yet — placeholder hook) ─────────────
+# ── 3. Stage local-path dependencies that the rustc workspace
+#       expects ─────────────────────────────────────────────────────────
+#
+# bjorn3's wasm20 branch carries a `[patch.crates-io]` line
+#   libwild = { path = "wild/libwild" }
+# in the workspace Cargo.toml, but the `wild/` tree itself isn't in
+# the rust repo — it's expected to be cloned in alongside. Without it
+# stage1 fails with "failed to read wild/libwild/Cargo.toml". The
+# Cargo.lock pins the matching libwild git source to a specific SHA;
+# we clone wild at that SHA so the local-path patch resolves.
+wild_sha="9a7ad7cb05bce0487a7089bffe95452b43d07cfb"
+if [ ! -f "$rust_src/wild/libwild/Cargo.toml" ]; then
+    echo "==> cloning wild-linker/wild @ $wild_sha into vendor/rust/wild"
+    git clone --depth 1 https://github.com/wild-linker/wild.git "$rust_src/wild"
+    ( cd "$rust_src/wild" \
+        && git fetch --depth 1 origin "$wild_sha" \
+        && git checkout "$wild_sha" )
+fi
+
+# Apply local patches (none yet — placeholder hook). Keeps the
+# vendor tree intact so the next distclean→setup cycle replays
+# any patches.
 patch_dir="$root/patches/wasm-rustc"
 if [ -d "$patch_dir" ]; then
     for p in "$patch_dir"/*.patch; do
