@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
-# Build examples/input_demo.elf from input_demo.c via the movfuscator
-# pipeline (mov-only x86), statically linked against the movfuscator
-# runtime + the shared stubs (set_video_mode / mmap_request / exit /
-# poll_input) and the .fb13h framebuffer region pinned at 0xA0000.
+# Build examples/input_demo.elf from input_demo.c via the llvm-mov
+# pipeline (clang -emit-llvm -> llvm-mov-llc -> mov-target asm).
 #
-# Integer-only demo — no softfloat needed (unlike the Mandelbrot
-# builds), so this links just crt0/crtf/crtd + stubs.
+# Why llvm-mov rather than movfuscator: llvm-mov emits ordinary jmp/call
+# control flow (no SIGILL master_loop dispatch), so the same ELF runs
+# *natively* on turbo86 as well as on movie86 — letting input_demo
+# exercise turbo86's WS key input, not just the browser path. (The
+# movfuscator build only ran on movie86; turbo86 hit the unhandled-
+# SIGSEGV dispatch wall — see the issue on running movfuscator output
+# natively on turbo86.)
 #
-#   input_demo.c → (movfuscator) → input_demo.elf
+#   input_demo.c -> clang -emit-llvm -> llvm-mov-llc -> .s -> .o
+#   link: _start_llvm.o + input_demo.o + stubs_llvm.o, .fb13h @ 0xA0000
 #
-# **Don't `--strip-all`** — movie86 wires SIGSEGV→dispatch and
-# SIGILL→master_loop from the ELF symbol table; strip-all kills the
-# symtab and the NULL-deref dispatch trick stops working. --strip-debug
-# is fine.
+# Requires movie86's jmp-rel8 (EB) decode to run on movie86: gas relaxes
+# the dispatcher jumps to the 2-byte EB form.
 #
-# Prereqs:
-#   - movfuscator-wasm/vendor built (`make -C movfuscator-wasm setup build-native`)
-#   - binutils with `as --32` + `ld -m elf_i386`
+# Prereqs: llvm-mov-llc built (cd ../../../llvm-mov && make build, or on
+# Arch: make build LLVM_CONFIG=llvm-config), clang (clang-22), binutils
+# `as --32` + `ld -m elf_i386`.
 
 set -euo pipefail
 
@@ -24,20 +26,28 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../../.." && pwd)"
 
 EX="$HERE/.."
-B="$ROOT/movfuscator-wasm/vendor/movfuscator/build"
+CLANG="${CLANG:-clang-22}"
+LLC="${LLC:-$ROOT/llvm-mov/build/bin/llvm-mov-llc}"
+
+if [ ! -x "$LLC" ]; then
+    echo "llvm-mov-llc not found at $LLC — build it first (see header)" >&2
+    exit 1
+fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-as --32 -mx86-used-note=no -o "$TMP/stubs_mov.o" "$HERE/stubs_movfuscator.s"
+echo "[llvm-mov] input_demo.c"
+"$CLANG" -m32 -O2 -emit-llvm -S "$HERE/input_demo.c" -o "$TMP/input_demo.ll"
+"$LLC" -verify-machineinstrs "$TMP/input_demo.ll" -mtriple=mov-unknown-linux-gnu -o "$TMP/input_demo.s"
 
-echo "[movfuscator] input_demo.c"
-"$ROOT/movfuscator-wasm/scripts/preprocess.sh" "$HERE/input_demo.c" "$TMP/input_demo.i" >/dev/null
-"$B/rcc" -target=x86/mov "$TMP/input_demo.i" "$TMP/input_demo.s"
-as --32 -mx86-used-note=no -o "$TMP/input_demo.o" "$TMP/input_demo.s" 2>/dev/null
+as --32 -mx86-used-note=no -o "$TMP/input_demo.o" "$TMP/input_demo.s"
+as --32 -mx86-used-note=no -o "$TMP/_start_llvm.o" "$HERE/_start_llvm.s"
+as --32 -mx86-used-note=no -o "$TMP/stubs_llvm.o" "$HERE/stubs_llvm.s"
+
 ld -m elf_i386 -static --hash-style=gnu \
     --section-start=.fb13h=0xA0000 --undefined=_fb13h_region \
-    "$B/crt0.o" "$TMP/input_demo.o" "$B/crtf.o" "$B/crtd.o" "$TMP/stubs_mov.o" \
+    "$TMP/_start_llvm.o" "$TMP/input_demo.o" "$TMP/stubs_llvm.o" \
     -o "$EX/input_demo.elf"
-strip --strip-debug "$EX/input_demo.elf"
+strip --strip-all "$EX/input_demo.elf"
 echo "  → $(stat -c %s "$EX/input_demo.elf") B"
