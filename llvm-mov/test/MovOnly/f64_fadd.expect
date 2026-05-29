@@ -1,0 +1,2 @@
+# Stage 7h4 — `call __adddf3` rewritten to dispatcher-jmp shape.
+jmp
