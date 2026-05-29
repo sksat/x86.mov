@@ -115,7 +115,11 @@ try {
                 [0xbb, 0x2a, 0x00, 0x00, 0x00],
                 `disasmAt bytes mismatch: got ${Array.from(d.bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}`,
             );
-            assert.ok(d.text.includes('Mov'), `disasmAt text should mention Mov, got ${d.text}`);
+            // AT&T-syntax disassembly: `mov ebx, 42` renders as
+            // `movl $0x2a, %ebx`. Pin the exact string so a format
+            // regression breaks loudly in CI.
+            assert.equal(d.text, 'movl $0x2a, %ebx',
+                `disasmAt text mismatch: got ${JSON.stringify(d.text)}`);
         } finally {
             d.free();
         }
