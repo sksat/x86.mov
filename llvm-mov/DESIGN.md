@@ -242,6 +242,80 @@ above sidesteps all of that.
     fixtures matched but the helpers' loop-with-PHI bodies, which
     RA spills around, did not.
 
+### 7g — single-precision floating-point
+
+- **7g1** `f32 fadd` via SDAG soft-float legalization →
+  `call __addsf3 (float, float) -> float`, with the helper body
+  injected by `llvm-mov-llc` (same `linkonce_odr` shape as the
+  stage-7f2 integer DIV/REM helpers). The body is an IEEE-754
+  single-precision add written entirely as straight-line `i1`-
+  conditioned `select`s over the bit pattern; the driver's pre-
+  existing SELECT → bit-blend rewrite (around stage 6d3e)
+  removes every internal branch before SDAG sees it, so the
+  helper does not introduce CMP+Jcc+PHI control flow.
+
+  Why driver IR injection again (vs. a `FADD32rr` byte-chain
+  pseudo): the per-call-site cost in `.text` is dominated by the
+  call's mov-only frame manipulation either way. Letting the
+  helper body amortise across all `fadd` callers keeps the per-
+  fixture `.text` linear in call-count rather than in the count
+  of fadd operations.
+
+  Backend plumbing for f32 is intentionally minimal: f32 is **not**
+  given a register class, so the SDAG type legalizer's soft-float
+  path takes over and converts every f32 SDAG node into i32 +
+  libcall before ISel sees it. Every existing TableGen pattern
+  stays i32-only. The only change in `MovISelLowering` is
+  `setOperationAction(ISD::FADD, MVT::f32, LibCall)` plus the
+  `setLibcallImpl(RTLIB::ADD_F32, RTLIB::impl___addsf3)` binding.
+
+  Algorithm (round-to-nearest, ties-to-even; bit-pattern operations
+  detailed inline in `tools/llvm-mov-llc/main.cpp`):
+
+  ```
+  ai, bi          = bitcast a, b to i32
+  sign, exp, mant = unpack
+  align mantissa with smaller exponent → sticky bit
+  add (same sign) | sub (diff sign)
+  ctlz → normalize shift (overflow / underflow / in-place)
+  round-to-nearest, ties-to-even with guard/round/sticky
+  repack → bitcast i32 to f32
+  ```
+
+  Same stage adds the surrounding f32 ops that come together as a
+  set:
+
+  - **fsub** via `__subsf3`. The body flips b's sign bit and tail-
+    calls `__addsf3` — IEEE-754 says `a - b = a + (-b)` regardless of
+    NaN-ness or special-value handling, so no separate algorithm is
+    needed.
+  - **fcmp** via `__eqsf2 / __nesf2 / __ltsf2 / __lesf2 / __gtsf2 /
+    __gesf2 / __unordsf2`. All six ordered helpers share the same
+    three-way compare body, parameterised by the unord-return
+    convention (+1 for eq/ne/lt/le, -1 for gt/ge). The compare uses
+    the standard "total-order key" trick so signed-i32 compare of
+    `(x XOR (sign_x ? 0x7FFFFFFF : 0))` matches float ordering;
+    `+0 == -0` is short-circuited via a magnitude-zero check.
+  - **i32 ↔ f32 conversion** via `__floatsisf` / `__floatunsisf`
+    (`sitofp` / `uitofp`) and `__fixsfsi` / `__fixunssfsi`
+    (`fptosi` / `fptoui`). The int → float path normalises via
+    `ctlz`, rounds-to-nearest-ties-to-even with a guard bit and a
+    sticky bit synthesised from "magnitude minus truncated-and-
+    shifted-back-up". The float → int path is straight truncation
+    toward zero with explicit saturation at `INT_MIN/MAX` /
+    `UINT_MAX` and a zero-result gate for `|f| < 1`.
+
+  Limitations of this first cut (deferred to follow-up stages):
+    - Inf / NaN inputs are best-effort; specifically a NaN input
+      may produce a finite garbage output for `fadd`/`fsub` (`fcmp`
+      and conversions handle NaN explicitly).
+    - Subnormal inputs flush to zero; the result also flushes to
+      zero on underflow.
+    - `fmul` / `fdiv` and `f32 ↔ f64` conversions are not yet wired
+      up. `fmul` needs a 32×32→48-bit byte-split multiply on top of
+      the existing 32-bit `mul i32`; `fdiv` needs a 24-iter long
+      division.
+
 ### Stage 7 gates
 
 [`test/MovOnly/run.sh`](test/MovOnly/run.sh) is the objdump gate.

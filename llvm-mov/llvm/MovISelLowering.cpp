@@ -26,6 +26,15 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
                                      const MovSubtarget &STI)
     : TargetLowering(TM, STI) {
   addRegisterClass(MVT::i32, &Mov::GPR32RegClass);
+  // Stage 7g0 — f32 is intentionally NOT given a register class. The
+  // type legalizer sees f32 as illegal and soft-promotes it to i32
+  // before ISel runs: every fadd/fsub/etc. SDAG node becomes a libcall
+  // taking i32 bit-patterns. The compiler-rt-named helpers
+  // (`__addsf3`, etc.) are injected as IR by `llvm-mov-llc` (stage 7g1
+  // — see the helper definitions in tools/llvm-mov-llc/main.cpp).
+  // This is the standard soft-float lowering pattern other backends
+  // (RISC-V soft-float, MSP430, …) use and keeps every TableGen
+  // pattern operating purely on i32.
   computeRegisterProperties(STI.getRegisterInfo());
 
   setStackPointerRegisterToSaveRestore(Mov::ESP);
@@ -173,6 +182,41 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setLibcallImpl(RTLIB::SDIV_I32,  RTLIB::impl___divsi3);
   setLibcallImpl(RTLIB::UREM_I32,  RTLIB::impl___umodsi3);
   setLibcallImpl(RTLIB::SREM_I32,  RTLIB::impl___modsi3);
+
+  // Stage 7g1 — single-precision floating-point ops. No FPU exists
+  // in mov-only land, so every FP op routes through compiler-rt-
+  // named libcalls. ADD_F32 lands first (this PR); the helper body
+  // for `__addsf3` is injected as IR by `llvm-mov-llc` along the
+  // same path that 7f2 used for the integer DIV/REM helpers.
+  // SUB / MUL / DIV / CMP / conversions are deferred to follow-up
+  // stage-7g rounds. The action mark below is LibCall so that the
+  // SDAG legalizer emits `call __addsf3` without trying to find a
+  // native FADD instruction first.
+  setOperationAction(ISD::FADD, MVT::f32, LibCall);
+  setOperationAction(ISD::FSUB, MVT::f32, LibCall);
+  setLibcallImpl(RTLIB::ADD_F32, RTLIB::impl___addsf3);
+  setLibcallImpl(RTLIB::SUB_F32, RTLIB::impl___subsf3);
+
+  // FP comparisons. Each predicate routes to its compiler-rt-named
+  // helper; the helper bodies share a single underlying compare and
+  // dispatch on the NaN-return convention. Driver injection sets up
+  // the bodies so SDAG's f32 SETCC legalizer can issue these as
+  // plain C-call libcalls and interpret the i32 result as the
+  // three-way ordered compare (-1 / 0 / +1).
+  setLibcallImpl(RTLIB::OEQ_F32, RTLIB::impl___eqsf2);
+  setLibcallImpl(RTLIB::UNE_F32, RTLIB::impl___nesf2);
+  setLibcallImpl(RTLIB::OLT_F32, RTLIB::impl___ltsf2);
+  setLibcallImpl(RTLIB::OLE_F32, RTLIB::impl___lesf2);
+  setLibcallImpl(RTLIB::OGT_F32, RTLIB::impl___gtsf2);
+  setLibcallImpl(RTLIB::OGE_F32, RTLIB::impl___gesf2);
+  setLibcallImpl(RTLIB::UO_F32,  RTLIB::impl___unordsf2);
+
+  // i32 ⇄ f32 conversions. Same shape — the libcalls are bound to
+  // compiler-rt names; the helper bodies are injected by the driver.
+  setLibcallImpl(RTLIB::SINTTOFP_I32_F32, RTLIB::impl___floatsisf);
+  setLibcallImpl(RTLIB::UINTTOFP_I32_F32, RTLIB::impl___floatunsisf);
+  setLibcallImpl(RTLIB::FPTOSINT_F32_I32, RTLIB::impl___fixsfsi);
+  setLibcallImpl(RTLIB::FPTOUINT_F32_I32, RTLIB::impl___fixunssfsi);
 
   // No `bswap` opcode either. Rust idioms like `u32::from_be(x)` or
   // `x.swap_bytes()` lower to ISD::BSWAP. Expand re-spells it as
