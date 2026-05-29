@@ -2098,6 +2098,275 @@ static void injectSubDf3Helper(Module &M, LLVMContext &Ctx) {
   B.CreateRet(R);
 }
 
+// Stage 7h5 — full 32×32 → 64-bit unsigned multiply, computed via
+// four 16×16 → 32-bit `mul i32` sub-multiplies (which the stage-7f1
+// byte-table lowering handles). Returns an i64. The naive `zext +
+// mul i64` approach would push SDAG into wide-mul lowerings we
+// don't support directly.
+static Value *emitMulU32U32ToI64(IRBuilder<> &B, Value *A, Value *Bv) {
+  LLVMContext &Ctx = B.getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Value *MaskLo16 = ConstantInt::get(I32, 0xFFFFu);
+  Value *Sixteen = ConstantInt::get(I32, 16);
+
+  // 16-bit decomposition.
+  Value *ALo = B.CreateAnd(A, MaskLo16);
+  Value *AHi = B.CreateLShr(A, Sixteen);
+  Value *BLo = B.CreateAnd(Bv, MaskLo16);
+  Value *BHi = B.CreateLShr(Bv, Sixteen);
+
+  // Four partial 16×16 products, each fits in i32.
+  Value *Pll = B.CreateMul(ALo, BLo);   // bits 31..0
+  Value *Plh = B.CreateMul(ALo, BHi);   // bits 47..16
+  Value *Phl = B.CreateMul(AHi, BLo);   // bits 47..16
+  Value *Phh = B.CreateMul(AHi, BHi);   // bits 63..32
+
+  // Sum p_lh + p_hl. Up to 33 bits; capture the carry-out (bit 32).
+  Value *Mid = B.CreateAdd(Plh, Phl);
+  Value *MidCarry = B.CreateZExt(B.CreateICmpULT(Mid, Plh), I32);
+  Value *MidLoShifted = B.CreateShl(B.CreateAnd(Mid, MaskLo16), Sixteen);
+  Value *MidHi = B.CreateLShr(Mid, Sixteen);
+
+  // Low 32 bits of the 64-bit product.
+  Value *Low32 = B.CreateAdd(Pll, MidLoShifted);
+  Value *CarryLo = B.CreateZExt(B.CreateICmpULT(Low32, Pll), I32);
+
+  // High 32 bits: p_hh + mid_hi17 + carry_lo. mid_hi17 = MidHi |
+  // (MidCarry << 16).
+  Value *MidHi17 = B.CreateOr(MidHi, B.CreateShl(MidCarry, Sixteen));
+  Value *High32 = B.CreateAdd(B.CreateAdd(Phh, MidHi17), CarryLo);
+
+  // Combine into i64 via constant-amount shl.
+  Value *Low64 = B.CreateZExt(Low32, I64);
+  Value *High64 = B.CreateZExt(High32, I64);
+  return B.CreateOr(B.CreateShl(High64, ConstantInt::get(I64, 32)), Low64);
+}
+
+// Stage 7h5 — `__muldf3 (a, b) -> double`. IEEE-754 double-precision
+// multiply. Same structure as `__mulsf3` but scaled to f64's 53-bit
+// mantissa with a 106-bit intermediate product.
+//
+// The mantissa multiply is a 53×53 → 106-bit product computed via
+// four 32×32 → 64-bit sub-multiplies on the (lo32, hi21) split of
+// each mantissa. The 106-bit product is held as two i64 halves
+// `{high64, low64}` (= bits 127..64, bits 63..0 of the conceptual
+// 128-bit value with the upper 22 bits guaranteed zero).
+//
+// Bit positions of the 106-bit product:
+//   bit 105 = top of product when "case A" (post-mul carry-out)
+//   bit 104 = top of product when "case B" (the more common case)
+// (Compared to f32: 47 / 46. Same shape, +58 bits.)
+//
+// In `high64` (which holds bits 127..64 of the product):
+//   bit 41 = bit 105 of product
+//   bit 40 = bit 104 of product
+//
+// Normalisation extracts the top 54 bits as the mantissa (with
+// implicit-1); guard / sticky come from the bits just below that
+// window. Round-to-nearest-ties-to-even, mantissa-overflow bump,
+// pack {sign, exp, mant}. Same flush-to-zero envelope as the f64
+// add helper: either-input-zero ⇒ signed zero; overflow ⇒ signed
+// Inf; underflow ⇒ signed zero; stage-7g4 Inf / NaN propagation.
+static void injectMulDf3Helper(Module &M, LLVMContext &Ctx) {
+  Type *F64 = Type::getDoubleTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(F64, {F64, F64}, /*isVarArg=*/false);
+
+  Function *F = makeOrPromoteHelper(M, "__muldf3", FnTy);
+  if (!F)
+    return;
+
+  F->getArg(0)->setName("a");
+  F->getArg(1)->setName("b");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+  auto C64 = [&](uint64_t V) { return ConstantInt::get(I64, V); };
+  auto C32 = [&](uint32_t V) { return ConstantInt::get(I32, V); };
+
+  Value *AI = B.CreateBitCast(F->getArg(0), I64, "ai");
+  Value *BI = B.CreateBitCast(F->getArg(1), I64, "bi");
+
+  // i32-pair compare helpers (same shape as 7h4).
+  auto SplitLoHi = [&](Value *X) -> std::pair<Value *, Value *> {
+    Value *Hi = B.CreateTrunc(B.CreateLShr(X, C64(32)), I32);
+    Value *Lo = B.CreateTrunc(X, I32);
+    return {Lo, Hi};
+  };
+  auto IsNonZeroI64 = [&](Value *X) {
+    auto [Lo, Hi] = SplitLoHi(X);
+    return B.CreateOr(B.CreateICmpNE(Lo, C32(0)),
+                      B.CreateICmpNE(Hi, C32(0)));
+  };
+  auto EqI64Const = [&](Value *X, uint64_t K) {
+    auto [Lo, Hi] = SplitLoHi(X);
+    return B.CreateAnd(
+        B.CreateICmpEQ(Hi, C32(static_cast<uint32_t>(K >> 32))),
+        B.CreateICmpEQ(Lo, C32(static_cast<uint32_t>(K))));
+  };
+  auto UltI64 = [&](Value *A, Value *Bv) {
+    auto [aLo, aHi] = SplitLoHi(A);
+    auto [bLo, bHi] = SplitLoHi(Bv);
+    Value *HiLt = B.CreateICmpULT(aHi, bHi);
+    Value *HiEq = B.CreateICmpEQ(aHi, bHi);
+    Value *LoLt = B.CreateICmpULT(aLo, bLo);
+    return B.CreateOr(HiLt, B.CreateAnd(HiEq, LoLt));
+  };
+
+  // Field extraction.
+  Value *SA = B.CreateLShr(AI, C64(63));
+  Value *SB = B.CreateLShr(BI, C64(63));
+  Value *EA64 = B.CreateAnd(B.CreateLShr(AI, C64(52)), C64(0x7FFull));
+  Value *EB64 = B.CreateAnd(B.CreateLShr(BI, C64(52)), C64(0x7FFull));
+  Value *EA = B.CreateTrunc(EA64, I32, "ea");
+  Value *EB = B.CreateTrunc(EB64, I32, "eb");
+  Value *MARaw = B.CreateAnd(AI, C64(0xFFFFFFFFFFFFFull));
+  Value *MBRaw = B.CreateAnd(BI, C64(0xFFFFFFFFFFFFFull));
+
+  // Result sign.
+  Value *SR = B.CreateXor(SA, SB);
+
+  // Either-zero / NaN-input detection.
+  Value *AIsZero = B.CreateICmpEQ(EA, C32(0));
+  Value *BIsZero = B.CreateICmpEQ(EB, C32(0));
+  Value *EitherZero = B.CreateOr(AIsZero, BIsZero);
+
+  // Add implicit-1.
+  Value *MA = B.CreateOr(MARaw, C64(0x10000000000000ull));
+  Value *MB = B.CreateOr(MBRaw, C64(0x10000000000000ull));
+
+  // 53×53 → 106-bit mantissa multiply.
+  Value *MaLo32 = B.CreateTrunc(MA, I32);
+  Value *MaHi32 = B.CreateTrunc(B.CreateLShr(MA, C64(32)), I32);
+  Value *MbLo32 = B.CreateTrunc(MB, I32);
+  Value *MbHi32 = B.CreateTrunc(B.CreateLShr(MB, C64(32)), I32);
+
+  Value *Pll = emitMulU32U32ToI64(B, MaLo32, MbLo32);
+  Value *Plh = emitMulU32U32ToI64(B, MaLo32, MbHi32);
+  Value *Phl = emitMulU32U32ToI64(B, MaHi32, MbLo32);
+  Value *Phh = emitMulU32U32ToI64(B, MaHi32, MbHi32);
+
+  // Combine partial products into {High64, Low64} = full 128-bit
+  // (effectively 106-bit) product.
+  Value *Mid = B.CreateAdd(Plh, Phl);
+  Value *MidCarryI1 = UltI64(Mid, Plh);
+  Value *MidCarry64 = B.CreateZExt(MidCarryI1, I64);
+  Value *MidLo32 = B.CreateAnd(Mid, C64(0xFFFFFFFFull));
+  Value *MidHi32_64 = B.CreateLShr(Mid, C64(32));
+  Value *MidLoShifted = B.CreateShl(MidLo32, C64(32));
+
+  Value *Low64 = B.CreateAdd(Pll, MidLoShifted);
+  Value *LowCarryI1 = UltI64(Low64, Pll);
+  Value *LowCarry64 = B.CreateZExt(LowCarryI1, I64);
+
+  Value *MidHiFull = B.CreateOr(MidHi32_64,
+                                B.CreateShl(MidCarry64, C64(32)));
+  Value *High64 = B.CreateAdd(B.CreateAdd(Phh, MidHiFull), LowCarry64);
+
+  // Normalise: bit 105 of product = bit 41 of High64. If set, "case A".
+  Value *TopBit41 = B.CreateAnd(B.CreateLShr(High64, C64(41)), C64(1));
+  Value *TopBit41I1 = EqI64Const(TopBit41, 1);
+
+  // Case A (bit 105 set): keep bits [105:53] as a 53-bit mantissa
+  // (bit 52 = implicit-1 of result, bits 51..0 = fractional bits).
+  //   bits 105..64 = High64[41:0]  → mant_pre_A bits 52..11 (shl 11)
+  //   bits 63..53  = Low64[63:53]  → mant_pre_A bits 10..0 (lshr 53)
+  //   guard_A      = (Low64 >> 52) & 1
+  //   sticky_A     = (Low64 & ((1ULL<<52) - 1)) != 0
+  Value *MantPreA = B.CreateOr(
+      B.CreateShl(B.CreateAnd(High64, C64(0x3FFFFFFFFFFull)), C64(11)),
+      B.CreateLShr(Low64, C64(53)));
+  Value *GuardA = B.CreateAnd(B.CreateLShr(Low64, C64(52)), C64(1));
+  Value *StickyAI1 = IsNonZeroI64(
+      B.CreateAnd(Low64, C64((1ULL << 52) - 1)));
+  Value *StickyA = B.CreateZExt(StickyAI1, I64);
+
+  // Case B (bit 104 set): keep bits [104:52] as a 53-bit mantissa.
+  //   bits 104..64 = High64[40:0]  → mant_pre_B bits 52..12 (shl 12)
+  //   bits 63..52  = Low64[63:52]  → mant_pre_B bits 11..0 (lshr 52)
+  //   guard_B      = (Low64 >> 51) & 1
+  //   sticky_B     = (Low64 & ((1ULL<<51) - 1)) != 0
+  Value *MantPreB = B.CreateOr(
+      B.CreateShl(B.CreateAnd(High64, C64(0x1FFFFFFFFFFull)), C64(12)),
+      B.CreateLShr(Low64, C64(52)));
+  Value *GuardB = B.CreateAnd(B.CreateLShr(Low64, C64(51)), C64(1));
+  Value *StickyBI1 = IsNonZeroI64(
+      B.CreateAnd(Low64, C64((1ULL << 51) - 1)));
+  Value *StickyB = B.CreateZExt(StickyBI1, I64);
+
+  // Rounding (RNTE), case A.
+  Value *LsbA = B.CreateAnd(MantPreA, C64(1));
+  Value *RoundUpA = B.CreateAnd(GuardA, B.CreateOr(StickyA, LsbA));
+  Value *MantRoundedA = B.CreateAdd(MantPreA, RoundUpA);
+  Value *MantOvfA = EqI64Const(MantRoundedA, 1ULL << 53);
+  Value *MantPostA = B.CreateSelect(MantOvfA,
+                                    B.CreateLShr(MantRoundedA, C64(1)),
+                                    MantRoundedA);
+
+  // Rounding (RNTE), case B.
+  Value *LsbB = B.CreateAnd(MantPreB, C64(1));
+  Value *RoundUpB = B.CreateAnd(GuardB, B.CreateOr(StickyB, LsbB));
+  Value *MantRoundedB = B.CreateAdd(MantPreB, RoundUpB);
+  Value *MantOvfB = EqI64Const(MantRoundedB, 1ULL << 53);
+  Value *MantPostB = B.CreateSelect(MantOvfB,
+                                    B.CreateLShr(MantRoundedB, C64(1)),
+                                    MantRoundedB);
+
+  // Result exponent. ExpSum fits in i32 (each ≤ 0x7FF).
+  Value *ExpSum = B.CreateAdd(EA, EB, "exp_sum");
+  Value *ErA = B.CreateSub(ExpSum, C32(1022u));  // = expSum - 1023 + 1
+  Value *ErAFinal = B.CreateSelect(MantOvfA,
+                                   B.CreateAdd(ErA, C32(1u)), ErA);
+  Value *ErB = B.CreateSub(ExpSum, C32(1023u));
+  Value *ErBFinal = B.CreateSelect(MantOvfB,
+                                   B.CreateAdd(ErB, C32(1u)), ErB);
+
+  // Pick case A or B.
+  Value *MantPost = B.CreateSelect(TopBit41I1, MantPostA, MantPostB);
+  Value *ErFinal = B.CreateSelect(TopBit41I1, ErAFinal, ErBFinal);
+
+  // Pack.
+  Value *MantField = B.CreateAnd(MantPost, C64(0xFFFFFFFFFFFFFull));
+  Value *ErFinal64 = B.CreateZExt(ErFinal, I64);
+  Value *ExpField = B.CreateAnd(B.CreateShl(ErFinal64, C64(52)),
+                                C64(0x7FF0000000000000ull));
+  Value *SignField = B.CreateShl(SR, C64(63));
+  Value *Packed = B.CreateOr(SignField, B.CreateOr(ExpField, MantField));
+
+  // Underflow / overflow on signed exponent. ErFinal is i32 signed.
+  Value *Underflow = B.CreateICmpSLE(ErFinal, C32(0), "underflow");
+  Value *Overflow = B.CreateICmpSGE(ErFinal, C32(2047), "overflow");
+  Value *SignedZero = SignField;
+  Value *SignedInf = B.CreateOr(SignField, C64(0x7FF0000000000000ull));
+
+  Value *Result = B.CreateSelect(Overflow, SignedInf, Packed);
+  Result = B.CreateSelect(Underflow, SignedZero, Result);
+  Result = B.CreateSelect(EitherZero, SignedZero, Result);
+
+  // Stage 7g4-style Inf / NaN propagation.
+  Value *EAMax = B.CreateICmpEQ(EA, C32(0x7FFu));
+  Value *EBMax = B.CreateICmpEQ(EB, C32(0x7FFu));
+  Value *MANonZero = IsNonZeroI64(MARaw);
+  Value *MBNonZero = IsNonZeroI64(MBRaw);
+  Value *AIsNaN = B.CreateAnd(EAMax, MANonZero);
+  Value *BIsNaN = B.CreateAnd(EBMax, MBNonZero);
+  Value *AIsInf = B.CreateAnd(EAMax, B.CreateNot(MANonZero));
+  Value *BIsInf = B.CreateAnd(EBMax, B.CreateNot(MBNonZero));
+  Value *ZeroTimesInf = B.CreateOr(B.CreateAnd(AIsZero, BIsInf),
+                                   B.CreateAnd(BIsZero, AIsInf));
+  Value *EitherNaN = B.CreateOr(AIsNaN, BIsNaN);
+  Value *NaNCase = B.CreateOr(EitherNaN, ZeroTimesInf);
+  Value *AnyInf = B.CreateOr(AIsInf, BIsInf);
+  Value *MulInfBits = B.CreateOr(SignField, C64(0x7FF0000000000000ull));
+
+  Result = B.CreateSelect(AnyInf, MulInfBits, Result);
+  Result = B.CreateSelect(NaNCase, C64(0x7FF8000000000000ull), Result);
+
+  B.CreateRet(B.CreateBitCast(Result, F64));
+}
+
 // Stage 7h1 — `__extendsfdf2 (float a) -> double`. Lossless f32 → f64
 // conversion. Algorithm:
 //   - decode {sign, exp32, mant32_raw} from the f32 bit pattern
@@ -2445,6 +2714,20 @@ static bool moduleNeedsAddDf3(Module &M) {
   return false;
 }
 
+// Stage 7h5 — scan for `fmul double`.
+static bool moduleNeedsMulDf3(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if (I.getOpcode() == Instruction::FMul &&
+          I.getOperand(0)->getType()->getScalarType()->isDoubleTy())
+        return true;
+    }
+  }
+  return false;
+}
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
 
@@ -2608,6 +2891,12 @@ int main(int argc, char **argv) {
     injectFixdfsiHelpers(*M, Ctx);
   // Stage 7h4 — f64 fadd / fsub. `__adddf3` first since `__subdf3`
   // tail-calls it.
+  // Stage 7h5 — `__muldf3` gated separately like 7g2 `__mulsf3`. The
+  // 53×53 → 106-bit mantissa multiply pulls in four 32×32 sub-
+  // multiplies (each = 4 byte-table `mul i32`), so an fadd-only
+  // module shouldn't pay for it.
+  if (moduleNeedsMulDf3(*M))
+    injectMulDf3Helper(*M, Ctx);
   if (moduleNeedsAddDf3(*M)) {
     injectAddDf3Helper(*M, Ctx);
     injectSubDf3Helper(*M, Ctx);
