@@ -543,21 +543,28 @@ await runTest('extraLdArgs splices --section-start / --undefined (byte-matches h
             `extraLdArgs ELF drift: wasm ${wasmElf.length} B vs host ${hostElf.length} B`,
         );
     }
-    // The section-start must actually have placed a PT_LOAD covering
-    // 0xA0000 — that's what lets movie86 pre-map the framebuffer.
+    // The section-start must actually have placed the framebuffer so
+    // that *some* PT_LOAD covers guest 0xA0000 — that's what lets
+    // movie86 pre-map it. The covering segment's VirtAddr is page-
+    // aligned *below* 0xA0000 (ld folds the ELF header + alignment in,
+    // so the real working canvas_mandelbrot.elf shows vaddr 0x9f000,
+    // MemSiz 0x3f800), with `.fb13h` itself landing at 0xA0000 inside
+    // it. So check range coverage, not an exact VirtAddr match.
     const dv = new DataView(wasmElf.buffer, wasmElf.byteOffset, wasmElf.byteLength);
     const phoff = dv.getUint32(28, true);
     const phentsize = dv.getUint16(42, true);
     const phnum = dv.getUint16(44, true);
+    const FB = 0xA0000;
     let foundFb = false;
     for (let i = 0; i < phnum; i++) {
         const base = phoff + i * phentsize;
         const ptype = dv.getUint32(base, true);
         const vaddr = dv.getUint32(base + 8, true);
-        if (ptype === 1 /* PT_LOAD */ && vaddr === 0xA0000) foundFb = true;
+        const memsz = dv.getUint32(base + 20, true);
+        if (ptype === 1 /* PT_LOAD */ && vaddr <= FB && FB < vaddr + memsz) foundFb = true;
     }
     if (!foundFb) {
-        throw new Error('no PT_LOAD at vaddr 0xA0000 — --section-start did not take effect');
+        throw new Error('no PT_LOAD covers guest 0xA0000 — --section-start did not take effect');
     }
 });
 
