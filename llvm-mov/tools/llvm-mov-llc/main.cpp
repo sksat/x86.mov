@@ -1990,6 +1990,218 @@ static void injectFixdfdiHelpers(Module &M, LLVMContext &Ctx) {
     emitDoubleToInt64Body(F, Ctx, /*IsSigned=*/false);
 }
 
+// Stage 7h10 — `__floatdisf (i64) -> f32` / `__floatundisf (u64) -> f32`.
+// Same skeleton as 7h9's `emitInt64ToDoubleBody` but the f32 mantissa
+// is 24 bits (23 explicit + 1 implicit) and the exponent bias is 127.
+// Lossless for |v| ≤ 2^24; otherwise RNTE via guard / round / sticky.
+//
+//   - if v == 0: return +0.0
+//   - sign / mag = (signed) sign + abs ; (unsigned) 0 + v
+//   - lz = ctlz_i64(mag) ; hi = 63 - lz                 (0..63)
+//   - exp_biased = hi + 127                            (127..190)
+//   - if hi ≤ 23: shift left by (23 - hi)              (lossless)
+//   - else: shift right by (hi - 23) with RNTE rounding
+//   - mantissa-overflow ⇒ shift right 1 and exp += 1
+//   - pack {sign[31], exp[30:23], mant[22:0]} and bitcast to f32
+static void emitInt64ToFloatBody(Function *F, LLVMContext &Ctx,
+                                 Module &M, bool IsSigned) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Type *F32 = Type::getFloatTy(Ctx);
+
+  Argument *V = F->getArg(0); V->setName("v");
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  auto C32 = [&](uint32_t X) { return B.getInt32(X); };
+  auto C64 = [&](uint64_t X) { return ConstantInt::get(I64, X); };
+
+  // Same i32-pair lambdas as 7h9 to keep i64 compares off SDAG's slow
+  // default-expand path.
+  auto SplitLoHi = [&](Value *X) -> std::pair<Value *, Value *> {
+    Value *Hi = B.CreateTrunc(B.CreateLShr(X, C64(32)), I32);
+    Value *Lo = B.CreateTrunc(X, I32);
+    return {Lo, Hi};
+  };
+  auto IsZeroI64 = [&](Value *X) {
+    auto [Lo, Hi] = SplitLoHi(X);
+    return B.CreateAnd(B.CreateICmpEQ(Lo, C32(0)),
+                       B.CreateICmpEQ(Hi, C32(0)));
+  };
+  auto EqI64Const = [&](Value *X, uint64_t K) {
+    auto [Lo, Hi] = SplitLoHi(X);
+    return B.CreateAnd(
+        B.CreateICmpEQ(Hi, C32(static_cast<uint32_t>(K >> 32))),
+        B.CreateICmpEQ(Lo, C32(static_cast<uint32_t>(K))));
+  };
+
+  Value *Sign;   // i32, 0 or 1
+  Value *Mag;    // i64
+  if (IsSigned) {
+    auto [VLo, VHi] = SplitLoHi(V);
+    Value *NegI1 = B.CreateICmpSLT(VHi, C32(0));
+    Sign = B.CreateZExt(NegI1, I32);
+    Value *VNeg = B.CreateSub(C64(0), V);
+    Mag = B.CreateSelect(NegI1, VNeg, V);
+  } else {
+    Sign = C32(0);
+    Mag = V;
+  }
+
+  Value *IsZero = IsZeroI64(Mag);
+
+  Value *LZ32 = emitCtlzI64(B, M, Mag);
+  Value *Hi32 = B.CreateSub(C32(63), LZ32);  // 0..63
+  Value *ExpBiased32 = B.CreateAdd(Hi32, C32(127));
+  Value *HiGt23 = B.CreateICmpUGT(Hi32, C32(23u));
+
+  // Shift-left arm (hi ≤ 23): no rounding. Result fits in low 24 bits.
+  Value *LeftShiftRaw = B.CreateSub(C32(23u), Hi32);
+  Value *LeftShift = B.CreateSelect(HiGt23, C32(0u), LeftShiftRaw);
+  Value *LeftPath = emitShlI64ByI32(B, Mag, LeftShift);
+
+  // Shift-right arm (hi > 23): RNTE with guard / sticky. Shift amount
+  // is in [1, 40].
+  Value *ShiftRRaw = B.CreateSub(Hi32, C32(23u));
+  Value *ShiftR = B.CreateSelect(HiGt23, ShiftRRaw, C32(1u));
+  Value *MantTrunc = emitLshrI64ByI32(B, Mag, ShiftR);
+  Value *MantTruncBack = emitShlI64ByI32(B, MantTrunc, ShiftR);
+  Value *LostBits = B.CreateSub(Mag, MantTruncBack);
+  Value *GuardShift = B.CreateSub(ShiftR, C32(1u));
+  Value *GuardBitVal = emitLshrI64ByI32(B, Mag, GuardShift);
+  Value *Guard = B.CreateAnd(GuardBitVal, C64(1));
+  Value *GuardOnly = emitShlI64ByI32(B, B.CreateAnd(GuardBitVal, C64(1)),
+                                     GuardShift);
+  Value *StickyRes = B.CreateSub(LostBits, GuardOnly);
+  Value *StickyI1NZ = B.CreateNot(IsZeroI64(StickyRes));
+  Value *Sticky = B.CreateZExt(StickyI1NZ, I64);
+  auto [MtLo, MtHi] = SplitLoHi(MantTrunc);
+  Value *Lsb = B.CreateZExt(B.CreateAnd(MtLo, C32(1)), I64);
+  Value *RoundUp = B.CreateAnd(Guard, B.CreateOr(Sticky, Lsb));
+  Value *MantRounded = B.CreateAdd(MantTrunc, RoundUp);
+  // Rounding overflow: mant_rounded == 1 << 24.
+  Value *RoundOvf = EqI64Const(MantRounded, 1ULL << 24);
+  Value *MantPostRound = B.CreateSelect(RoundOvf,
+                                        B.CreateLShr(MantRounded, C64(1)),
+                                        MantRounded);
+  Value *ExpAfterRound = B.CreateSelect(RoundOvf,
+                                        B.CreateAdd(ExpBiased32, C32(1u)),
+                                        ExpBiased32);
+  // Pick arm.
+  Value *MantForPack = B.CreateSelect(HiGt23, MantPostRound, LeftPath);
+  Value *ExpForPack = B.CreateSelect(HiGt23, ExpAfterRound, ExpBiased32);
+
+  // Pack into 32-bit f32 representation. mant fits in 24 bits, take
+  // low 23 (drop the implicit 1).
+  Value *Mant32 = B.CreateTrunc(MantForPack, I32);
+  Value *MantField = B.CreateAnd(Mant32, C32(0x7FFFFFu));
+  Value *ExpField = B.CreateAnd(B.CreateShl(ExpForPack, C32(23)),
+                                C32(0x7F800000u));
+  Value *SignField = B.CreateShl(Sign, C32(31));
+  Value *Packed = B.CreateOr(SignField,
+                             B.CreateOr(ExpField, MantField));
+
+  Value *SignedZero = SignField;
+  Value *Result = B.CreateSelect(IsZero, SignedZero, Packed);
+  B.CreateRet(B.CreateBitCast(Result, F32));
+}
+
+static void injectFloatdisfHelpers(Module &M, LLVMContext &Ctx) {
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Type *F32 = Type::getFloatTy(Ctx);
+  FunctionType *FnTy = FunctionType::get(F32, {I64}, /*isVarArg=*/false);
+  if (Function *F = makeOrPromoteHelper(M, "__floatdisf", FnTy))
+    emitInt64ToFloatBody(F, Ctx, M, /*IsSigned=*/true);
+  if (Function *F = makeOrPromoteHelper(M, "__floatundisf", FnTy))
+    emitInt64ToFloatBody(F, Ctx, M, /*IsSigned=*/false);
+}
+
+// Stage 7h10 — `__fixsfdi (f32) -> i64` / `__fixunssfdi (f32) -> u64`.
+// f32 → i64 truncate-toward-zero with saturation:
+//   exp < 127                ⇒ |f| < 1                    ⇒ 0
+//   exp ∈ [127, 189]         ⇒ |f| ∈ [1, 2^63)             ⇒ shift
+//   exp ≥ 190 (signed)       ⇒ |f| ≥ 2^63                  ⇒ INT_MIN/MAX
+//   exp ≥ 191 (unsigned)     ⇒ |f| ≥ 2^64                  ⇒ UINT_MAX
+//   NaN                                                    ⇒ 0
+static void emitFloatToInt64Body(Function *F, LLVMContext &Ctx,
+                                 bool IsSigned) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+
+  Argument *V = F->getArg(0); V->setName("f");
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  auto C32 = [&](uint32_t X) { return B.getInt32(X); };
+  auto C64 = [&](uint64_t X) { return ConstantInt::get(I64, X); };
+
+  Value *FBits = B.CreateBitCast(V, I32);
+  Value *Sign = B.CreateLShr(FBits, C32(31));
+  Value *Exp = B.CreateAnd(B.CreateLShr(FBits, C32(23)), C32(0xFFu));
+  Value *Mant23 = B.CreateAnd(FBits, C32(0x7FFFFFu));
+
+  // 24-bit mantissa with implicit 1; widened to i64 for the shift.
+  Value *MantWithHidden32 = B.CreateOr(Mant23, C32(0x800000u));
+  Value *FullMant64 = B.CreateZExt(MantWithHidden32, I64);
+
+  // Underflow: |f| < 1 ⇒ exp < 127.
+  Value *Underflow = B.CreateICmpULT(Exp, C32(127u));
+
+  // Shift amount: bit position of the integer is (exp - 127). The
+  // mantissa's implicit 1 is at bit 23, so the integer's bit 0 lands
+  // at:  if exp ≥ 150, shift left by (exp - 150) ; else shift right
+  // by (150 - exp).
+  Value *ExpGe150 = B.CreateICmpUGE(Exp, C32(150u));
+  Value *ShiftL_raw = B.CreateSub(Exp, C32(150u));        // wants 0..39
+  Value *ShiftL = B.CreateSelect(ExpGe150, ShiftL_raw, C32(0u));
+  Value *ShiftR_raw = B.CreateSub(C32(150u), Exp);        // wants 0..22
+  Value *ShiftR = B.CreateSelect(ExpGe150, C32(0u), ShiftR_raw);
+  Value *LeftPath = emitShlI64ByI32(B, FullMant64, ShiftL);
+  Value *RightPath = emitLshrI64ByI32(B, FullMant64, ShiftR);
+  Value *MagPath = B.CreateSelect(ExpGe150, LeftPath, RightPath);
+
+  Value *Result;
+  if (IsSigned) {
+    Value *NegSignI1 = B.CreateICmpEQ(Sign, C32(1));
+    Value *NegMag = B.CreateSub(C64(0), MagPath);
+    Result = B.CreateSelect(NegSignI1, NegMag, MagPath);
+
+    // Saturate at |f| ≥ 2^63 (exp ≥ 190). The unique exp-190 value with
+    // sign=1 and mant=0 is -2^63 = INT_MIN; saturation lands there too.
+    Value *ExpGe190 = B.CreateICmpUGE(Exp, C32(190u));
+    Value *PosSat = C64(0x7FFFFFFFFFFFFFFFull);
+    Value *NegSat = C64(0x8000000000000000ull);
+    Value *Sat = B.CreateSelect(NegSignI1, NegSat, PosSat);
+    Result = B.CreateSelect(ExpGe190, Sat, Result);
+  } else {
+    Result = MagPath;
+    Value *NegSignI1 = B.CreateICmpEQ(Sign, C32(1));
+    Value *ExpGe191 = B.CreateICmpUGE(Exp, C32(191u));
+    Value *PosOverflow = B.CreateAnd(B.CreateNot(NegSignI1), ExpGe191);
+    Result = B.CreateSelect(PosOverflow, C64(0xFFFFFFFFFFFFFFFFull),
+                            Result);
+    Result = B.CreateSelect(NegSignI1, C64(0), Result);
+  }
+
+  Result = B.CreateSelect(Underflow, C64(0), Result);
+
+  // NaN → 0 (saturating-intrinsic convention).
+  Value *ExpIsMax = B.CreateICmpEQ(Exp, C32(0xFFu));
+  Value *MantNZ = B.CreateICmpNE(Mant23, C32(0u));
+  Value *IsNaN = B.CreateAnd(ExpIsMax, MantNZ);
+  Result = B.CreateSelect(IsNaN, C64(0), Result);
+
+  B.CreateRet(Result);
+}
+
+static void injectFixsfdiHelpers(Module &M, LLVMContext &Ctx) {
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Type *F32 = Type::getFloatTy(Ctx);
+  FunctionType *FnTy = FunctionType::get(I64, {F32}, /*isVarArg=*/false);
+  if (Function *F = makeOrPromoteHelper(M, "__fixsfdi", FnTy))
+    emitFloatToInt64Body(F, Ctx, /*IsSigned=*/true);
+  if (Function *F = makeOrPromoteHelper(M, "__fixunssfdi", FnTy))
+    emitFloatToInt64Body(F, Ctx, /*IsSigned=*/false);
+}
+
 // Stage 7h4 — variable-amount i64 shift utilities. The backend can't
 // select `shl_parts` directly, so we emulate variable-amount i64
 // shifts via clamped i32-pair operations (same technique as stage
@@ -3213,6 +3425,38 @@ static bool moduleNeedsFixdfdi(Module &M) {
   return false;
 }
 
+// Stage 7h10 — scan for sitofp / uitofp from i64 to float.
+static bool moduleNeedsFloatdisf(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if ((I.getOpcode() == Instruction::SIToFP ||
+           I.getOpcode() == Instruction::UIToFP) &&
+          I.getType()->getScalarType()->isFloatTy() &&
+          I.getOperand(0)->getType()->getScalarType()->isIntegerTy(64))
+        return true;
+    }
+  }
+  return false;
+}
+
+// Stage 7h10 — scan for fptosi / fptoui from float to i64.
+static bool moduleNeedsFixsfdi(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if ((I.getOpcode() == Instruction::FPToSI ||
+           I.getOpcode() == Instruction::FPToUI) &&
+          I.getOperand(0)->getType()->getScalarType()->isFloatTy() &&
+          I.getType()->getScalarType()->isIntegerTy(64))
+        return true;
+    }
+  }
+  return false;
+}
+
 // Stage 7h4 — scan for `fadd double` / `fsub double`.
 static bool moduleNeedsAddDf3(Module &M) {
   for (Function &F : M) {
@@ -3399,20 +3643,18 @@ int main(int argc, char **argv) {
         Type *DstTy = II->getType();
         Type *SrcTy = II->getArgOperand(0)->getType();
         // Codex-review P1 (stage 7h9): only rewrite when the source
-        // FP type has a wired helper for the destination width:
+        // FP type has a wired helper for the destination width.
+        // After stage 7h10 wires `__fix{,uns}sfdi`, both source types
+        // are covered for both destination widths:
         //   - dst i32: `__fix*sfsi` (f32) / `__fix*dfsi` (f64)
-        //   - dst i64: only `__fix*dfdi` (f64) is wired; f32→i64 has
-        //             no libcall mapping, so leave that intrinsic
-        //             to SDAG's default expansion.
+        //   - dst i64: `__fix*sfdi` (f32) / `__fix*dfdi` (f64)
         bool DstI32 = DstTy->isIntegerTy(32);
         bool DstI64 = DstTy->isIntegerTy(64);
         if (!DstI32 && !DstI64)
           continue;
         bool SrcF32 = SrcTy->isFloatTy();
         bool SrcF64 = SrcTy->isDoubleTy();
-        if (DstI32 && !(SrcF32 || SrcF64))
-          continue;
-        if (DstI64 && !SrcF64)
+        if (!(SrcF32 || SrcF64))
           continue;
         SatCalls.push_back(II);
       }
@@ -3485,6 +3727,11 @@ int main(int argc, char **argv) {
     injectFloatdidfHelpers(*M, Ctx);
   if (moduleNeedsFixdfdi(*M))
     injectFixdfdiHelpers(*M, Ctx);
+  // Stage 7h10 — i64 ↔ f32 conversion helpers.
+  if (moduleNeedsFloatdisf(*M))
+    injectFloatdisfHelpers(*M, Ctx);
+  if (moduleNeedsFixsfdi(*M))
+    injectFixsfdiHelpers(*M, Ctx);
   // Stage 7h4 — f64 fadd / fsub. `__adddf3` first since `__subdf3`
   // tail-calls it.
   // Stage 7h5 — `__muldf3` gated separately like 7g2 `__mulsf3`. The

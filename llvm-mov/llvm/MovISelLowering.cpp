@@ -269,6 +269,15 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setLibcallImpl(RTLIB::FPTOSINT_F64_I64, RTLIB::impl___fixdfdi);
   setLibcallImpl(RTLIB::FPTOUINT_F64_I64, RTLIB::impl___fixunsdfdi);
 
+  // Stage 7h10 — i64 ↔ f32 conversions. Same shape as 7h9 but with
+  // a 24-bit mantissa (precision lost above 2^24); RNTE on the
+  // i64→f32 direction and saturation + NaN→0 on the f32→i64
+  // direction. Helper bodies injected by the driver.
+  setLibcallImpl(RTLIB::SINTTOFP_I64_F32, RTLIB::impl___floatdisf);
+  setLibcallImpl(RTLIB::UINTTOFP_I64_F32, RTLIB::impl___floatundisf);
+  setLibcallImpl(RTLIB::FPTOSINT_F32_I64, RTLIB::impl___fixsfdi);
+  setLibcallImpl(RTLIB::FPTOUINT_F32_I64, RTLIB::impl___fixunssfdi);
+
   // Stage 7h4 / 7h5 / 7h6 — f64 fadd / fsub / fmul / fdiv. Helper
   // bodies emulate variable-amount i64 shifts via the i32-pair
   // clamped-arm split technique established by stage-7h3's
