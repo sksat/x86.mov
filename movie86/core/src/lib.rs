@@ -14,8 +14,10 @@ pub mod mem;
 pub mod syscall;
 
 pub use abi_host::{
-    is_abi_addr, unpack_mmap_request, AbiHost, ABI_BASE, ABI_PAGE_SIZE, CALL_EXIT,
-    CALL_MMAP_REQUEST, CALL_SET_VIDEO_MODE, CALL_WRITE,
+    is_abi_addr, unpack_mmap_request, AbiHost, InputQueue, ABI_BASE, ABI_PAGE_SIZE, CALL_EXIT,
+    CALL_MMAP_REQUEST, CALL_POLL_INPUT, CALL_SET_VIDEO_MODE, CALL_WRITE, KEY_BACKSPACE, KEY_DOWN,
+    KEY_END, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_LEFT, KEY_NONE, KEY_PAGE_DOWN, KEY_PAGE_UP,
+    KEY_RIGHT, KEY_SPACE, KEY_UP,
 };
 pub use bios_host::{BiosArgs, BiosHost, BiosResult};
 pub use context::{capture_sparse_regions, load_context, Context, MemRegion, Regs, Reservation};

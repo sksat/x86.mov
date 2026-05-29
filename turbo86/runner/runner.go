@@ -234,8 +234,16 @@ const (
 	// "set video mode") without renumbering downstream consumers.
 	abiCallSetVideoMode uint16 = 0x010
 	abiCallMmapRequest  uint16 = 0x020
+	abiCallPollInput    uint16 = 0x040
 	abiCallWrite        uint16 = 0x080
 	abiCallExit         uint16 = 0x0FE
+
+	// keyNone is the "no input pending" code returned by abiCallPollInput.
+	// Mirrors movie86::abi_host::KEY_NONE — part of the cross-engine
+	// contract. turbo86 has no input source wired yet, so every poll
+	// reports keyNone; a future Inbound key-event message can feed real
+	// codes through the same EAX return path.
+	keyNone uint8 = 0x00
 )
 
 // i386 mmap2 args / packing for the mov-only ABI mmap_request call.
@@ -1033,6 +1041,14 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 		r.eventsCh <- proto.VideoMode{Mode: uint8(call.arg)}
 	case abiCallMmapRequest:
 		return r.handleMmapRequest(call, regs)
+	case abiCallPollInput:
+		// Poll for one pending input event. The guest's written value
+		// (the trigger) is ignored; we hand a key code back in EAX, the
+		// same "return through EAX" shape abiCallWrite uses. No input
+		// source is wired yet, so this always reports keyNone — the
+		// EIP-advance + SetRegs at the bottom of the switch writes the
+		// updated EAX back to the guest.
+		regs.Eax = uint32(keyNone)
 	case abiCallWrite:
 		// Mirrors the int 0x80 SYS_write ABI: fd in ebx, buf in ecx,
 		// len in edx. eax (the "value" the guest wrote to trigger the

@@ -1089,6 +1089,61 @@ mod tests {
     }
 
     #[test]
+    fn step_poll_input_returns_queued_key_in_eax() {
+        // `mov [0x1FFE_0040], al` (A2 imm32) — CALL_POLL_INPUT. The
+        // generic input ABI: triggering the call pops one key code from
+        // the host's input queue and hands it back in eax (KEY_NONE = 0
+        // when the queue is empty). The written value (al) is the
+        // trigger only; the handler ignores it, exactly like the way
+        // CALL_WRITE returns bytes-written through eax.
+        use crate::abi_host::{InputQueue, CALL_POLL_INPUT, KEY_NONE, KEY_RIGHT};
+        struct RecordingAbi {
+            input: InputQueue,
+        }
+        impl SysHost for RecordingAbi {
+            fn syscall(
+                &mut self,
+                args: &SyscallArgs,
+                _mem: &mut dyn Memory,
+            ) -> Result<SyscallResult, Fault> {
+                panic!("unexpected syscall {:#x}", args.eax);
+            }
+        }
+        impl LibcHost for RecordingAbi {}
+        impl BiosHost for RecordingAbi {}
+        impl AbiHost for RecordingAbi {
+            fn abi_call(
+                &mut self,
+                call_num: u16,
+                _value: u32,
+                regs: &mut [u32; 8],
+                _mem: &mut dyn Memory,
+            ) -> Result<(), Fault> {
+                assert_eq!(call_num, CALL_POLL_INPUT);
+                regs[Reg32::Eax as usize] = u32::from(self.input.pop());
+                Ok(())
+            }
+        }
+        // mov al, 0 ; mov [0x1FFE_0040], al ; mov [0x1FFE_0040], al
+        let bytes = [
+            0xB0, 0x00, // mov al, 0
+            0xA2, 0x40, 0x00, 0xFE, 0x1F, // poll (queue has KEY_RIGHT)
+            0xA2, 0x40, 0x00, 0xFE, 0x1F, // poll (queue now empty)
+        ];
+        let mut mem = FlatMemory::new_zeroed(0x1000, 16);
+        mem.write_bytes(0x1000, &bytes).unwrap();
+        let mut cpu = Cpu::new(0x1000);
+        let mut input = InputQueue::new();
+        input.push(KEY_RIGHT);
+        let mut host = RecordingAbi { input };
+        cpu.step(&mut mem, &mut host).unwrap(); // mov al, 0
+        cpu.step(&mut mem, &mut host).unwrap(); // first poll
+        assert_eq!(cpu.reg(Reg32::Eax), u32::from(KEY_RIGHT));
+        cpu.step(&mut mem, &mut host).unwrap(); // second poll, empty
+        assert_eq!(cpu.reg(Reg32::Eax), u32::from(KEY_NONE));
+    }
+
+    #[test]
     fn step_int_non_syscall_vector_traps() {
         let mut mem = FlatMemory::new_zeroed(0x1000, 16);
         mem.write_bytes(0x1000, &[0xcd, 0x03]).unwrap();

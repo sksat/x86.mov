@@ -16,7 +16,7 @@ use movie86::decode::decode as decode_insn;
 use movie86::elf::{flatten_with_stack, parse, LoadedElf};
 use movie86::libc_host::{LibcCall, LibcHost, LibcResult};
 use movie86::syscall::{SysHost, SyscallArgs, SyscallResult};
-use movie86::{Cpu, Fault, FlatMemory, Memory, Reg32, Signal};
+use movie86::{Cpu, Fault, FlatMemory, InputQueue, Memory, Reg32, Signal};
 
 use wasm_bindgen::prelude::*;
 
@@ -52,6 +52,11 @@ struct WasmHost {
     /// receiving turbo86 wouldn't know to map the range and would
     /// SIGSEGV on the first guest write.
     reservations: Vec<Reservation>,
+    /// Pending generic input key codes feeding `CALL_POLL_INPUT`. JS
+    /// `push`es a code per keydown (gated to canvas hover, so the page
+    /// at large keeps its keystrokes); the guest drains it one event
+    /// per poll. See `core::abi_host::InputQueue`.
+    input: InputQueue,
 }
 
 impl SysHost for WasmHost {
@@ -202,6 +207,12 @@ impl movie86::AbiHost for WasmHost {
                 // snapshot can't know that without an explicit hint.
                 let (addr, size) = movie86::unpack_mmap_request(value);
                 self.reservations.push(Reservation { addr, size });
+                Ok(())
+            }
+            movie86::CALL_POLL_INPUT => {
+                // Pop one pending key code into eax (KEY_NONE = 0 when
+                // empty), same "return through eax" shape as CALL_WRITE.
+                regs[Reg32::Eax as usize] = u32::from(self.input.pop());
                 Ok(())
             }
             movie86::CALL_EXIT => Err(Fault::Exit(value)),
@@ -553,6 +564,16 @@ impl Vm {
     /// Convenience: one instruction.
     pub fn step(&mut self) -> u64 {
         self.step_n(1)
+    }
+
+    /// Enqueue one generic input key code for the guest to read via
+    /// `CALL_POLL_INPUT`. JS calls this on keydown (gated to canvas
+    /// hover); codes are the `KEY_*` alphabet from `core::abi_host`
+    /// (printable ASCII pass through verbatim). No-op semantics are
+    /// fine after halt — a queued code just never gets polled.
+    #[wasm_bindgen(js_name = pushInput)]
+    pub fn push_input(&mut self, code: u8) {
+        self.host.input.push(code);
     }
 
     /// 8 GPRs in [`Reg32`] order: eax, ecx, edx, ebx, esp, ebp, esi, edi.
