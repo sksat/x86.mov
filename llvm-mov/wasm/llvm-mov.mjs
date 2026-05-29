@@ -50,8 +50,34 @@ async function fetchChunkedClangWasm(count, onProgress) {
         CLANG_WASM_VERSION
             ? `clang.wasm-${CLANG_WASM_VERSION}.part-${i}`
             : `clang.wasm.part-${i}`;
-    let done = 0;
-    onProgress?.({ stage: 'fetch-clang', done, total: count });
+
+    // Aggregate byte counters so the demo can show overall download
+    // progress across the parallel chunk fetches. `totalBytes` only
+    // becomes reliable once every response header has landed; before
+    // then we send `0` so the UI can fall back to chunk-only progress.
+    const bytesPerChunk  = new Array(count).fill(0);
+    const totalPerChunk  = new Array(count).fill(0);
+    let chunksDone = 0;
+    let lastEmit = 0;
+    const emit = (force) => {
+        const now = performance.now();
+        // Throttle to ≈20 Hz so a fast LAN doesn't drown the UI thread
+        // in fetch-clang events. Always emit on chunk completion so
+        // the count-based progress line ticks promptly.
+        if (!force && (now - lastEmit) < 50) return;
+        lastEmit = now;
+        const bytes = bytesPerChunk.reduce((s, n) => s + n, 0);
+        const totalBytes = totalPerChunk.reduce((s, n) => s + n, 0);
+        onProgress?.({
+            stage: 'fetch-clang',
+            done: chunksDone,
+            total: count,
+            bytes,
+            totalBytes,
+        });
+    };
+    emit(true);
+
     const buffers = await Promise.all(
         Array.from({ length: count }, async (_, i) => {
             const url = new URL(filename(i), base);
@@ -59,12 +85,26 @@ async function fetchChunkedClangWasm(count, onProgress) {
             if (!r.ok) {
                 throw new Error(`fetch ${url}: ${r.status} ${r.statusText}`);
             }
-            const buf = new Uint8Array(await r.arrayBuffer());
-            done += 1;
-            onProgress?.({ stage: 'fetch-clang', done, total: count });
+            const lenHeader = r.headers.get('Content-Length');
+            totalPerChunk[i] = lenHeader ? parseInt(lenHeader, 10) : 0;
+            const reader = r.body.getReader();
+            const parts = [];
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                parts.push(value);
+                bytesPerChunk[i] += value.byteLength;
+                emit(false);
+            }
+            const buf = new Uint8Array(bytesPerChunk[i]);
+            let off = 0;
+            for (const p of parts) { buf.set(p, off); off += p.byteLength; }
+            chunksDone += 1;
+            emit(true);
             return buf;
         }),
     );
+
     const total = buffers.reduce((s, b) => s + b.byteLength, 0);
     const merged = new Uint8Array(total);
     let offset = 0;

@@ -1,16 +1,20 @@
 /**
  * Status event emitted by `onProgress` callbacks. Stages:
- *  - `fetch-clang`: a clang.wasm chunk fetch completed (only emitted
- *    when the deploy uses chunked artefacts; `done`/`total` track
- *    progress; an initial event with `done: 0` fires before the first
- *    chunk lands).
+ *  - `fetch-clang`: a clang.wasm chunk fetch made progress. Throttled
+ *    to ~20 Hz on the wire; an initial event with all zeros fires
+ *    before the first byte lands. Only emitted when the deploy uses
+ *    chunked artefacts.
+ *    - `done`/`total`: chunks completed / chunks total.
+ *    - `bytes`/`totalBytes`: bytes downloaded so far / sum of all
+ *      chunks' `Content-Length` (may be 0 until the first response
+ *      header arrives).
  *  - `instantiate-clang` / `instantiate-llc`: the Emscripten module
  *    is about to be instantiated.
  *  - `compile-c`: clang's main() is about to run (C → LLVM IR).
  *  - `compile-ir`: llvm-mov-llc's main() is about to run (IR → asm).
  */
 export type ProgressEvent =
-    | { stage: 'fetch-clang'; done: number; total: number }
+    | { stage: 'fetch-clang'; done: number; total: number; bytes: number; totalBytes: number }
     | { stage: 'instantiate-clang' }
     | { stage: 'instantiate-llc' }
     | { stage: 'compile-c' }

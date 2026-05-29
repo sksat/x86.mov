@@ -184,9 +184,23 @@ function renderTimingHTML(durations) {
 // instantiate-clang because the merged buffer is cached in the
 // wrapper. Across page loads the browser's HTTP cache reuses the
 // hashed chunk files via the `Cache-Control: immutable` _headers.
+function fmtMB(bytes) {
+    return (bytes / (1024 * 1024)).toFixed(1);
+}
+
 function statusFor(ev) {
     switch (ev.stage) {
-        case 'fetch-clang':       return `fetching clang.wasm chunks ${ev.done}/${ev.total}…`;
+        case 'fetch-clang': {
+            // The chunk-count line ticks slowly (4 chunks total); the
+            // bytes line ticks ~20 Hz with progress info from each
+            // active stream. Pre-header (totalBytes === 0) we just show
+            // the chunk count so the user sees motion immediately.
+            if (ev.totalBytes > 0) {
+                const pct = ((ev.bytes / ev.totalBytes) * 100).toFixed(0);
+                return `fetching clang.wasm chunks ${ev.done}/${ev.total} — ${fmtMB(ev.bytes)} / ${fmtMB(ev.totalBytes)} MiB (${pct}%)…`;
+            }
+            return `fetching clang.wasm chunks ${ev.done}/${ev.total}…`;
+        }
         case 'instantiate-clang': return 'instantiating clang…';
         case 'compile-c':         return 'compiling C → LLVM IR…';
         case 'instantiate-llc':   return 'instantiating llvm-mov-llc…';
