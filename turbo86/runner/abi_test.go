@@ -53,6 +53,39 @@ func TestRunOnce_AbiSetVideoMode(t *testing.T) {
 	}
 }
 
+// TestRunOnce_AbiExit drives an exit through the mov-only ABI: the
+// guest packs the exit code into EAX and writes it to call slot 0x0FE.
+// The runner emits Exit{code} and tears down the session — same
+// observable wire behaviour as the existing `mov eax, 1 ; mov ebx, n
+// ; int 0x80` path, but without an `int` in sight. Replaces the last
+// `int 0x80` in the toolchain-generated guests (the `_start_llvm.s`
+// epilogue and `stubs_movfuscator.s`'s `exit()` wrapper) so a canvas
+// ELF can be entirely mov-only.
+//
+// Guest:
+//
+//	B8 17 00 00 00      mov eax, 23           ; exit code
+//	A3 FE 00 FE 1F      mov [0x1FFE00FE], eax ; ABI exit
+func TestRunOnce_AbiExit(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	const entry uint32 = 0x08048000
+	code := []byte{
+		0xB8, 0x17, 0x00, 0x00, 0x00,
+		0xA3, 0xFE, 0x00, 0xFE, 0x1F,
+	}
+
+	events, err := RunOnce(stub.Bytes, map[uint32][]byte{entry: code}, entry, testStackTop)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	want := []proto.Outbound{proto.Exit{Code: 23}}
+	if !reflect.DeepEqual(events, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", events, want)
+	}
+}
+
 // TestRunOnce_AbiLoadContext_AutoMmapsOutOfRangeRegions verifies that
 // a LoadContext carrying a region OUTSIDE the stub's static guestRegions
 // triggers a dynamic mmap2 before the region's bytes are written via

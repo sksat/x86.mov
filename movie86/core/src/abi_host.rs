@@ -38,6 +38,11 @@ pub const CALL_SET_VIDEO_MODE: u16 = 0x010;
 /// range. Packing: `eax = addr | (pages - 1)`.
 pub const CALL_MMAP_REQUEST: u16 = 0x020;
 
+/// `mov [ABI_BASE + 0x0FE], eax` — terminate the session with `eax` as
+/// the exit code. The host returns [`Fault::Exit`] (mov-only equivalent
+/// of `mov eax, 1; mov ebx, code; int 0x80`).
+pub const CALL_EXIT: u16 = 0x0FE;
+
 /// Returns `true` if `addr` falls inside the ABI page. CPU uses this on
 /// every mov-to-memory to decide whether to route through [`AbiHost`]
 /// instead of the underlying `Memory`.

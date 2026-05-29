@@ -167,6 +167,10 @@ impl BiosHost for WasmHost {
 ///   isn't pre-mapped); on wasm it's effectively a "we already have
 ///   you covered" acknowledgement. Returns Ok so the guest proceeds
 ///   straight to the FB write.
+/// - `CALL_EXIT` — same semantics as `int 0x80 / SYS_exit`: surface
+///   the value as `Fault::Exit`, which the existing run loop catches
+///   and reports as the final exit status. Lets canvas examples drop
+///   the trailing `int 0x80` epilogue entirely.
 impl movie86::AbiHost for WasmHost {
     fn abi_call(&mut self, call_num: u16, value: u32, _mem: &mut dyn Memory) -> Result<(), Fault> {
         match call_num {
@@ -175,6 +179,7 @@ impl movie86::AbiHost for WasmHost {
                 Ok(())
             }
             movie86::CALL_MMAP_REQUEST => Ok(()),
+            movie86::CALL_EXIT => Err(Fault::Exit(value)),
             _ => Err(Fault::UnsupportedAbiCall(call_num)),
         }
     }

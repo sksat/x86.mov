@@ -233,6 +233,7 @@ const (
 	// "set video mode") without renumbering downstream consumers.
 	abiCallSetVideoMode uint16 = 0x010
 	abiCallMmapRequest  uint16 = 0x020
+	abiCallExit         uint16 = 0x0FE
 )
 
 // i386 mmap2 args / packing for the mov-only ABI mmap_request call.
@@ -817,6 +818,12 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 		r.eventsCh <- proto.VideoMode{Mode: uint8(call.arg)}
 	case abiCallMmapRequest:
 		return r.handleMmapRequest(call, regs)
+	case abiCallExit:
+		// Mirrors `int 0x80 / SYS_exit` semantics: emit the Exit event
+		// and stop the syscall loop. EIP isn't advanced because the
+		// session ends here — the next instruction never runs.
+		r.eventsCh <- proto.Exit{Code: int32(call.arg)}
+		return false
 	default:
 		r.emitFault(fmt.Sprintf("unknown mov-only ABI call 0x%03x at EIP=0x%x", call.num, regs.Eip))
 		return false

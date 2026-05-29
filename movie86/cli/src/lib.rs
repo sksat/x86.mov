@@ -174,10 +174,11 @@ impl BiosHost for StdHost {}
 /// falls through to the default trap so typos in the guest's ABI use
 /// surface loudly.
 impl AbiHost for StdHost {
-    fn abi_call(&mut self, call_num: u16, _value: u32, _mem: &mut dyn Memory) -> Result<(), Fault> {
-        use movie86::abi_host::CALL_SET_VIDEO_MODE;
+    fn abi_call(&mut self, call_num: u16, value: u32, _mem: &mut dyn Memory) -> Result<(), Fault> {
+        use movie86::abi_host::{CALL_EXIT, CALL_SET_VIDEO_MODE};
         match call_num {
             CALL_SET_VIDEO_MODE => Ok(()),
+            CALL_EXIT => Err(Fault::Exit(value)),
             _ => Err(Fault::UnsupportedAbiCall(call_num)),
         }
     }

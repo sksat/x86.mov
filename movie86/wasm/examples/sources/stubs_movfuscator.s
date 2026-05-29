@@ -5,9 +5,12 @@
  *                    and SIGILL → master_loop directly from the ELF
  *                    symbol table, so we don't actually install handlers.
  *
- * exit(status)     — Linux i386 SYS_exit. cdecl ABI:
+ * exit(status)     — mov-only ABI call 0x0FE. cdecl ABI:
  *                    movfuscator's jmp_extern pushes the args, so
- *                    [esp+4] = status.
+ *                    [esp+4] = status. Writes the 32-bit value to
+ *                    the ABI page; both engines route that to
+ *                    Fault::Exit / Outbound::Exit (replaces the
+ *                    earlier `int 0x80 SYS_exit` epilogue).
  *
  * set_video_mode(mode)
  *                  — mov-only ABI call 0x010. Writes mode to the
@@ -41,9 +44,8 @@ sigaction:
 .globl exit
 .type exit, @function
 exit:
-    movl $1, %eax
-    movl 4(%esp), %ebx
-    int  $0x80
+    movl 4(%esp), %eax
+    movl %eax, 0x1FFE00FE
 
 .globl set_video_mode
 .type set_video_mode, @function
