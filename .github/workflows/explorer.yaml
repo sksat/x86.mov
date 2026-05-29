@@ -1,0 +1,75 @@
+name: explorer
+
+on:
+  push:
+    branches: [mov]
+    paths:
+      - 'explorer/**'
+      - '.github/workflows/explorer.yaml'
+  pull_request:
+    branches: [mov]
+    paths:
+      - 'explorer/**'
+      - '.github/workflows/explorer.yaml'
+  workflow_dispatch:
+
+concurrency:
+  group: explorer-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: explorer
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: explorer/package-lock.json
+
+      - name: install
+        run: npm ci
+
+      - name: unit tests (orchestration)
+        run: npm run test:unit
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: vite build
+        run: npm run build
+
+      # Playwright browser binary cache keyed by the lockfile so a node
+      # bump (which pulls a new @playwright/test) busts the cache once.
+      - name: cache Playwright browsers
+        uses: actions/cache@v5.0.5
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('explorer/package-lock.json') }}-v1
+
+      - name: install Playwright browsers
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: install playwright host deps (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: structural smoke (Playwright)
+        run: npm run test:e2e
+
+      - name: upload Playwright traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4.6.1
+        with:
+          name: playwright-traces
+          path: explorer/test-results/
+          retention-days: 7
