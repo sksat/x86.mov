@@ -503,6 +503,76 @@ try {
     failed++;
 }
 
+// --- int-free regression check ---
+//
+// The mov-only ABI migration in #28/#29 took the canvas pipeline plus
+// hello/cycle/call_greet to zero `int` instructions. Without a check,
+// a future commit that re-adds `int 0x80 SYS_write` to a hand-written
+// .s fixture (or `int 0x10` to a stub) would land silently because
+// both paths still happen to work end-to-end (the engines keep their
+// int handlers for legacy fixtures). Scan the executable PT_LOAD
+// segments of each mov-only ELF for `CD {10,80,81}` byte pairs and
+// fail if any show up. This is a byte-level heuristic — a 0xCD that
+// happens to sit inside a constant or displacement is a false
+// positive, but for the small / well-pinned fixtures here the
+// expected count is exactly zero, and a deliberate regression
+// (someone re-adding an int) is what we want to catch.
+function scanExecForInt(elfBuf) {
+    const dv = new DataView(elfBuf.buffer, elfBuf.byteOffset, elfBuf.byteLength);
+    // ELF32 LE header: e_phoff @0x1c, e_phentsize @0x2a, e_phnum @0x2c.
+    const phoff = dv.getUint32(0x1c, true);
+    const phentsize = dv.getUint16(0x2a, true);
+    const phnum = dv.getUint16(0x2c, true);
+    const hits = [];
+    for (let i = 0; i < phnum; i++) {
+        const off = phoff + i * phentsize;
+        if (dv.getUint32(off + 0, true) !== 1) continue;          // PT_LOAD
+        if ((dv.getUint32(off + 24, true) & 1) === 0) continue;   // PF_X
+        const segOff = dv.getUint32(off + 4, true);               // p_offset
+        const segLen = dv.getUint32(off + 16, true);              // p_filesz
+        const view = elfBuf.subarray(segOff, segOff + segLen);
+        for (let j = 0; j + 1 < view.length; j++) {
+            if (view[j] !== 0xCD) continue;
+            const vec = view[j + 1];
+            if (vec === 0x10 || vec === 0x80 || vec === 0x81) {
+                hits.push({ fileOff: segOff + j, vec });
+            }
+        }
+    }
+    return hits;
+}
+
+// return42.elf is deliberately excluded — see return42.s. It's the
+// legacy `int 0x80 SYS_exit` canary, kept as a regression test for
+// the original syscall trap path. Everything else in the canvas
+// pipeline + the mov-only-stub examples is expected int-free.
+const INT_FREE_FIXTURES = [
+    'hello.elf',
+    'cycle.elf',
+    'call_greet.elf',
+    'canvas_mandelbrot.elf',
+    'canvas_mandelbrot_hires.elf',
+    'canvas_mandelbrot_max.elf',
+];
+try {
+    for (const name of INT_FREE_FIXTURES) {
+        const buf = new Uint8Array(await readFile(`${root}/examples/${name}`));
+        const hits = scanExecForInt(buf);
+        if (hits.length > 0) {
+            const detail = hits
+                .slice(0, 4)
+                .map(h => `int 0x${h.vec.toString(16)} at file offset 0x${h.fileOff.toString(16)}`)
+                .join(', ');
+            const more = hits.length > 4 ? ` (+${hits.length - 4} more)` : '';
+            throw new Error(`${name} should have NO int 0x10/0x80/0x81 — found: ${detail}${more}`);
+        }
+    }
+    console.log(`ok  int-free regression  ${INT_FREE_FIXTURES.length} fixtures × 0 hits`);
+} catch (e) {
+    console.error(`FAIL int-free regression: ${e.message}`);
+    failed++;
+}
+
 if (failed > 0) {
     console.error(`${failed} smoke test(s) failed`);
     process.exit(1);
