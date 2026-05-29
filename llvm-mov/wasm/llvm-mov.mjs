@@ -16,6 +16,7 @@
 // non-reusable. Same shape as movfuscator-wasm's wrappers.
 
 import createMovLlc from './build/llvm-mov-llc.js';
+import { CLANG_WASM_URL } from './wasm-config.js';
 
 // Clang is lazy-loaded so callers who only need `.ll → .s` (i.e. the
 // `compile()` API) can run without the 80 MB clang.wasm artifact
@@ -27,6 +28,21 @@ async function loadClang() {
         _createMovClang = m.default;
     }
     return _createMovClang;
+}
+
+// Emscripten's default wasm-file resolution looks for `clang.wasm`
+// next to clang.js. The deploy hosts the .wasm on a GitHub Release
+// instead (Cloudflare Pages caps files at 25 MiB; clang.wasm is ~76 MiB),
+// so `locateFile` redirects the loader to the release URL when
+// `CLANG_WASM_URL` is set. `null` (the default committed in
+// wasm-config.js) preserves the colocated `./build/clang.wasm`
+// behavior used in local dev + tests.
+function clangModuleOpts(base) {
+    if (CLANG_WASM_URL == null) return base;
+    return {
+        ...base,
+        locateFile: (path) => (path === 'clang.wasm' ? CLANG_WASM_URL : path),
+    };
 }
 
 // llvm-mov-llc writes its banner ("input module data layout mismatch"
@@ -175,7 +191,7 @@ export async function cToIR(source, opts = {}) {
     const optFlags = flagsForOptLevel(optLevel);
     const createMovClang = await loadClang();
     const buf = makeBuffered();
-    const clang = await createMovClang(buf.opts);
+    const clang = await createMovClang(clangModuleOpts(buf.opts));
     // Stage the file at MEMFS / and pass clang the *bare basename* (not
     // /<name>). Emscripten starts the wasm module with cwd = /, so a
     // bare basename resolves correctly, and the IR's `source_filename`

@@ -19,8 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180   # cold llvm-mov-wasm build is ~90 min; cache hits drop us to <10 min
     permissions:
-      contents: read
-      pull-requests: write   # for sticking the preview URL on the PR
+      contents: write          # for uploading clang.wasm to a deploy-artifact GH Release
+      pull-requests: write     # for sticking the preview URL on the PR
     # Skip deploys triggered by PRs from forks — they don't carry the
     # secrets and would only ever fail. Same-repo PRs (our current
     # workflow) and pushes to mov still run.
@@ -199,8 +199,72 @@ jobs:
           make build-native-llvm-mov-llc
           make build-wasm-llvm-mov-llc
 
+      # clang.wasm is too large (~76 MiB) for Cloudflare Pages' 25 MiB/file
+      # cap, so we host it on a GitHub Release instead and rewrite the
+      # wrapper's locateFile to point at the asset URL. Two release lines:
+      #   - prod                : the mov branch deploy
+      #   - staging-pr-<N>      : per-PR previews
+      # Staging releases accumulate one per active PR; PR close hooks the
+      # cleanup-staging-release workflow to delete them. We also prune
+      # the oldest ones here if the staging-pr-* count climbs past 30,
+      # so an abandoned PR doesn't leak storage forever.
+      - name: determine deploy-artifacts release tag
+        id: release-tag
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "tag=staging-pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=prod" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: prune old staging-pr-* releases (>30)
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # gh release list sorts newest-first by default; ask for JSON
+          # and re-sort by creation date ascending so we delete oldest.
+          # Keep at most KEEP releases; the new one we're about to
+          # publish doesn't count yet (it's not on the list).
+          KEEP=30
+          mapfile -t tags < <(
+              gh release list --limit 200 --json tagName,createdAt \
+                  --jq 'sort_by(.createdAt) | .[] | select(.tagName | startswith("staging-pr-")) | .tagName'
+          )
+          total=${#tags[@]}
+          if [ "$total" -ge "$KEEP" ]; then
+              to_delete=$((total - KEEP + 1))
+              echo "pruning $to_delete of $total staging releases"
+              for tag in "${tags[@]:0:$to_delete}"; do
+                  echo "  delete: $tag"
+                  gh release delete "$tag" --yes --cleanup-tag || true
+              done
+          else
+              echo "$total staging release(s), no prune"
+          fi
+
+      - name: upload clang.wasm to deploy-artifacts release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release-tag.outputs.tag }}
+          PRERELEASE: ${{ steps.release-tag.outputs.prerelease }}
+        run: |
+          # Create the release on first push, otherwise reuse. --clobber
+          # on `gh release upload` overwrites any existing asset with the
+          # same filename, so we don't have to delete first.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+              args=(--title "deploy-artifacts/$TAG" --notes "Auto-uploaded by deploy.yaml. Hosts clang.wasm (too large for Cloudflare Pages' 25 MiB/file limit).")
+              [ "$PRERELEASE" = "true" ] && args+=(--prerelease)
+              gh release create "$TAG" --target "${{ github.event.pull_request.head.sha || github.sha }}" "${args[@]}"
+          fi
+          gh release upload "$TAG" llvm-mov/wasm/build/clang.wasm --clobber
+
       - name: stage llvm-mov/wasm into dist/llvm-mov/
         working-directory: llvm-mov/wasm
+        env:
+          CLANG_WASM_URL: https://github.com/${{ github.repository }}/releases/download/${{ steps.release-tag.outputs.tag }}/clang.wasm
         run: make stage-deploy
 
       # ----------------------- upload + comment ----------------------------

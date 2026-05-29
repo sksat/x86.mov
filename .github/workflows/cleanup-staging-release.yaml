@@ -1,0 +1,31 @@
+name: cleanup-staging-release
+
+# Delete the `staging-pr-<N>` deploy-artifacts release (created by
+# deploy.yaml to host clang.wasm for the PR's CF Pages preview) when
+# the PR closes — merged or not. The deploy workflow itself also
+# prunes old staging-pr-* releases if the count climbs past 30, so
+# even an abandoned PR doesn't leak storage forever; this hook just
+# makes the common-case cleanup eager.
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: delete staging-pr-${{ github.event.pull_request.number }} release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: staging-pr-${{ github.event.pull_request.number }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+              echo "deleting $TAG"
+              gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
+          else
+              echo "$TAG not present, nothing to delete"
+          fi
