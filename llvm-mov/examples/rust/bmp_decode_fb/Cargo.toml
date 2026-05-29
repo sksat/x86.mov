@@ -1,0 +1,26 @@
+# BMP full-decode to framebuffer (vs the existing bmp_decode example
+# that just digests). Reads the embedded 32bpp BMP fixture, copies
+# pixels into a static OUT buffer (RGBA, top-down) for benchmarking
+# the per-pixel write cost through llvm-mov.
+[package]
+name = "rust-mov-bmp-decode-fb"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "rust-mov-bmp-decode-fb"
+path = "src/main.rs"
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = 1
+codegen-units = 1
+overflow-checks = false
+debug = false
+strip = false
+lto = false

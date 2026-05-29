@@ -1,0 +1,30 @@
+# Minimum viable PNG decoder through llvm-mov.
+#
+# Strategy: hand-rolled inflate that handles stored blocks (BTYPE=00)
+# only — real PNGs can use compressed IDAT, but storing the IDAT as
+# stored blocks is fully spec-compliant and `zlib-deflate -z 0` produces
+# such files. This gives us a real PNG (decodes in libpng/Pillow
+# unchanged) without pulling Huffman tables through the llvm-mov pipeline.
+# A follow-up could swap in `miniz_oxide` for compressed IDAT.
+[package]
+name = "rust-mov-png-decode"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "rust-mov-png-decode"
+path = "src/main.rs"
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = 1
+codegen-units = 1
+overflow-checks = false
+debug = false
+strip = false
+lto = false
