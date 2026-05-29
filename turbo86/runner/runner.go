@@ -217,6 +217,23 @@ var guestRegions = []struct{ addr, size uint32 }{
 	{0x70000000, 0x00200000}, // stack:      2 MiB well clear of the stub's own stack
 }
 
+// abiBase is the start of the mov-only ABI page. The page itself is
+// deliberately left unmapped in the stub, so any guest write into it
+// raises SIGSEGV; the runner intercepts that signal and interprets
+// the offset within the page as a host call number (see classifyAbi
+// below). Picked to sit between the stub's code region
+// (`[0x08048000, 0x09048000)`) and stack region (`[0x70000000,
+// 0x70200000)`) so it never collides with code, data, or stack.
+const (
+	abiBase     uint32 = 0x1FFE0000
+	abiPageSize uint32 = 0x1000
+
+	// Call numbers — page offsets. Keep these sparse to leave room for
+	// related sub-calls (e.g. a "query video mode" pair next to
+	// "set video mode") without renumbering downstream consumers.
+	abiCallSetVideoMode uint16 = 0x010
+)
+
 // pageSize is the smallest snapshot granule. Anonymous mmap mappings
 // are demand-zero — pages that the guest never touched read as zeros
 // via /proc/PID/mem and are skipped here.
@@ -688,6 +705,71 @@ type pausedSnapshot struct {
 	signal  uint8
 }
 
+// abiCall describes a decoded mov-only ABI invocation:
+//
+//	mov [imm32], al     (opcode A2, 5 bytes) — 8-bit  argument in AL
+//	mov [imm32], eax    (opcode A3, 5 bytes) — 32-bit argument in EAX
+//
+// where imm32 lies inside `[abiBase, abiBase + abiPageSize)`. The call
+// number is the page offset (`imm32 - abiBase`), and the argument is
+// extracted from the source register according to the opcode.
+//
+// Restricting to the absolute-address mov forms (A2/A3) keeps the
+// classifier honest: real bug-faults at register-indirect movs whose
+// destination happens to point into the ABI page won't get
+// misclassified as host calls — there's no instruction to decode an
+// argument from. The mov-only ABI's published convention is that
+// guests use A2/A3 specifically, so this is by design, not a limitation.
+type abiCall struct {
+	num     uint16
+	arg     uint32
+	insnLen uint8
+}
+
+// classifyAbi inspects a SIGSEGV stop and decides whether it's a
+// mov-only ABI invocation. Returns the decoded call if so, or
+// (zero, false) for a real fault that should follow the existing
+// Paused / signal-forward path.
+func classifyAbi(regs *regs32, mem *procMem) (abiCall, bool) {
+	var buf [5]byte
+	if err := mem.ReadAt(regs.Eip, buf[:]); err != nil {
+		return abiCall{}, false
+	}
+	target := uint32(buf[1]) | uint32(buf[2])<<8 | uint32(buf[3])<<16 | uint32(buf[4])<<24
+	if target < abiBase || target >= abiBase+abiPageSize {
+		return abiCall{}, false
+	}
+	num := uint16(target - abiBase)
+	switch buf[0] {
+	case 0xA2: // mov [imm32], al
+		return abiCall{num: num, arg: regs.Eax & 0xFF, insnLen: 5}, true
+	case 0xA3: // mov [imm32], eax
+		return abiCall{num: num, arg: regs.Eax, insnLen: 5}, true
+	}
+	return abiCall{}, false
+}
+
+// dispatchAbi handles an ABI call: emits the corresponding Outbound
+// event and advances EIP past the faulting mov so the guest resumes
+// at the next instruction. Returns false (with a side-effect emitFault)
+// for unknown call numbers so a typo in the guest's ABI use surfaces
+// loudly rather than silently consuming the fault.
+func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
+	switch call.num {
+	case abiCallSetVideoMode:
+		r.eventsCh <- proto.VideoMode{Mode: uint8(call.arg)}
+	default:
+		r.emitFault(fmt.Sprintf("unknown mov-only ABI call 0x%03x at EIP=0x%x", call.num, regs.Eip))
+		return false
+	}
+	regs.Eip += uint32(call.insnLen)
+	if err := ptraceSetRegs32(r.pid, regs); err != nil {
+		r.emitFault(fmt.Sprintf("set regs after ABI dispatch: %v", err))
+		return false
+	}
+	return true
+}
+
 func (r *Runner) capturePausedSnapshot(sig syscall.Signal) (pausedSnapshot, error) {
 	var snap pausedSnapshot
 	var rs regs32
@@ -754,6 +836,24 @@ func (r *Runner) syscallLoop(regs *regs32) {
 				return
 			}
 			if isForwardableSignal(sig) {
+				// mov-only ABI: an unmapped write into [abiBase, abiBase+
+				// abiPageSize) is a host call disguised as a SIGSEGV.
+				// Check before mode-specific handler dispatch so the
+				// behaviour is identical in ModeHost and ModeTrap (the
+				// runner owns the ABI page regardless of which signal-
+				// dispatch policy is in effect).
+				if sig == syscall.SIGSEGV {
+					if err := ptraceGetRegs32(r.pid, regs); err != nil {
+						r.emitFault(fmt.Sprintf("get regs (ABI probe): %v", err))
+						return
+					}
+					if call, ok := classifyAbi(regs, r.mem); ok {
+						if !r.dispatchAbi(call, regs) {
+							return
+						}
+						continue
+					}
+				}
 				// In trap mode the runner owns signal dispatch: look up
 				// the guest-registered handler in r.handlers, save the
 				// pre-signal regs on r.signalRegs for a future
