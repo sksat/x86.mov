@@ -119,8 +119,17 @@ chmod +x "$linker_wrapper"
 #           sysroot for the mov-backend pipeline). The others match
 #           what rubrc ships so the registry row covers the same
 #           surface plus the i686 delta.
-cat > "$rust_src/config.toml" <<EOF
-profile = "compiler"
+# Note on path: this branch reads `bootstrap.toml` as the primary,
+# `config.toml` as a deprecated fallback. Writing the primary so
+# nothing else can shadow our settings.
+#
+# `profile = "..."` deliberately omitted: the `compiler` profile
+# carries `[llvm] download-ci-llvm = true` as its default, which
+# is hostile for a --depth 1 shallow clone (the bootstrap then walks
+# git history looking for the LLVM submodule's last upstream commit
+# and dies with "could not find commit hash for downloading LLVM").
+# Going profile-less keeps the merge clean.
+cat > "$rust_src/bootstrap.toml" <<EOF
 change-id = 0
 
 [build]
@@ -142,15 +151,17 @@ sysconfdir = "etc"
 debug-logging = false
 codegen-units = 1
 
-# Force a local LLVM build instead of downloading prebuilt CI
-# artefacts. The download path walks git history to find the
-# commit that last touched the LLVM submodule, which fails on the
-# --depth 1 shallow clone we do above ("could not find commit
-# hash for downloading LLVM"). Building LLVM locally adds ~1-2
-# hours but works deterministically off the shallow tree.
+# Local LLVM build. The CI download path is incompatible with the
+# --depth 1 shallow clone (needs git history to find the matching
+# upstream LLVM commit). Local build adds ~1-2 hours but is the
+# deterministic option from a shallow tree.
 [llvm]
 download-ci-llvm = false
 EOF
+# Sweep any leftover config.toml from earlier runs so its (possibly
+# stale) settings can't shadow bootstrap.toml via the deprecated
+# fallback path.
+rm -f "$rust_src/config.toml"
 
 env \
     WASI_SDK_PATH="$wasi_sdk" \
