@@ -11,6 +11,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/sksat/x86.mov/turbo86/server"
@@ -45,7 +46,7 @@ func main() {
 
 	patterns := parseOriginPatterns(*allowOrigin)
 
-	for _, line := range securityBanner() {
+	for _, line := range colorize(securityBanner(), isTerminal(os.Stderr)) {
 		log.Print(line)
 	}
 
@@ -68,13 +69,53 @@ func main() {
 func securityBanner() []string {
 	return []string{
 		"================================================================",
-		"  turbo86 — *** SUPER INSECURE ***",
+		"  turbo86 — *** SUPER INSECURE REMOTE CODE EXECUTION PLATFORM ***",
 		"  Executes UNTRUSTED guest machine code NATIVELY on this host's",
 		"  CPU. Syscalls are only ptrace-bridged; there is no in-process",
 		"  sandbox. Anything the guest does runs as YOU.",
 		"  Run ONLY in a disposable / sandboxed environment.",
 		"================================================================",
 	}
+}
+
+// colorize wraps each non-empty banner line in bold-red ANSI when
+// enabled, resetting at the end of every line so an escape never
+// bleeds past its own line (log.Print prepends a timestamp, so the
+// reset has to be per-line, not once at the very end). When disabled
+// it returns the input untouched — that's exactly the bytes we want
+// in a redirected log file or a pipe, with no escape soup. The
+// caller decides "enabled" via isTerminal; keeping that probe out of
+// here makes the wrapping unit-testable.
+func colorize(lines []string, enabled bool) []string {
+	if !enabled {
+		return lines
+	}
+	const (
+		boldRed = "\x1b[1;31m"
+		reset   = "\x1b[0m"
+	)
+	out := make([]string, len(lines))
+	for i, line := range lines {
+		if line == "" {
+			out[i] = line
+			continue
+		}
+		out[i] = boldRed + line + reset
+	}
+	return out
+}
+
+// isTerminal reports whether f is attached to a terminal, so the
+// banner only emits ANSI color when a human is actually watching.
+// Using the file's mode (a character device) keeps this dependency-
+// free — pipes and regular files (`> log`, `| tee`) report false and
+// stay color-clean, which is the case that matters for logs.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 // parseOriginPatterns splits a comma-separated pattern list, trimming
