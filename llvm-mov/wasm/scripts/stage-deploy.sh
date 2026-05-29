@@ -123,11 +123,16 @@ fi
 
 # Cloudflare Pages `_headers` only takes one file per project at the
 # dist root. We're the first subproject to use it; if a sibling later
-# needs its own rules, refactor into an append-and-dedupe shape. The
-# hashed clang.wasm chunk pattern caches immutably — content bumps
-# rotate the URL so a stale cache can't pin the user to an old binary.
+# needs its own rules, refactor into an append-and-dedupe shape.
+#
+# CF Pages path matching only honours a single trailing `*`, so we
+# anchor on the `clang.wasm-` prefix (which is content-hashed by
+# stage-deploy and only appears on chunk files) and let the wildcard
+# cover both the hash and the `.part-N` tail. Content bumps rotate the
+# hash → new URL → fresh fetch, so caching this pattern as immutable
+# can't pin a user to a stale binary.
 cat > "$dist/_headers" <<'EOF'
-/llvm-mov/build/clang.wasm-*.part-*
+/llvm-mov/build/clang.wasm-*
   Cache-Control: public, max-age=31536000, immutable
 EOF
 
