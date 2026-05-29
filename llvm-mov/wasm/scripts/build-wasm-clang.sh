@@ -49,8 +49,21 @@ driver_obj_targets=(
     "tools/clang/tools/driver/CMakeFiles/clang.dir/cc1gen_reproducer_main.cpp.o"
     "tools/clang/tools/driver/CMakeFiles/clang.dir/clang-driver.cpp.o"
 )
-ninja -C "$llvm_build" "${driver_obj_targets[@]}" clang-resource-headers \
-    2>&1 | tee "$llvm_build/clang.build.log"
+# Same cache-restore short-circuit as build-wasm-llvm.sh: if all the
+# inputs we'd hand to ninja are already on disk (the cache restored
+# them under tools/ and lib/clang/), don't invoke ninja at all — the
+# top-level CMakeFiles/ rules.ninja is intentionally not cached and
+# ninja would crash trying to load it.
+all_present=true
+for o in "${driver_obj_targets[@]}"; do
+    [ -f "$llvm_build/$o" ] || { all_present=false; break; }
+done
+if $all_present && [ -d "$llvm_build/lib/clang" ]; then
+    echo "clang driver objs + resource headers already on disk; skipping ninja."
+else
+    ninja -C "$llvm_build" "${driver_obj_targets[@]}" clang-resource-headers \
+        2>&1 | tee "$llvm_build/clang.build.log"
+fi
 
 if [ ! -d "$driver_dir" ]; then
     echo "expected clang driver object dir at $driver_dir — missing" >&2

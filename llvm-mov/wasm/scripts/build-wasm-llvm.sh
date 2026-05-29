@@ -60,6 +60,19 @@ fi
 
 mkdir -p "$build"
 
+# Cache-restore detection. actions/cache only restores the explicit
+# paths we listed (lib/, bin/, include/, tools/ and the ninja top-level
+# files), not the multi-GB `CMakeFiles/` intermediate state. If lib/
+# was restored and CMakeFiles/ is missing, the cached static libs are
+# usable directly — build-wasm-llvm-mov-llc and build-wasm-clang only
+# need them and the cmake config dir. Asking ninja to "rebuild" would
+# dereference references into the missing CMakeFiles/ tree and crash,
+# so bail out early and let downstream steps consume the cache.
+if [ -f "$build/lib/cmake/llvm/LLVMConfig.cmake" ] && [ ! -d "$build/CMakeFiles" ]; then
+    echo "build/llvm-wasm/ restored from cache (no CMakeFiles/); skipping ninja."
+    exit 0
+fi
+
 # Idempotent: skip the configure step if it already ran. Re-running
 # emcmake on a configured build dir is harmless but cmake re-walks the
 # whole config which is ~30 s of pointless work on warm builds.
