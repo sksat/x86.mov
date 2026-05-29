@@ -1,9 +1,9 @@
 // Wasm artefact loading config.
 //
-// `clang.wasm` is too large for Cloudflare Pages' 25 MiB/file limit so
-// the deploy hosts it on a GitHub Release instead (see
-// scripts/stage-deploy.sh + the deploy workflow). At stage-deploy
-// time the placeholder `null` below is substituted with the release
-// asset URL. When unset (local dev, tests), llvm-mov.mjs falls back to
-// the colocated `./build/clang.wasm`.
-export const CLANG_WASM_URL = null;
+// `clang.wasm` is too large (~76 MiB) for Cloudflare Pages' 25 MiB
+// per-file upload limit, so the deploy splits it into ≤24 MiB chunks
+// (`clang.wasm.part-0..N`) and the wrapper concatenates them client-
+// side. `CLANG_WASM_CHUNKS` is the chunk count; stage-deploy.sh sets it
+// before staging. `null` (the committed default) keeps the colocated
+// `./build/clang.wasm` behavior for local dev + tests.
+export const CLANG_WASM_CHUNKS = null;

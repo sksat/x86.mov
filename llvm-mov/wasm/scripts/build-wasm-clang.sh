@@ -134,6 +134,19 @@ if [ ! -f "$out/clang.wasm" ]; then
     exit 1
 fi
 
+# Split clang.wasm into ≤24 MiB chunks for the deploy. Cloudflare Pages
+# rejects single files larger than 25 MiB at upload time, and the demo
+# preview is the front-door for this subproject. The chunks live next
+# to the single file so local dev keeps using clang.wasm via the
+# Emscripten loader's default fetch; stage-deploy.sh decides whether
+# the static deploy should include the single file or the chunks.
+#
+# `-d -a 1` numeric 1-digit suffix → clang.wasm.part-0..N (≤10 chunks).
+# clang.wasm is ~80 MiB → 4 chunks today. The wrapper enumerates by
+# `CLANG_WASM_CHUNKS` (the count), injected by stage-deploy.sh.
+rm -f "$out"/clang.wasm.part-*
+( cd "$out" && split -b 24M -d -a 1 clang.wasm clang.wasm.part- )
+
 # Reuse the {"type":"module"} marker produced by the llvm-mov-llc
 # staging step (build/package.json already exists if that script ran);
 # write it ourselves otherwise.
@@ -142,4 +155,4 @@ if [ ! -f "$out/package.json" ]; then
 fi
 
 echo "wasm clang build complete:"
-ls -la "$out"/clang.{js,wasm}
+ls -la "$out"/clang.{js,wasm} "$out"/clang.wasm.part-*
