@@ -114,6 +114,20 @@ sudo apt-get install -y \
     gcc-multilib libc6-dev-i386
 ```
 
+On Arch the distro `llvm` package already tracks 22.1.x, so no extra repo is
+needed:
+
+```sh
+sudo pacman -S --needed llvm clang lld cmake ninja
+rustup target add i686-unknown-linux-gnu   # only for `make test-rust-example`
+```
+
+Arch ships LLVM unversioned (bare `llvm-config`) and as a single monolithic
+`libLLVM.so` rather than per-component static archives. The `Makefile` picks up
+the unversioned `llvm-config` automatically and the build links the monolithic
+dylib when LLVM was configured with `LLVM_LINK_LLVM_DYLIB` — `make build` works
+without overrides.
+
 Why LLVM 22: bumping in lockstep with upstream is cheap *before* the backend
 has shape; pinning early would just lock us behind. Once the codegen surface
 stabilises we will pin to a specific `22.1.<patch>`.
