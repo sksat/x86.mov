@@ -709,6 +709,202 @@ static void injectMulSf3Helper(Module &M, LLVMContext &Ctx) {
   B.CreateRet(B.CreateBitCast(Result, F32));
 }
 
+// Stage 7g3 — IEEE-754 single-precision divide: `__divsf3 (a, b)`.
+//
+// Shape:
+//   1. Extract sign / exp / mantissa from both inputs and OR in the
+//      implicit-1 bit to get 24-bit ma / mb.
+//   2. Initial normalize. The exact quotient ma/mb is in (1/2, 2);
+//      if ma < mb we left-shift ma by 1 and decrement the result
+//      exponent so the long-division loop starts with ma_norm in
+//      `[mb, 2*mb)`. The first quotient bit is then implicitly 1
+//      (the implicit-1 of the result mantissa), and the loop only
+//      needs to grind out the remaining 23 fractional bits.
+//   3. Long-division loop, 23 iterations:
+//        r = ma_norm - mb        // [0, mb)
+//        q = 1                   // implicit-1
+//        for i in 23..1:
+//          r <<= 1
+//          q <<= 1
+//          if r >= mb: r -= mb; q |= 1
+//      After the loop q is the 24-bit mantissa with bit 23 = 1.
+//   4. One more iter for the guard bit, then sticky = (residue != 0)
+//      and round-to-nearest-ties-to-even. Rounding overflow bumps the
+//      exponent by 1 and shifts q right by 1 (matches the existing
+//      add / mul helpers).
+//   5. Pack {sign = sa XOR sb, exp = ea - eb + 127 (- 1 if renorm,
+//      + 1 if rounding overflow), mant}. Special cases:
+//        - a == 0 (ea == 0)  → signed zero with sr
+//        - b == 0 (eb == 0)  → signed Inf with sr
+//        - ER overflow (>= 255) → signed Inf
+//        - ER underflow (<= 0)  → signed zero
+//      Inf / NaN propagation stays at the 7g1 best-effort level.
+//
+// Unlike the straight-line `__addsf3` / `__mulsf3` bodies, this
+// helper uses a real loop with PHI nodes — exactly the same shape
+// stage-7f2's `__udivsi3` uses for its 32-iter restoring division.
+// The driver's SELECT → bit-blend rewrite still fires on the loop-
+// body `select`s; the loop control itself (CondBr / PHI) survives
+// into the lowered MIR. SDAG handles that without the multi-minute
+// pathology that motivated the bit-blend rewrite, because the
+// branching is now coarse (per-iteration, not per-arithmetic-op).
+static void injectDivSf3Helper(Module &M, LLVMContext &Ctx) {
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(F32, {F32, F32}, /*isVarArg=*/false);
+
+  Function *F = makeOrPromoteHelper(M, "__divsf3", FnTy);
+  if (!F)
+    return;
+
+  F->getArg(0)->setName("a");
+  F->getArg(1)->setName("b");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "loop", F);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", F);
+
+  // === entry ===
+  IRBuilder<> B(Entry);
+  auto C = [&](uint32_t V) { return B.getInt32(V); };
+
+  Value *AI = B.CreateBitCast(F->getArg(0), I32, "ai");
+  Value *BI = B.CreateBitCast(F->getArg(1), I32, "bi");
+
+  Value *SA = B.CreateLShr(AI, C(31), "sa");
+  Value *SB = B.CreateLShr(BI, C(31), "sb");
+  Value *EA = B.CreateAnd(B.CreateLShr(AI, C(23)), C(0xFFu), "ea");
+  Value *EB = B.CreateAnd(B.CreateLShr(BI, C(23)), C(0xFFu), "eb");
+  Value *MARaw = B.CreateAnd(AI, C(0x7FFFFFu), "ma_raw");
+  Value *MBRaw = B.CreateAnd(BI, C(0x7FFFFFu), "mb_raw");
+
+  Value *SR = B.CreateXor(SA, SB, "sr");
+
+  // Special-case detection. Same flush-to-zero treatment of denormals
+  // as the other 7g helpers (ex == 0 ⇒ value treated as zero).
+  Value *AIsZero = B.CreateICmpEQ(EA, C(0u));
+  Value *BIsZero = B.CreateICmpEQ(EB, C(0u));
+
+  // Add the implicit-1 to each mantissa. Both ma and mb are now 24
+  // bits, in `[2^23, 2^24)`.
+  Value *MA = B.CreateOr(MARaw, C(0x800000u), "ma");
+  Value *MB = B.CreateOr(MBRaw, C(0x800000u), "mb");
+
+  // Initial renormalize: if ma < mb, the exact ma/mb is in (1/2, 1)
+  // and we want to bring the implicit-1 of the result into the right
+  // position. Shift ma left by 1 (so ma_norm in [mb, 2*mb)) and drop
+  // ER by 1.
+  Value *InitialRenorm = B.CreateICmpULT(MA, MB, "initial_renorm");
+  Value *MANorm = B.CreateSelect(InitialRenorm, B.CreateShl(MA, C(1)), MA,
+                                 "ma_norm");
+
+  // Result exponent. ER = EA - EB + 127, adjusted by -1 if we
+  // renormed.
+  Value *ER0 = B.CreateAdd(B.CreateSub(EA, EB), C(127u));
+  Value *ER = B.CreateSelect(InitialRenorm,
+                             B.CreateSub(ER0, C(1u)), ER0, "er");
+
+  // Initial loop state. ma_norm in [mb, 2*mb) ⇒ r0 = ma_norm - mb in
+  // `[0, mb)` ⊂ `[0, 2^24)`. q0 = 1 represents the implicit-1 quotient
+  // bit. The 23-iter loop fills in the remaining 23 fractional bits
+  // (one per iteration); a final extra step in the exit block
+  // produces the guard bit for round-to-nearest-ties-to-even.
+  Value *R0 = B.CreateSub(MANorm, MB);
+  Value *Q0 = C(1);
+
+  B.CreateBr(Loop);
+
+  // === loop ===
+  B.SetInsertPoint(Loop);
+  PHINode *IPhi = B.CreatePHI(I32, 2, "i");
+  PHINode *RPhi = B.CreatePHI(I32, 2, "r");
+  PHINode *QPhi = B.CreatePHI(I32, 2, "q");
+  IPhi->addIncoming(C(23u), Entry);
+  RPhi->addIncoming(R0, Entry);
+  QPhi->addIncoming(Q0, Entry);
+
+  Value *RShifted = B.CreateShl(RPhi, C(1));
+  Value *QShifted = B.CreateShl(QPhi, C(1));
+  Value *Take = B.CreateICmpUGE(RShifted, MB);
+  Value *RSub = B.CreateSub(RShifted, MB);
+  Value *QSet = B.CreateOr(QShifted, C(1));
+  Value *RNext = B.CreateSelect(Take, RSub, RShifted);
+  Value *QNext = B.CreateSelect(Take, QSet, QShifted);
+  Value *INext = B.CreateSub(IPhi, C(1));
+  // Loop control: continue while INext > 0. We start at i = 23 and
+  // want 23 iterations total (i = 23, 22, …, 1 each running the body
+  // once; after the iter where IPhi == 1 we hit INext == 0 and exit).
+  Value *Done = B.CreateICmpEQ(INext, C(0));
+  B.CreateCondBr(Done, Exit, Loop);
+  IPhi->addIncoming(INext, Loop);
+  RPhi->addIncoming(RNext, Loop);
+  QPhi->addIncoming(QNext, Loop);
+
+  // === exit ===
+  B.SetInsertPoint(Exit);
+  PHINode *RExit = B.CreatePHI(I32, 1, "r_out");
+  PHINode *QExit = B.CreatePHI(I32, 1, "q_out");
+  RExit->addIncoming(RNext, Loop);
+  QExit->addIncoming(QNext, Loop);
+
+  // Guard bit: one extra long-division step on the residue.
+  Value *RGuardRaw = B.CreateShl(RExit, C(1));
+  Value *GuardTake = B.CreateICmpUGE(RGuardRaw, MB);
+  Value *GuardBit = B.CreateZExt(GuardTake, I32);
+  Value *RAfterGuard = B.CreateSelect(GuardTake,
+                                      B.CreateSub(RGuardRaw, MB),
+                                      RGuardRaw);
+  // Sticky: any leftover residue means at least one of the bits we
+  // discarded was nonzero ⇒ "below halfway" rounding decision flips.
+  Value *StickyI1 = B.CreateICmpNE(RAfterGuard, C(0));
+  Value *Sticky = B.CreateZExt(StickyI1, I32);
+
+  Value *Lsb = B.CreateAnd(QExit, C(1u));
+  Value *RoundUp = B.CreateAnd(GuardBit, B.CreateOr(Sticky, Lsb));
+  Value *QRounded = B.CreateAdd(QExit, RoundUp);
+  Value *RoundOvf = B.CreateICmpEQ(QRounded, C(0x1000000u));
+  Value *QFinal = B.CreateSelect(RoundOvf,
+                                 B.CreateLShr(QRounded, C(1)),
+                                 QRounded, "q_final");
+  Value *ERFinal = B.CreateSelect(RoundOvf,
+                                  B.CreateAdd(ER, C(1u)), ER, "er_final");
+
+  // Pack.
+  Value *MantField = B.CreateAnd(QFinal, C(0x7FFFFFu));
+  Value *ExpField = B.CreateAnd(B.CreateShl(ERFinal, C(23)),
+                                C(0x7F800000u));
+  Value *SignField = B.CreateShl(SR, C(31));
+  Value *Packed = B.CreateOr(SignField,
+                             B.CreateOr(ExpField, MantField));
+
+  // Result-exponent gates. ERFinal can wrap into the high i32 range
+  // when underflowing, so use signed comparisons.
+  Value *Underflow = B.CreateICmpSLE(ERFinal, C(0), "underflow");
+  Value *Overflow = B.CreateICmpSGE(ERFinal, C(255), "overflow");
+  Value *SignedZero = SignField;
+  Value *SignedInf = B.CreateOr(SignField, C(0x7F800000u));
+
+  Value *Result = B.CreateSelect(Overflow, SignedInf, Packed);
+  Result = B.CreateSelect(Underflow, SignedZero, Result);
+  // Final input-zero gates, applied so divisor-zero wins over
+  // dividend-zero. With this ordering:
+  //   - a == 0, b != 0   → signed zero with sr  (correct)
+  //   - a != 0, b == 0   → signed Inf  with sr  (correct, IEEE)
+  //   - a == 0, b == 0   → signed Inf            (best-effort; real
+  //                                               IEEE would emit a
+  //                                               quiet NaN, out of
+  //                                               scope alongside
+  //                                               `__addsf3` etc.)
+  // The codex-review P2 reordering matters: applying AIsZero last
+  // would let the dividend-zero gate overwrite the divisor-zero
+  // gate, so `0.0 / 0.0` would silently return signed zero instead
+  // of the documented signed Inf.
+  Result = B.CreateSelect(AIsZero, SignedZero, Result);
+  Result = B.CreateSelect(BIsZero, SignedInf, Result);
+
+  B.CreateRet(B.CreateBitCast(Result, F32));
+}
+
 // Stage 7g1 — IEEE-754 single-precision comparison helpers
 // (`__eqsf2`, `__nesf2`, `__ltsf2`, `__lesf2`, `__gtsf2`, `__gesf2`,
 // `__unordsf2`). The soft-float SDAG legalizer lowers each `fcmp
@@ -1077,6 +1273,7 @@ static bool moduleNeedsF32Helpers(Module &M) {
       case Instruction::FAdd:
       case Instruction::FSub:
       case Instruction::FMul:
+      case Instruction::FDiv:
       case Instruction::FCmp:
         if (I.getOperand(0)->getType()->getScalarType()->isFloatTy())
           return true;
@@ -1113,6 +1310,23 @@ static bool moduleNeedsMulSf3(Module &M) {
       continue;
     for (Instruction &I : instructions(F)) {
       if (I.getOpcode() == Instruction::FMul &&
+          I.getOperand(0)->getType()->getScalarType()->isFloatTy())
+        return true;
+    }
+  }
+  return false;
+}
+
+// Per-helper gate for `__divsf3` — same reasoning as `__mulsf3`. The
+// 23-iter long-division loop + guard / sticky body is materially
+// larger than the straight-line helpers, so an `fadd`-only module
+// shouldn't pay for it.
+static bool moduleNeedsDivSf3(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if (I.getOpcode() == Instruction::FDiv &&
           I.getOperand(0)->getType()->getScalarType()->isFloatTy())
         return true;
     }
@@ -1258,6 +1472,11 @@ int main(int argc, char **argv) {
   // so emitting it on every `fadd`-only module would regress size.
   if (moduleNeedsMulSf3(*M))
     injectMulSf3Helper(*M, Ctx);
+  // `__divsf3` similarly: its 23-iter long-division loop adds enough
+  // body code that gating on actual `fdiv` use is worth the extra
+  // scan.
+  if (moduleNeedsDivSf3(*M))
+    injectDivSf3Helper(*M, Ctx);
 
   // Stage 6d2 — pre-Scalarizer lowering of `llvm.vector.reduce.*`.
   //

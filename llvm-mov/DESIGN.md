@@ -312,7 +312,7 @@ above sidesteps all of that.
     - Subnormal inputs flush to zero; the result also flushes to
       zero on underflow.
     - `fdiv` and `f32 ↔ f64` conversions are not yet wired up.
-      `fdiv` needs a 24-iter long division on the 24-bit mantissa.
+      (`fdiv` lands in stage 7g3 below.)
 
 - **7g2** `f32 fmul` via SDAG soft-float → `call __mulsf3`, with the
   body injected by `llvm-mov-llc` along the same path the earlier
@@ -347,6 +347,44 @@ above sidesteps all of that.
   operand is zero ⇒ signed zero; ErFinal ≤ 0 ⇒ signed zero (flush
   to zero on underflow); ErFinal ≥ 255 ⇒ signed Inf. Real NaN
   propagation is still a follow-up.
+
+- **7g3** `f32 fdiv` via SDAG soft-float → `call __divsf3`. Unlike
+  the previous 7g* helpers the body is *not* straight-line: the
+  mantissa is divided by a 23-iter restoring long-division loop with
+  real CondBr / PHI control flow, mirroring stage-7f2's `__udivsi3`
+  shape. The driver's SELECT → bit-blend rewrite still fires inside
+  the loop body (the loop-body `select`s are bit-blends like in
+  the rest of the codebase), but the loop control itself survives
+  into the lowered MIR. The reason this doesn't pin DAG-ISel: the
+  branching is now coarse (per-iteration, not per-arithmetic-op),
+  so the SELECT-rewrite pathology that motivates the bit-blend pass
+  doesn't kick in.
+
+  Algorithm sketch:
+
+  ```
+  unpack {sa, ea, ma}, {sb, eb, mb} from ai / bi
+  ma = ma_raw | 0x800000 ; mb = mb_raw | 0x800000  (hidden 1)
+  // Initial renormalize so ma_norm ∈ [mb, 2*mb).
+  initial_renorm = ma < mb
+  ma_norm = initial_renorm ? ma << 1 : ma
+  er = ea - eb + 127 - initial_renorm
+  // 23-iter long division. q seeded with 1 (the implicit-1 quotient
+  // bit); r seeded with ma_norm - mb (residue in [0, mb)).
+  r = ma_norm - mb ; q = 1
+  for i in 23..1:
+    r <<= 1 ; q <<= 1
+    if r >= mb: r -= mb ; q |= 1
+  // One more step for the guard bit, then sticky from any leftover
+  // residue. Round-to-nearest-ties-to-even.
+  pack {sr = sa XOR sb, er (+1 if rounding-overflow), mant}
+  ```
+
+  Special cases match the `__addsf3` / `__mulsf3` flush-to-zero
+  envelope: `a == 0` (`ea == 0`) → signed zero with `sr`; `b == 0`
+  → signed Inf with `sr` (0/0 surfaces as Inf in this best-effort
+  scope rather than NaN, like the other helpers); `er ≤ 0` →
+  signed zero; `er ≥ 255` → signed Inf.
 
 ### Stage 7 gates
 

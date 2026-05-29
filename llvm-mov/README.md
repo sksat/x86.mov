@@ -51,6 +51,7 @@ in `_start.s` (the runtime escape, gate-accepted) and `jmp` from the
 | 7f2    | 32-bit UDIV / SDIV / UREM / SREM via `__udivsi3` etc. injected by `llvm-mov-llc` as IR (restoring 32-iter division) | `udiv` / `sdiv` / `urem` / `srem` + `udiv` / `srem` MovOnly gates green | ✅ |
 | 7g1    | `f32 fadd / fsub / fcmp / sitofp / fptosi (+ unsigned)` via SDAG soft-float → `__addsf3 / __subsf3 / __{eq,ne,lt,le,gt,ge,unord}sf2 / __floatsisf / __fixsfsi` injected as IR | exec: `fadd_*`, `fsub_*`, `fcmp_*`, `sitofp`, `fptosi`, `round_trip`; MovOnly: `fadd`, `fsub`, `fcmp`, `sitofp`, `fptosi` | ✅ |
 | 7g2    | `f32 fmul` via SDAG soft-float → `__mulsf3` injected as IR (24×24→48-bit byte-split multiply on top of stage-7f1 `mul i32`) | exec: `fmul_*`; MovOnly: `fmul` | ✅ |
+| 7g3    | `f32 fdiv` via SDAG soft-float → `__divsf3` injected as IR (23-iter mantissa restoring long-division loop with PHIs, same shape as stage-7f2 `__udivsi3`) | exec: `fdiv_*`; MovOnly: `fdiv` | ✅ |
 | 6e     | indirect `call` via function pointer (CALL32r)     | `indirect_call` exec + MovOnly                           | ✅    |
 | 8      | bigger fixtures (AES, mandelbrot, …)               | richer side-by-side bench                                | future |
 
