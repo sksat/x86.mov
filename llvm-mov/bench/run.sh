@@ -68,6 +68,14 @@ resolve_fixture() {
 
 BUILD_DIR="${BUILD_DIR:-$LLVM_MOV_DIR/build}"
 LLVM_MOV_LLC="$BUILD_DIR/bin/llvm-mov-llc"
+# Resolve to absolute — `build_llvm_mov_rust` invokes cargo with
+# `cd "$crate_dir"`, and cargo-link.sh inherits LLVM_MOV_LLC; a
+# relative path that was rooted at bench's CWD silently doesn't
+# exist any more from the crate dir. The Makefile invokes us with
+# BUILD_DIR=build (relative to llvm-mov/), so this matters.
+if [ -f "$LLVM_MOV_LLC" ]; then
+    LLVM_MOV_LLC="$(cd "$(dirname "$LLVM_MOV_LLC")" && pwd)/$(basename "$LLVM_MOV_LLC")"
+fi
 MOVCC="$MOVFUSCATOR_WASM/vendor/movfuscator/build/movcc"
 
 CLANG="${CLANG:-clang-22}"
@@ -351,12 +359,26 @@ build_llvm_mov_rust() {
     local crate_dir="$1" cargo_name="$2" out_dir="$3"
     mkdir -p "$out_dir"
     local triple="i686-unknown-linux-gnu"
-    (cd "$crate_dir" && LLVM_MOV_LLC="$LLVM_MOV_LLC" cargo build --release --quiet \
-        >/dev/null 2>&1)
     # [[bin]] name is the hyphenated `cargo_name`, materialised at
-    # target/.../release/<bin-name>.
+    # target/.../release/<bin-name>. The actual linked artifact cargo
+    # writes lives under `deps/<cargo_name>-<hash>` (no extension);
+    # `release/<bin-name>` is a hardlink copy of it.
     local bin_name="${cargo_name//_/-}"
     local elf="$crate_dir/target/$triple/release/$bin_name"
+    # Force cargo to re-invoke the linker (= cargo-link.sh) by
+    # deleting both copies of the bin. Otherwise an incremental
+    # build that finds the artifact already up-to-date skips the
+    # link step entirely and `<OUTPUT>.deps-status` isn't refreshed
+    # — bench-check then diverges between a warm-cache dev box and
+    # a cold-cache CI run (the row appears empty here, populated
+    # there). Removing only `release/<bin>` isn't enough: cargo
+    # just re-copies it from `deps/`.
+    rm -f "$elf"
+    find "$crate_dir/target/$triple/release/deps/" \
+        -maxdepth 1 -type f -name "${cargo_name}-*" -not -name "*.*" \
+        -delete 2>/dev/null || true
+    (cd "$crate_dir" && LLVM_MOV_LLC="$LLVM_MOV_LLC" cargo build --release --quiet \
+        >/dev/null 2>&1)
     if ! [ -x "$elf" ]; then
         return 1
     fi
