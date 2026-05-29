@@ -201,15 +201,52 @@ jobs:
         working-directory: llvm-mov/wasm
         run: make build-wasm-clang
 
-      - name: llvm-mov/wasm build (native llvm-mov-llc + wasm driver)
-        working-directory: llvm-mov/wasm
-        run: |
-          make build-native-llvm-mov-llc
-          make build-wasm-llvm-mov-llc
+      # Native llvm-mov-llc is a pure function of the backend sources
+      # (llvm/, tools/) + the CMake/Makefile that drives them. The wasm
+      # build script is excluded from this key because it only affects
+      # the wasm artifact, not this native binary.
+      - name: cache native llvm-mov-llc
+        uses: actions/cache@v5.0.5
+        id: lmw-native-llc-cache
+        with:
+          path: llvm-mov/build/bin/llvm-mov-llc
+          key: llvm-mov-llc-native-${{ runner.os }}-${{ hashFiles('llvm-mov/llvm/**', 'llvm-mov/tools/**', 'llvm-mov/CMakeLists.txt', 'llvm-mov/Makefile') }}-v1
 
+      - name: llvm-mov/wasm build (native llvm-mov-llc)
+        if: steps.lmw-native-llc-cache.outputs.cache-hit != 'true'
+        working-directory: llvm-mov/wasm
+        run: make build-native-llvm-mov-llc
+
+      # Wasm llvm-mov-llc is a function of the same backend sources
+      # plus the emcmake link script. The build-wasm-llvm.sh artefacts
+      # it consumes (build/llvm-wasm/lib/cmake/llvm) are already covered
+      # by lmw-build-cache above, so they don't need to be in this key.
+      - name: cache wasm llvm-mov-llc artifact
+        uses: actions/cache@v5.0.5
+        id: lmw-wasm-llc-cache
+        with:
+          path: |
+            llvm-mov/wasm/build/llvm-mov-llc.js
+            llvm-mov/wasm/build/llvm-mov-llc.wasm
+            llvm-mov/wasm/build/package.json
+          key: llvm-mov-llc-wasm-${{ runner.os }}-${{ hashFiles('llvm-mov/llvm/**', 'llvm-mov/tools/**', 'llvm-mov/CMakeLists.txt', 'llvm-mov/wasm/scripts/build-wasm-llvm-mov-llc.sh') }}-v1
+
+      - name: llvm-mov/wasm build (wasm llvm-mov-llc driver)
+        if: steps.lmw-wasm-llc-cache.outputs.cache-hit != 'true'
+        working-directory: llvm-mov/wasm
+        run: make build-wasm-llvm-mov-llc
+
+      # Invoke the staging script directly instead of `make stage-deploy`.
+      # The Makefile target declares `build` as a prerequisite, and `build`
+      # is .PHONY — calling it would re-run the wasm + native llvm-mov-llc
+      # builds even when both caches above hit, defeating the cache gates.
+      # The fzstd-install guard from the Makefile is inlined here so the
+      # script's `node_modules/fzstd/main.js` import still resolves.
       - name: stage llvm-mov/wasm into dist/llvm-mov/
         working-directory: llvm-mov/wasm
-        run: make stage-deploy
+        run: |
+          if [ ! -d node_modules/fzstd ]; then npm install; fi
+          ./scripts/stage-deploy.sh
 
       # ----------------------- explorer side -------------------------------
 
