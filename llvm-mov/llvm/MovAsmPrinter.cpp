@@ -127,6 +127,17 @@ void MovAsmPrinter::lower(const MachineInstr *MI, MCInst &OutMI) const {
       MCOp = MCOperand::createExpr(Expr);
       break;
     }
+    case MachineOperand::MO_JumpTableIndex: {
+      // Stage 7i — jump-table base address (issue #11). ISel lowers
+      // ISD::JumpTable to `MOV32ri reg, <jti>`; print it as
+      // `mov reg, offset .LJTI<fn>_<idx>`. The table body itself is
+      // emitted by the base AsmPrinter's emitJumpTableInfo (one
+      // absolute MBB address per arm). GetJTISymbol returns the
+      // function-local `.LJTI<fn>_<idx>` label that section anchors.
+      MCOp = MCOperand::createExpr(MCSymbolRefExpr::create(
+          GetJTISymbol(MO.getIndex()), OutContext));
+      break;
+    }
     case MachineOperand::MO_RegisterMask:
       // Call regmask: not part of the printed asm, but the MachineOperand
       // exists so RA / liveness know which registers the call clobbers.

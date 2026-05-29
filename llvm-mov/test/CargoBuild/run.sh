@@ -42,6 +42,15 @@ fi
 
 export LLVM_MOV_LLC="$(cd "$BUILD_DIR/bin" && pwd)/llvm-mov-llc"
 
+# Keep the gate fast: a dep whose mov-only lower blows up the legalize
+# pass (currently crates.io `base64` — issue #11 follow-up) should fall
+# back to its native .o quickly rather than burning the full default
+# budget. 25s is far above every dep that lowers in practice (qoi +
+# bytemuck are sub-second) yet well below base64's runaway runtime, so
+# the gate still exercises the mov path for the lowerable deps while
+# base64 lands as `native(llc-timeout)` without stalling the suite.
+export LLVM_MOV_LLC_DEP_TIMEOUT="${LLVM_MOV_LLC_DEP_TIMEOUT:-25}"
+
 declare -A EXPECTED=(
     [main]=42
     [fib]=32

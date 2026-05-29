@@ -548,6 +548,29 @@ let isBranch = 1, isTerminator = 1, isBarrier = 1,
 def JMP32r_CALL : MovInst<(outs), (ins GPR32:$dst),
                           "jmp\t$dst", []>;
 
+// Stage 7i — register-indirect jump for `switch` jump tables (issue
+// #11). LLVM lowers a dense `switch` to a jump table; with BR_JT set
+// to Expand (see MovISelLowering) the legalizer rewrites it into
+//     addr   = jumptable_base + index*4   ; ADD32rr / SHL32ri
+//     target = load [addr]                ; MOV32rm  (the .rodata JT
+//                                           entry = absolute MBB addr,
+//                                           EK_BlockAddress encoding)
+//     brind target
+// and this instruction selects the trailing `brind`. The address
+// arithmetic flows through the stage-7a/7b byte-chain legalize like
+// any other ADD/SHL; the final `jmp reg` is left as-is — it's the
+// same mov-equivalent indirect-jump primitive the 7c dispatcher's
+// `jmp [next_pc]` already relies on (movie86 decodes `jmp r32`).
+//
+// Unlike JMP32r_CALL this carries no call-clobber regmask / side
+// effects — it's a pure intra-function indirect branch, so it has a
+// real `(brind GPR32)` selection pattern instead of being built by
+// hand in MovOnlyLegalize.
+let isBranch = 1, isTerminator = 1, isBarrier = 1,
+    isIndirectBranch = 1 in
+def JMP32r : MovInst<(outs), (ins GPR32:$dst),
+                     "jmp\t$dst", [(brind GPR32:$dst)]>;
+
 //===----------------------------------------------------------------------===//
 // RET
 //===----------------------------------------------------------------------===//
