@@ -39,9 +39,11 @@ async function loadClang() {
 // default behaviour (fetching the single `./build/clang.wasm`) is
 // untouched.
 let _chunkedWasm = null;
-async function fetchChunkedClangWasm(count) {
+async function fetchChunkedClangWasm(count, onProgress) {
     if (_chunkedWasm) return _chunkedWasm;
     const base = new URL('./build/', import.meta.url);
+    let done = 0;
+    onProgress?.({ stage: 'fetch-clang', done, total: count });
     const buffers = await Promise.all(
         Array.from({ length: count }, async (_, i) => {
             const url = new URL(`clang.wasm.part-${i}`, base);
@@ -49,7 +51,10 @@ async function fetchChunkedClangWasm(count) {
             if (!r.ok) {
                 throw new Error(`fetch ${url}: ${r.status} ${r.statusText}`);
             }
-            return new Uint8Array(await r.arrayBuffer());
+            const buf = new Uint8Array(await r.arrayBuffer());
+            done += 1;
+            onProgress?.({ stage: 'fetch-clang', done, total: count });
+            return buf;
         }),
     );
     const total = buffers.reduce((s, b) => s + b.byteLength, 0);
@@ -63,9 +68,9 @@ async function fetchChunkedClangWasm(count) {
     return _chunkedWasm;
 }
 
-async function clangModuleOpts(base) {
+async function clangModuleOpts(base, onProgress) {
     if (CLANG_WASM_CHUNKS == null) return base;
-    const wasmBinary = await fetchChunkedClangWasm(CLANG_WASM_CHUNKS);
+    const wasmBinary = await fetchChunkedClangWasm(CLANG_WASM_CHUNKS, onProgress);
     return { ...base, wasmBinary };
 }
 
@@ -98,7 +103,7 @@ function assertSafeName(name) {
  * @param {string} ir LLVM IR source text. If it lacks a
  *   `target triple = "..."` line, the driver defaults to
  *   `mov-unknown-linux-gnu`.
- * @param {{ name?: string, mtriple?: string }} [opts]
+ * @param {{ name?: string, mtriple?: string, onProgress?: (ev: ProgressEvent) => void }} [opts]
  *   - `name`: basename used for the MEMFS input file. The native driver
  *     bakes the input filename into a `.file "<name>"` directive, so
  *     matching it here is required for byte-identical parity with
@@ -108,13 +113,16 @@ function assertSafeName(name) {
  *     clang-emitted IR (which carries `i386-unknown-linux-gnu` from
  *     `-target i386-...`) — the driver only accepts a `mov-...` triple
  *     unless one is explicitly forced.
+ *   - `onProgress`: status callback. Emits `{ stage: 'instantiate-llc' }`
+ *     before Emscripten module init and `{ stage: 'compile-ir' }`
+ *     before llvm-mov-llc's main runs.
  * @returns {Promise<string>} mov-target x86-32 GAS-syntax assembly text
  */
 export async function compile(ir, opts = {}) {
     if (typeof ir !== 'string') {
         throw new TypeError('ir must be a string');
     }
-    const { name = 'in.ll', mtriple } = opts;
+    const { name = 'in.ll', mtriple, onProgress } = opts;
     assertSafeName(name);
     const args = [`/${name}`, '-o', '/out.s'];
     if (mtriple !== undefined) {
@@ -124,8 +132,10 @@ export async function compile(ir, opts = {}) {
         args.unshift(`-mtriple=${mtriple}`);
     }
     const buf = makeBuffered();
+    onProgress?.({ stage: 'instantiate-llc' });
     const llc = await createMovLlc(buf.opts);
     llc.FS.writeFile(`/${name}`, ir);
+    onProgress?.({ stage: 'compile-ir' });
     const exit = llc.callMain(args);
     if (exit !== 0) {
         throw new Error(`llvm-mov-llc exited ${exit}\n${buf.joined()}`);
@@ -207,7 +217,7 @@ export async function cToIR(source, opts = {}) {
     if (typeof source !== 'string') {
         throw new TypeError('source must be a string');
     }
-    const { name = 'in.c', optLevel = '0', clangFlags = [] } = opts;
+    const { name = 'in.c', optLevel = '0', clangFlags = [], onProgress } = opts;
     assertSafeName(name);
     if (!Array.isArray(clangFlags) || !clangFlags.every(f => typeof f === 'string')) {
         throw new TypeError('opts.clangFlags must be a string[]');
@@ -215,7 +225,9 @@ export async function cToIR(source, opts = {}) {
     const optFlags = flagsForOptLevel(optLevel);
     const createMovClang = await loadClang();
     const buf = makeBuffered();
-    const clang = await createMovClang(await clangModuleOpts(buf.opts));
+    const moduleOpts = await clangModuleOpts(buf.opts, onProgress);
+    onProgress?.({ stage: 'instantiate-clang' });
+    const clang = await createMovClang(moduleOpts);
     // Stage the file at MEMFS / and pass clang the *bare basename* (not
     // /<name>). Emscripten starts the wasm module with cwd = /, so a
     // bare basename resolves correctly, and the IR's `source_filename`
@@ -223,6 +235,7 @@ export async function cToIR(source, opts = {}) {
     // invocation produces — important for byte-identical parity.
     clang.FS.writeFile(`/${name}`, source);
     const llName = name.replace(/\.c$/, '') + '.ll';
+    onProgress?.({ stage: 'compile-c' });
     const exit = clang.callMain([
         ...CLANG_BASE_FLAGS, ...optFlags, ...clangFlags,
         name, '-o', llName,
@@ -253,5 +266,9 @@ export async function compileC(source, opts = {}) {
     // anything that isn't a `mov-...` triple unless `-mtriple` overrides
     // it, so we force-retarget here to the Mov default.
     const llName = (opts.name ?? 'in.c').replace(/\.c$/, '') + '.ll';
-    return compile(ir, { name: llName, mtriple: 'mov-unknown-linux-gnu' });
+    return compile(ir, {
+        name: llName,
+        mtriple: 'mov-unknown-linux-gnu',
+        onProgress: opts.onProgress,
+    });
 }

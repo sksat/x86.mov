@@ -117,24 +117,53 @@ function loadExample() {
 $ex.addEventListener('change', loadExample);
 loadExample();
 
+function setStatus(text) {
+    $status.className = 'status';
+    $status.textContent = text;
+}
+
+// Translate wrapper stage events into UI status text. The clang.wasm
+// fetch dominates the first compile after a cold load (~80 MB across
+// 4 chunks); subsequent compiles skip straight to instantiate-clang
+// because the merged buffer is cached in the wrapper.
+function onProgress(ev) {
+    switch (ev.stage) {
+        case 'fetch-clang':
+            setStatus(`fetching clang.wasm chunks ${ev.done}/${ev.total}…`);
+            break;
+        case 'instantiate-clang':
+            setStatus('instantiating clang…');
+            break;
+        case 'compile-c':
+            setStatus('compiling C → LLVM IR…');
+            break;
+        case 'instantiate-llc':
+            setStatus('instantiating llvm-mov-llc…');
+            break;
+        case 'compile-ir':
+            setStatus('compiling LLVM IR → mov-target asm…');
+            break;
+    }
+}
+
 $run.addEventListener('click', async () => {
     $run.disabled = true;
-    $status.className = 'status';
-    $status.textContent = 'compiling…';
+    setStatus('starting…');
     const t0 = performance.now();
     try {
         // Two stages so the IR appears in its own pane: cToIR runs the
         // wasm clang, compile runs the wasm llvm-mov-llc on its output.
-        const ir = await cToIR($in.value, { optLevel: $opt.value });
+        const ir = await cToIR($in.value, { optLevel: $opt.value, onProgress });
         $ll.textContent = ir;
         const asm = await compile(ir, {
             name: 'in.ll',
             // clang IR carries an i386 triple; force-retarget to mov.
             mtriple: 'mov-unknown-linux-gnu',
+            onProgress,
         });
         $out.textContent = asm;
         const dt = (performance.now() - t0).toFixed(0);
-        $status.textContent = `compiled in ${dt} ms (-O${$opt.value})`;
+        setStatus(`compiled in ${dt} ms (-O${$opt.value})`);
     } catch (e) {
         $out.textContent = '';
         $ll.textContent = '';

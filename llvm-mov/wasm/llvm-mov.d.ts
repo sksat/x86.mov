@@ -1,3 +1,23 @@
+/**
+ * Status event emitted by `onProgress` callbacks. Stages:
+ *  - `fetch-clang`: a clang.wasm chunk fetch completed (only emitted
+ *    when the deploy uses chunked artefacts; `done`/`total` track
+ *    progress; an initial event with `done: 0` fires before the first
+ *    chunk lands).
+ *  - `instantiate-clang` / `instantiate-llc`: the Emscripten module
+ *    is about to be instantiated.
+ *  - `compile-c`: clang's main() is about to run (C → LLVM IR).
+ *  - `compile-ir`: llvm-mov-llc's main() is about to run (IR → asm).
+ */
+export type ProgressEvent =
+    | { stage: 'fetch-clang'; done: number; total: number }
+    | { stage: 'instantiate-clang' }
+    | { stage: 'instantiate-llc' }
+    | { stage: 'compile-c' }
+    | { stage: 'compile-ir' };
+
+export type ProgressCallback = (ev: ProgressEvent) => void;
+
 export interface CompileOptions {
     /**
      * Basename used for the MEMFS input file. The native driver bakes
@@ -13,6 +33,8 @@ export interface CompileOptions {
      * `mov-...` triples unless one is explicitly forced.
      */
     mtriple?: string;
+    /** Status callback; see ProgressEvent for the stage sequence. */
+    onProgress?: ProgressCallback;
 }
 
 export type OptLevel = '0' | '1' | '2' | '3' | 's' | 'z';
@@ -24,6 +46,8 @@ export interface CompileCOptions {
     optLevel?: OptLevel;
     /** Extra clang command-line flags (e.g. `-D` / `-I`). */
     clangFlags?: string[];
+    /** Status callback; see ProgressEvent for the stage sequence. */
+    onProgress?: ProgressCallback;
 }
 
 /**
