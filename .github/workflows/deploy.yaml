@@ -236,9 +236,17 @@ jobs:
         working-directory: llvm-mov/wasm
         run: make build-wasm-llvm-mov-llc
 
+      # Invoke the staging script directly instead of `make stage-deploy`.
+      # The Makefile target declares `build` as a prerequisite, and `build`
+      # is .PHONY — calling it would re-run the wasm + native llvm-mov-llc
+      # builds even when both caches above hit, defeating the cache gates.
+      # The fzstd-install guard from the Makefile is inlined here so the
+      # script's `node_modules/fzstd/main.js` import still resolves.
       - name: stage llvm-mov/wasm into dist/llvm-mov/
         working-directory: llvm-mov/wasm
-        run: make stage-deploy
+        run: |
+          if [ ! -d node_modules/fzstd ]; then npm install; fi
+          ./scripts/stage-deploy.sh
 
       # ----------------------- explorer side -------------------------------
 
