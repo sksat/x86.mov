@@ -33,6 +33,15 @@ export interface LinkOptions {
    *  `extraLibs: ['c', ...]` plus a libc.a staged via `extraInputs`.
    *  Default `false`. */
   static?: boolean;
+  /** Which runtime objects the wrapper auto-wraps the user inputs in.
+   *  - `'movfuscator'` (default): historical LCC + mov-backend recipe,
+   *    `crt0 ... crtf crtd softfloat32`.
+   *  - `'none'`: just the user inputs; caller supplies `_start` and
+   *    any other runtime symbols. Matches the llvm-mov pipeline's
+   *    `_start_llvm.o ... stubs.o` recipe (see
+   *    `movie86/wasm/examples/sources/build-mandelbrot.sh`'s `build_llvm`).
+   */
+  runtime?: 'movfuscator' | 'none';
   /** Extra `-l<name>` flags appended after the per-mode defaults
    *  (`-lgcc -lc -lm` in dynamic mode, none in static mode). */
   extraLibs?: string[];

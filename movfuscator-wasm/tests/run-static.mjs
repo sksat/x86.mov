@@ -224,7 +224,77 @@ await runTest('static-linked ELF has no PT_INTERP / PT_DYNAMIC', async () => {
     if (types.includes(2)) throw new Error(`unexpected PT_DYNAMIC (types=${types.join(',')})`);
 });
 
-// --- Test 3: static + extraLibs places -l<name> AFTER runtime objects ---
+// --- Test 3: opts.runtime: 'none' drops the movfuscator CRT objects ---
+//
+// llvm-mov's pipeline supplies its own `_start.o` and doesn't link
+// against movfuscator's crt0/crtf/crtd/softfloat32. The wrapper exposes
+// that via `runtime: 'none'`. Pin byte-identical against a host
+// `/usr/bin/ld -static <user objs>` invocation that omits the
+// movfuscator runtime entirely.
+//
+// Use a minimal `_start` that calls `int 0x80 SYS_exit(42)` directly,
+// so the produced ELF is also runnable in principle. The byte-identical
+// check itself only verifies the wire shape; runtime correctness is
+// orthogonal.
+const MINIMAL_START_S = `
+.text
+.globl _start
+_start:
+    movl $42, %ebx
+    movl $1, %eax
+    int $0x80
+`;
+
+await runTest('runtime: none drops movfuscator CRT (byte-matches host ld)', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'movfuscator-static-none-'));
+    const sPath = join(tmp, '_start.s');
+    const oPath = join(tmp, '_start.o');
+    writeFileSync(sPath, MINIMAL_START_S);
+    const asRes = spawnSync('/usr/bin/as', [
+        '--32', '-mx86-used-note=no', '-o', oPath, sPath,
+    ]);
+    if (asRes.status !== 0) {
+        throw new Error(`as failed: ${asRes.stderr?.toString() || ''}`);
+    }
+    const startObj = readFileSync(oPath);
+
+    const wasmElf = await link(
+        { '_start.o': new Uint8Array(startObj) },
+        libs,
+        { static: true, runtime: 'none' },
+    );
+
+    // Host baseline: link the same _start.o with `-static`, no
+    // movfuscator runtime, same -L set as the wrapper.
+    const hostOut = join(tmp, 'out.elf');
+    const B = join(root, 'vendor/movfuscator/build');
+    const args = [
+        '-m', 'elf_i386', '--hash-style=gnu',
+        '-static',
+        '-L', B, '-L', `${B}/gcc/32`, '-L', '/usr/lib32', '-L', '/lib32',
+        oPath,
+        '-o', hostOut,
+    ];
+    const res = spawnSync('/usr/bin/ld', args, { encoding: 'buffer' });
+    if (res.status !== 0) {
+        throw new Error(
+            `host static (runtime=none) ld failed: ${res.stderr?.toString() || ''}`,
+        );
+    }
+    const hostElf = readFileSync(hostOut);
+    if (!bytesEqual(wasmElf, hostElf)) {
+        throw new Error(
+            `runtime=none ELF drift: wasm ${wasmElf.length} B vs host ${hostElf.length} B`,
+        );
+    }
+    // Sanity: PT_INTERP / PT_DYNAMIC still absent under runtime=none.
+    const types = elfPhdrTypes(wasmElf);
+    if (types.includes(2) || types.includes(3)) {
+        throw new Error(`runtime=none output unexpectedly carries dynamic phdrs: ${types.join(',')}`);
+    }
+});
+
+// --- Test 4: static + extraLibs places -l<name> AFTER runtime objects ---
 //
 // `ld -static` scans each archive once, left-to-right; a static
 // archive placed before the objects that reference its symbols won't

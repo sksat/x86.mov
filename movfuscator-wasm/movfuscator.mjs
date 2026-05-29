@@ -238,22 +238,28 @@ function assertSafeExtraInputPath(p, userObjPaths) {
  * Link one or more ELF32 i386 relocatable objects into a mov-only ELF
  * executable.
  *
- * Two link modes:
- *  - **dynamic** (default) — the historical shape. `ld` is invoked with
- *    `-dynamic-linker /lib/ld-linux.so.2` and the default
- *    `-lgcc -lc -lm`, so the produced ELF depends on glibc + ld.so at
- *    runtime. Suitable for any program that calls into libc.
- *  - **static** (`opts.static = true`) — `ld -static` over just the
- *    movfuscator runtime (crt0 + crtf + crtd + softfloat32) and the
- *    user objects. **No `-l...` defaults**, because the runtime is
- *    self-contained for `int 0x80` / mov-only-ABI programs (the same
- *    recipe used by `movie86/wasm/examples/sources/build-mandelbrot.sh`
- *    to produce the canvas_mandelbrot_mov.elf fixture). The output is
- *    free of PT_INTERP / PT_DYNAMIC so it can be loaded by movie86,
- *    which rejects dynamic ELFs at `Vm::new`. If the caller's program
- *    *does* need libc, they can re-introduce `extraLibs: ['c', ...]`
- *    plus a staged libc.a via `extraInputs` — the wrapper deliberately
- *    doesn't ship one to keep the default bundle the same size.
+ * Two orthogonal axes:
+ *
+ *  - `opts.static` (boolean) — link mode.
+ *    - `false` (default) — `-dynamic-linker /lib/ld-linux.so.2` +
+ *      default `-lgcc -lc -lm`. Produces a dynamic ELF that depends on
+ *      glibc + ld.so at runtime. Historical shape.
+ *    - `true` — `ld -static`, no default `-l...`. Output has no
+ *      PT_INTERP / PT_DYNAMIC, so it can be loaded by movie86 (which
+ *      rejects dynamic ELFs at `Vm::new`). The caller must resolve all
+ *      external symbols via `extraInputs` / `extraLibs`.
+ *
+ *  - `opts.runtime` (string) — which pre/post objects the wrapper
+ *    automatically wraps the user inputs in.
+ *    - `'movfuscator'` (default) — the historical movfuscator recipe:
+ *      `crt0.o <user objects> crtf.o crtd.o softfloat32.o`. Used by the
+ *      LCC + mov-backend pipeline this subproject is named for.
+ *    - `'none'` — just `<user objects>`. The caller supplies their own
+ *      `_start.o` and everything else. This is the recipe llvm-mov's
+ *      examples use (see `movie86/wasm/examples/sources/
+ *      build-mandelbrot.sh`'s `build_llvm` function), so the explorer
+ *      can drive `clang.wasm → llvm-mov-llc.wasm → as → link({
+ *      static: true, runtime: 'none' })` end-to-end.
  *
  * @param {Uint8Array | Uint8Array[] | Record<string,Uint8Array>} objs
  *   - Uint8Array: single .o (the original shape). Staged at
@@ -269,12 +275,15 @@ function assertSafeExtraInputPath(p, userObjPaths) {
  * @param {{
  *   name?: string,
  *   static?: boolean,
+ *   runtime?: 'movfuscator' | 'none',
  *   extraLibs?: string[],
  *   searchPaths?: string[],
  *   extraInputs?: Record<string,Uint8Array>,
  * }} [opts]
  *   - `name`: only used when `objs` is a single Uint8Array. Default `a.out.o`.
  *   - `static`: link statically (see above). Default `false`.
+ *   - `runtime`: which runtime objects to auto-wrap the user inputs in.
+ *     Default `'movfuscator'`.
  *   - `extraLibs`: appended as `-l<name>` (after the per-mode defaults).
  *   - `searchPaths`: appended as `-L<path>` (after the default `-L/movfuscator
  *     -L/usr/lib32 -L/lib32`).
@@ -287,6 +296,7 @@ export async function link(objs, libs, opts = {}) {
     const {
         name = 'a.out.o',
         static: staticLink = false,
+        runtime = 'movfuscator',
         extraLibs = [],
         searchPaths = [],
         extraInputs = {},
@@ -303,6 +313,11 @@ export async function link(objs, libs, opts = {}) {
     }
     if (typeof staticLink !== 'boolean') {
         throw new TypeError('opts.static must be boolean');
+    }
+    if (runtime !== 'movfuscator' && runtime !== 'none') {
+        throw new TypeError(
+            `opts.runtime must be 'movfuscator' | 'none', got ${JSON.stringify(runtime)}`,
+        );
     }
 
     if (!libs) {
@@ -358,16 +373,23 @@ export async function link(objs, libs, opts = {}) {
     const trailerLibArgs = staticLink
         ? extraLibs.map(l => `-l${l}`)
         : [];
+    // Runtime selection: 'movfuscator' wraps user inputs in the
+    // historical `crt0 ... crtf crtd softfloat32` recipe; 'none' just
+    // emits the user inputs, leaving _start / runtime symbols to the
+    // caller (the llvm-mov pipeline's pattern).
+    const runtimePrefix = runtime === 'movfuscator' ? ['/movfuscator/crt0.o'] : [];
+    const runtimeSuffix = runtime === 'movfuscator'
+        ? ['/movfuscator/crtf.o', '/movfuscator/crtd.o', '/movfuscator/softfloat32.o']
+        : [];
     const cmd = [
         '-m', 'elf_i386', '--hash-style=gnu',
         ...modeArgs,
         '-L/movfuscator', '-L/usr/lib32', '-L/lib32',
         ...searchPaths.map(p => `-L${p}`),
         ...headerLibArgs,
-        '/movfuscator/crt0.o',
+        ...runtimePrefix,
         ...userObjs.map(({ name: n }) => `/${n}`),
-        '/movfuscator/crtf.o', '/movfuscator/crtd.o',
-        '/movfuscator/softfloat32.o',
+        ...runtimeSuffix,
         ...trailerLibArgs,
         '-o', '/out.elf',
     ];
