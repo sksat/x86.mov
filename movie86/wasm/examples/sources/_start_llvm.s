@@ -1,12 +1,23 @@
+/* _start for llvm-mov-built canvas examples.
+ *
+ * Originally `call main; mov [0x1FFE00FE], eax`. The `call main` was
+ * the only non-mov-non-jmp control flow left in the linked ELF
+ * (everything else gets rewritten by llvm-mov stage 7d3's CALL32d →
+ * JMP32d_CALL pass). Per upstream issue #42 ("100% mov+jmp"), the
+ * fix:
+ *
+ *   - `_start: jmp main`        — entry transfers to main with no
+ *                                 return address pushed.
+ *   - `main` calls a `noreturn` `exit(int)` stub at its tail that
+ *                                 writes to the ABI-exit page
+ *                                 (0x1FFE00FE), so clang elides the
+ *                                 epilogue `ret`.
+ *
+ * Net effect: .text has zero `call` and zero `ret` opcodes.
+ */
+
 .intel_syntax noprefix
 .section .text
 .globl _start
 _start:
-    call main
-    # mov-only ABI exit (call 0x0FE): eax = main()'s return value.
-    # Replaces `mov ebx, eax ; mov eax, 1 ; int 0x80` so the
-    # toolchain-generated _start can't ever surface an `int` to the
-    # engine — turbo86 catches the SIGSEGV on this mov and emits
-    # Outbound{Exit{code}}, movie86 routes via AbiHost::abi_call →
-    # Fault::Exit.
-    mov [0x1FFE00FE], eax
+    jmp main
