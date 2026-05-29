@@ -46,7 +46,10 @@ test('staging movfuscator compile populates IR/asm/ELF panes but surfaces the dy
         timeout: 120_000,
     });
 
-    // Inspect path works.
+    // Inspect path works. The ELF hex dump lives inside the `binary`
+    // tab of the Output card (default tab is `asm`); click into it so
+    // the dump mounts.
+    await page.getByTestId('output-tab-binary').click();
     await expect(page.getByTestId('elf-hexdump')).toBeVisible({ timeout: 5_000 });
 
     // Run path is intentionally blocked today on the movfuscator side —
