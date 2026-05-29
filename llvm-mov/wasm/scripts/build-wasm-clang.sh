@@ -147,6 +147,15 @@ fi
 rm -f "$out"/clang.wasm.part-*
 ( cd "$out" && split -b 24M -d -a 1 clang.wasm clang.wasm.part- )
 
+# Content-hash of clang.wasm (first 12 hex of SHA-256). stage-deploy.sh
+# embeds this in the deployed chunk filenames so the URLs change on a
+# content bump — the browser's HTTP cache (with `Cache-Control:
+# immutable` set via `_headers`) then keeps the bytes forever between
+# page loads, and a real binary update naturally invalidates the
+# cache via the new URL. Local dev doesn't care about caching, so
+# this file is informational here.
+sha256sum "$out/clang.wasm" | awk '{ print substr($1, 1, 12) }' > "$out/clang.wasm.hash"
+
 # Reuse the {"type":"module"} marker produced by the llvm-mov-llc
 # staging step (build/package.json already exists if that script ran);
 # write it ourselves otherwise.

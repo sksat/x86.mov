@@ -45,7 +45,7 @@ required=(
     "$here/llvm-mov.mjs" "$here/llvm-mov.d.ts" "$here/index.html"
     "$here/wasm-config.js"
     "$here/build/llvm-mov-llc.js" "$here/build/llvm-mov-llc.wasm"
-    "$here/build/clang.js"
+    "$here/build/clang.js" "$here/build/clang.wasm.hash"
     "$here/build/package.json"
 )
 for p in "${required[@]}"; do
@@ -90,21 +90,47 @@ cp "$here/build/llvm-mov-llc.js"   \
    "$here/build/package.json"      \
    "$sub/build/"
 
-# Stage the chunks; clang.wasm (the unsplit version) is deliberately
-# NOT copied — CF Pages would reject it for being over the 25 MiB
-# per-file limit.
-cp "$here"/build/clang.wasm.part-* "$sub/build/"
+# Read the content-hash build-wasm-clang.sh stamped on clang.wasm and
+# rename the chunks with it as we copy. The hashed filename lets us set
+# `Cache-Control: immutable` on the chunks via `_headers` below: the
+# browser keeps them forever, and a binary bump produces new URLs that
+# bypass the cached entries cleanly.
+hash="$(tr -d ' \n' < "$here/build/clang.wasm.hash")"
+case "$hash" in
+    [0-9a-f]*) ;;
+    *)
+        echo "clang.wasm.hash content $hash is not a hex digest" >&2
+        exit 1 ;;
+esac
+for chunk in "$here"/build/clang.wasm.part-*; do
+    base="$(basename "$chunk")"                       # clang.wasm.part-0
+    suffix="${base#clang.wasm.}"                      # part-0
+    cp "$chunk" "$sub/build/clang.wasm-${hash}.${suffix}"
+done
 
-# Tell the wrapper how many chunks to fetch by sed'ing the const value
-# in the staged wasm-config.js. The source stays at `null` so local dev
-# keeps using the single clang.wasm.
-sed -i "s|^export const CLANG_WASM_CHUNKS = null;|export const CLANG_WASM_CHUNKS = $chunk_count;|" \
+# Tell the wrapper how many chunks to fetch, and at what hash, by
+# sed'ing the const values in the staged wasm-config.js. Source stays
+# at `null` so local dev keeps using the single clang.wasm.
+sed -i \
+    -e "s|^export const CLANG_WASM_CHUNKS = null;|export const CLANG_WASM_CHUNKS = $chunk_count;|" \
+    -e "s|^export const CLANG_WASM_VERSION = null;|export const CLANG_WASM_VERSION = '$hash';|" \
     "$sub/wasm-config.js"
-if ! grep -q "CLANG_WASM_CHUNKS = $chunk_count;" "$sub/wasm-config.js"; then
+if ! grep -q "CLANG_WASM_CHUNKS = $chunk_count;" "$sub/wasm-config.js" \
+   || ! grep -q "CLANG_WASM_VERSION = '$hash';" "$sub/wasm-config.js"; then
     echo "wasm-config.js placeholder substitution failed" >&2
     exit 1
 fi
 
+# Cloudflare Pages `_headers` only takes one file per project at the
+# dist root. We're the first subproject to use it; if a sibling later
+# needs its own rules, refactor into an append-and-dedupe shape. The
+# hashed clang.wasm chunk pattern caches immutably — content bumps
+# rotate the URL so a stale cache can't pin the user to an old binary.
+cat > "$dist/_headers" <<'EOF'
+/llvm-mov/build/clang.wasm-*.part-*
+  Cache-Control: public, max-age=31536000, immutable
+EOF
+
 bytes=$(du -sb "$sub" | cut -f1)
 files=$(find "$sub" -type f | wc -l)
-echo "staged $files files ($chunk_count clang chunks) / $(numfmt --to=iec --suffix=B "$bytes") into $sub"
+echo "staged $files files ($chunk_count clang chunks @ $hash) / $(numfmt --to=iec --suffix=B "$bytes") into $sub"

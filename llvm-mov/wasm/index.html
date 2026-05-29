@@ -33,6 +33,13 @@
   pre.out { background: #f7f7f7; }
   .status { font-size: 0.85rem; color: #666; }
   .status.err { color: #b00; }
+  .timing {
+      font-size: 0.8rem;
+      color: #888;
+      margin: 0.1rem 0 0.5rem;
+      font-variant-numeric: tabular-nums;
+  }
+  .timing .stage { color: #555; }
   .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
   @media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   @media (max-width: 700px)  { .grid { grid-template-columns: minmax(0, 1fr); } }
@@ -69,6 +76,7 @@
   </select>
   <span class="status" id="status"></span>
 </div>
+<div class="timing" id="timing"></div>
 
 <div class="grid">
   <div>
@@ -117,39 +125,87 @@ function loadExample() {
 $ex.addEventListener('change', loadExample);
 loadExample();
 
+const $timing = document.getElementById('timing');
+
 function setStatus(text) {
     $status.className = 'status';
     $status.textContent = text;
 }
 
+// Labels for stage breakdown rendered below the status line. Order
+// matters: it's the visual order in the timing element.
+const STAGE_LABEL = {
+    'fetch-clang':       'fetch clang',
+    'instantiate-clang': 'instantiate clang',
+    'compile-c':         'compile c→ir',
+    'instantiate-llc':   'instantiate llc',
+    'compile-ir':        'compile ir→asm',
+};
+
+function makeStageTracker() {
+    const durations = new Map(); // preserves insertion order — first-seen stage order
+    let last = null;             // { stage, t }
+    return {
+        onEvent(stage) {
+            const now = performance.now();
+            if (last && last.stage !== stage) {
+                durations.set(last.stage, (durations.get(last.stage) || 0) + (now - last.t));
+                last = { stage, t: now };
+            } else if (!last) {
+                last = { stage, t: now };
+            }
+            // Same-stage events (e.g. successive fetch-clang chunks)
+            // don't reset the timer.
+        },
+        finish() {
+            if (last) {
+                durations.set(last.stage, (durations.get(last.stage) || 0) + (performance.now() - last.t));
+            }
+            return durations;
+        },
+    };
+}
+
+function renderTimingHTML(durations) {
+    const parts = [];
+    for (const [stage, ms] of durations) {
+        if (ms < 1) continue;
+        const label = STAGE_LABEL[stage] ?? stage;
+        parts.push(
+            `<span class="stage">${label}</span> ${Math.round(ms)} ms`,
+        );
+    }
+    return parts.join(' · ');
+}
+
 // Translate wrapper stage events into UI status text. The clang.wasm
 // fetch dominates the first compile after a cold load (~80 MB across
-// 4 chunks); subsequent compiles skip straight to instantiate-clang
-// because the merged buffer is cached in the wrapper.
-function onProgress(ev) {
+// 4 chunks); subsequent compiles in the same tab skip straight to
+// instantiate-clang because the merged buffer is cached in the
+// wrapper. Across page loads the browser's HTTP cache reuses the
+// hashed chunk files via the `Cache-Control: immutable` _headers.
+function statusFor(ev) {
     switch (ev.stage) {
-        case 'fetch-clang':
-            setStatus(`fetching clang.wasm chunks ${ev.done}/${ev.total}…`);
-            break;
-        case 'instantiate-clang':
-            setStatus('instantiating clang…');
-            break;
-        case 'compile-c':
-            setStatus('compiling C → LLVM IR…');
-            break;
-        case 'instantiate-llc':
-            setStatus('instantiating llvm-mov-llc…');
-            break;
-        case 'compile-ir':
-            setStatus('compiling LLVM IR → mov-target asm…');
-            break;
+        case 'fetch-clang':       return `fetching clang.wasm chunks ${ev.done}/${ev.total}…`;
+        case 'instantiate-clang': return 'instantiating clang…';
+        case 'compile-c':         return 'compiling C → LLVM IR…';
+        case 'instantiate-llc':   return 'instantiating llvm-mov-llc…';
+        case 'compile-ir':        return 'compiling LLVM IR → mov-target asm…';
     }
+    return null;
 }
 
 $run.addEventListener('click', async () => {
     $run.disabled = true;
+    $timing.textContent = '';
     setStatus('starting…');
     const t0 = performance.now();
+    const tracker = makeStageTracker();
+    const onProgress = (ev) => {
+        tracker.onEvent(ev.stage);
+        const s = statusFor(ev);
+        if (s !== null) setStatus(s);
+    };
     try {
         // Two stages so the IR appears in its own pane: cToIR runs the
         // wasm clang, compile runs the wasm llvm-mov-llc on its output.
@@ -164,11 +220,13 @@ $run.addEventListener('click', async () => {
         $out.textContent = asm;
         const dt = (performance.now() - t0).toFixed(0);
         setStatus(`compiled in ${dt} ms (-O${$opt.value})`);
+        $timing.innerHTML = renderTimingHTML(tracker.finish());
     } catch (e) {
         $out.textContent = '';
         $ll.textContent = '';
         $status.className = 'status err';
         $status.textContent = String(e.message || e);
+        $timing.textContent = '';
     } finally {
         $run.disabled = false;
     }

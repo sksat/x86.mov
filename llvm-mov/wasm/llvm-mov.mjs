@@ -16,7 +16,7 @@
 // non-reusable. Same shape as movfuscator-wasm's wrappers.
 
 import createMovLlc from './build/llvm-mov-llc.js';
-import { CLANG_WASM_CHUNKS } from './wasm-config.js';
+import { CLANG_WASM_CHUNKS, CLANG_WASM_VERSION } from './wasm-config.js';
 
 // Clang is lazy-loaded so callers who only need `.ll → .s` (i.e. the
 // `compile()` API) can run without the 80 MB clang.wasm artifact
@@ -42,11 +42,19 @@ let _chunkedWasm = null;
 async function fetchChunkedClangWasm(count, onProgress) {
     if (_chunkedWasm) return _chunkedWasm;
     const base = new URL('./build/', import.meta.url);
+    // Deployed chunks carry a content-hash in their filename
+    // (clang.wasm-{hash}.part-i) so a binary bump invalidates the
+    // browser's immutable HTTP cache automatically. Local dev (where
+    // CLANG_WASM_VERSION stays null) uses the unhashed names.
+    const filename = (i) =>
+        CLANG_WASM_VERSION
+            ? `clang.wasm-${CLANG_WASM_VERSION}.part-${i}`
+            : `clang.wasm.part-${i}`;
     let done = 0;
     onProgress?.({ stage: 'fetch-clang', done, total: count });
     const buffers = await Promise.all(
         Array.from({ length: count }, async (_, i) => {
-            const url = new URL(`clang.wasm.part-${i}`, base);
+            const url = new URL(filename(i), base);
             const r = await fetch(url);
             if (!r.ok) {
                 throw new Error(`fetch ${url}: ${r.status} ${r.statusText}`);
