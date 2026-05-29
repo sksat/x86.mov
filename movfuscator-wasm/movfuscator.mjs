@@ -340,16 +340,16 @@ export async function link(objs, libs, opts = {}) {
  * @param {string | Record<string,string>} source
  *   - string: single .c. Equivalent to
  *     `link(await assemble(await compile(source, headers)), undefined, linkOpts)`.
- *   - Record<string,string>: multi-file. Each `[basename, .c text]` is
- *     compiled + assembled independently and the resulting .o set is
- *     handed to link() in iteration order. The `basename` shows up in
- *     the resulting ELF's `.symtab`.
+ *   - Record<string,string>: multi-file. Sources are concatenated into a
+ *     single translation unit (with `#line` markers preserving per-file
+ *     diagnostics), compiled once, and the resulting single .o is linked.
+ *     This sidesteps an upstream movfuscator cross-`.o` ABI bug — see
+ *     issue #9 / the comment in this function for the long story.
  * @param {Record<string,string>} [headers] `name.h` → content map shared
  *   across every .c in `source`. Header sidecars are staged in MEMFS root
  *   so `#include "name.h"` resolves.
  * @param {object} [linkOpts] forwarded to link() (`name`, `extraLibs`,
- *   `searchPaths`, `extraInputs`). With multi-file `source` the `name`
- *   option is ignored — basenames come from the source map.
+ *   `searchPaths`, `extraInputs`).
  * @returns {Promise<Uint8Array>} ELF32 executable bytes
  */
 export async function compileToElf(source, headers = {}, linkOpts = {}) {
@@ -359,13 +359,62 @@ export async function compileToElf(source, headers = {}, linkOpts = {}) {
     if (!source || typeof source !== 'object') {
         throw new TypeError('source must be a string or Record<string,string>');
     }
-    const objs = {};
-    for (const [name, src] of Object.entries(source)) {
-        assertSafeName(name, 'source basename');
-        objs[name.endsWith('.o') ? name : `${name}.o`] =
-            await assemble(await compile(src, headers));
+    const entries = Object.entries(source);
+    for (const [name] of entries) assertSafeName(name, 'source basename');
+    if (entries.length === 0) {
+        throw new TypeError('source must have at least one entry');
     }
-    return link(objs, undefined, linkOpts);
+    // Multi-source: amalgamate into one TU. Upstream movfuscator decides
+    // the internal-vs-external CALL protocol per translation unit
+    // (movfuscator.c:3538 — `ext = !s || s->sclass == EXTERN`). When two
+    // `.o`s defined in separate TUs reference each other, the caller
+    // emits the libc-style external-trampoline protocol while the callee
+    // waits on the internal compare protocol, and `master_loop`
+    // deadlocks. Routing every CALL through a single TU keeps both sides
+    // on the internal protocol — almost. The combine alone isn't enough:
+    // a leftover `extern int add(...)` declaration in one piece will
+    // still mark the symbol's sclass as EXTERN and re-trigger the bug
+    // even when the definition lives in the very same amalgam.
+    // Workaround: scan every source for top-level function definitions
+    // and prepend a non-`extern` prototype (`retType name();` K&R form)
+    // for each one. C allows a non-`extern` prototype to follow a later
+    // ANSI prototype with full args, and lcc treats the resulting symbol
+    // as non-EXTERN — which is exactly what we want at every CALL site.
+    const seen = new Set();
+    const shadowProtos = [];
+    for (const [, src] of entries) {
+        for (const def of scanDefinedFunctions(src)) {
+            if (seen.has(def.name)) continue;
+            seen.add(def.name);
+            shadowProtos.push(`${def.retType} ${def.name}();`);
+        }
+    }
+    const amalgam =
+        (shadowProtos.length ? shadowProtos.join('\n') + '\n' : '') +
+        entries
+            .map(([name, src]) => `#line 1 "${name}.c"\n${src}`)
+            .join('\n');
+    return link(await assemble(await compile(amalgam, headers)), undefined, linkOpts);
+}
+
+// Best-effort scanner for top-level function definitions in a `.c` source.
+// Matches the typical fixture style — `[storage/qualifier]* returnType name(args) {`
+// on a single line, no leading indentation. Misses K&R definitions, defs
+// whose header spans multiple lines, and function-pointer return types;
+// those aren't represented in our current fixtures and falling back to a
+// missing shadow on them just reproduces the original deadlock without
+// silently mis-compiling.
+function scanDefinedFunctions(src) {
+    const re = /^([A-Za-z_][\w\s*]*?)\b([A-Za-z_]\w*)\s*\([^)]*\)\s*\{/gm;
+    const defs = [];
+    let m;
+    while ((m = re.exec(src)) !== null) {
+        const retType = m[1].trim();
+        const name = m[2];
+        if (retType.length === 0) continue;
+        defs.push({ retType, name });
+    }
+    return defs;
 }
 
 /**

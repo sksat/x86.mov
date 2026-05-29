@@ -11,7 +11,7 @@
 // + multi-<group>-helper.c) is linked together; the .o files come from
 // the committed tests/goldens-o/ tree.
 
-import { existsSync, readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, chmodSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -174,6 +174,46 @@ await runTest('compileToElf (multi-source)', async () => {
     if (!h || 'raw' in h) throw new Error(`unexpected ELF header: ${JSON.stringify(h)}`);
     if (h.type !== 'EXEC (executable)') throw new Error(`expected EXEC, got ${h.type}`);
     if (h.machine !== 'i386')          throw new Error(`expected i386, got ${h.machine}`);
+});
+
+// --- Test 5: compileToElf multi-source produces a runnable ELF ---
+//
+// Upstream movfuscator has a cross-`.o` ABI bug (issue #9): the caller
+// emits a libc-style external call protocol while the callee waits on
+// the internal compare protocol, so master_loop deadlocks. The wrapper
+// works around that for the multi-source compileToElf path by feeding a
+// single TU to the codegen, which keeps every CALL on the internal
+// protocol.
+//
+// Native-execution signal: the program must complete on its own (signal
+// === null). Upstream's crt0 exits with the dynamic linker's status —
+// typically 1, not main()'s return value — so we don't pin the exact
+// exit code, only that the process didn't have to be killed.
+await runTest('compileToElf (multi-source) runs natively without hanging', async () => {
+    const { compileToElf } = await import(wrapper);
+    const aSrc = readFileSync(join(root, 'tests/fixtures/multi-add.c'), 'utf8');
+    const bSrc = readFileSync(join(root, 'tests/fixtures/multi-add-helper.c'), 'utf8');
+    const elf = await compileToElf({
+        'multi-add': aSrc,
+        'multi-add-helper': bSrc,
+    });
+    const tmp = mkdtempSync(join(tmpdir(), 'movfuscator-multi-run-'));
+    const elfPath = join(tmp, 'multi-add.elf');
+    writeFileSync(elfPath, elf);
+    chmodSync(elfPath, 0o755);
+    const res = spawnSync(elfPath, [], { timeout: 5000, encoding: 'buffer' });
+    if (res.signal !== null) {
+        throw new Error(
+            `multi-add ELF was killed by ${res.signal} (timed out — cross-.o deadlock?)`
+            + `\n  ${elfPath}`,
+        );
+    }
+    if (typeof res.status !== 'number') {
+        throw new Error(
+            `multi-add ELF did not exit cleanly (status=${res.status}, signal=${res.signal})`
+            + `\n  ${elfPath}`,
+        );
+    }
 });
 
 console.log();
