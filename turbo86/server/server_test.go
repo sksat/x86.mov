@@ -328,10 +328,18 @@ func sendInbound(t *testing.T, ctx context.Context, ws *websocket.Conn, msg prot
 // TestE2E_LogsAreCoherentForOneSession is the structural test for the
 // session-logging surface. A LoadContext → Exit{42} session should
 // produce: connect, runner ready, inbound LoadContext, outbound Exit,
-// events summary, session end ok — all tagged with the same 8-hex
-// session id. Stdout/Stderr content stays out of the log (only
-// byte counts) by design — guests should not be able to leak data
-// into operator logs.
+// events summary, session end ok — all tagged with one 8-hex session
+// id. Stdout/Stderr content stays out of the log (only byte counts)
+// by design — guests should not be able to leak data into operator
+// logs.
+//
+// Identifying *our* session id by the last `connect:` line in the
+// captured buffer is deliberate: when the test runner replays prior
+// tests' deferred handlers (or another in-process WS connection
+// fires concurrently), unrelated `[xxxxxxxx]` ids may show up too.
+// The assertion is "every expected substring appears with our id",
+// not "the buffer contains only our id" — that's strictly testable
+// without false positives from log-buffer contamination.
 func TestE2E_LogsAreCoherentForOneSession(t *testing.T) {
 	var buf safeBuffer
 	prev := log.Default().Writer()
@@ -366,39 +374,42 @@ func TestE2E_LogsAreCoherentForOneSession(t *testing.T) {
 	// final "session end" log line gets emitted before we assert.
 	_ = ws.Close(websocket.StatusNormalClosure, "")
 
-	// A short wait covers the goroutine-scheduling tail; without it
-	// the "session end" log line can race the assertion below.
-	deadline := time.Now().Add(500 * time.Millisecond)
+	// Wait for the per-session "session end" line to land in the
+	// buffer with our session's id — without this, the assertions
+	// below race the handler goroutine's final log flush.
+	connectRE := regexp.MustCompile(`\[([0-9a-f]{8})\] connect: remote=`)
+	var sessID string
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if strings.Contains(buf.String(), "session end") {
-			break
+		text := buf.String()
+		matches := connectRE.FindAllStringSubmatch(text, -1)
+		if len(matches) > 0 {
+			candidate := matches[len(matches)-1][1]
+			// Only treat the connect as ours once its session-end
+			// log has also landed; otherwise we may pick the right
+			// id but assert against an incomplete log.
+			if strings.Contains(text, "["+candidate+"] session end") {
+				sessID = candidate
+				break
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if sessID == "" {
+		t.Fatalf("did not see our session's connect+session-end before deadline; log:\n%s",
+			buf.String())
+	}
 
 	logText := buf.String()
-
-	// All session log lines must share a single 8-hex session id.
-	ids := regexp.MustCompile(`\[([0-9a-f]{8})\]`).FindAllStringSubmatch(logText, -1)
-	if len(ids) == 0 {
-		t.Fatalf("expected at least one [session-id] log line, got:\n%s", logText)
-	}
-	first := ids[0][1]
-	for _, m := range ids {
-		if m[1] != first {
-			t.Errorf("multiple session ids in one session log: %q vs %q", first, m[1])
-			break
-		}
-	}
-
+	tag := "[" + sessID + "] "
 	for _, want := range []string{
-		"connect: remote=",
-		"runner: ready",
-		"inbound LoadContext: mode=host",
+		tag + "connect: remote=",
+		tag + "runner: ready",
+		tag + "inbound LoadContext: mode=host",
 		"eip=0x8048000",
-		"outbound Exit: code=42",
-		"events: total=1",
-		"session end: ok",
+		tag + "outbound Exit: code=42",
+		tag + "events: total=1",
+		tag + "session end: ok",
 	} {
 		if !strings.Contains(logText, want) {
 			t.Errorf("log missing %q\nfull log:\n%s", want, logText)
@@ -407,9 +418,10 @@ func TestE2E_LogsAreCoherentForOneSession(t *testing.T) {
 
 	// Stdout content must NOT leak into the log — guests shouldn't be
 	// able to push data into the operator's transcript. This program
-	// emits no stdout so we just sanity-check the counter format.
-	if !strings.Contains(logText, "stdout=0B") {
-		t.Errorf("log should include `stdout=0B` summary, got:\n%s", logText)
+	// emits no stdout so we just sanity-check the counter format on
+	// our session's events line.
+	if !strings.Contains(logText, tag+"events: total=1 stdout=0B") {
+		t.Errorf("expected %q to include stdout=0B, got:\n%s", tag+"events:", logText)
 	}
 }
 
