@@ -138,11 +138,11 @@ fn decode_ff_group(rest: &[u8]) -> Result<(Insn, u8), Fault> {
     if m.reg != 4 {
         return Err(Fault::UnknownOpcode(0xFF));
     }
-    // jmp r/m32. We've only seen the memory-indirect form
-    // (mod ≠ 11) in movfuscator's crtf.plt; reg-indirect would land
-    // here too and is straightforward to add when needed.
+    // jmp r/m32. mod=11 is the register-indirect form (`jmp ecx`
+    // etc.); the llvm-mov canvas stubs use this as `ret`'s mov+jmp
+    // replacement (`pop ecx ; jmp ecx`, see upstream issue #42).
     if m.mod_ == 0b11 {
-        return Err(Fault::UnknownOpcode(0xFF));
+        return Ok((Insn::JmpReg32(Reg32::from_index(m.rm)), 2));
     }
     let (ea, ea_extra) = parse_effective_address_32(m.mod_, m.rm, &rest[2..])?;
     Ok((Insn::JmpIndirectMem32(ea), 2 + ea_extra))
@@ -911,6 +911,16 @@ mod tests {
         // e9 fb ff ff ff → jmp -5 (i.e. an infinite loop on a 5-byte jmp)
         let (insn, _) = decode(&[0xe9, 0xfb, 0xff, 0xff, 0xff]).unwrap();
         assert_eq!(insn, Insn::JmpRel32(-5));
+    }
+
+    #[test]
+    fn jmp_reg32_via_ff_4_modrm_11() {
+        // ff e1  →  jmp ecx   (FF /4, mod=11, r/m=001 = ECX)
+        // Used by the llvm-mov canvas stubs as the mov+jmp replacement
+        // for `ret` so the resulting .text has no `ret` opcode.
+        let (insn, len) = decode(&[0xff, 0xe1]).unwrap();
+        assert_eq!(len, 2);
+        assert_eq!(insn, Insn::JmpReg32(Reg32::Ecx));
     }
 
     // --- int n ---
