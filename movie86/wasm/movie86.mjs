@@ -179,7 +179,19 @@ export function snapshotContext(vm) {
                 bytes: s.regionBytesAt(i),
             });
         }
-        return { regs, regions };
+        // Reservations: address ranges the guest mmap_request'd that
+        // carry no bytes (the page may still be all-zero). turbo86
+        // mmaps each one at LoadContext so the next guest write
+        // doesn't SIGSEGV on an unmapped page.
+        const reservations = [];
+        const m = s.reservationCount;
+        for (let i = 0; i < m; i++) {
+            reservations.push({
+                addr: s.reservationAddrAt(i),
+                size: s.reservationSizeAt(i),
+            });
+        }
+        return { regs, regions, reservations };
     } finally {
         s.free();
     }
@@ -228,12 +240,18 @@ function base64ToBytes(b64) {
  * the guest depends on the same software signal model movie86 uses
  * (movfuscator-style `mov cs, ax` → SIGILL dispatch).
  *
+ * `memUpdateIntervalMs` (default 0 = disabled) asks turbo86 to emit
+ * `MemUpdate` Outbound events at the given cadence — progressive
+ * display works by applying those updates to the local Vm so the
+ * canvas pane keeps up with the in-flight guest.
+ *
  * @param {{regs: object, regions: Array<{addr: number, bytes: Uint8Array}>}} ctx
  * @param {'host'|'trap'} [mode='host']
+ * @param {number} [memUpdateIntervalMs=0]
  * @returns {string} JSON-encoded frame, ready for WebSocket.send().
  */
-export function makeLoadContextMessage(ctx, mode = 'host') {
-    return JSON.stringify({
+export function makeLoadContextMessage(ctx, mode = 'host', memUpdateIntervalMs = 0) {
+    const msg = {
         type: 'load_context',
         context: {
             regs: ctx.regs,
@@ -243,7 +261,20 @@ export function makeLoadContextMessage(ctx, mode = 'host') {
             })),
         },
         mode,
-    });
+    };
+    // Reservations are optional; emit only when non-empty so the wire
+    // shape stays byte-for-byte with Go's `omitempty` on the Reservations
+    // field for snapshots that don't use it.
+    if (ctx.reservations && ctx.reservations.length > 0) {
+        msg.context.reservations = ctx.reservations.map(r => ({
+            addr: r.addr,
+            size: r.size,
+        }));
+    }
+    if (memUpdateIntervalMs > 0) {
+        msg.mem_update_interval_ms = memUpdateIntervalMs;
+    }
+    return JSON.stringify(msg);
 }
 
 /**
@@ -324,6 +355,19 @@ export function parseOutboundMessage(data) {
                 bytes: base64ToBytes(r.bytes),
             }));
             return { type: 'paused', regs: m.regs, regions, signal: m.signal, reason: m.reason };
+        }
+        case 'video_mode': return { type: 'video_mode', mode: m.mode };
+        case 'mem_update': {
+            // Periodic mid-session snapshot — same shape as paused.regions
+            // but no regs/signal/reason. Frontend applies the regions to
+            // its local Vm via `vm.writeMem`, so the canvas pane keeps
+            // up with the in-flight guest without waiting for terminal
+            // Paused / Exit.
+            const regions = (m.regions ?? []).map(r => ({
+                addr: r.addr,
+                bytes: base64ToBytes(r.bytes),
+            }));
+            return { type: 'mem_update', regions };
         }
         default:
             throw new Error(`unknown turbo86 outbound type ${JSON.stringify(m.type)}`);

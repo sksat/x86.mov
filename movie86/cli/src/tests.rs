@@ -273,6 +273,7 @@ fn apply_context_zeros_extent_before_overlaying_regions() {
             ..Default::default()
         },
         regions: Vec::new(),
+        reservations: Vec::new(),
     };
     apply_context_to_fresh_extent(&ctx, &mut cpu, &mut mem).unwrap();
     assert_eq!(
@@ -302,6 +303,7 @@ fn apply_context_overlays_regions_after_zeroing() {
             addr: 0x1100,
             bytes: vec![0xaa, 0xbb, 0xcc, 0xdd],
         }],
+        reservations: Vec::new(),
     };
     apply_context_to_fresh_extent(&ctx, &mut cpu, &mut mem).unwrap();
     assert_eq!(mem.read_u32(0x1100).unwrap(), 0xddcc_bbaa);
@@ -329,6 +331,7 @@ fn apply_context_drains_pending_log_writes_so_setup_does_not_taint_step_zero() {
             addr: 0x1100,
             bytes: vec![0xff; 8],
         }],
+        reservations: Vec::new(),
     };
     apply_context_to_fresh_extent(&ctx, &mut cpu, &mut mem).unwrap();
     assert!(

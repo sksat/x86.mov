@@ -140,6 +140,7 @@ fn handover_load_context_exit_round_trip_through_real_turbo86() {
             addr: ENTRY,
             bytes: vec![0xcd, 0x80], // int 0x80
         }],
+        reservations: vec![],
     };
 
     let mut client = HandoverClient::connect(&url).expect("connect turbo86");

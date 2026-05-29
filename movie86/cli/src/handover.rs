@@ -12,7 +12,7 @@
 //! use movie86::{Context, Regs};
 //!
 //! let mut client = HandoverClient::connect("ws://127.0.0.1:1234").unwrap();
-//! let ctx = Context { regs: Regs::default(), regions: vec![] };
+//! let ctx = Context { regs: Regs::default(), regions: vec![], reservations: vec![] };
 //! client.send(&Inbound::LoadContext { context: ctx, mode: Mode::Host }).unwrap();
 //! while let Ok(Some(ev)) = client.recv() {
 //!     match ev {
@@ -243,6 +243,7 @@ mod tests {
                 addr: 0x1000,
                 bytes: vec![0xcd, 0x80],
             }],
+            reservations: vec![],
         };
         client
             .send(&Inbound::LoadContext {
@@ -271,6 +272,7 @@ mod tests {
                 context: Context {
                     regs: Regs::default(),
                     regions: vec![],
+                    reservations: vec![],
                 },
                 mode: Mode::Host,
             })
@@ -304,6 +306,7 @@ mod tests {
                 context: Context {
                     regs: Regs::default(),
                     regions: vec![],
+                    reservations: vec![],
                 },
                 mode: Mode::Host,
             })

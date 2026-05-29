@@ -19,7 +19,7 @@ use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use movie86::{Context, MemRegion, Regs};
+use movie86::{Context, MemRegion, Regs, Reservation};
 
 /// Mirrors `proto.Mode`. Empty = default host on the Go side; we
 /// always emit explicit values to avoid implicit drift.
@@ -146,6 +146,32 @@ impl From<WireRegion> for MemRegion {
 struct WireContext {
     regs: WireRegs,
     regions: Vec<WireRegion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reservations: Vec<WireReservation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireReservation {
+    addr: u32,
+    size: u32,
+}
+
+impl From<&Reservation> for WireReservation {
+    fn from(r: &Reservation) -> Self {
+        Self {
+            addr: r.addr,
+            size: r.size,
+        }
+    }
+}
+
+impl From<WireReservation> for Reservation {
+    fn from(w: WireReservation) -> Self {
+        Self {
+            addr: w.addr,
+            size: w.size,
+        }
+    }
 }
 
 impl From<&Context> for WireContext {
@@ -153,6 +179,7 @@ impl From<&Context> for WireContext {
         Self {
             regs: WireRegs::from(&c.regs),
             regions: c.regions.iter().map(WireRegion::from).collect(),
+            reservations: c.reservations.iter().map(WireReservation::from).collect(),
         }
     }
 }
@@ -162,6 +189,7 @@ impl From<WireContext> for Context {
         Self {
             regs: w.regs.into(),
             regions: w.regions.into_iter().map(MemRegion::from).collect(),
+            reservations: w.reservations.into_iter().map(Reservation::from).collect(),
         }
     }
 }
@@ -321,6 +349,7 @@ mod tests {
                         bytes: vec![0xca, 0xfe],
                     },
                 ],
+                reservations: vec![],
             },
             mode: Mode::Host,
         };

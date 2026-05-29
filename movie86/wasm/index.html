@@ -1157,9 +1157,17 @@ async function doSendToTurbo86() {
     ws.onopen = () => {
         setT86Status('connected — sending Context', 'ok');
         try {
-            const frame = makeLoadContextMessage(ctx, mode);
+            // Ask turbo86 for periodic memory snapshots so the canvas
+            // pane keeps up with the in-flight guest. Read the cadence
+            // from the existing `refresh` knob — it's already "how
+            // often does the UI redraw" so reusing it is symmetrical
+            // with the local Run loop. Clamp ≥ 25 ms; a 0 turns
+            // progressive display off entirely.
+            const memUpdateMs = Math.max(0, Math.floor(Number($('refresh').value) || 100));
+            const frame = makeLoadContextMessage(ctx, mode, memUpdateMs);
             ws.send(frame);
-            appendT86Event('sent', `LoadContext (${frame.length.toLocaleString()} B JSON)`);
+            appendT86Event('sent',
+                `LoadContext (${frame.length.toLocaleString()} B JSON, mem_update=${memUpdateMs}ms)`);
             setT86Status('running…', 'ok');
             $('turbo86-pause').hidden = false;
             // Periodic full render so the meta cards (sourced from
@@ -1233,6 +1241,32 @@ async function doSendToTurbo86() {
                 turbo86.lastPaused = msg;
                 $('turbo86-restore').hidden = false;
                 break;
+            case 'video_mode':
+                // turbo86 surfaced a mov-only ABI set_video_mode write.
+                // `vm.activeVideoMode` is what `renderCanvases()` keys
+                // on to pick the active FB region. Use the dedicated
+                // setter — writeMem(0x1FFE_0010, ...) would silently
+                // no-op because the ABI page is intercepted by the CPU
+                // at dispatch time and isn't part of FlatMemory, so
+                // host-side writes there fall outside the mapped range.
+                state.vm.setActiveVideoMode(msg.mode & 0xff);
+                break;
+            case 'mem_update': {
+                // Periodic in-flight memory snapshot from turbo86.
+                // Apply every region to the local Vm so the canvas /
+                // memory panes show in-progress decoder output. Out-of-
+                // range bytes are silently skipped by writeMem, so
+                // turbo86's stack region (which the local Vm doesn't
+                // map) is harmless. JSON parse + base64 decode of the
+                // regions dominate the cost; 100 ms cadence is fine
+                // even for FHD-class snapshots.
+                let applied = 0;
+                for (const r of msg.regions) {
+                    applied += state.vm.writeMem(r.addr, r.bytes);
+                }
+                turbo86.stats.lastMemUpdateBytes = applied;
+                break;
+            }
         }
         renderT86Stats();
         // Follow toggle drives the in-handover render cadence the

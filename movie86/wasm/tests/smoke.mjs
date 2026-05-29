@@ -151,6 +151,20 @@ try {
         assert.equal(vm.activeVideoMode, undefined,
             `return42 shouldn't touch BIOS — activeVideoMode expected undefined, got ${vm.activeVideoMode}`);
 
+        // setActiveVideoMode is the seam the demo's turbo86 handover
+        // uses when a VideoMode Outbound arrives — turbo86 caught the
+        // ABI write on the native side, the local Vm needs the same
+        // mode reflected so `renderCanvases()` flips to the right
+        // canvas. Writing to the ABI page via writeMem would no-op
+        // (page is unmapped in FlatMemory), so we expose this direct
+        // setter and pin its semantics here.
+        vm.setActiveVideoMode(0x13);
+        assert.equal(vm.activeVideoMode, 0x13,
+            `setActiveVideoMode(0x13) didn't flip activeVideoMode — got ${vm.activeVideoMode}`);
+        vm.setActiveVideoMode(0x12);
+        assert.equal(vm.activeVideoMode, 0x12,
+            `setActiveVideoMode(0x12) didn't overwrite — got ${vm.activeVideoMode}`);
+
         console.log('ok  Vm introspection (return42)');
     } finally {
         vm.free();
@@ -367,6 +381,95 @@ try {
     }
 } catch (e) {
     console.error(`FAIL handover surface: ${e.stack || e.message}`);
+    failed++;
+}
+
+// --- Reservations roundtrip via mmap_request → snapshotContext ---
+//
+// Pin the wire mechanism that keeps the canvas-mandelbrot post-
+// set_video_mode handover from SIGSEGVing. The FB page at 0xA0000 is
+// declared as a zero-filled PT_LOAD; once the guest executes
+// `mmap_request(FB13H_MMAP)` the wasm AbiHost records the requested
+// range. A snapshot taken right after must include that range as a
+// Reservation so turbo86 mmaps the page before resuming — otherwise
+// the next pixel write faults on an unmapped address. The smoke
+// fixture is a hand-crafted 1-page Vm so we can drive the ABI write
+// without depending on the full canvas_mandelbrot ELF.
+try {
+    // Build a minimal ELF that issues mmap_request then exits via
+    // CALL_EXIT (the mov-only equivalent of int 0x80 SYS_exit). We
+    // synthesize the ELF directly from canvas_smile's loader form by
+    // grabbing return42 (smallest committed ELF at 0x08048000) and
+    // overwriting its first 18 bytes with our test sequence.
+    //
+    // Bytes:
+    //   B8 3F 00 0A 00   mov eax, 0xA003F   (packed: addr 0xA0000 | (64-1))
+    //   A3 20 00 FE 1F   mov [0x1FFE0020], eax  ; ABI mmap_request
+    //   B8 00 00 00 00   mov eax, 0          (exit code)
+    //   A3 FE 00 FE 1F   mov [0x1FFE00FE], eax  ; CALL_EXIT
+    //                                            (return 0; total 20 bytes)
+    const seq = new Uint8Array([
+        0xB8, 0x3F, 0x00, 0x0A, 0x00,
+        0xA3, 0x20, 0x00, 0xFE, 0x1F,
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+        0xA3, 0xFE, 0x00, 0xFE, 0x1F,
+    ]);
+    // The committed canvas_bars.elf has a 33-byte .text at 0x08048000
+    // and declares a PT_LOAD covering 0xA0000 (so the FlatMemory base
+    // already includes the FB extent). Reuse it as a substrate.
+    const elf = new Uint8Array(await readFile(`${root}/examples/canvas_bars.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        // Overwrite the entry's first 20 bytes with our mov-only ABI
+        // sequence. writeMem returns the count of bytes actually
+        // applied — should equal seq.length since the .text segment
+        // is mapped at vm.eip.
+        const wrote = vm.writeMem(vm.eip, seq);
+        assert.equal(wrote, seq.length,
+            `couldn't overwrite entry with mov-only ABI sequence: writeMem returned ${wrote}`);
+
+        // Run until halt — Cpu emits Fault::Exit on CALL_EXIT, surfaced
+        // as a haltReason. Twenty bytes = 4 instructions, well under
+        // the smoke loop's batch budget.
+        while (!vm.haltReason) vm.stepN(100n);
+        assert.equal(vm.exitCode, 0,
+            `mov-only ABI sequence should exit 0, got exit=${vm.exitCode} halt=${vm.haltReason}`);
+
+        // snapshotContext must now carry the reservation populated by
+        // the mmap_request side-effect: addr 0xA0000, size 64 pages
+        // (0x40000 bytes).
+        const ctx = wrapper.snapshotContext(vm);
+        assert.ok(Array.isArray(ctx.reservations),
+            `snapshotContext().reservations should be an array, got ${typeof ctx.reservations}`);
+        assert.equal(ctx.reservations.length, 1,
+            `expected 1 reservation from mmap_request, got ${ctx.reservations.length}`);
+        assert.equal(ctx.reservations[0].addr, 0x000A_0000,
+            `reservation addr ${ctx.reservations[0].addr.toString(16)} != 0xA0000`);
+        assert.equal(ctx.reservations[0].size, 64 * 0x1000,
+            `reservation size ${ctx.reservations[0].size} != 64 * 4 KiB`);
+
+        // Wire encoding: reservations show up as an array of
+        // `{addr, size}` under context.reservations, matching
+        // turbo86's `proto.Reservation` JSON shape byte-for-byte.
+        const frame = JSON.parse(wrapper.makeLoadContextMessage(ctx, 'host'));
+        assert.deepEqual(frame.context.reservations,
+            [{ addr: 0x000A_0000, size: 64 * 0x1000 }],
+            `wire reservations mismatch: ${JSON.stringify(frame.context.reservations)}`);
+
+        // And: an empty-reservation snapshot must NOT emit the field,
+        // matching Go's `omitempty` so old turbo86 builds keep
+        // accepting payloads.
+        const emptyCtx = { regs: ctx.regs, regions: [], reservations: [] };
+        const emptyFrame = JSON.parse(wrapper.makeLoadContextMessage(emptyCtx, 'host'));
+        assert.ok(!('reservations' in emptyFrame.context),
+            `empty reservations should be omitted from wire, got: ${JSON.stringify(emptyFrame.context)}`);
+
+        console.log('ok  reservations roundtrip (mmap_request → snapshotContext → wire)');
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL reservations roundtrip: ${e.stack || e.message}`);
     failed++;
 }
 

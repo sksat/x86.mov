@@ -178,22 +178,32 @@ func handleSession(ctx context.Context, ws *websocket.Conn, slog *sessionLogger)
 			if mode == "" {
 				mode = proto.ModeHost
 			}
-			slog.logf("inbound Start: entry=%#x stack_top=%#x mode=%s",
-				m.Entry, m.StackTop, mode)
-			events = r.RunWithMode(m.Entry, m.StackTop, mode)
+			memUpdateInterval := time.Duration(m.MemUpdateIntervalMs) * time.Millisecond
+			slog.logf("inbound Start: entry=%#x stack_top=%#x mode=%s mem_update=%s",
+				m.Entry, m.StackTop, mode, memUpdateInterval)
+			if memUpdateInterval > 0 {
+				events = r.RunWithModeAndMemUpdate(m.Entry, m.StackTop, mode, memUpdateInterval)
+			} else {
+				events = r.RunWithMode(m.Entry, m.StackTop, mode)
+			}
 		case proto.LoadContext:
 			mode := m.Mode
 			if mode == "" {
 				mode = proto.ModeHost
 			}
+			memUpdateInterval := time.Duration(m.MemUpdateIntervalMs) * time.Millisecond
 			var totalBytes int
 			for _, region := range m.Context.Regions {
 				totalBytes += len(region.Bytes)
 			}
-			slog.logf("inbound LoadContext: mode=%s eip=%#x esp=%#x regions=%d total_bytes=%d",
+			slog.logf("inbound LoadContext: mode=%s eip=%#x esp=%#x regions=%d total_bytes=%d mem_update=%s",
 				mode, m.Context.Regs.Eip, m.Context.Regs.Esp,
-				len(m.Context.Regions), totalBytes)
-			events = r.RunWithContextAndMode(m.Context, mode)
+				len(m.Context.Regions), totalBytes, memUpdateInterval)
+			if memUpdateInterval > 0 {
+				events = r.RunWithContextModeAndMemUpdate(m.Context, mode, memUpdateInterval)
+			} else {
+				events = r.RunWithContextAndMode(m.Context, mode)
+			}
 		case proto.Stop:
 			slog.logf("inbound Stop (pre-run abort)")
 			return nil

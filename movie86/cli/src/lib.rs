@@ -841,6 +841,7 @@ fn write_context_at_step(
     let ctx = movie86::Context {
         regs: movie86::Regs::from_cpu(cpu),
         regions,
+        reservations: Vec::new(),
     };
     let bytes = match context_json::to_json_pretty(&ctx) {
         Ok(b) => b,

@@ -48,10 +48,18 @@ const (
 
 // Start sets the guest's initial EIP and ESP and begins execution.
 // Sent after the Code messages that supply the entry-point's code.
+//
+// `MemUpdateIntervalMs` opts the session into periodic mid-run
+// memory snapshots — turbo86 will SIGSTOP the guest every N ms,
+// snapshot the sparse non-zero pages, emit `MemUpdate{Regions}`, and
+// resume. 0 (the default) disables it; the session emits no mid-run
+// memory events, matching the original behavior. Typical value for a
+// browser frontend driving a canvas: 100ms.
 type Start struct {
-	Entry    uint32 `json:"entry"`
-	StackTop uint32 `json:"stack_top"`
-	Mode     Mode   `json:"mode,omitempty"`
+	Entry               uint32 `json:"entry"`
+	StackTop            uint32 `json:"stack_top"`
+	Mode                Mode   `json:"mode,omitempty"`
+	MemUpdateIntervalMs uint32 `json:"mem_update_interval_ms,omitempty"`
 }
 
 func (Start) inboundKind() string { return "start" }
@@ -82,6 +90,19 @@ type MemRegion struct {
 	Bytes []byte `json:"bytes"`
 }
 
+// Reservation declares an address range that must be mapped on the
+// receiver before the guest resumes, even when the sender's snapshot
+// carries no bytes for it (e.g. an all-zero framebuffer page the
+// sparse-region walk skipped). Concretely the guest may have already
+// issued a mov-only ABI `mmap_request` on the sender — that side
+// effect is invisible in Regs/Regions, so we record it here so the
+// receiver can replay the mmap. Addr and Size are in guest bytes;
+// the receiver page-aligns internally.
+type Reservation struct {
+	Addr uint32 `json:"addr"`
+	Size uint32 `json:"size"`
+}
+
 // Context is a transferable snapshot of guest execution: enough state
 // for either engine to pick up from where the other left off. The
 // receiver loads memory regions first, then sets Regs, then resumes
@@ -91,9 +112,15 @@ type MemRegion struct {
 // v1 ships the simplest workable schema — full memory in Regions, no
 // signal disposition, no generation counter. Both can be added later
 // without breaking existing payloads (additive JSON fields).
+//
+// Reservations are additive: pages the receiver must mmap before
+// resuming, even though they carry no bytes in Regions. Needed for
+// ABI mmap_request side effects (e.g. a mode-13h framebuffer that
+// was still all-zero when the snapshot was taken).
 type Context struct {
-	Regs    Regs        `json:"regs"`
-	Regions []MemRegion `json:"regions"`
+	Regs         Regs          `json:"regs"`
+	Regions      []MemRegion   `json:"regions"`
+	Reservations []Reservation `json:"reservations,omitempty"`
 }
 
 // LoadContext hands a Context to the runner: write each MemRegion into
@@ -102,8 +129,9 @@ type Context struct {
 // turbo86 for the hot path. Mode picks the execution policy; empty
 // defaults to "host".
 type LoadContext struct {
-	Context Context `json:"context"`
-	Mode    Mode    `json:"mode,omitempty"`
+	Context             Context `json:"context"`
+	Mode                Mode    `json:"mode,omitempty"`
+	MemUpdateIntervalMs uint32  `json:"mem_update_interval_ms,omitempty"`
 }
 
 func (LoadContext) inboundKind() string { return "load_context" }
@@ -276,6 +304,25 @@ type VideoMode struct {
 
 func (VideoMode) outboundKind() string { return "video_mode" }
 
+// MemUpdate reports a periodic mid-session snapshot of guest memory
+// regions. Same sparse `MemRegion` shape Paused uses, but it's an
+// *intermediate* event — the session is still running — so a peer
+// engine can keep its own view of guest memory in sync for
+// progressive display (canvas filling in as a decoder writes pixels,
+// etc.) without waiting for terminal Paused / Exit.
+//
+// Cadence is configured at session start via Start.MemUpdateIntervalMs
+// / LoadContext.MemUpdateIntervalMs (default 0 = disabled). While
+// enabled, the runner periodically SIGSTOPs the guest, captures the
+// non-zero pages, emits one MemUpdate, and resumes. The guest never
+// sees the stop — `SIGSTOP` is non-forwardable and the snapshot path
+// doesn't dispatch into the guest's signal table.
+type MemUpdate struct {
+	Regions []MemRegion `json:"regions"`
+}
+
+func (MemUpdate) outboundKind() string { return "mem_update" }
+
 // MarshalOutbound encodes an Outbound as a JSON object with a "type" field.
 func MarshalOutbound(msg Outbound) ([]byte, error) {
 	switch m := msg.(type) {
@@ -308,6 +355,11 @@ func MarshalOutbound(msg Outbound) ([]byte, error) {
 		return json.Marshal(struct {
 			Type string `json:"type"`
 			VideoMode
+		}{m.outboundKind(), m})
+	case MemUpdate:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			MemUpdate
 		}{m.outboundKind(), m})
 	default:
 		return nil, fmt.Errorf("proto: unknown Outbound type %T", msg)
@@ -358,6 +410,12 @@ func UnmarshalOutbound(data []byte) (Outbound, error) {
 		var m VideoMode
 		if err := json.Unmarshal(data, &m); err != nil {
 			return nil, fmt.Errorf("proto: parsing VideoMode payload: %w", err)
+		}
+		return m, nil
+	case "mem_update":
+		var m MemUpdate
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, fmt.Errorf("proto: parsing MemUpdate payload: %w", err)
 		}
 		return m, nil
 	default:

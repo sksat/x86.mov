@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/sksat/x86.mov/turbo86/bridge"
@@ -302,7 +303,16 @@ func (r *Runner) snapshotMemory() ([]proto.MemRegion, error) {
 			return nil, err
 		}
 	}
-	for _, gr := range r.extraRegions {
+	// Copy extraRegions under the lock so the tracer goroutine can
+	// still append (mmap_request handler) without racing the walk.
+	// The async MemUpdate ticker is the other reader; without the
+	// snapshot under lock a guest that calls mmap_request mid-run
+	// would trigger a Go data race on the slice header.
+	r.extraRegionsMu.RLock()
+	extras := make([]struct{ addr, size uint32 }, len(r.extraRegions))
+	copy(extras, r.extraRegions)
+	r.extraRegionsMu.RUnlock()
+	for _, gr := range extras {
 		if err := walk(gr.addr, gr.size); err != nil {
 			return nil, err
 		}
@@ -398,6 +408,25 @@ type Runner struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
+	// tickerStop is closed by the tracer goroutine's defer to signal
+	// the MemUpdate ticker (if running) to wind down, and tickerWg
+	// is the join handle the defer waits on **before** closing
+	// eventsCh. Without the wait the ticker's `select { send,
+	// tickerStop }` could pick the send case after we've closed
+	// eventsCh and panic with "send on closed channel" — a real
+	// hazard when a terminal event races a pending MemUpdate.
+	// Created in `New`.
+	tickerStop chan struct{}
+	tickerWg   sync.WaitGroup
+
+	// extraRegionsMu guards extraRegions against concurrent access
+	// between the tracer goroutine (which appends in the mmap_request
+	// ABI path) and the MemUpdate ticker goroutine (which iterates the
+	// slice via snapshotMemory). Without it a guest that grows its
+	// address space mid-session triggers a Go data race on the slice
+	// header.
+	extraRegionsMu sync.RWMutex
+
 	// Mode-dependent state, populated when the syscall loop starts.
 	mode       proto.Mode       // host (default) or trap
 	handlers   map[uint8]uint32 // signum → handler addr (trap mode only)
@@ -410,14 +439,20 @@ type Runner struct {
 	// pre-declare every region; the Pause / Fault snapshot stays
 	// accurate. Only touched from the tracer goroutine.
 	extraRegions []struct{ addr, size uint32 }
+
+	// (No periodic-snapshot flags — the MemUpdate ticker reads
+	// /proc/PID/mem from a separate goroutine without stopping the
+	// tracee, so it doesn't interact with the tracer's signal-stop
+	// machinery. Pause()'s SIGSTOP path is unchanged.)
 }
 
 type startMsg struct {
-	withCtx  bool
-	entry    uint32
-	stackTop uint32
-	ctx      proto.Context
-	mode     proto.Mode
+	withCtx           bool
+	entry             uint32
+	stackTop          uint32
+	ctx               proto.Context
+	mode              proto.Mode
+	memUpdateInterval time.Duration
 }
 
 // New spawns the stub and drives it to its self-SIGSTOP. The internal
@@ -431,9 +466,10 @@ func New(stubBytes []byte) (*Runner, error) {
 		// consumer reads, so the tracer can't outrun the consumer and
 		// tear down resources (mem fd, child) before mid-session
 		// streaming writes have a chance to land.
-		eventsCh: make(chan proto.Outbound),
-		closeCh:  make(chan struct{}),
-		done:     make(chan struct{}),
+		eventsCh:   make(chan proto.Outbound),
+		closeCh:    make(chan struct{}),
+		done:       make(chan struct{}),
+		tickerStop: make(chan struct{}),
 	}
 
 	bootErr := make(chan error, 1)
@@ -480,6 +516,36 @@ func (r *Runner) RunWithContext(ctx proto.Context) <-chan proto.Outbound {
 // RunWithContextAndMode is RunWithContext with explicit mode selection.
 func (r *Runner) RunWithContextAndMode(ctx proto.Context, mode proto.Mode) <-chan proto.Outbound {
 	r.startCh <- startMsg{withCtx: true, ctx: ctx, mode: mode}
+	return r.eventsCh
+}
+
+// RunWithModeAndMemUpdate is RunWithMode plus periodic MemUpdate
+// Outbound events. `memUpdateInterval` controls the cadence: zero
+// disables (identical to RunWithMode), values > 0 enable a background
+// goroutine that SIGSTOPs the child every `memUpdateInterval`, the
+// tracer catches the resulting stop, emits a `proto.MemUpdate` with
+// the sparse memory snapshot, and resumes the guest. Typical use:
+// `100 * time.Millisecond` for a browser frontend driving a canvas
+// that wants to show partial decoder output mid-run.
+func (r *Runner) RunWithModeAndMemUpdate(
+	entry, stackTop uint32, mode proto.Mode, memUpdateInterval time.Duration,
+) <-chan proto.Outbound {
+	r.startCh <- startMsg{
+		entry: entry, stackTop: stackTop, mode: mode,
+		memUpdateInterval: memUpdateInterval,
+	}
+	return r.eventsCh
+}
+
+// RunWithContextModeAndMemUpdate is RunWithContextAndMode plus periodic
+// MemUpdate (see RunWithModeAndMemUpdate for the cadence semantics).
+func (r *Runner) RunWithContextModeAndMemUpdate(
+	ctx proto.Context, mode proto.Mode, memUpdateInterval time.Duration,
+) <-chan proto.Outbound {
+	r.startCh <- startMsg{
+		withCtx: true, ctx: ctx, mode: mode,
+		memUpdateInterval: memUpdateInterval,
+	}
 	return r.eventsCh
 }
 
@@ -547,6 +613,15 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 	// Single defer covers all exit paths (bootstrap failure, pre-Run
 	// close, post-Run close, natural session end).
 	defer func() {
+		// Signal the periodic MemUpdate ticker to stop AND join its
+		// goroutine before closing eventsCh. Without the join the
+		// ticker's `select { send_to_eventsCh, <-tickerStop }` can
+		// observe the send case becoming "ready for evaluation" (Go
+		// makes no ordering guarantees on which case fires when
+		// multiple ready cases exist) and then panic when
+		// `close(eventsCh)` lands mid-pick.
+		close(r.tickerStop)
+		r.tickerWg.Wait()
 		if r.cmd != nil && r.cmd.Process != nil {
 			_ = r.cmd.Process.Kill() // no-op if already dead
 			var ws syscall.WaitStatus
@@ -601,6 +676,27 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 		return
 	}
 	if msg.withCtx {
+		// Reservations come first. They cover address ranges the
+		// guest's mov-only ABI mmap_request handler already mapped
+		// on the sender — invisible in Regions when those pages
+		// were still all-zero at snapshot time (the sparse-region
+		// walk skips zero pages). Without this, the canvas demo's
+		// post-set_video_mode handover SIGSEGVs on its first
+		// pixel write because the FB page was never mapped here.
+		// Regions that overlap a reservation are still safe: their
+		// mmap below re-maps the page (MAP_FIXED, fresh zero) and
+		// the region bytes get written on top — same net result.
+		for _, res := range msg.ctx.Reservations {
+			if regionFitsStaticGuest(res.Addr, res.Size) {
+				continue
+			}
+			if err := r.mmapRegionForLoadContext(res.Addr, res.Size, &regs); err != nil {
+				r.emitFault(fmt.Sprintf(
+					"mmap context reservation 0x%x..0x%x: %v",
+					res.Addr, res.Addr+res.Size, err))
+				return
+			}
+		}
 		for _, region := range msg.ctx.Regions {
 			// Regions outside the stub's static guestRegions
 			// (canvas framebuffers from a wasm snapshot, etc.) need a
@@ -641,7 +737,62 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 		return
 	}
 
+	// Start the periodic MemUpdate ticker, if the caller asked for
+	// one. tracerLoop's defer joins via `tickerWg.Wait()` before
+	// closing eventsCh so the ticker can't panic on a closed
+	// channel.
+	if msg.memUpdateInterval > 0 {
+		r.tickerWg.Add(1)
+		go func() {
+			defer r.tickerWg.Done()
+			r.memUpdateTicker(msg.memUpdateInterval)
+		}()
+	}
+
 	r.syscallLoop(&regs)
+}
+
+// memUpdateTicker runs alongside the tracer goroutine and emits one
+// `proto.MemUpdate` every `interval`. **No SIGSTOP, no ptrace stop**:
+// the snapshot reads `/proc/PID/mem` from this goroutine while the
+// guest keeps executing. A small amount of tearing is OK — the
+// canvas / progressive-display consumer keeps each frame; the next
+// tick fully overwrites it. The trade-off (vs the SIGSTOP-based
+// design) is consistency: a snapshot taken while the guest is mid-
+// scanline-write may show half a row in the old state and half in
+// the new. For movie86's canvas pane that looks fine.
+//
+// Sends to the shared `eventsCh` are serialised against the tracer
+// goroutine's terminal-event sends by an unbuffered-channel race;
+// since both sides eventually progress, whichever wins delivery
+// first is fine. `Close()` short-circuits via `closeCh`.
+func (r *Runner) memUpdateTicker(interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			regions, err := r.snapshotMemory()
+			if err != nil {
+				// Best-effort: snapshot can fail mid-session if the
+				// guest is reading a page that just got remapped or
+				// /proc/PID/mem hit a transient EAGAIN. Skip the tick
+				// rather than tearing down the whole session.
+				continue
+			}
+			select {
+			case r.eventsCh <- proto.MemUpdate{Regions: regions}:
+			case <-r.closeCh:
+				return
+			case <-r.tickerStop:
+				return
+			}
+		case <-r.closeCh:
+			return
+		case <-r.tickerStop:
+			return
+		}
+	}
 }
 
 func (r *Runner) bootstrap(stubBytes []byte) error {
@@ -867,9 +1018,12 @@ func regionFitsStaticGuest(addr, size uint32) bool {
 // same ptrace mechanics. Only difference is *when* it's called (init
 // vs mid-execution); the child is stopped in both cases.
 func (r *Runner) mmapRegionForLoadContext(addr, size uint32, regs *regs32) error {
+	r.extraRegionsMu.RLock()
 	if len(r.extraRegions) >= mmapMaxRegions {
+		r.extraRegionsMu.RUnlock()
 		return fmt.Errorf("too many dynamic regions (cap=%d)", mmapMaxRegions)
 	}
+	r.extraRegionsMu.RUnlock()
 	pageAddr := addr & mmapAddrMask
 	pageEnd := (addr + size + 0xFFF) & mmapAddrMask
 	if pageEnd <= pageAddr {
@@ -884,7 +1038,9 @@ func (r *Runner) mmapRegionForLoadContext(addr, size uint32, regs *regs32) error
 	if ret != pageAddr {
 		return fmt.Errorf("mmap returned 0x%x, asked for 0x%x", ret, pageAddr)
 	}
+	r.extraRegionsMu.Lock()
 	r.extraRegions = append(r.extraRegions, struct{ addr, size uint32 }{pageAddr, pageSize})
+	r.extraRegionsMu.Unlock()
 	return nil
 }
 
@@ -933,7 +1089,10 @@ func (r *Runner) handleAbiWrite(regs *regs32) bool {
 // progress without the region it asked for, and silent partial success
 // would let the next mov into that range fault confusingly.
 func (r *Runner) handleMmapRequest(call abiCall, regs *regs32) bool {
-	if len(r.extraRegions) >= mmapMaxRegions {
+	r.extraRegionsMu.RLock()
+	full := len(r.extraRegions) >= mmapMaxRegions
+	r.extraRegionsMu.RUnlock()
+	if full {
 		r.emitFault(fmt.Sprintf(
 			"mov-only ABI mmap_request: too many dynamic regions (cap=%d)", mmapMaxRegions))
 		return false
@@ -952,7 +1111,9 @@ func (r *Runner) handleMmapRequest(call abiCall, regs *regs32) bool {
 			"mmap_request: kernel mapped 0x%x, asked for 0x%x (size=0x%x)", ret, addr, size))
 		return false
 	}
+	r.extraRegionsMu.Lock()
 	r.extraRegions = append(r.extraRegions, struct{ addr, size uint32 }{addr, size})
+	r.extraRegionsMu.Unlock()
 
 	regs.Eip += uint32(call.insnLen)
 	if err := ptraceSetRegs32(r.pid, regs); err != nil {
@@ -1198,7 +1359,19 @@ func (r *Runner) syscallLoop(regs *regs32) {
 				nextSignal = int(sig)
 				continue
 			}
+			// Periodic MemUpdate path: if this SIGSTOP is one we sent
+			// ourselves for a memory snapshot (CAS 1→0 on
+			// snapshotPending), grab the regions, emit MemUpdate, and
+			// resume the guest without delivering the signal. The
+			// alternative — sending Paused here — would terminate the
+			// session, which is the right thing for a user-initiated
+			// Pause but wrong for "tick periodically while still
+			// running". CAS distinguishes ours from a Pause()-sent or
+			// truly external SIGSTOP.
 			// Not forwardable (job-control, etc.) — surface as Paused.
+			// (No special-case for periodic SIGSTOP — that path no
+			// longer exists; the MemUpdate ticker reads memory async
+			// without stopping the tracee.)
 			snap, err := r.capturePausedSnapshot(sig)
 			if err != nil {
 				r.emitFault(fmt.Sprintf("snapshot at non-forwardable signal: %v", err))

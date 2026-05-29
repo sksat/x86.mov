@@ -347,6 +347,186 @@ async function main() {
             console.error(`FAIL real turbo86 handover (write): ${e.message}`);
             failed++;
         }
+
+        // VideoMode Outbound + setActiveVideoMode round-trip. This is
+        // the canvas-rendering path: turbo86 catches a `mov [ABI+0x010],
+        // al` (CALL_SET_VIDEO_MODE) and emits a VideoMode event; the
+        // frontend has to flip the local Vm's activeVideoMode so the
+        // canvas pane picks the right FB region. An earlier version
+        // wrote the mode byte to the ABI page via `writeMem` — but the
+        // ABI page is unmapped in FlatMemory, so the write silently
+        // no-oped and the canvas placeholder stayed visible. The fix
+        // (lib.rs::setActiveVideoMode) is what this pin guards.
+        try {
+            // Guest: mov al, 0x13 ; mov [0x1FFE0010], al ; mov eax, 1 ;
+            // mov ebx, 0 ; int 0x80 — sets mode 13h via the mov-only
+            // ABI then exits 0. The ABI write triggers VideoMode on
+            // both host and trap mode (signal-dispatch policy is past
+            // the ABI gate).
+            const setModeCode = new Uint8Array([
+                0xB0, 0x13,                   // mov al, 0x13
+                0xA2, 0x10, 0x00, 0xFE, 0x1F, // mov [0x1FFE0010], al
+                0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1   (SYS_exit)
+                0xBB, 0x00, 0x00, 0x00, 0x00, // mov ebx, 0
+                0xCD, 0x80,                   // int 0x80
+            ]);
+            const events = await runHandover(
+                { regs: { ...ctx.regs }, regions: [{ addr: 0x08048000, bytes: setModeCode }] },
+                'host',
+            );
+            const videoMode = events.find(e => e.type === 'video_mode');
+            assert.ok(videoMode,
+                `expected video_mode event, got types=${events.map(e => e.type).join(',')}`);
+            assert.equal(videoMode.mode, 0x13,
+                `VideoMode.mode = ${videoMode.mode}, expected 0x13`);
+
+            // Now exercise the frontend response: a fresh Vm has no
+            // active mode; setActiveVideoMode(videoMode.mode) must
+            // flip it. This is what index.html's `case 'video_mode'`
+            // does — pin the seam end-to-end so a regression on
+            // either side fires.
+            const elfBytes = new Uint8Array(
+                await readFile(`${root}/examples/return42.elf`),
+            );
+            const vm = new wasmMod.Vm(elfBytes);
+            try {
+                assert.equal(vm.activeVideoMode, undefined,
+                    `fresh Vm should have undefined activeVideoMode, got ${vm.activeVideoMode}`);
+                vm.setActiveVideoMode(videoMode.mode);
+                assert.equal(vm.activeVideoMode, 0x13,
+                    `setActiveVideoMode(0x13) didn't flip activeVideoMode — got ${vm.activeVideoMode}`);
+            } finally {
+                vm.free();
+            }
+            console.log('ok  real turbo86 handover (VideoMode → setActiveVideoMode flips mode)');
+        } catch (e) {
+            console.error(`FAIL VideoMode E2E: ${e.stack || e.message}`);
+            failed++;
+        }
+
+        // MemUpdate Outbound + writeMem round-trip. Pin the periodic-
+        // snapshot path: LoadContext carries `mem_update_interval_ms`,
+        // turbo86 emits MemUpdate events while the guest runs, the
+        // frontend applies each region's bytes to the local Vm via
+        // writeMem. We drive a tight jmp-self loop so the only events
+        // turbo86 emits are MemUpdates (no Exit until Pause), then
+        // Pause to terminate.
+        try {
+            const entry = 0x08048000;
+            // jmp $ (EB FE — 2-byte tight loop) at entry. We seed an
+            // arbitrary sentinel byte right after so we can prove the
+            // MemUpdate carried real memory bytes back to us.
+            const sentinelOffset = 2;
+            const sentinel = 0x5A;
+            const tightLoop = new Uint8Array([0xEB, 0xFE, sentinel]);
+            const loopCtx = {
+                regs: {
+                    eax: 0, ebx: 0, ecx: 0, edx: 0,
+                    esi: 0, edi: 0, ebp: 0,
+                    esp: 0x701FFFF0, eip: entry, eflags: 0,
+                },
+                regions: [{ addr: entry, bytes: tightLoop }],
+            };
+
+            const url = `ws://127.0.0.1:${port}/`;
+            const ws = new WebSocket(url);
+            const events = [];
+            const done = new Promise((resolve, reject) => {
+                ws.addEventListener('open', () => {
+                    ws.send(wrapper.makeLoadContextMessage(loopCtx, 'host', 50));
+                    // Give the ticker a few cadences (50 ms × ~6 = ~300 ms)
+                    // so we definitely see multiple MemUpdate events,
+                    // then Pause to drain.
+                    setTimeout(() => ws.send(JSON.stringify({ type: 'pause' })), 300);
+                }, { once: true });
+                ws.addEventListener('message', (e) => {
+                    events.push(wrapper.parseOutboundMessage(e.data));
+                });
+                ws.addEventListener('close', resolve, { once: true });
+                ws.addEventListener('error', reject, { once: true });
+            });
+            await done;
+
+            const memUpdates = events.filter(e => e.type === 'mem_update');
+            assert.ok(memUpdates.length >= 2,
+                `expected ≥2 MemUpdate events at 50 ms cadence over 300 ms, got ${memUpdates.length}`);
+
+            // Pick the first MemUpdate whose regions contain entry —
+            // turbo86 may also include stack regions. Apply via the
+            // same writeMem path the frontend uses, then verify the
+            // sentinel byte lands at entry+2.
+            const elfBytes = new Uint8Array(
+                await readFile(`${root}/examples/return42.elf`),
+            );
+            const vm = new wasmMod.Vm(elfBytes);
+            try {
+                const update = memUpdates.find(u =>
+                    u.regions.some(r =>
+                        r.addr <= entry && entry < r.addr + r.bytes.length));
+                assert.ok(update,
+                    `no MemUpdate covered entry ${entry.toString(16)}`);
+                let applied = 0;
+                for (const r of update.regions) {
+                    applied += vm.writeMem(r.addr, r.bytes);
+                }
+                assert.ok(applied > 0,
+                    `writeMem applied 0 bytes from MemUpdate — frontend would render an empty canvas`);
+                const at = vm.readMem(entry, 3);
+                assert.deepEqual(Array.from(at), [0xEB, 0xFE, sentinel],
+                    `MemUpdate bytes at entry round-trip mismatch: got ${Array.from(at)}`);
+            } finally {
+                vm.free();
+            }
+            console.log(`ok  real turbo86 handover (MemUpdate ×${memUpdates.length} → writeMem applies bytes)`);
+        } catch (e) {
+            console.error(`FAIL MemUpdate E2E: ${e.stack || e.message}`);
+            failed++;
+        }
+
+        // Reservations E2E. Without it, a canvas demo that handed over
+        // mid-flight (post-mmap_request, pre-first-FB-write) would
+        // SIGSEGV on the next pixel store: the sender's mmap_request
+        // side-effect is invisible in Regs/Regions, the receiver has
+        // no idea the page is supposed to be mapped, and a write to
+        // 0xA0000 traps. The Reservation roundtrip lets turbo86
+        // replay the mmap at LoadContext so the same write succeeds.
+        try {
+            const entry = 0x08048000;
+            const fbAddr = 0x000A_0000;
+            // Guest: mov [0xA0000], 0x12345678 ; mov eax, 1 ;
+            // mov ebx, 42 ; int 0x80. The write tests the page was
+            // actually mapped (a SIGSEGV would surface as Paused
+            // signal=11 with no Exit).
+            const code = new Uint8Array([
+                0xC7, 0x05, 0x00, 0x00, 0x0A, 0x00, 0x78, 0x56, 0x34, 0x12,
+                0xB8, 0x01, 0x00, 0x00, 0x00,
+                0xBB, 0x2A, 0x00, 0x00, 0x00,
+                0xCD, 0x80,
+            ]);
+            const ctxWithReservation = {
+                regs: {
+                    eax: 0, ebx: 0, ecx: 0, edx: 0,
+                    esi: 0, edi: 0, ebp: 0,
+                    esp: 0x701FFFF0,
+                    eip: entry,
+                    eflags: 0,
+                },
+                regions: [{ addr: entry, bytes: code }],
+                reservations: [{ addr: fbAddr, size: 0x1000 }],
+            };
+            const events = await runHandover(ctxWithReservation, 'host');
+            assert.equal(events.length, 1,
+                `expected 1 event (Exit), got ${events.length} (Paused → Reservation handling failed?)`);
+            assert.equal(events[0].type, 'exit',
+                `expected exit (not ${events[0].type} signal=${events[0].signal ?? '-'})`);
+            assert.equal(events[0].code, 42,
+                `expected exit 42, got ${events[0].code}`);
+
+            console.log('ok  real turbo86 handover (Reservation → FB page mmap\'d → guest writes succeed)');
+        } catch (e) {
+            console.error(`FAIL Reservation E2E: ${e.stack || e.message}`);
+            failed++;
+        }
     } finally {
         child.kill('SIGTERM');
         if (bin.cleanup) await bin.cleanup();
