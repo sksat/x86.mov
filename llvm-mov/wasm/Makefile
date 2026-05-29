@@ -102,7 +102,12 @@ test-e2e-dist: stage-deploy
 # (The URL subpath stays as `llvm-mov`, even though the source tree
 # moved to llvm-mov/wasm/, because the deploy is the front door for the
 # subproject.)
+#
+# fzstd (the in-browser zstd fallback) lives in node_modules/, so
+# install if missing — keeps both local `make stage-deploy` and the
+# CI deploy job self-sufficient without a separate `npm ci` step.
 stage-deploy: build
+	@if [ ! -d node_modules/fzstd ]; then npm install; fi
 	./scripts/stage-deploy.sh
 
 PORT ?= 8087
