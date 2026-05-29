@@ -15,12 +15,22 @@
 // exit() at the end of main (EXIT_RUNTIME=1), making the runtime
 // non-reusable. Same shape as movfuscator-wasm's wrappers.
 
-import createMovLlc from './build/llvm-mov-llc.js';
 import { CLANG_WASM_VERSION } from './wasm-config.js';
 
-// Clang is lazy-loaded so callers who only need `.ll → .s` (i.e. the
-// `compile()` API) can run without the 80 MB clang.wasm artifact
-// present. The dynamic import is cached by the host module loader.
+// Drivers are lazy-loaded so callers that only use one path (e.g.
+// `rsToIR` from the Rust frontend, with no built llvm-mov-llc.wasm
+// in the worktree yet) don't get blocked by a missing artefact on
+// the other path. The dynamic imports are cached by the host module
+// loader.
+let _createMovLlc = null;
+async function loadLlc() {
+    if (_createMovLlc === null) {
+        const m = await import('./build/llvm-mov-llc.js');
+        _createMovLlc = m.default;
+    }
+    return _createMovLlc;
+}
+
 let _createMovClang = null;
 async function loadClang() {
     if (_createMovClang === null) {
@@ -202,6 +212,7 @@ export async function compile(ir, opts = {}) {
     }
     const buf = makeBuffered();
     onProgress?.({ stage: 'instantiate-llc' });
+    const createMovLlc = await loadLlc();
     const llc = await createMovLlc(buf.opts);
     llc.FS.writeFile(`/${name}`, ir);
     onProgress?.({ stage: 'compile-ir' });
@@ -367,7 +378,13 @@ export async function compileC(source, opts = {}) {
  */
 export const RUSTC_VERSIONS = {
     'rubrc-v0.2.0': {
-        rustVersion: '1.79.0',
+        // Reported by the artefact at startup as `1.83.0-dev`. That's
+        // a snapshot off bjorn3/rust around the 1.83 nightly (between
+        // the `compile_rustc_for_wasm16` and `wasm17` branches). The
+        // "-dev" suffix flows through to `!llvm.ident` in emitted IR,
+        // which is fine for our purposes (we strip / ignore it on the
+        // way to the mov backend).
+        rustVersion: '1.83.0-dev',
         // Edition 2024 stabilized in 1.85; this artefact predates it.
         editions: ['2015', '2018', '2021'],
         // What rubrc actually ships sysroot tarballs for under
@@ -384,9 +401,10 @@ export const RUSTC_VERSIONS = {
         },
         // Parity-test hint: tests run `rustup run <nativeRustup> rustc …`
         // so the native reference matches the wasm artefact's Rust
-        // version exactly. (`rustup install 1.79.0` is the one-time
-        // setup on the dev box.)
-        nativeRustup: '1.79.0',
+        // version exactly. `1.83.0-dev` isn't a rustup channel — the
+        // closest stable for cross-checks is `1.83.0`; full nightly
+        // match requires `rustup toolchain link nightly-2024-xx-xx`.
+        nativeRustup: '1.83.0',
     },
     // Future expansion:
     //
@@ -478,6 +496,7 @@ export async function rsToIR(source, opts = {}) {
     const driver = await loadRustcDriver();
     return driver(source, spec, {
         ...opts,
+        versionKey: verKey,
         name,
         target,
         edition,

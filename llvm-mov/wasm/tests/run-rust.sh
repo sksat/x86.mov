@@ -47,7 +47,7 @@ run_rs_fixture() {
         const ir = await rsToIR(src, { name: '$name.rs' });
         writeFileSync('$wasm_ll', ir);
     " 2>"$node_log"; then
-        if grep -qE 'define [^ ]+ @rust_main' "$wasm_ll"; then
+        if grep -qE 'define .* @rust_main\(' "$wasm_ll"; then
             pass=$((pass + 1))
             echo "PASS  $name (rs smoke)"
         else

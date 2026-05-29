@@ -74,11 +74,14 @@ build-native-llvm-mov-llc:
 test: build
 	./tests/run.sh
 
-# Rust-frontend parity. Currently RED — `rsToIR()` is not yet wired
-# into llvm-mov.mjs. See ../CLAUDE.md "Rust frontend (in progress)" §.
-# Kept off the default `test` target until the wasm artefact lands so
-# CI doesn't go red on a known-pending feature.
-test-rust: build-native-llvm-mov-llc
+# Rust-frontend smoke test. Drives a wasm-hosted rustc (rubrc v0.2.0
+# artefact, Rust 1.83-dev) through `rsToIR()`. Needs `wasmtime` on
+# $PATH or at ~/.local/wasmtime/wasmtime — the driver prints an
+# install hint if neither is present. Kept off the default `test`
+# target because the artefact + sysroot fetch (~40 MB compressed,
+# one-time per version) shouldn't gate a clean `make test`.
+# See ../CLAUDE.md "Rust frontend (in progress)" §.
+test-rust:
 	./tests/run-rust.sh
 
 # Playwright drives the demo at index.html in a real (headless) Chromium,
