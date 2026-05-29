@@ -9,6 +9,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -46,8 +47,11 @@ func main() {
 
 	patterns := parseOriginPatterns(*allowOrigin)
 
+	// Banner goes straight to stderr (not through log) so the
+	// per-line date/time prefix doesn't eat ~20 columns and wrap the
+	// art on narrow terminals. log still owns the "listening" line.
 	for _, line := range colorize(securityBanner(), isTerminal(os.Stderr)) {
-		log.Print(line)
+		fmt.Fprintln(os.Stderr, line)
 	}
 
 	http.Handle("/", server.Handler(patterns))
@@ -68,13 +72,14 @@ func main() {
 // exact ASCII art.
 func securityBanner() []string {
 	return []string{
-		"================================================================",
-		"  turbo86 — *** SUPER INSECURE REMOTE CODE EXECUTION PLATFORM ***",
-		"  Executes UNTRUSTED guest machine code NATIVELY on this host's",
-		"  CPU. Syscalls are only ptrace-bridged; there is no in-process",
-		"  sandbox. Anything the guest does runs as YOU.",
+		"============================================================",
+		"  turbo86 — *** SUPER INSECURE ***",
+		"  REMOTE CODE EXECUTION PLATFORM",
+		"  Runs UNTRUSTED guest machine code NATIVELY on this",
+		"  host's CPU as YOU. No in-process sandbox; syscalls",
+		"  are only ptrace-bridged.",
 		"  Run ONLY in a disposable / sandboxed environment.",
-		"================================================================",
+		"============================================================",
 	}
 }
 
