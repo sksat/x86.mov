@@ -418,6 +418,188 @@ fn handover_round_trip_via_dump_load_context_continues_to_exit() {
     let _ = std::fs::remove_file(&dump_path);
 }
 
+/// movfuscator-runtime link-order pin: when caller user/stub objects
+/// are placed between `crt0.o` and `crtf.o` on the `ld` command line,
+/// `master_loop`'s straight-line body is fragmented — its head lives
+/// in `crt0.o.text` (1406 bytes) and its tail (`mov esp, [&sesp]; mov
+/// cs, ax`) lives in `crtf.o.text` (8 bytes), and the linker
+/// concatenates the two adjacently *only* if nothing else's `.text`
+/// sits between them.
+///
+/// Drop a caller `stub.o` (`sigaction` / `exit`) between them and the
+/// `master_loop` fallthrough crosses the stub's body. The stub's
+/// `c3 ret` pops a value off the *shadow* stack that `master_loop`
+/// staged for itself — a movfuscator-encoded label `0x80000000 + dest`
+/// — and the CPU's `ret` jumps to that high-bit-set address.
+/// `FlatMemory` traps it as `Fault::Unmapped(addr)`.
+///
+/// This is **not** a movie86 emulation bug — the bit is set
+/// deliberately by `mov eax, 0x88049309` in `master_loop`'s body,
+/// which is movfuscator's `MOV_OFFSET` label encoding (real addr +
+/// `0x80000000`). movie86 preserves the value correctly through every
+/// move; the runtime would have stripped the high bit at a later
+/// stage if execution had stayed on the `master_loop` fallthrough
+/// path.
+///
+/// The fix lives on the link-recipe side: caller objects must be
+/// linked *after* `crtf.o crtd.o softfloat32.o`, not between `crt0.o`
+/// and `crtf.o`. `movie86/scripts/link-real-return42.sh` does this
+/// correctly; the `movfuscator-wasm` `link({ static: true })` wrapper
+/// does not (issue surfaced through PR #39's static-link branch).
+///
+/// This test pins both the failing layout (so a future fix to that
+/// wrapper still observes the same emulator-side fault as a hard
+/// signal) and the working layout (so a regression that breaks the
+/// working layout fails loudly here).
+///
+/// Skipped (returns silently) when the vendored movfuscator runtime
+/// objects aren't materialized. Materialize via:
+///   cd movfuscator-wasm && make setup && make build-native
+/// The test picks up the canonical paths automatically; override via
+/// `MOVIE86_MOVF_BUILD` and `MOVIE86_MOVF_SOFTFLOAT_DIR`.
+#[test]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+fn movfuscator_runtime_link_order_pin() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    // Resolve where vendor objects live. Default to the canonical
+    // movfuscator-wasm layout one repo above this crate; allow override
+    // for git-worktree or CI shapes.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .ancestors()
+        .nth(2)
+        .expect("repo root above cli/")
+        .to_path_buf();
+    let default_build = repo_root.join("movfuscator-wasm/vendor/movfuscator/build");
+    let default_softfloat = repo_root.join("movfuscator-wasm/vendor/movfuscator/movfuscator/lib");
+    let build_dir = std::env::var_os("MOVIE86_MOVF_BUILD").map_or(default_build, PathBuf::from);
+    let softfloat_dir =
+        std::env::var_os("MOVIE86_MOVF_SOFTFLOAT_DIR").map_or(default_softfloat, PathBuf::from);
+    let crt0 = build_dir.join("crt0.o");
+    let crtf = build_dir.join("crtf.o");
+    let crtd = build_dir.join("crtd.o");
+    let softfloat32 = softfloat_dir.join("softfloat32.o");
+    let return42_o = repo_root.join("movfuscator-wasm/tests/goldens-o/return42.o");
+    for f in [&crt0, &crtf, &crtd, &softfloat32, &return42_o] {
+        if !f.exists() {
+            eprintln!(
+                "movfuscator_runtime_link_order_pin: skipping — missing {}",
+                f.display()
+            );
+            eprintln!("  to enable: cd movfuscator-wasm && make setup && make build-native");
+            return;
+        }
+    }
+    // /usr/bin/as and /usr/bin/ld required.
+    if !std::path::Path::new("/usr/bin/as").exists()
+        || !std::path::Path::new("/usr/bin/ld").exists()
+    {
+        eprintln!(
+            "movfuscator_runtime_link_order_pin: skipping — /usr/bin/as or /usr/bin/ld missing"
+        );
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join(format!("movie86-linkorder-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create tmpdir");
+
+    // Caller-supplied stub matching PR #39's static-link test:
+    // sigaction returns 0; exit(status) issues int 0x80 SYS_exit. The
+    // cdecl `ret` inside `sigaction` is the load-bearing instruction
+    // for this test — it's the one that pops the master_loop-staged
+    // label when the stub object is inserted between crt0 and crtf.
+    let stub_s = tmp.join("stub.s");
+    std::fs::write(
+        &stub_s,
+        b".text\n\
+         .globl sigaction\n\
+         .type sigaction, @function\n\
+         sigaction:\n    \
+             movl $0, %eax\n    \
+             ret\n\
+         .globl exit\n\
+         .type exit, @function\n\
+         exit:\n    \
+             movl 4(%esp), %ebx\n    \
+             movl $1, %eax\n    \
+             int $0x80\n",
+    )
+    .expect("write stub.s");
+    let stub_o = tmp.join("stub.o");
+    let as_status = Command::new("/usr/bin/as")
+        .args(["--32", "-o"])
+        .arg(&stub_o)
+        .arg(&stub_s)
+        .status()
+        .expect("spawn /usr/bin/as");
+    assert!(as_status.success(), "as failed: {as_status}");
+
+    // Helper: invoke /usr/bin/ld with a given object order and run the
+    // result through `run_elf`. Returns the outcome.
+    let link_and_run = |out: &std::path::Path, order: &[&std::path::Path]| -> RunOutcome {
+        let mut cmd = Command::new("/usr/bin/ld");
+        cmd.args(["-m", "elf_i386", "-static", "--hash-style=gnu"]);
+        for o in order {
+            cmd.arg(o);
+        }
+        cmd.arg("-o").arg(out);
+        let status = cmd.status().expect("spawn /usr/bin/ld");
+        assert!(status.success(), "ld failed: {status}");
+        let bytes = std::fs::read(out).expect("read linked elf");
+        run_elf(&bytes)
+    };
+
+    // --- Broken layout: stub between user code and crtf ---
+    // This is the exact order PR #39's link({ static: true }) emits.
+    // master_loop's straight-line body falls through the stub's
+    // `sigaction: mov eax,0; ret` sequence; the ret pops the value
+    // master_loop staged on the shadow stack (a movfuscator-encoded
+    // label, high bit set), and the CPU jumps there.
+    let broken_out = tmp.join("return42-broken.elf");
+    let broken_outcome = link_and_run(
+        &broken_out,
+        &[&crt0, &return42_o, &stub_o, &crtf, &crtd, &softfloat32],
+    );
+    match broken_outcome {
+        RunOutcome::Fault(movie86::Fault::Unmapped(addr)) => {
+            // Bit 31 must be set — that's the movfuscator MOV_OFFSET
+            // encoding. The low 31 bits land somewhere inside the
+            // linked binary's text region (master_loop body).
+            assert!(
+                addr & 0x8000_0000 != 0,
+                "expected MOV_OFFSET-encoded label (bit 31 set), got {addr:#010x}"
+            );
+            let real = addr & 0x7fff_ffff;
+            assert!(
+                (0x0804_8000..=0x0904_8000).contains(&real),
+                "expected target near linked text (~0x08049...), got {addr:#010x}"
+            );
+        }
+        other => panic!("broken layout: expected Fault::Unmapped(MOV_OFFSET addr), got {other:?}"),
+    }
+
+    // --- Working layout: stub at the end, after the movfuscator
+    // runtime objects. master_loop's body stays contiguous. ---
+    let good_out = tmp.join("return42-good.elf");
+    let good_outcome = link_and_run(
+        &good_out,
+        &[&crt0, &return42_o, &crtf, &crtd, &softfloat32, &stub_o],
+    );
+    match good_outcome {
+        // movfuscator's crt0 hardcodes `push("$0"); jmp_extern("exit")`,
+        // so the int-0x80 SYS_exit stub terminates with status 0
+        // regardless of what `main` returned. See `link-real-return42.sh`
+        // for the same observation.
+        RunOutcome::Exit(0) => {}
+        other => panic!("working layout: expected Exit(0), got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn fault_on_unsupported_syscall() {
     // mov eax, 999 ; int 0x80  → syscall 999 is unimplemented

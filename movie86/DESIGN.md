@@ -581,3 +581,69 @@ Diff output (span-based to handle a 10 MB `FlatMemory`):
 
 Designed for the wasm runtime: snapshot uses the `Memory` trait, not
 `FlatMemory` directly, so a future paged memory impl works too.
+
+## 2026-05-29 follow-up: movfuscator-runtime static-link order
+
+When statically linking a movfuscator-compiled user object alongside
+`crt0.o + crtf.o + crtd.o + softfloat32.o` plus a caller stub
+(`sigaction` / `exit`), **the stub object MUST be placed after
+`softfloat32.o`**, not between `crt0.o` and `crtf.o`. Putting it
+in the middle deterministically triggers
+`Fault::Unmapped(0x80000000 | dst)` partway through master_loop's
+first iteration.
+
+### Why
+
+`master_loop` is split across two objects:
+
+- `crt0.o.text` carries the head — 1406 bytes of mov-only setup +
+  dispatch table walking that ends with `mov (%eax),%eax`.
+- `crtf.o.text` carries the tail — 8 bytes: `mov esp, [&sesp]`
+  followed by `mov cs, ax` (the SIGILL re-entry trick).
+
+The linker concatenates `.text` sections in command-line order. For
+master_loop's straight-line fallthrough to work, nothing whose `.text`
+contains a control-flow boundary (`ret`, `jmp`, `call`) may sit between
+those two pieces. movfuscator user code is fine — it's all `mov` — and
+naturally tail-calls into `crtf.o`'s `mov cs, ax` epilogue. A
+hand-written assembly stub like
+```
+sigaction: movl $0, %eax ; ret
+exit:      movl 4(%esp), %ebx ; movl $1, %eax ; int $0x80
+```
+is NOT fine — its `c3 ret` byte appears in the linked text at exactly
+the spot master_loop's fallthrough crosses, and pops a value off the
+shadow stack (`esp = &data_p = 0x08686134` region) that master_loop
+staged for itself. The value is movfuscator's `MOV_OFFSET`-encoded
+label form (real address + `0x80000000`), so the resulting jump target
+has bit 31 set and `FlatMemory` correctly traps it as `Unmapped`.
+
+### How `movfuscator-wasm`'s `link({ static: true })` got this wrong
+
+The wrapper concatenates `crt0.o + <user objs> + crtf.o + crtd.o +
+softfloat32.o`. For *production* movfuscator usage that historical
+order was fine because dynamic linking against libc never injected
+non-mov `.text` between crt0 and crtf — `sigaction` / `exit` resolved
+to `.plt` stubs in a separate section. Once the wrapper started
+supporting static link via `{ static: true }` and callers started
+supplying caller stub objects in their user-objs list, that historical
+order became a foot-gun.
+
+The right shape for the static path is `crt0.o + <user objs that
+are mov-only> + crtf.o + crtd.o + softfloat32.o + <caller stubs
+with non-mov text>`. `movie86/scripts/link-real-return42.sh` does
+this; `movfuscator-wasm`'s wrapper needs to (issue tracked on PR
+#39's branch — the fix belongs there, not in movie86).
+
+### Pinned by
+
+`cli/tests/e2e.rs::movfuscator_runtime_link_order_pin` builds both
+layouts from the committed `return42.o` + a real
+`as`/`ld`-assembled stub and asserts:
+
+- broken layout → `Fault::Unmapped(addr)` with bit 31 set
+- working layout → `Exit(0)`
+
+Skipped when the vendor movfuscator runtime objects aren't materialized
+(env: `MOVIE86_MOVF_BUILD`, `MOVIE86_MOVF_SOFTFLOAT_DIR`; default paths
+follow `movfuscator-wasm/vendor/movfuscator/...`).
