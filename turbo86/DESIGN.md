@@ -115,6 +115,28 @@ Companion to [`movie86`](../movie86/): movie86 is the in-browser interpreter ("w
 
 - **Interrupting a no-syscall tight loop.** A guest in `jmp $` makes no syscalls and never signals; the tracer's wait4 would block forever. `Runner.Close()` sends SIGKILL to the child, which wakes wait4 (returning Signaled). The session ends with a `Paused{Signal: SIGKILL}`. This is the kill-switch for runaway guests; the server reader goroutine has a `defer r.Close()` so a WS disconnect triggers it automatically, and the `Stop` Inbound message is the polite caller-initiated form.
 
+## Mov-only ABI page
+
+`int 0x10` / `int 0x80` を介さずに **magic page への `mov` だけで host call を発火する** dispatch 仕組み。movie86 (wasm + cli) と byte-for-byte で対応する契約。
+
+- **ABI base = `0x1FFE_0000`、size = 1 ページ (`0x1000`)**。stub の static guestRegions (`[0x08048000, 0x09048000)` + `[0x70000000, 0x70200000)`) と意図的に重ねず、guest がここに書くと自動で SIGSEGV になるよう unmapped で保つ。
+- **call 番号は page 内 offset**。現在の slot:
+
+  | offset | call           | trigger / args                                                 |
+  |--------|----------------|----------------------------------------------------------------|
+  | `0x010`| set_video_mode | `mov [ABI+0x010], al`、al = mode (BIOS `int 0x10/AH=0` 相当)   |
+  | `0x020`| mmap_request   | `mov [ABI+0x020], eax`、eax = addr (page-aligned, low 12 bits = pages-1)、stub の address space を ptrace 経由で動的拡張 |
+  | `0x080`| write          | `mov [ABI+0x080], eax` (eax = SYS_write marker)、ebx=fd / ecx=buf / edx=len、handler は `regs.Eax = bytes_written` で返す |
+  | `0x0FE`| exit           | `mov [ABI+0x0FE], eax`、eax = exit code、`Outbound{Exit}` 発火して session 終了 |
+
+- **decode は `A2`/`A3` の絶対アドレス mov 限定**。`classifyAbi` は SIGSEGV stop 時に EIP の 5 bytes を `/proc/PID/mem` で読み、`A2 imm32` (`mov [imm32], al`) または `A3 imm32` (`mov [imm32], eax`) の imm32 が ABI page なら call として認識。register-indirect mov 等の他形式は誤判定しないよう真の SIGSEGV パスに落とす。
+- **ptrace-injected syscall** はトランポリン `trapTrampolineAddr + 5` (= `CD 80`) を流用。SIGSEGV stop 中の child の regs/EIP を一時的に書き換えて `PTRACE_SYSCALL` を 2 回 (entry stop + exit stop) drive、戻り値を読んで元の regs を復元。trap-mode 用 trampoline を **mode 問わず常時** 書くことで host mode でも inject 可能 (`runner.go` bootstrap)。
+- **mmap_request は `r.extraRegions` で管理**。snapshot 時に static guestRegions と一緒に walk され、Paused に乗る。soft cap は `mmapMaxRegions = 32`。
+- **LoadContext で region が static map 外なら自動 mmap**。受信側 turbo86 は LoadContext 適用前に各 region の addr range を `regionFitsStaticGuest` で判定、外側なら `mmapRegionForLoadContext` で injectSyscall 経由に拡張してから `/proc/PID/mem` に write。wasm Vm の snapshot に `.fb13h` 等の FB region が含まれていても受け取れる。
+- **host/trap mode parity**。runner が ABI page を奪うのは signal-dispatch policy の前段なので、Host/Trap どちらでも同一の event stream を出す。`TestRunOnce_AbiSetVideoMode_TrapMode` で構造的に pin。
+- **proto.VideoMode** Outbound (`{type: "video_mode", mode: N}`) を新設。`set_video_mode` の発火を frontend に通知。`Exit` / `Stdout` / `Stderr` は既存型を再利用。
+- **設計の動機**: int 0x10 は Linux カーネルが userspace IDT に持たず SIGSEGV になる (turbo86 では即 Fault)、int 0x80 は narrative 上 "everything is a mov" を破る。両方を mov に統一すると movfuscator-style "kernel との接点も mov 経由" になり、後付けの BIOS 経路や syscall も同じ枠で扱える。詳細は [#28](https://github.com/sksat/x86.mov/issues/28) を参照。
+
 ## CI
 
 [`.github/workflows/turbo86.yaml`](../.github/workflows/turbo86.yaml) at the repo root. Runs on push/PR to `mov`: `gofmt -l .`, `go vet ./...`, `go test -v ./...`, `go build ./cmd/turbo86`, and a stub-from-source rebuild check. Actions pinned to `vMAJOR.MINOR.PATCH`.

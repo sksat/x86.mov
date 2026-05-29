@@ -10,6 +10,7 @@ The repo-wide rule is "failing test first, implementation second, golden updates
 - **Integration tests for ptrace behaviour live behind `//go:build linux`.** They drive hand-assembled mov programs through the runner (see [`runner/sigaction_test.go`](runner/sigaction_test.go) for a worked example). Hand-assembling small i386 fragments is the norm — there's no compiler in the test path.
 - **Two-mode parity.** When a behaviour involves signals or sigaction, the test should be table-driven over `[proto.ModeHost, proto.ModeTrap]` — both policies have to produce the same observable event stream (this is the migration-parity doctrine, see DESIGN.md).
 - **Adding a bridge syscall**: bridge unit test (`bridge/bridge_test.go`) for the syscall→event translation, plus a runner-level integration test if the new syscall has interesting interaction with the ptrace state machine (passthrough vs emulate vs fault).
+- **Adding a mov-only ABI call**: pick an unused offset on the ABI page (`abiBase + 0xNN`, see [DESIGN.md](DESIGN.md)). Mirror the constant on the movie86 side (`movie86::abi_host::CALL_*`) **in the same PR** so the cross-engine contract stays in lockstep. TDD shape: failing `runner/abi_test.go` test that drives a hand-assembled `mov [abiBase+0xNN], al/eax` fixture → wire up `classifyAbi` (decode) + `dispatchAbi` (handler) → green. New `proto.Outbound` types (e.g. `VideoMode`) get a round-trip test in `proto/proto_test.go` too.
 
 ## Build notes
 
