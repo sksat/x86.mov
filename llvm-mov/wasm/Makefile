@@ -36,25 +36,27 @@ help:
 setup:
 	./scripts/fetch.sh
 
-build: build-native-llvm-mov-llc build-wasm-llvm-mov-llc build-wasm-clang
+# build-wasm-{clang,llvm-mov-llc} both consume static libs produced by
+# build-wasm-llvm. We orchestrate the order here via sub-make invocations
+# rather than ordinary prereqs so that a standalone `make build-wasm-clang`
+# (the CI fine-grained step shape, where caching sits between layers)
+# does NOT re-walk the LLVM tree. Phony-target prereqs would always
+# re-run, which is correct but wastes ~30 s on every cached CI step.
+build: build-native-llvm-mov-llc
+	$(MAKE) build-wasm-llvm
+	$(MAKE) build-wasm-clang
+	$(MAKE) build-wasm-llvm-mov-llc
 
 build-wasm-llvm:
 	./scripts/build-wasm-llvm.sh
 
-# Standalone clang driver — depends on build-wasm-llvm's clang+LLVM
-# static libs in build/llvm-wasm/lib/. Same parenthetical as
-# build-wasm-llvm-mov-llc below: the dependency isn't expressed as a
-# Make prerequisite because the underlying script's idempotency is
-# cheaper than Ninja's dep walk.
+# Standalone clang driver — needs build-wasm-llvm's static libs +
+# cmake config at build/llvm-wasm/lib/cmake/. If invoked on a fresh
+# tree, the underlying script fails with a clear "wasm LLVM not built"
+# message; run `make build` for an end-to-end build.
 build-wasm-clang:
 	./scripts/build-wasm-clang.sh
 
-# The wasm backend build links against the wasm LLVM static libs, so it
-# implicitly depends on build-wasm-llvm. We don't list it as a Make
-# prerequisite because the LLVM build is idempotent — re-running it on
-# a warm tree is fast but still does a full Ninja dep walk, and the
-# script's "already built" check is faster. Run `make build-wasm-llvm`
-# explicitly the first time.
 build-wasm-llvm-mov-llc:
 	./scripts/build-wasm-llvm-mov-llc.sh
 

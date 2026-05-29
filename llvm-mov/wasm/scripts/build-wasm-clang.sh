@@ -17,6 +17,14 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 llvm_build="$here/build/llvm-wasm"
 out="$here/build"
 
+# Match the fail-fast check in build-wasm-llvm-mov-llc.sh so the user
+# gets a clear "wasm LLVM not built" hint instead of an opaque ninja
+# error when this script is invoked on a fresh tree.
+if [ ! -d "$llvm_build/lib/cmake/llvm" ]; then
+    echo "wasm LLVM not built — run scripts/build-wasm-llvm.sh first" >&2
+    exit 1
+fi
+
 if [ -z "${EMSDK:-}" ]; then
     if [ -f "$HOME/emsdk/emsdk_env.sh" ]; then
         # shellcheck disable=SC1091
