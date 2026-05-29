@@ -14,13 +14,14 @@ target_link_libraries(llvm-mov-llc
   LLVMMovInfo
 )
 
-# LLVM ships in two link flavours. apt.llvm.org (Debian/Ubuntu CI) provides
-# per-component static archives (libLLVMCodeGen.a, ...). Arch's `llvm` package
-# ships ONLY the monolithic libLLVM.so and sets LLVM_LINK_LLVM_DYLIB=ON, so the
-# per-component names below don't exist as link targets there. Pick the flavour
-# the installed LLVM actually offers.
+# Distros differ on how LLVM ships: apt.llvm.org installs the per-
+# component static libs (libLLVMCodeGen.a, …), while Arch (and any
+# `LLVM_LINK_LLVM_DYLIB=ON` build) ships a single monolithic
+# `libLLVM.so` and *no* component archives — there, mapping components
+# to `-lLLVM<Component>` fails to link. Prefer the dylib when LLVM was
+# built that way; fall back to component libs otherwise.
 if(LLVM_LINK_LLVM_DYLIB)
-  set(LLVM_LIBS LLVM)
+  target_link_libraries(llvm-mov-llc PRIVATE LLVM)
 else()
   llvm_map_components_to_libnames(LLVM_LIBS
     AsmPrinter
@@ -34,6 +35,5 @@ else()
     Target
     TransformUtils
   )
+  target_link_libraries(llvm-mov-llc PRIVATE ${LLVM_LIBS})
 endif()
-
-target_link_libraries(llvm-mov-llc PRIVATE ${LLVM_LIBS})
