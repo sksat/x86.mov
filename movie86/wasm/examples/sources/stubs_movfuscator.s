@@ -61,6 +61,21 @@ mmap_request:
     movl %eax, 0x1FFE0020
     ret
 
+/* poll_input() -> int
+ *                — mov-only ABI call 0x040. Triggers a poll by writing
+ *                  any byte to the unmapped page at 0x1FFE_0040; the
+ *                  host pops one pending key code off its input queue
+ *                  and hands it back in eax (KEY_NONE = 0 when empty),
+ *                  the same "return through eax" shape CALL_WRITE uses.
+ *                  The written value (al) is the trigger only — the
+ *                  handler ignores it — so we just leave eax to carry
+ *                  the result straight into the cdecl return. */
+.globl poll_input
+.type poll_input, @function
+poll_input:
+    movb %al, 0x1FFE0040
+    ret
+
 /* 320 × 200 × 4 bytes RGBA framebuffer, BSS-like. */
 .section .fb13h, "aw", @nobits
 .globl _fb13h_region

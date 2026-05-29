@@ -236,6 +236,7 @@
       <option value="canvas_mandelbrot_mov">canvas_mandelbrot_mov — same C, movfuscator pipeline (~10 min, for comparison)</option>
       <option value="png_decode">png_decode — 64×64 PNG full decode (stored block)</option>
       <option value="bmp_decode">bmp_decode — 320×180 32bpp BMP full decode → FB buffer</option>
+      <option value="input_demo">input_demo — steer a block with arrow keys / Space (hover the canvas; mov-only input ABI)</option>
       <option value="upload">(upload your own ELF)</option>
     </select>
   </label>
@@ -342,6 +343,7 @@ import {
     loadContextInto,
     makeLoadContextMessage,
     parseOutboundMessage,
+    attachKeyboard,
 } from './movie86.mjs';
 import { runLoop } from './runloop.mjs';
 
@@ -361,6 +363,7 @@ const EXAMPLES = {
     canvas_mandelbrot_mov:    './examples/canvas_mandelbrot_mov.elf',
     png_decode:               './examples/png_decode_64x64.elf',
     bmp_decode:               './examples/bmp_decode_320x180.elf',
+    input_demo:               './examples/input_demo.elf',
 };
 
 // Register file order matches movie86's `Reg32`: EAX, ECX, EDX, EBX,
@@ -443,9 +446,14 @@ async function fetchExample(name) {
 }
 
 async function loadFromBytes(bytes, label) {
+    if (state.detachKeyboard) { state.detachKeyboard(); state.detachKeyboard = null; }
     if (state.vm) { state.vm.free(); state.vm = null; }
     state.elfBytes = bytes;
     state.vm = await loadVm(bytes);
+    // Route keyboard into the guest's input queue, but only while the
+    // pointer is over the canvas area — off-canvas keystrokes stay with
+    // the page. Examples that never poll just never drain the queue.
+    state.detachKeyboard = attachKeyboard(state.vm, $('canvases'));
     state.prevRegs = null;
     state.prevEip = null;
     state.stdoutBuf = '';

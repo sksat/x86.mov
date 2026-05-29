@@ -144,6 +144,40 @@ func TestRunOnce_AbiExit(t *testing.T) {
 	}
 }
 
+// TestRunOnce_AbiPollInput drives the input half of the mov-only ABI:
+// the guest polls call slot 0x040, which must hand a key code back in
+// EAX (movie86 mirrors this exactly via CALL_POLL_INPUT). turbo86 has
+// no input source wired yet, so a poll always reports KEY_NONE (0) —
+// like the headless CLI. The test pre-loads EAX with a sentinel and
+// asserts the poll overwrote it with 0, proving the handler writes EAX
+// (not just advances EIP) and that the contract offset matches.
+//
+// Guest:
+//
+//	B8 EF BE AD DE      mov eax, 0xDEADBEEF   ; sentinel
+//	A2 40 00 FE 1F      mov [0x1FFE0040], al  ; poll → EAX = KEY_NONE (0)
+//	A3 FE 00 FE 1F      mov [0x1FFE00FE], eax ; exit(EAX)
+func TestRunOnce_AbiPollInput(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	const entry uint32 = 0x08048000
+	code := []byte{
+		0xB8, 0xEF, 0xBE, 0xAD, 0xDE,
+		0xA2, 0x40, 0x00, 0xFE, 0x1F,
+		0xA3, 0xFE, 0x00, 0xFE, 0x1F,
+	}
+
+	events, err := RunOnce(stub.Bytes, map[uint32][]byte{entry: code}, entry, testStackTop)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	want := []proto.Outbound{proto.Exit{Code: 0}}
+	if !reflect.DeepEqual(events, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", events, want)
+	}
+}
+
 // TestRunOnce_AbiLoadContext_AutoMmapsOutOfRangeRegions verifies that
 // a LoadContext carrying a region OUTSIDE the stub's static guestRegions
 // triggers a dynamic mmap2 before the region's bytes are written via

@@ -73,6 +73,119 @@ export function modeForNumber(n) {
     return FRAMEBUFFER_MODES.find(m => m.modeNumber === n);
 }
 
+/**
+ * Generic input key codes — the JS mirror of `core::abi_host`'s
+ * `KEY_*` constants and the alphabet `vm.pushInput(code)` /
+ * `CALL_POLL_INPUT` speak. Printable keys are delivered as their ASCII
+ * byte (no constant needed); these name the control + navigation keys
+ * a guest can't spell as a printable character. Kept byte-for-byte in
+ * sync with the Rust side — it's a cross-engine contract.
+ */
+export const KEY = Object.freeze({
+    NONE: 0x00,
+    BACKSPACE: 0x08,
+    ENTER: 0x0d,
+    ESC: 0x1b,
+    SPACE: 0x20,
+    LEFT: 0x80,
+    RIGHT: 0x81,
+    UP: 0x82,
+    DOWN: 0x83,
+    PAGE_UP: 0x84,
+    PAGE_DOWN: 0x85,
+    HOME: 0x86,
+    END: 0x87,
+});
+
+// Named keys (KeyboardEvent.key) → KEY code. Printable single chars are
+// handled separately (their ASCII byte), so this table is only the
+// non-printable ones.
+const NAMED_KEYS = Object.freeze({
+    ArrowLeft: KEY.LEFT,
+    ArrowRight: KEY.RIGHT,
+    ArrowUp: KEY.UP,
+    ArrowDown: KEY.DOWN,
+    PageUp: KEY.PAGE_UP,
+    PageDown: KEY.PAGE_DOWN,
+    Home: KEY.HOME,
+    End: KEY.END,
+    Enter: KEY.ENTER,
+    Escape: KEY.ESC,
+    Backspace: KEY.BACKSPACE,
+    ' ': KEY.SPACE,
+    Spacebar: KEY.SPACE, // legacy Edge/IE spelling
+});
+
+// Codes whose browser default (scroll / page navigation) we suppress
+// while the guest is consuming them, so a hovered canvas can drive
+// slides with Space / arrows without the page scrolling underneath.
+const SCROLL_KEYS = new Set([
+    KEY.SPACE, KEY.LEFT, KEY.RIGHT, KEY.UP, KEY.DOWN,
+    KEY.PAGE_UP, KEY.PAGE_DOWN, KEY.HOME, KEY.END,
+]);
+
+/**
+ * Translate a `KeyboardEvent` into a generic `KEY` code, or `null` if
+ * it carries no code the guest cares about (modifier-only presses,
+ * function keys, IME composition, multi-codepoint `key` values).
+ *
+ * @param {KeyboardEvent} e
+ * @returns {number|null}
+ */
+export function keyEventToCode(e) {
+    if (e.isComposing) return null;
+    const named = NAMED_KEYS[e.key];
+    if (named !== undefined) return named;
+    // Printable single character → its ASCII byte (0x20..=0x7e). Wider
+    // codepoints (é, あ, emoji) don't fit the u8 generic alphabet.
+    if (e.key.length === 1) {
+        const code = e.key.charCodeAt(0);
+        if (code >= 0x20 && code <= 0x7e) return code;
+    }
+    return null;
+}
+
+/**
+ * Bridge DOM keyboard input into a `vm`'s input queue, gated to pointer
+ * hover over `hoverEl` (the canvas). Off-canvas keystrokes stay with
+ * the page — typing elsewhere, browser shortcuts, scrolling all keep
+ * working; the guest only sees keys pressed "while looking at it".
+ *
+ * The listener lives on `window` (keydown doesn't target a canvas,
+ * which can't hold focus without a tabindex), and is filtered by a
+ * hover flag tracked via `pointerenter` / `pointerleave` on `hoverEl`.
+ *
+ * @param {object} vm  A movie86 `Vm` (must expose `pushInput(code)`).
+ * @param {Element} hoverEl  The element whose hover arms input (canvas).
+ * @param {object} [opts]
+ * @param {Document|Window} [opts.target=window]  Where to bind keydown.
+ * @returns {() => void}  Detach function removing all listeners.
+ */
+export function attachKeyboard(vm, hoverEl, opts = {}) {
+    const target = opts.target ?? window;
+    let hovered = false;
+
+    const onEnter = () => { hovered = true; };
+    const onLeave = () => { hovered = false; };
+    const onKeyDown = (e) => {
+        if (!hovered) return;
+        const code = keyEventToCode(e);
+        if (code === null) return;
+        if (SCROLL_KEYS.has(code)) e.preventDefault();
+        vm.pushInput(code);
+    };
+
+    hoverEl.addEventListener('pointerenter', onEnter);
+    hoverEl.addEventListener('pointerleave', onLeave);
+    target.addEventListener('keydown', onKeyDown);
+
+    return () => {
+        hoverEl.removeEventListener('pointerenter', onEnter);
+        hoverEl.removeEventListener('pointerleave', onLeave);
+        target.removeEventListener('keydown', onKeyDown);
+    };
+}
+
 let initialized = null;
 
 async function ensureInit() {

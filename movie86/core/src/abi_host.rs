@@ -21,6 +21,8 @@
 //! (Go side) and movie86's wasm/CLI hosts (Rust side) both target them
 //! byte-for-byte. Don't renumber without coordinating both sides.
 
+use alloc::collections::VecDeque;
+
 use crate::{Fault, Memory};
 
 /// Base of the mov-only ABI page. Picked to sit between movie86's typical
@@ -53,10 +55,107 @@ pub const CALL_MMAP_REQUEST: u16 = 0x020;
 /// trigger value in place.
 pub const CALL_WRITE: u16 = 0x080;
 
+/// `mov [ABI_BASE + 0x040], al` — poll for one pending input event.
+///
+/// This is the only *input* call: the guest triggers it like any other
+/// (a `mov` into the page; the written value is ignored), and the host
+/// pops one generic key code off its [`InputQueue`] and returns it in
+/// `eax` (zero-extended), exactly the way [`CALL_WRITE`] returns its
+/// byte count. An empty queue yields [`KEY_NONE`] (`0`), so a guest can
+/// busy-poll each frame without blocking the engine's step loop.
+///
+/// The encoding is deliberately *generic* — movie86 is a general mov
+/// emulator, not a slideshow player — so a guest sees raw key codes,
+/// not application verbs. Higher layers (e.g. `simd`) map `KEY_RIGHT` →
+/// "next slide" themselves. Printable keys pass through as their ASCII
+/// byte; non-printable keys use the [`KEY_LEFT`]..[`KEY_END`] block.
+pub const CALL_POLL_INPUT: u16 = 0x040;
+
 /// `mov [ABI_BASE + 0x0FE], eax` — terminate the session with `eax` as
 /// the exit code. The host returns [`Fault::Exit`] (mov-only equivalent
 /// of `mov eax, 1; mov ebx, code; int 0x80`).
 pub const CALL_EXIT: u16 = 0x0FE;
+
+// ---------------------------------------------------------------------
+// Generic input key codes (the [`CALL_POLL_INPUT`] alphabet).
+//
+// These are part of the cross-engine contract: turbo86 enqueues the
+// same byte for the same physical key so a guest behaves identically
+// under both engines. Printable keys (Space, letters, digits, …) are
+// delivered as their ASCII byte (`0x20..=0x7E`) and need no constant;
+// the named constants below cover the control + navigation keys a
+// guest can't spell as a printable character.
+// ---------------------------------------------------------------------
+
+/// No event pending — [`InputQueue::pop`] returns this when empty, and
+/// [`CALL_POLL_INPUT`] hands it back in `eax` so the guest can tell
+/// "nothing happened" from a real key without a separate flag.
+pub const KEY_NONE: u8 = 0x00;
+
+/// Backspace (ASCII BS).
+pub const KEY_BACKSPACE: u8 = 0x08;
+/// Enter / Return (ASCII CR).
+pub const KEY_ENTER: u8 = 0x0D;
+/// Escape (ASCII ESC).
+pub const KEY_ESC: u8 = 0x1B;
+/// Space bar (ASCII space) — named for symmetry; equals `b' '`.
+pub const KEY_SPACE: u8 = 0x20;
+
+// Non-printable navigation keys live in a `0x80+` block so they never
+// collide with a printable ASCII byte passed through verbatim.
+/// Left arrow.
+pub const KEY_LEFT: u8 = 0x80;
+/// Right arrow.
+pub const KEY_RIGHT: u8 = 0x81;
+/// Up arrow.
+pub const KEY_UP: u8 = 0x82;
+/// Down arrow.
+pub const KEY_DOWN: u8 = 0x83;
+/// Page Up.
+pub const KEY_PAGE_UP: u8 = 0x84;
+/// Page Down.
+pub const KEY_PAGE_DOWN: u8 = 0x85;
+/// Home.
+pub const KEY_HOME: u8 = 0x86;
+/// End.
+pub const KEY_END: u8 = 0x87;
+
+/// FIFO of pending input key codes feeding [`CALL_POLL_INPUT`].
+///
+/// A host (the wasm `WasmHost`, the CLI test host, …) owns one of these
+/// and `push`es a code on every keydown; the guest drains it one event
+/// per poll. Edge events, not level state: each physical keypress is
+/// exactly one entry, so a guest that polls many times per frame can't
+/// accidentally act on the same press twice (the bug the slide layer
+/// would otherwise hit — one tap skipping a dozen slides).
+#[derive(Debug, Default, Clone)]
+pub struct InputQueue {
+    events: VecDeque<u8>,
+}
+
+impl InputQueue {
+    /// A new, empty queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enqueue one key code (the host's keydown handler calls this).
+    pub fn push(&mut self, code: u8) {
+        self.events.push_back(code);
+    }
+
+    /// Pop the oldest pending key code, or [`KEY_NONE`] if empty.
+    pub fn pop(&mut self) -> u8 {
+        self.events.pop_front().unwrap_or(KEY_NONE)
+    }
+
+    /// `true` when no events are pending.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
 
 /// Returns `true` if `addr` falls inside the ABI page. CPU uses this on
 /// every mov-to-memory to decide whether to route through [`AbiHost`]
@@ -105,5 +204,22 @@ pub trait AbiHost {
         _mem: &mut dyn Memory,
     ) -> Result<(), Fault> {
         Err(Fault::UnsupportedAbiCall(call_num))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InputQueue, KEY_NONE, KEY_RIGHT};
+
+    #[test]
+    fn input_queue_is_fifo_and_returns_none_when_empty() {
+        let mut q = InputQueue::new();
+        assert_eq!(q.pop(), KEY_NONE, "empty queue yields KEY_NONE");
+
+        q.push(KEY_RIGHT);
+        q.push(b'a');
+        assert_eq!(q.pop(), KEY_RIGHT, "first in, first out");
+        assert_eq!(q.pop(), b'a');
+        assert_eq!(q.pop(), KEY_NONE, "drained queue yields KEY_NONE again");
     }
 }

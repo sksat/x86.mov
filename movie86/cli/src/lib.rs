@@ -181,9 +181,20 @@ impl AbiHost for StdHost {
         regs: &mut [u32; 8],
         mem: &mut dyn Memory,
     ) -> Result<(), Fault> {
-        use movie86::abi_host::{CALL_EXIT, CALL_SET_VIDEO_MODE, CALL_WRITE};
+        use movie86::abi_host::{
+            CALL_EXIT, CALL_POLL_INPUT, CALL_SET_VIDEO_MODE, CALL_WRITE, KEY_NONE,
+        };
         match call_num {
             CALL_SET_VIDEO_MODE => Ok(()),
+            CALL_POLL_INPUT => {
+                // The CLI has no keyboard, so polling always reports
+                // "nothing pending". Returning KEY_NONE (rather than
+                // trapping) keeps interactive guests — which busy-poll
+                // for input — running under the headless CLI instead of
+                // faulting on the first poll; they just never see a key.
+                regs[Reg32::Eax as usize] = u32::from(KEY_NONE);
+                Ok(())
+            }
             CALL_EXIT => Err(Fault::Exit(value)),
             CALL_WRITE => {
                 let fd = regs[Reg32::Ebx as usize];
