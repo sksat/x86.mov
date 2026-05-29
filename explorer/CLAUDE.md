@@ -73,6 +73,9 @@ explorer/
   postcss.config.js
   index.html                    Vite entry
   explorer.mjs                  ← framework-free orchestration (tested in Node)
+  explorer.d.mts                ← sidecar TS types for explorer.mjs
+  runloop.mjs                   ← framework-free Run loop (tested in Node)
+  runloop.d.mts                 ← sidecar TS types for runloop.mjs
   src/
     main.tsx
     App.tsx                     Top-level layout / state owner
@@ -83,7 +86,7 @@ explorer/
       utils.ts                  cn(), hex helpers
       presets.ts                Bundled C snippets
     hooks/
-      useMovie86Vm.ts           Vm lifecycle + Run/Step/Reset state
+      useMovie86Vm.ts           Vm lifecycle + Run/Step/Reset/Follow state
     components/
       ui/                       shadcn primitives (Button, Card, Select, …)
       SourceEditor.tsx          CodeMirror + cpp lang
@@ -101,6 +104,7 @@ explorer/
         Console.tsx
   tests/
     unit.test.mjs               Node --test: orchestration surface
+    runloop.test.mjs            Node --test: Run-loop / live Follow toggle
     e2e/structure.spec.ts       Playwright: structural smoke
   scripts/
     stage-deploy.sh
@@ -185,6 +189,21 @@ what you compiled".
 - **Run `cargo fmt` is not us, but `npm run typecheck` is.** CI gates
   on `tsc -b --noEmit`; local dev should run `make typecheck` before
   pushing.
+- **The Follow toggle must stay *live* (re-read each loop iteration).**
+  The Movie86 panel has a "Follow" checkbox + step-delay input
+  (`vm-follow` / `vm-delay`) that switch between one-step-per-frame and
+  the batched periodic dump — same two strategies as the movie86 demo.
+  The loop lives in [`runloop.mjs`](runloop.mjs) (own copy, *not*
+  imported from `movie86/wasm/` — the subproject keeps siblings at
+  arm's length; we mirror its tested shape instead and pin it in
+  [`tests/runloop.test.mjs`](tests/runloop.test.mjs)). `useMovie86Vm`
+  mirrors `follow` / `delayMs` into refs so `readControls()` sees the
+  *current* value every iteration — that's what lets the toggle take
+  effect mid-run. If you ever capture `follow` once into the `run()`
+  closure, the toggle silently goes back to "only applies on the next
+  Run" — that was the original movie86 bug. `batchSize` / `refreshMs`
+  stay fixed per run (passed as `run()` opts); only follow/delay are
+  live.
 - **Stage-deploy order.** `.github/workflows/deploy.yaml` runs
   movfuscator-wasm → movie86/wasm → llvm-mov/wasm → explorer.
   movfuscator-wasm's step `rm -rf`s the parent `dist/` and rebuilds;

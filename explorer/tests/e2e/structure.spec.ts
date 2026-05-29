@@ -35,6 +35,32 @@ test('Explorer renders the major panes', async ({ page }) => {
     await expect(page.getByTestId('turbo86-handover')).toBeVisible();
 });
 
+test('Movie86 panel exposes a live Follow toggle + step-delay control', async ({
+    page,
+}) => {
+    await page.goto('/');
+
+    const follow = page.getByTestId('vm-follow');
+    const delay = page.getByTestId('vm-delay');
+    await expect(follow).toBeVisible();
+    await expect(delay).toBeVisible();
+
+    // Default is Follow on (watch each mov land), so the step-delay
+    // input — only meaningful in follow mode — starts enabled.
+    await expect(follow).toBeChecked();
+    await expect(delay).toBeEnabled();
+
+    // Toggling is plain UI state, so it works without a loaded Vm (and,
+    // in turn, can be flipped while a run is in flight — the run loop
+    // reads it live). Off disables the delay input; on re-enables it.
+    await follow.uncheck();
+    await expect(follow).not.toBeChecked();
+    await expect(delay).toBeDisabled();
+
+    await follow.check();
+    await expect(delay).toBeEnabled();
+});
+
 test('Compiler select hides the IR column when movfuscator is chosen', async ({ page }) => {
     await page.goto('/');
     // The IR column is mounted initially (llvm-mov default).
