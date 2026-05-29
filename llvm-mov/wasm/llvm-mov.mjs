@@ -406,20 +406,36 @@ export const RUSTC_VERSIONS = {
         // match requires `rustup toolchain link nightly-2024-xx-xx`.
         nativeRustup: '1.83.0',
     },
-    // Future expansion:
+    // Self-hosted next-row. The script that populates it
+    // (scripts/build-wasm-rustc.sh) is committed; the artefact tree
+    // is not (multi-GB Rust build output). Until the script runs,
+    // calling `rsToIR(src, { rustcVersion: 'self-bjorn3-wasm20' })`
+    // throws an actionable error pointing at the build script.
     //
-    // 'self-bjorn3-wasm20': {
-    //     rustVersion: '1.96.0',
-    //     editions: ['2015', '2018', '2021', '2024'],
-    //     supportedTargets: ['i686-unknown-linux-gnu', 'x86_64-unknown-linux-gnu', 'wasm32-wasip1'],
-    //     artefacts: {
-    //         // self-hosted from scripts/build-wasm-rustc.sh
-    //         rustcWasm: '/llvm-mov/rustc-1.96.0.wasm.br',
-    //         sysrootBase: '/llvm-mov/sysroot-1.96.0',
-    //         compression: 'brotli',
-    //     },
-    //     nativeRustup: '1.96.0',
-    // },
+    // The closure with the rubrc row: this entry adds
+    // `i686-unknown-linux-gnu` (the ABI llvm-mov-llc actually accepts)
+    // and edition 2024, both of which rubrc lacks.
+    'self-bjorn3-wasm20': {
+        rustVersion: '1.96.0',
+        editions: ['2015', '2018', '2021', '2024'],
+        supportedTargets: [
+            'i686-unknown-linux-gnu',
+            'x86_64-unknown-linux-gnu',
+            'wasm32-wasip1',
+        ],
+        artefacts: {
+            // Sentinel: the driver skips fetch logic and expects
+            // `build/rustc-cache/self-bjorn3-wasm20/dist/` to already
+            // exist (populated by scripts/build-wasm-rustc.sh).
+            local: true,
+            // Documentary only — the cache layout the build script
+            // produces, so the registry row is self-explanatory.
+            rustcWasm: 'local:dist/bin/rustc.wasm',
+            sysrootBase: 'local:dist/lib/rustlib',
+            compression: 'none',
+        },
+        nativeRustup: '1.96.0',
+    },
 };
 
 export const DEFAULT_RUSTC_VERSION = 'rubrc-v0.2.0';

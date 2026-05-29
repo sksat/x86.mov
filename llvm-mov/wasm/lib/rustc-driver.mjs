@@ -143,9 +143,31 @@ async function downloadAndExtractSysroot(url, destDir, target) {
     });
 }
 
-async function ensureRustcWasm(versionDir, artefacts, onProgress) {
+// Local artefacts (e.g. self-built rustc from scripts/build-wasm-rustc.sh)
+// short-circuit the fetch path: the script is the only thing that's
+// allowed to populate them, and missing files mean the script hasn't
+// run yet. We surface that as an actionable error instead of trying
+// to download a placeholder URL.
+function missingLocalArtefact(versionKey, what, expectedPath) {
+    return new Error(
+        `local artefact missing for rustcVersion=${versionKey}: ` +
+        `${what} not found at ${expectedPath}. ` +
+        `Run scripts/build-wasm-rustc.sh (multi-hour build; see ` +
+        `../CLAUDE.md "Self-hosted artefact" §) to populate it.`,
+    );
+}
+
+async function ensureRustcWasm(versionDir, artefacts, versionKey, onProgress) {
     const marker = path.join(versionDir, '.complete-rustc');
     if (await exists(marker)) return;
+    if (artefacts.local) {
+        const wasmPath = path.join(versionDir, 'dist', 'bin', 'rustc.wasm');
+        if (!(await exists(wasmPath))) {
+            throw missingLocalArtefact(versionKey, 'rustc.wasm', wasmPath);
+        }
+        await fsp.writeFile(marker, '');
+        return;
+    }
     await once(`rustc:${marker}`, async () => {
         // Re-check after potentially awaiting another in-flight call —
         // the dedup'd peer may have completed the work for us.
@@ -157,9 +179,17 @@ async function ensureRustcWasm(versionDir, artefacts, onProgress) {
     });
 }
 
-async function ensureSysroot(versionDir, artefacts, target, onProgress) {
+async function ensureSysroot(versionDir, artefacts, target, versionKey, onProgress) {
     const marker = path.join(versionDir, `.complete-sysroot-${target}`);
     if (await exists(marker)) return;
+    if (artefacts.local) {
+        const sysrootDir = path.join(versionDir, 'dist', 'lib', 'rustlib', target, 'lib');
+        if (!(await exists(sysrootDir))) {
+            throw missingLocalArtefact(versionKey, `sysroot for ${target}`, sysrootDir);
+        }
+        await fsp.writeFile(marker, '');
+        return;
+    }
     await once(`sysroot:${marker}`, async () => {
         if (await exists(marker)) return;
         onProgress?.({ stage: 'fetch-sysroot' });
@@ -215,8 +245,8 @@ export async function rsToIRImpl(source, spec, opts) {
     const versionDir = path.join(CACHE_ROOT, versionKey);
     await fsp.mkdir(versionDir, { recursive: true });
 
-    await ensureRustcWasm(versionDir, opts.artefacts, opts.onProgress);
-    await ensureSysroot(versionDir, opts.artefacts, opts.target, opts.onProgress);
+    await ensureRustcWasm(versionDir, opts.artefacts, versionKey, opts.onProgress);
+    await ensureSysroot(versionDir, opts.artefacts, opts.target, versionKey, opts.onProgress);
 
     // One run dir per invocation: rustc emits `rust_out.ll` into it
     // (via --out-dir=/tmp + tmp::/ mount → host = runDir).

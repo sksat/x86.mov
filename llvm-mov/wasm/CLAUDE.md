@@ -134,10 +134,36 @@ then throws an install-hint error.
 | Registry API (`RUSTC_VERSIONS` + `rsToIR` validation) | ✅ landed | — |
 | Driver (Node mode, `lib/rustc-driver.mjs` via wasmtime subprocess) | ✅ landed | — |
 | Cache layout: `build/rustc-cache/<versionKey>/dist/{bin,lib/rustlib/<target>/lib}` | ✅ landed | — |
-| Smoke test (`tests/run-rust.sh`) | ✅ green on `ret_42.rs` | extend fixture set |
-| Self-hosted Rust 1.96 artefact (i686 + edition 2024) | not started | `scripts/build-wasm-rustc.sh` from bjorn3 wasm20 |
-| Browser driver (`@oligami/rustc-browser-wasi_shim` + WASIFarm) | not started | mirror this driver's shape for the explorer page |
+| Cold-cache in-process dedup + per-PID staging path | ✅ landed | — |
+| Smoke test (`tests/run-rust.sh`) | ✅ green on `ret_42.rs` (rubrc v0.2.0) | extend fixture set |
+| `'self-bjorn3-wasm20'` registry row (Rust 1.96 / i686 / edition 2024) | ✅ slot defined; `scripts/build-wasm-rustc.sh` documented | run the script — multi-hour build |
+| Browser driver (`@oligami/rustc-browser-wasi_shim` + WASIFarm) | not started | mirror Node driver's shape for the explorer page |
 | Explorer UI integration | not started | dropdown + dynamic-import in `explorer/src/lib/wrappers.ts` |
+
+### Self-hosted artefact (`scripts/build-wasm-rustc.sh`)
+
+The 2nd registry row `'self-bjorn3-wasm20'` carries `artefacts.local = true`,
+which makes the driver skip its fetch logic and expect the cache tree
+at `build/rustc-cache/self-bjorn3-wasm20/dist/…` to already exist.
+[`scripts/build-wasm-rustc.sh`](scripts/build-wasm-rustc.sh) is the
+only thing allowed to populate it; until the script runs, calling
+`rsToIR(src, { rustcVersion: 'self-bjorn3-wasm20' })` throws an
+actionable error pointing at the script.
+
+What the script does, in shape:
+
+1. `git clone https://github.com/bjorn3/rust @ compile_rustc_for_wasm20`
+   into `vendor/rust/` (pinned at a SHA recorded in the script header).
+2. Stage `wasi-sdk-22` into `vendor/wasi-sdk-22.0/`.
+3. Apply any local patches under `patches/wasm-rustc/` (none yet).
+4. Write a `config.toml` and run `./x.py install` with `WASI_SDK_PATH` /
+   `WASI_SYSROOT` / `WASI_CLANG_WRAPPER_LINKER` env set, prefix-installing
+   directly into `build/rustc-cache/self-bjorn3-wasm20/dist/`.
+5. Drop the per-target `.complete-sysroot-<target>` markers the driver
+   keys off, then echo a one-liner that exercises the row.
+
+Resource cost: hours of CPU, ~3 GB vendored source, ~200 MB install
+dir, 8 GB+ RAM. Don't run it on a laptop battery.
 
 ### Tests
 
