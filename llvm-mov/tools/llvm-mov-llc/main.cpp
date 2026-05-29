@@ -1514,6 +1514,227 @@ static void injectFixsfsiHelpers(Module &M, LLVMContext &Ctx) {
     emitFloatToInt32Body(F, Ctx, /*IsSigned=*/false);
 }
 
+// Stage 7h3 — `__floatsidf (i32) -> f64` / `__floatunsidf (u32) -> f64`.
+// Always-exact conversion (i32's 32 bits fit in f64's 53-bit mantissa
+// without loss). Algorithm:
+//   - if v == 0: return +0.0
+//   - sign / mag = (signed) sign + abs; (unsigned) 0 + v
+//   - lz = ctlz(mag), hi = 31 - lz                    (0..31)
+//   - exp_biased = hi + 1023                          (1023..1054)
+//   - shift = 52 - hi                                 (21..52)
+//
+//   Position the leading 1 of mag at bit 52 of the i64 mantissa.
+//   Split into two arms by whether `shift < 32`:
+//     small arm (21..31):
+//       mant64_hi = mag >> (32 - shift)     (1..11 right-shift)
+//       mant64_lo = mag << shift            (21..31 left-shift)
+//     big arm (32..52):
+//       mant64_hi = mag << (shift - 32)     (0..20 left-shift)
+//       mant64_lo = 0
+//
+//   Drop the implicit-1 at bit 52 (= bit 20 of mant64_hi) when
+//   packing; pack {sign, exp_biased, mant_hi[19:0]} into i32 hi half
+//   and `mant_lo` into i32 lo half.
+//
+// All variable shifts are i32-typed with amounts clamped to [0, 31]
+// so the SELECT → bit-blend rewrite's "evaluate both arms" semantics
+// stays defined regardless of which arm is finally selected. The i64
+// recombination at the end uses only constant-amount shifts.
+static void emitInt32ToDoubleBody(Function *F, LLVMContext &Ctx,
+                                  Module &M, bool IsSigned) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Type *F64 = Type::getDoubleTy(Ctx);
+
+  Argument *V = F->getArg(0); V->setName("v");
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  auto C = [&](uint32_t X) { return B.getInt32(X); };
+
+  Value *Sign;
+  Value *Mag;
+  if (IsSigned) {
+    Value *Neg = B.CreateICmpSLT(V, C(0));
+    Sign = B.CreateZExt(Neg, I32);
+    Value *VNeg = B.CreateSub(C(0), V);
+    Mag = B.CreateSelect(Neg, VNeg, V);
+  } else {
+    Sign = C(0);
+    Mag = V;
+  }
+
+  Value *IsZero = B.CreateICmpEQ(Mag, C(0));
+
+  Function *Ctlz =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::ctlz, {I32});
+  Value *LZ = B.CreateCall(Ctlz, {Mag, ConstantInt::getFalse(Ctx)}, "lz");
+  Value *Hi = B.CreateSub(C(31), LZ);
+  Value *ExpBiased = B.CreateAdd(Hi, C(1023u));
+
+  // Shift to put leading 1 at bit 52 of mantissa.
+  Value *Shift = B.CreateSub(C(52u), Hi);
+  Value *Small = B.CreateICmpULT(Shift, C(32u));
+
+  // Small-arm clamped shifts: when not chosen, the shift amounts are
+  // bogus; force them into a defined range so the materialised arm
+  // doesn't introduce undefined-shift poison through the bit-blend.
+  Value *SmallShiftL = B.CreateSelect(Small, Shift, C(0u));
+  Value *SmallShiftR = B.CreateSelect(Small, B.CreateSub(C(32u), Shift),
+                                      C(1u));
+  Value *MantHiSmall = B.CreateLShr(Mag, SmallShiftR);
+  Value *MantLoSmall = B.CreateShl(Mag, SmallShiftL);
+
+  // Big-arm clamped shift.
+  Value *BigShiftL = B.CreateSelect(Small, C(0u),
+                                    B.CreateSub(Shift, C(32u)));
+  Value *MantHiBig = B.CreateShl(Mag, BigShiftL);
+  Value *MantLoBig = C(0);
+
+  Value *MantHi = B.CreateSelect(Small, MantHiSmall, MantHiBig);
+  Value *MantLo = B.CreateSelect(Small, MantLoSmall, MantLoBig);
+
+  // Pack: drop bit 52 (= bit 20 of MantHi, the implicit 1).
+  Value *MantHiField = B.CreateAnd(MantHi, C(0xFFFFFu));
+  Value *ExpField = B.CreateAnd(B.CreateShl(ExpBiased, C(20)),
+                                C(0x7FF00000u));
+  Value *SignField = B.CreateShl(Sign, C(31));
+  Value *PackHi = B.CreateOr(SignField,
+                             B.CreateOr(ExpField, MantHiField));
+  Value *PackLo = MantLo;
+
+  // Zero override on both halves.
+  Value *FinalHi = B.CreateSelect(IsZero, C(0), PackHi);
+  Value *FinalLo = B.CreateSelect(IsZero, C(0), PackLo);
+
+  // Combine to i64 via constant-amount shifts.
+  Value *Result64 = B.CreateOr(
+      B.CreateShl(B.CreateZExt(FinalHi, I64), B.getInt64(32)),
+      B.CreateZExt(FinalLo, I64));
+  B.CreateRet(B.CreateBitCast(Result64, F64));
+}
+
+static void injectFloatsidfHelpers(Module &M, LLVMContext &Ctx) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *F64 = Type::getDoubleTy(Ctx);
+  FunctionType *FnTy = FunctionType::get(F64, {I32}, /*isVarArg=*/false);
+  if (Function *F = makeOrPromoteHelper(M, "__floatsidf", FnTy))
+    emitInt32ToDoubleBody(F, Ctx, M, /*IsSigned=*/true);
+  if (Function *F = makeOrPromoteHelper(M, "__floatunsidf", FnTy))
+    emitInt32ToDoubleBody(F, Ctx, M, /*IsSigned=*/false);
+}
+
+// Stage 7h3 — `__fixdfsi (f64) -> i32` / `__fixunsdfsi (f64) -> u32`.
+// f64 → i32 truncate-toward-zero with explicit saturation outside
+// the i32 range.
+//
+//   exp < 1023                 ⇒ |d| < 1                   ⇒ 0
+//   exp ∈ [1023, 1053]         ⇒ |d| ∈ [1, 2^31)            ⇒ shift
+//   exp ≥ 1054 (signed)        ⇒ |d| ≥ 2^31                 ⇒ saturate to
+//                                                            INT_MIN/MAX
+//   exp ≥ 1055 (unsigned)      ⇒ |d| ≥ 2^32                 ⇒ UINT_MAX
+//
+// For the in-range case, the 53-bit mantissa is right-shifted by
+// `1075 - exp` (range 22..52) to extract the integer part. Split
+// across i32 halves:
+//   if shift_right ≥ 32 (exp ≤ 1043):
+//     result = full_mant_hi >> (shift_right - 32)
+//   else:
+//     result = (full_mant_lo >> shift_right) | (full_mant_hi << (32 - shift_right))
+static void emitDoubleToInt32Body(Function *F, LLVMContext &Ctx,
+                                  bool IsSigned) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+
+  Argument *V = F->getArg(0); V->setName("d");
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  auto C = [&](uint32_t X) { return B.getInt32(X); };
+
+  Value *DI64 = B.CreateBitCast(V, I64);
+  Value *DHi = B.CreateTrunc(B.CreateLShr(DI64, B.getInt64(32)),
+                             I32, "d_hi");
+  Value *DLo = B.CreateTrunc(DI64, I32, "d_lo");
+
+  Value *Sign = B.CreateLShr(DHi, C(31));
+  Value *Exp = B.CreateAnd(B.CreateLShr(DHi, C(20)), C(0x7FFu));
+  Value *MantTop = B.CreateAnd(DHi, C(0xFFFFFu));    // 20 bits
+  Value *MantBot = DLo;                              // 32 bits
+
+  // 53-bit mantissa with implicit 1.
+  Value *FullMantHi = B.CreateOr(MantTop, C(0x100000u));
+  Value *FullMantLo = MantBot;
+
+  // Underflow.
+  Value *Underflow = B.CreateICmpULT(Exp, C(1023u));
+
+  Value *ShiftR = B.CreateSub(C(1075u), Exp);  // wants 22..52
+  Value *ShiftRGe32 = B.CreateICmpUGE(ShiftR, C(32u));
+
+  // Codex-review P1: `Exp` can be any value in [0, 2047] because we
+  // accept arbitrary f64 inputs (zero, denormal, Inf, NaN, …); only
+  // the [1023, 1053] window has a well-defined ShiftR in [22, 52].
+  // Outside that window the bit-blended unused arm would compute a
+  // poison shift (e.g. ShiftR = 1075 for f64 = 0.0). The later
+  // Underflow / Overflow gates override Result correctly, but the
+  // shifts themselves still have to be defined. Clamp every shift
+  // count to ≤ 31 so each `lshr` / `shl` is well-defined regardless
+  // of input.
+  auto ClampTo31 = [&](Value *X) {
+    return B.CreateSelect(B.CreateICmpUGT(X, C(31u)), C(31u), X);
+  };
+
+  // Big arm (shift_right ≥ 32): result comes from FullMantHi alone.
+  Value *BigShift = ClampTo31(B.CreateSelect(
+      ShiftRGe32, B.CreateSub(ShiftR, C(32u)), C(0u)));
+  Value *BigPath = B.CreateLShr(FullMantHi, BigShift);
+
+  // Small arm (shift_right < 32): combine both halves.
+  Value *SmallShiftR = ClampTo31(
+      B.CreateSelect(ShiftRGe32, C(1u), ShiftR));
+  Value *SmallShiftL = ClampTo31(B.CreateSelect(
+      ShiftRGe32, C(0u), B.CreateSub(C(32u), ShiftR)));
+  Value *SmallPath = B.CreateOr(B.CreateLShr(FullMantLo, SmallShiftR),
+                                B.CreateShl(FullMantHi, SmallShiftL));
+
+  Value *MagPath = B.CreateSelect(ShiftRGe32, BigPath, SmallPath);
+
+  Value *Result;
+  if (IsSigned) {
+    Value *NegSign = B.CreateICmpEQ(Sign, C(1));
+    Value *NegMag = B.CreateSub(C(0), MagPath);
+    Result = B.CreateSelect(NegSign, NegMag, MagPath);
+
+    // Saturate when |d| ≥ 2^31. exp == 1054 with sign == 1 and
+    // mant == 0 is exactly INT_MIN; the saturation lands on the
+    // same value, so no special-case needed.
+    Value *ExpGe1054 = B.CreateICmpUGE(Exp, C(1054u));
+    Value *PosSat = C(0x7FFFFFFFu);
+    Value *NegSat = C(0x80000000u);
+    Value *Sat = B.CreateSelect(NegSign, NegSat, PosSat);
+    Result = B.CreateSelect(ExpGe1054, Sat, Result);
+  } else {
+    Result = MagPath;
+    Value *NegSign = B.CreateICmpEQ(Sign, C(1));
+    Value *ExpGe1055 = B.CreateICmpUGE(Exp, C(1055u));
+    Value *PosOverflow = B.CreateAnd(B.CreateNot(NegSign), ExpGe1055);
+    Result = B.CreateSelect(PosOverflow, C(0xFFFFFFFFu), Result);
+    Result = B.CreateSelect(NegSign, C(0), Result);
+  }
+
+  Result = B.CreateSelect(Underflow, C(0), Result);
+  B.CreateRet(Result);
+}
+
+static void injectFixdfsiHelpers(Module &M, LLVMContext &Ctx) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *F64 = Type::getDoubleTy(Ctx);
+  FunctionType *FnTy = FunctionType::get(I32, {F64}, /*isVarArg=*/false);
+  if (Function *F = makeOrPromoteHelper(M, "__fixdfsi", FnTy))
+    emitDoubleToInt32Body(F, Ctx, /*IsSigned=*/true);
+  if (Function *F = makeOrPromoteHelper(M, "__fixunsdfsi", FnTy))
+    emitDoubleToInt32Body(F, Ctx, /*IsSigned=*/false);
+}
+
 // Stage 7h1 — `__extendsfdf2 (float a) -> double`. Lossless f32 → f64
 // conversion. Algorithm:
 //   - decode {sign, exp32, mant32_raw} from the f32 bit pattern
@@ -1814,6 +2035,38 @@ static bool moduleNeedsDoubleCompare(Module &M) {
   return false;
 }
 
+// Stage 7h3 — scan for sitofp / uitofp into double.
+static bool moduleNeedsFloatsidf(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if ((I.getOpcode() == Instruction::SIToFP ||
+           I.getOpcode() == Instruction::UIToFP) &&
+          I.getType()->getScalarType()->isDoubleTy() &&
+          I.getOperand(0)->getType()->getScalarType()->isIntegerTy(32))
+        return true;
+    }
+  }
+  return false;
+}
+
+// Stage 7h3 — scan for fptosi / fptoui from double to i32.
+static bool moduleNeedsFixdfsi(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if ((I.getOpcode() == Instruction::FPToSI ||
+           I.getOpcode() == Instruction::FPToUI) &&
+          I.getOperand(0)->getType()->getScalarType()->isDoubleTy() &&
+          I.getType()->getScalarType()->isIntegerTy(32))
+        return true;
+    }
+  }
+  return false;
+}
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
 
@@ -1969,6 +2222,12 @@ int main(int argc, char **argv) {
   // the body.
   if (moduleNeedsDoubleCompare(*M))
     injectDoubleCompareHelpers(*M, Ctx);
+  // Stage 7h3 — i32 ↔ f64 conversion helpers. Each gates on the
+  // corresponding cast actually appearing in the module.
+  if (moduleNeedsFloatsidf(*M))
+    injectFloatsidfHelpers(*M, Ctx);
+  if (moduleNeedsFixdfsi(*M))
+    injectFixdfsiHelpers(*M, Ctx);
 
   // Stage 6d2 — pre-Scalarizer lowering of `llvm.vector.reduce.*`.
   //

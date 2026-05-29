@@ -246,6 +246,13 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setLibcallImpl(RTLIB::OGE_F64, RTLIB::impl___gedf2);
   setLibcallImpl(RTLIB::UO_F64,  RTLIB::impl___unorddf2);
 
+  // Stage 7h3 — i32 ↔ f64 conversions. Same shape as the 7g1 f32
+  // versions; helper bodies injected by the driver.
+  setLibcallImpl(RTLIB::SINTTOFP_I32_F64, RTLIB::impl___floatsidf);
+  setLibcallImpl(RTLIB::UINTTOFP_I32_F64, RTLIB::impl___floatunsidf);
+  setLibcallImpl(RTLIB::FPTOSINT_F64_I32, RTLIB::impl___fixdfsi);
+  setLibcallImpl(RTLIB::FPTOUINT_F64_I32, RTLIB::impl___fixunsdfsi);
+
   // No `bswap` opcode either. Rust idioms like `u32::from_be(x)` or
   // `x.swap_bytes()` lower to ISD::BSWAP. Expand re-spells it as
   // the standard four-byte shuffle (`(x << 24) | ((x & 0xff00) << 8)
