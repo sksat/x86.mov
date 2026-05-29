@@ -109,11 +109,16 @@ function buildStubO() {
 }
 const STUB = buildStubO();
 
-// Static link command-line baseline. Matches the order
-// `crt0.o input.o crtf.o crtd.o softfloat32.o stub.o` from
-// `movie86/wasm/examples/sources/build-mandelbrot.sh` — caller-supplied
-// stubs come *after* the runtime so they resolve crt0's undefineds.
-function hostStaticLink(objPath, stubPath) {
+// Static link command-line baseline. **Must match the wrapper's
+// argument layout exactly** for the byte-identical assertion to be
+// meaningful — that means every caller-supplied object lands together
+// in a single group between `crt0.o` and `crtf.o`, in the same order
+// the wrapper's `normalizeObjs` produced (Object.entries iteration
+// order on Record inputs). Movie86/wasm's build-mandelbrot.sh recipe
+// puts caller stubs after softfloat32; the wrapper API doesn't expose
+// that two-group split, so the test mirrors the wrapper layout
+// instead.
+function hostStaticLink(callerObjPaths) {
     const tmp = mkdtempSync(join(tmpdir(), 'movfuscator-static-'));
     const out = join(tmp, 'out.elf');
     const B = join(root, 'vendor/movfuscator/build');
@@ -123,9 +128,8 @@ function hostStaticLink(objPath, stubPath) {
         '-static',
         '-L', B, '-L', `${B}/gcc/32`, '-L', '/usr/lib32', '-L', '/lib32',
         `${B}/crt0.o`,
-        objPath,
+        ...callerObjPaths,
         `${B}/crtf.o`, `${B}/crtd.o`, `${SF}/softfloat32.o`,
-        stubPath,
         '-o', out,
     ];
     const res = spawnSync('/usr/bin/ld', args, { encoding: 'buffer' });
@@ -158,7 +162,7 @@ function elfPhdrTypes(bytes) {
     return types;
 }
 
-let pass = 0, fail = 0;
+let pass = 0, fail = 0, skip = 0;
 async function runTest(name, fn) {
     try {
         await fn();
@@ -183,12 +187,22 @@ await runTest('static link of return42.o + stub.o byte-matches host /usr/bin/ld 
         throw new Error('goldens-o/return42.o missing — run `make goldens-o`');
     }
     const obj = readFileSync(oPath);
+    // Wasm side: Record form preserves the basenames `return42.o` and
+    // `stub.o` in the resulting .symtab. The host command must use the
+    // same basenames to keep the byte comparison meaningful — stage
+    // both .o into /tmp with their canonical names before invoking
+    // /usr/bin/ld.
+    const tmp = mkdtempSync(join(tmpdir(), 'movfuscator-static-stage-'));
+    const stagedObj = join(tmp, 'return42.o');
+    const stagedStub = join(tmp, 'stub.o');
+    writeFileSync(stagedObj, obj);
+    writeFileSync(stagedStub, STUB.bytes);
     const wasmElf = await link(
         { 'return42.o': new Uint8Array(obj), 'stub.o': STUB.bytes },
         libs,
         { static: true },
     );
-    const hostElf = hostStaticLink(oPath, STUB.path);
+    const hostElf = hostStaticLink([stagedObj, stagedStub]);
     if (!bytesEqual(wasmElf, hostElf)) {
         throw new Error(
             `wasm static ELF ${wasmElf.length} B != host static ELF ${hostElf.length} B`,
@@ -210,7 +224,83 @@ await runTest('static-linked ELF has no PT_INTERP / PT_DYNAMIC', async () => {
     if (types.includes(2)) throw new Error(`unexpected PT_DYNAMIC (types=${types.join(',')})`);
 });
 
-// --- Test 3: dynamic path non-regression ---
+// --- Test 3: static + extraLibs places -l<name> AFTER runtime objects ---
+//
+// `ld -static` scans each archive once, left-to-right; a static
+// archive placed before the objects that reference its symbols won't
+// resolve. The wrapper must emit `extraLibs` after the runtime in
+// static mode (different from the dynamic path, which keeps them
+// before). Codex flagged this on review and the regression cost is
+// silent — a stage-staged libc.a "appears to link" but the binary
+// hasn't actually been pulled in.
+//
+// Use /usr/lib32/libpthread.a as the smoke fixture (same as the
+// dynamic extraLibs smoke in run-multi.mjs). On modern glibc it's a
+// near-empty stub archive, so the link succeeds regardless of
+// ordering — but the wrapper's command line must still place it
+// after the objects to match the host static baseline byte-for-byte.
+await runTest('static + extraLibs places -l<name> after runtime (byte-matches host)', async () => {
+    const oPath = join(goldensO, 'return42.o');
+    if (!existsSync(oPath)) throw new Error('goldens-o/return42.o missing');
+    const libpthreadPath = '/usr/lib32/libpthread.a';
+    if (!existsSync(libpthreadPath)) {
+        console.log(`SKIP static + extraLibs — ${libpthreadPath} not installed`);
+        skip++;
+        return;
+    }
+    const obj = readFileSync(oPath);
+    const libpthread = readFileSync(libpthreadPath);
+    const wasmElf = await link(
+        { 'return42.o': new Uint8Array(obj), 'stub.o': STUB.bytes },
+        libs,
+        {
+            static: true,
+            extraLibs: ['pthread'],
+            searchPaths: ['/extralibs'],
+            extraInputs: { '/extralibs/libpthread.a': new Uint8Array(libpthread) },
+        },
+    );
+    // Host baseline: same -L /tmp/extralibs + -lpthread, placed AFTER
+    // the runtime objects.
+    const tmp = mkdtempSync(join(tmpdir(), 'movfuscator-static-extralibs-'));
+    const stagedObj = join(tmp, 'return42.o');
+    const stagedStub = join(tmp, 'stub.o');
+    const stagedLibDir = join(tmp, 'extralibs');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(stagedLibDir, { recursive: true });
+    writeFileSync(stagedObj, obj);
+    writeFileSync(stagedStub, STUB.bytes);
+    writeFileSync(join(stagedLibDir, 'libpthread.a'), libpthread);
+    const out = join(tmp, 'out.elf');
+    const B = join(root, 'vendor/movfuscator/build');
+    const SF = join(root, 'vendor/movfuscator/movfuscator/lib');
+    const args = [
+        '-m', 'elf_i386', '--hash-style=gnu',
+        '-static',
+        '-L', B, '-L', `${B}/gcc/32`, '-L', '/usr/lib32', '-L', '/lib32',
+        '-L', stagedLibDir,
+        `${B}/crt0.o`,
+        stagedObj,
+        stagedStub,
+        `${B}/crtf.o`, `${B}/crtd.o`, `${SF}/softfloat32.o`,
+        '-lpthread',
+        '-o', out,
+    ];
+    const res = spawnSync('/usr/bin/ld', args, { encoding: 'buffer' });
+    if (res.status !== 0) {
+        throw new Error(
+            `native static + extraLibs ld failed: ${res.stderr?.toString() || ''}`,
+        );
+    }
+    const hostElf = readFileSync(out);
+    if (!bytesEqual(wasmElf, hostElf)) {
+        throw new Error(
+            `static + extraLibs ELF drift: wasm ${wasmElf.length} B vs host ${hostElf.length} B`,
+        );
+    }
+});
+
+// --- Test 4: dynamic path non-regression ---
 //
 // The default link (no opts.static) must keep its existing byte-
 // identical contract with host /usr/bin/ld. Adding the option mustn't
@@ -247,5 +337,5 @@ await runTest('default link (no opts.static) is byte-unchanged', async () => {
 });
 
 console.log();
-console.log(`results: ${pass} passed, ${fail} failed`);
+console.log(`results: ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ''}`);
 process.exit(fail ? 1 : 0);

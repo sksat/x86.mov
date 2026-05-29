@@ -339,24 +339,36 @@ export async function link(objs, libs, opts = {}) {
     // together) so the wrapper isn't tied to a particular gcc release.
     //
     // Mode switch:
-    //   - dynamic: `-dynamic-linker /lib/ld-linux.so.2 ... -lgcc -lc -lm`
-    //   - static : `-static` only, no default `-l...`. Mirrors the host
-    //     recipe in movie86/wasm/examples/sources/build-mandelbrot.sh.
+    //   - dynamic: `-dynamic-linker /lib/ld-linux.so.2 ... -lgcc -lc -lm
+    //     -l<extra>` before the objects — the dynamic linker resolves
+    //     symbols at runtime so position is mostly cosmetic.
+    //   - static : `-static`, no default `-l...`, **caller's `-l<extra>`
+    //     after the runtime objects** so `ld -static` can pull stub
+    //     archives lazily (ld scans each archive once, left-to-right;
+    //     a `libc.a` placed before crt0 wouldn't satisfy crt0's
+    //     references). Mirrors movie86/wasm/examples/sources/
+    //     build-mandelbrot.sh's recipe and matches the host parity
+    //     baseline in tests/run-static.mjs.
     const modeArgs = staticLink
         ? ['-static']
         : ['-dynamic-linker', '/lib/ld-linux.so.2'];
-    const defaultLibArgs = staticLink ? [] : ['-lgcc', '-lc', '-lm'];
+    const headerLibArgs = staticLink
+        ? []
+        : ['-lgcc', '-lc', '-lm', ...extraLibs.map(l => `-l${l}`)];
+    const trailerLibArgs = staticLink
+        ? extraLibs.map(l => `-l${l}`)
+        : [];
     const cmd = [
         '-m', 'elf_i386', '--hash-style=gnu',
         ...modeArgs,
         '-L/movfuscator', '-L/usr/lib32', '-L/lib32',
         ...searchPaths.map(p => `-L${p}`),
-        ...defaultLibArgs,
-        ...extraLibs.map(l => `-l${l}`),
+        ...headerLibArgs,
         '/movfuscator/crt0.o',
         ...userObjs.map(({ name: n }) => `/${n}`),
         '/movfuscator/crtf.o', '/movfuscator/crtd.o',
         '/movfuscator/softfloat32.o',
+        ...trailerLibArgs,
         '-o', '/out.elf',
     ];
     const exit = ld.callMain(cmd);
