@@ -257,6 +257,7 @@ impl Cpu {
                 let target = mem.read_u32(self.compute_ea(ea))?;
                 Ok(target)
             }
+            Insn::JmpReg32(r) => Ok(self.reg(r)),
         }
     }
 

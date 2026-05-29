@@ -22,6 +22,11 @@ typedef int fp_t;
 
 extern void set_video_mode(unsigned mode);
 extern void mmap_request(unsigned packed);
+#ifdef __LCC__
+extern void exit(int code);
+#else
+extern void exit(int code) __attribute__((noreturn));
+#endif
 
 #define ABI_MMAP_PACK(addr, pages) ((unsigned)(addr) | (unsigned)((pages) - 1))
 /* VESA 6Ah FB: 0x00400000 + 800*600*4 / 4096 = 469 pages.
@@ -75,5 +80,8 @@ int main(void)
         }
     }
 
+    /* Tail-call exit(0) — see mandelbrot_coarse.c for the issue #42
+     * rationale. */
+    exit(0);
     return 0;
 }

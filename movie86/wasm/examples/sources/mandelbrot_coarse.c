@@ -27,6 +27,11 @@ typedef int fp_t;   /* Q16.16 */
 
 extern void set_video_mode(unsigned mode);
 extern void mmap_request(unsigned packed);
+#ifdef __LCC__
+extern void exit(int code);                                     /* LCC: bare extern */
+#else
+extern void exit(int code) __attribute__((noreturn));           /* clang: drop ret */
+#endif
 
 /* Pack (addr, pages) for the mov-only ABI mmap_request call. */
 #define ABI_MMAP_PACK(addr, pages) ((unsigned)(addr) | (unsigned)((pages) - 1))
@@ -92,5 +97,12 @@ int main(void)
         }
     }
 
-    return 0;
+    /* Tail-call exit(0) instead of `return 0`. The extern is marked
+     * `noreturn` for clang so the function epilogue (and its `ret`)
+     * gets dropped — see _start_llvm.s and upstream issue #42. LCC
+     * doesn't grok the attribute so the #ifdef above makes the extern
+     * bare; LCC keeps emitting `return 0` and the crt0 wrapper handles
+     * the eventual exit (canvas_mandelbrot_mov.elf path). */
+    exit(0);
+    return 0;  /* unreachable on both paths */
 }

@@ -213,10 +213,13 @@ pub enum Insn {
     /// model segment registers in flat 32-bit mode, so this is a no-op.
     MovToOtherSegReg,
     /// `jmp r/m32` indirect through memory (opcode `FF /4`, mod≠11).
-    /// Only the memory form is observed in movfuscator output (crtf's
-    /// `.plt` dispatch). Register-indirect `jmp r32` (FF /4, mod=11)
-    /// can be added if it ever appears.
+    /// Used by movfuscator's `crtf.plt` dispatch.
     JmpIndirectMem32(EffectiveAddress),
+    /// `jmp r32` indirect through a register (opcode `FF /4`, mod=11).
+    /// Used by the canvas demo's hand-written stubs as the mov+jmp
+    /// equivalent of `ret` (`pop ecx ; jmp ecx`) so the resulting
+    /// `.text` stays free of `ret` opcodes (upstream issue #42).
+    JmpReg32(Reg32),
 }
 
 // ---------- AT&T-syntax Display impls --------------------------------
@@ -409,6 +412,7 @@ impl core::fmt::Display for Insn {
             }
             Self::MovToOtherSegReg => f.write_str("movw <r/m16>, <sreg>"),
             Self::JmpIndirectMem32(ea) => write!(f, "jmp *{ea}"),
+            Self::JmpReg32(r) => write!(f, "jmp *{r}"),
         }
     }
 }
