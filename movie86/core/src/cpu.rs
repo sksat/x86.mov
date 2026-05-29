@@ -287,7 +287,7 @@ impl Cpu {
                 // ABI_PAGE_SIZE = 0x1000 < u16::MAX, so the offset
                 // within the page always fits.
                 let call = u16::try_from(addr - ABI_BASE).expect("ABI page offset fits in u16");
-                return host.abi_call(call, v, mem);
+                return host.abi_call(call, v, &mut self.regs, mem);
             }
         }
         if let Operand::Mem8(ea) = dst {
@@ -295,7 +295,7 @@ impl Cpu {
             if is_abi_addr(addr) {
                 let v = self.read_operand_u8(src, mem)?;
                 let call = u16::try_from(addr - ABI_BASE).expect("ABI page offset fits in u16");
-                return host.abi_call(call, u32::from(v), mem);
+                return host.abi_call(call, u32::from(v), &mut self.regs, mem);
             }
         }
         match dst {
@@ -1022,6 +1022,7 @@ mod tests {
                 &mut self,
                 call_num: u16,
                 value: u32,
+                _regs: &mut [u32; 8],
                 _mem: &mut dyn Memory,
             ) -> Result<(), Fault> {
                 self.last = Some((call_num, value));
@@ -1066,6 +1067,7 @@ mod tests {
                 &mut self,
                 call_num: u16,
                 value: u32,
+                _regs: &mut [u32; 8],
                 _mem: &mut dyn Memory,
             ) -> Result<(), Fault> {
                 self.last = Some((call_num, value));

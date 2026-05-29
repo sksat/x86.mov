@@ -174,14 +174,75 @@ impl BiosHost for StdHost {}
 /// falls through to the default trap so typos in the guest's ABI use
 /// surface loudly.
 impl AbiHost for StdHost {
-    fn abi_call(&mut self, call_num: u16, value: u32, _mem: &mut dyn Memory) -> Result<(), Fault> {
-        use movie86::abi_host::{CALL_EXIT, CALL_SET_VIDEO_MODE};
+    fn abi_call(
+        &mut self,
+        call_num: u16,
+        value: u32,
+        regs: &mut [u32; 8],
+        mem: &mut dyn Memory,
+    ) -> Result<(), Fault> {
+        use movie86::abi_host::{CALL_EXIT, CALL_SET_VIDEO_MODE, CALL_WRITE};
         match call_num {
             CALL_SET_VIDEO_MODE => Ok(()),
             CALL_EXIT => Err(Fault::Exit(value)),
+            CALL_WRITE => {
+                let fd = regs[Reg32::Ebx as usize];
+                let buf = regs[Reg32::Ecx as usize];
+                let len = regs[Reg32::Edx as usize];
+                let n = abi_write_to_host_stdio(fd, buf, len, mem);
+                // Mirror the int 0x80 SYS_write convention: kernel
+                // would place bytes-written in eax. We do the same
+                // so the guest can read the return like before.
+                regs[Reg32::Eax as usize] = n;
+                Ok(())
+            }
             _ => Err(Fault::UnsupportedAbiCall(call_num)),
         }
     }
+}
+
+/// Read `len` bytes starting at guest `buf` and forward them to the
+/// host's `stdout` (fd=1) or `stderr` (fd=2). Mirrors the int 0x80
+/// `SYS_write` semantics so `WriteHelloAbi`-style fixtures behave the
+/// same way as the existing int 0x80 path.
+///
+/// Returns the number of bytes accepted (in the success case, `len`).
+/// Bad fd / unreadable memory produce errno-style negative values
+/// (`-EBADF=9` / `-EFAULT=14`), matching `write_syscall`.
+fn abi_write_to_host_stdio(fd: u32, buf: u32, len: u32, mem: &mut dyn Memory) -> u32 {
+    const CHUNK: usize = 4096;
+    if fd != 1 && fd != 2 {
+        // -EBADF as u32 — same encoding the int 0x80 path uses.
+        return 0u32.wrapping_sub(9);
+    }
+    let mut addr = buf;
+    let mut remaining = len as usize;
+    let mut written: u32 = 0;
+    let mut scratch = [0u8; CHUNK];
+    while remaining > 0 {
+        let this = remaining.min(CHUNK);
+        let slice = &mut scratch[..this];
+        if mem.read_bytes(addr, slice).is_err() {
+            if written > 0 {
+                return written;
+            }
+            return 0u32.wrapping_sub(14);
+        }
+        let res = if fd == 1 {
+            io::stdout().write_all(slice)
+        } else {
+            io::stderr().write_all(slice)
+        };
+        if res.is_err() {
+            // Host I/O failure mid-stream — return partial count.
+            return written;
+        }
+        let n_u32 = u32::try_from(this).unwrap_or(u32::MAX);
+        written = written.saturating_add(n_u32);
+        addr = addr.wrapping_add(n_u32);
+        remaining = remaining.saturating_sub(this);
+    }
+    written
 }
 
 /// Maximum length of a guest-supplied format string or `%s` argument.

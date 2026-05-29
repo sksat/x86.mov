@@ -15,7 +15,7 @@ pub mod syscall;
 
 pub use abi_host::{
     is_abi_addr, unpack_mmap_request, AbiHost, ABI_BASE, ABI_PAGE_SIZE, CALL_EXIT,
-    CALL_MMAP_REQUEST, CALL_SET_VIDEO_MODE,
+    CALL_MMAP_REQUEST, CALL_SET_VIDEO_MODE, CALL_WRITE,
 };
 pub use bios_host::{BiosArgs, BiosHost, BiosResult};
 pub use context::{capture_sparse_regions, load_context, Context, MemRegion, Regs};

@@ -53,6 +53,64 @@ func TestRunOnce_AbiSetVideoMode(t *testing.T) {
 	}
 }
 
+// TestRunOnce_AbiWriteThenExit drives a write+exit pair through the
+// mov-only ABI: the guest stages the SYS_write arguments in
+// ebx/ecx/edx exactly like the int 0x80 ABI expects (fd, buf, len),
+// then writes to ABI slot 0x080 to trigger the host-side write. The
+// runner reads the regs out of ptrace, copies bytes via
+// /proc/PID/mem, emits Stdout(...) and advances past the mov.
+//
+// This is the last `int 0x80` removal — together with set_video_mode
+// and exit, it makes the entire toolchain-generated mov-only canvas
+// pipeline `int`-free.
+//
+// Guest:
+//
+//	BB 01 00 00 00            mov ebx, 1            ; fd = stdout
+//	B9 00 81 04 08            mov ecx, 0x08048100   ; buf = data addr
+//	BA 02 00 00 00            mov edx, 2            ; len
+//	B8 04 00 00 00            mov eax, 4            ; SYS_write marker
+//	A3 80 00 FE 1F            mov [0x1FFE0080], eax ; ABI write
+//	B8 00 00 00 00            mov eax, 0            ; exit code
+//	A3 FE 00 FE 1F            mov [0x1FFE00FE], eax ; ABI exit
+func TestRunOnce_AbiWriteThenExit(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	const entry uint32 = 0x08048000
+	const bufAddr uint32 = 0x08048100
+
+	code := []byte{
+		0xBB, 0x01, 0x00, 0x00, 0x00,
+		0xB9, 0x00, 0x81, 0x04, 0x08,
+		0xBA, 0x02, 0x00, 0x00, 0x00,
+		0xB8, 0x04, 0x00, 0x00, 0x00,
+		0xA3, 0x80, 0x00, 0xFE, 0x1F,
+		0xB8, 0x00, 0x00, 0x00, 0x00,
+		0xA3, 0xFE, 0x00, 0xFE, 0x1F,
+	}
+
+	events, err := RunOnce(
+		stub.Bytes,
+		map[uint32][]byte{
+			entry:   code,
+			bufAddr: []byte("hi"),
+		},
+		entry,
+		testStackTop,
+	)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	want := []proto.Outbound{
+		proto.Stdout{Bytes: []byte("hi")},
+		proto.Exit{Code: 0},
+	}
+	if !reflect.DeepEqual(events, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", events, want)
+	}
+}
+
 // TestRunOnce_AbiExit drives an exit through the mov-only ABI: the
 // guest packs the exit code into EAX and writes it to call slot 0x0FE.
 // The runner emits Exit{code} and tears down the session — same

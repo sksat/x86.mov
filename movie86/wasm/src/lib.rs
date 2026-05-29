@@ -172,7 +172,13 @@ impl BiosHost for WasmHost {
 ///   and reports as the final exit status. Lets canvas examples drop
 ///   the trailing `int 0x80` epilogue entirely.
 impl movie86::AbiHost for WasmHost {
-    fn abi_call(&mut self, call_num: u16, value: u32, _mem: &mut dyn Memory) -> Result<(), Fault> {
+    fn abi_call(
+        &mut self,
+        call_num: u16,
+        value: u32,
+        regs: &mut [u32; 8],
+        mem: &mut dyn Memory,
+    ) -> Result<(), Fault> {
         match call_num {
             movie86::CALL_SET_VIDEO_MODE => {
                 self.active_video_mode = Some((value & 0xFF) as u8);
@@ -180,8 +186,54 @@ impl movie86::AbiHost for WasmHost {
             }
             movie86::CALL_MMAP_REQUEST => Ok(()),
             movie86::CALL_EXIT => Err(Fault::Exit(value)),
+            movie86::CALL_WRITE => {
+                let fd = regs[Reg32::Ebx as usize];
+                let buf = regs[Reg32::Ecx as usize];
+                let len = regs[Reg32::Edx as usize];
+                let n = self.abi_write(fd, buf, len, mem);
+                regs[Reg32::Eax as usize] = n;
+                Ok(())
+            }
             _ => Err(Fault::UnsupportedAbiCall(call_num)),
         }
+    }
+}
+
+impl WasmHost {
+    /// Buffered write that mirrors the existing `write_syscall` flow:
+    /// stdout/stderr each get their own `Vec<u8>`, JS pulls the bytes
+    /// via `drainStdout` / `drainStderr`. Bad fd → -EBADF, unreadable
+    /// memory → partial count or -EFAULT (same as the int 0x80 path).
+    fn abi_write(&mut self, fd: u32, buf: u32, len: u32, mem: &mut dyn Memory) -> u32 {
+        const CHUNK: usize = 4096;
+        if fd != 1 && fd != 2 {
+            return 0u32.wrapping_sub(9);
+        }
+        let mut addr = buf;
+        let mut remaining = len as usize;
+        let mut written: u32 = 0;
+        let mut scratch = [0u8; CHUNK];
+        while remaining > 0 {
+            let this = remaining.min(CHUNK);
+            let slice = &mut scratch[..this];
+            if mem.read_bytes(addr, slice).is_err() {
+                if written > 0 {
+                    return written;
+                }
+                return 0u32.wrapping_sub(14);
+            }
+            let sink: &mut Vec<u8> = if fd == 1 {
+                &mut self.stdout
+            } else {
+                &mut self.stderr
+            };
+            sink.extend_from_slice(slice);
+            let n_u32 = u32::try_from(this).unwrap_or(u32::MAX);
+            written = written.saturating_add(n_u32);
+            addr = addr.wrapping_add(n_u32);
+            remaining = remaining.saturating_sub(this);
+        }
+        written
     }
 }
 

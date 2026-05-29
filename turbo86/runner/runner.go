@@ -233,6 +233,7 @@ const (
 	// "set video mode") without renumbering downstream consumers.
 	abiCallSetVideoMode uint16 = 0x010
 	abiCallMmapRequest  uint16 = 0x020
+	abiCallWrite        uint16 = 0x080
 	abiCallExit         uint16 = 0x0FE
 )
 
@@ -818,6 +819,14 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 		r.eventsCh <- proto.VideoMode{Mode: uint8(call.arg)}
 	case abiCallMmapRequest:
 		return r.handleMmapRequest(call, regs)
+	case abiCallWrite:
+		// Mirrors the int 0x80 SYS_write ABI: fd in ebx, buf in ecx,
+		// len in edx. eax (the "value" the guest wrote to trigger the
+		// call) is conventionally 4 = SYS_write but isn't checked
+		// here — the call number already says "this is a write".
+		if !r.handleAbiWrite(regs) {
+			return false
+		}
 	case abiCallExit:
 		// Mirrors `int 0x80 / SYS_exit` semantics: emit the Exit event
 		// and stop the syscall loop. EIP isn't advanced because the
@@ -877,6 +886,42 @@ func (r *Runner) mmapRegionForLoadContext(addr, size uint32, regs *regs32) error
 	}
 	r.extraRegions = append(r.extraRegions, struct{ addr, size uint32 }{pageAddr, pageSize})
 	return nil
+}
+
+// handleAbiWrite reads the int-0x80-style write args from regs
+// (fd=ebx, buf=ecx, len=edx), copies bytes from /proc/PID/mem, and
+// emits Outbound{Stdout/Stderr}. Bad fd → Fault; mid-stream memory
+// read failure → partial Stdout/Stderr followed by Fault, mirroring
+// what the bridge's int 0x80 path would do.
+//
+// Returns true on success (caller advances EIP), false on failure
+// (handler has already emitted Fault and aborted the session).
+func (r *Runner) handleAbiWrite(regs *regs32) bool {
+	fd := regs.Ebx
+	bufAddr := regs.Ecx
+	length := regs.Edx
+	if fd != 1 && fd != 2 {
+		r.emitFault(fmt.Sprintf("mov-only ABI write: unsupported fd=%d", fd))
+		return false
+	}
+	if length == 0 {
+		// Successful zero-byte write — no event needed, just advance.
+		regs.Eax = 0
+		return true
+	}
+	buf := make([]byte, length)
+	if err := r.mem.ReadAt(bufAddr, buf); err != nil {
+		r.emitFault(fmt.Sprintf("mov-only ABI write: read /proc/PID/mem at 0x%x..0x%x: %v",
+			bufAddr, bufAddr+length, err))
+		return false
+	}
+	if fd == 1 {
+		r.eventsCh <- proto.Stdout{Bytes: buf}
+	} else {
+		r.eventsCh <- proto.Stderr{Bytes: buf}
+	}
+	regs.Eax = length
+	return true
 }
 
 // handleMmapRequest unpacks the (addr, size) pair the guest packed into

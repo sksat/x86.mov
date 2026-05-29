@@ -1,4 +1,5 @@
 # cycle — print "1 2 3 4 5" forever via five `call`s + `jmp _start`.
+# int-free via mov-only ABI (see hello.s).
 #
 # Each `pN` function writes a 2-byte slice of the shared `msg` string
 # (`"1 ".."5 "`) and `ret`s. `_start` calls them in sequence, then
@@ -35,7 +36,7 @@ _start:
     mov ecx, OFFSET msg + \off
     mov ebx, 1
     mov eax, 4
-    int 0x80
+    mov [0x1FFE0080], eax   # ABI write (replaces int 0x80 SYS_write)
     ret
 .endm
 
