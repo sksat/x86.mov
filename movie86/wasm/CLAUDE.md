@@ -257,6 +257,18 @@ slider — they answer different questions ("show me each step" vs
   the snapshot then `vm.free()`; that's a UI-policy decision the
   button intentionally leaves to the user.
 
+- **Bundled examples are linked at 0x08048000, not 0x1000.** Earlier
+  fixtures used 0x1000 (which movie86's loader accepts fine) but that
+  collides with `mmap_min_addr` on most Linux hosts and — more
+  importantly — sits outside turbo86's stub RWX region (`[0x08048000,
+  0x09048000)`), so a handover snapshot at 0x1000 fails to land in
+  /proc/PID/mem with `input/output error`. Re-link new examples at
+  0x08048000; `make rebase-examples` runs `examples/rebase.py` over
+  every committed .elf (idempotent — skips entries already at the new
+  base) and bumps `e_entry` / Phdr vaddrs / inline `mov rXX, imm32`
+  pointers in lockstep. The disasm / mem pane defaults in `index.html`
+  also point at 0x08048000 to match.
+
 ## CI
 
 [`.github/workflows/movie86-wasm.yaml`](../../.github/workflows/movie86-wasm.yaml)

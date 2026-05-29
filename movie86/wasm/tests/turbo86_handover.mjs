@@ -31,6 +31,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = `${here}/..`;
 const repoRoot = `${root}/../..`;
 
+const wasm = await readFile(`${root}/build/browser/movie86_wasm_bg.wasm`);
+const wasmMod = await import(`${root}/build/browser/movie86_wasm.js`);
+await wasmMod.default({ module_or_path: wasm });
 const wrapper = await import(`${root}/movie86.mjs`);
 
 // --- locate or build turbo86 ---
@@ -156,6 +159,61 @@ async function main() {
         } catch (e) {
             console.error(`FAIL real turbo86 handover: ${e.message}`);
             failed++;
+        }
+
+        // Third path: real Vm snapshot. Load each bundled example
+        // into a wasm Vm, take a snapshot via the same
+        // `wrapper.snapshotContext` the browser button uses, hand it
+        // straight to turbo86. This is the path that broke when
+        // example ELFs were linked at 0x1000 (below turbo86's stub
+        // mapping); the rebase to 0x08048000 is what this test pins.
+        // A regression here surfaces as `fault write context region
+        // 0x...: input/output error` from /proc/PID/mem, exactly what
+        // users saw.
+        const vmCases = [
+            // name, expected exit code, expected stdout bytes (or null).
+            { name: 'return42',   exit: 42, stdout: null },
+            { name: 'hello',      exit: 0,  stdout: 'Hello\n' },
+            { name: 'call_greet', exit: 0,  stdout: 'Hi!\n' },
+        ];
+        for (const tc of vmCases) {
+            try {
+                const elfBytes = new Uint8Array(
+                    await readFile(`${root}/examples/${tc.name}.elf`),
+                );
+                const vm = new wasmMod.Vm(elfBytes);
+                let ctx;
+                try {
+                    assert.ok(
+                        0x08048000 <= vm.eip && vm.eip < 0x09048000,
+                        `${tc.name}: EIP ${vm.eip.toString(16)} is outside turbo86's [0x08048000, 0x09048000) RWX region — examples need rebasing`,
+                    );
+                    ctx = wrapper.snapshotContext(vm);
+                } finally {
+                    vm.free();
+                }
+                const events = await runHandover(ctx, 'host');
+                const exit = events.find(e => e.type === 'exit');
+                assert.ok(exit, `${tc.name}: no exit event in ${events.length} events`);
+                assert.equal(exit.code, tc.exit,
+                    `${tc.name}: exit ${exit.code} != ${tc.exit}`);
+                if (tc.stdout !== null) {
+                    const stdoutBytes = events
+                        .filter(e => e.type === 'stdout')
+                        .reduce((acc, e) => {
+                            const merged = new Uint8Array(acc.length + e.bytes.length);
+                            merged.set(acc); merged.set(e.bytes, acc.length);
+                            return merged;
+                        }, new Uint8Array(0));
+                    const stdout = new TextDecoder().decode(stdoutBytes);
+                    assert.equal(stdout, tc.stdout,
+                        `${tc.name}: stdout ${JSON.stringify(stdout)} != ${JSON.stringify(tc.stdout)}`);
+                }
+                console.log(`ok  real turbo86 handover (Vm.snapshotContext → ${tc.name}.elf → exit ${tc.exit})`);
+            } catch (e) {
+                console.error(`FAIL real turbo86 handover (${tc.name}): ${e.message}`);
+                failed++;
+            }
         }
 
         // Second handover: write(1, "Hi\n", 3) then exit(0). Exercises
