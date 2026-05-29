@@ -402,6 +402,14 @@ type Runner struct {
 	pid int
 	mem *procMem
 
+	// perfFd is the perf_event_open file descriptor counting retired
+	// instructions on the child. -1 when the kernel rejected the open
+	// (typical on locked-down containers with
+	// `kernel.perf_event_paranoid > 2`). The MemUpdate ticker treats
+	// -1 as "counter unavailable" and emits Insns=0 so the field is
+	// always present on the wire but optionally meaningful.
+	perfFd int
+
 	startCh   chan startMsg
 	eventsCh  chan proto.Outbound
 	closeCh   chan struct{}
@@ -470,6 +478,7 @@ func New(stubBytes []byte) (*Runner, error) {
 		closeCh:    make(chan struct{}),
 		done:       make(chan struct{}),
 		tickerStop: make(chan struct{}),
+		perfFd:     -1,
 	}
 
 	bootErr := make(chan error, 1)
@@ -630,6 +639,9 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 		if r.mem != nil {
 			_ = r.mem.f.Close()
 		}
+		if r.perfFd != -1 {
+			_ = syscall.Close(r.perfFd)
+		}
 		close(r.eventsCh)
 		close(r.done)
 	}()
@@ -780,8 +792,18 @@ func (r *Runner) memUpdateTicker(interval time.Duration) {
 				// rather than tearing down the whole session.
 				continue
 			}
+			// Sample the retired-insn counter best-effort; a transient
+			// read failure (or a perfFd that never opened) just yields
+			// 0 here so the frontend sees a frozen-ish counter for
+			// that tick instead of dropping the whole MemUpdate.
+			var insns uint64
+			if r.perfFd != -1 {
+				if n, perfErr := readInsnCount(r.perfFd); perfErr == nil {
+					insns = n
+				}
+			}
 			select {
-			case r.eventsCh <- proto.MemUpdate{Regions: regions}:
+			case r.eventsCh <- proto.MemUpdate{Regions: regions, Insns: insns}:
 			case <-r.closeCh:
 				return
 			case <-r.tickerStop:
@@ -856,6 +878,16 @@ func (r *Runner) bootstrap(stubBytes []byte) error {
 		return fmt.Errorf("open /proc/%d/mem: %w", r.pid, err)
 	}
 	r.mem = &procMem{f: memFile}
+
+	// Open a perf_event_open retired-instruction counter on the child
+	// so MemUpdate can carry a native instruction count. Soft-fail:
+	// when the kernel rejects (e.g. `perf_event_paranoid > 2` in a
+	// locked-down container), `r.perfFd` stays -1 and the ticker
+	// emits Insns=0. We don't bubble the error up — the session
+	// should run without the counter, just with worse-looking cards.
+	if fd, perfErr := openInsnCounter(r.pid); perfErr == nil {
+		r.perfFd = fd
+	}
 	return nil
 }
 

@@ -744,17 +744,39 @@ function renderMetaFromLocal() {
 
 function renderMetaFromTurbo86() {
     const s = turbo86.stats;
-    $('m-steps').textContent = fmtCount(s.events);
+    // Prefer the real retired-instruction count (from turbo86's
+    // perf_event_open) over the Outbound event count — the latter
+    // was off by orders of magnitude (a guest running at 10⁸ insn/s
+    // emitted ~10 MemUpdate events/s, making the cards look like
+    // execution slowed a million-fold after handover). Falls back
+    // to event count when perf_event_open was denied by the kernel
+    // (`insns` stays 0), so locked-down environments still see the
+    // cards tick.
+    const haveInsns = s.insns > 0;
+    $('m-steps').textContent = fmtCount(haveInsns ? s.insns : s.events);
 
-    // events/sec sampled over the same 250 ms window as the local
-    // mov-rate so the visual cadence is consistent across engines.
+    // Sample rate over the same 250 ms window as the local mov-rate
+    // so the visual cadence is consistent across engines. The window
+    // anchor tracks whichever counter we're displaying.
     if (turbo86.ws && s.halt == null) {
         const now = performance.now();
-        const dt = now - s.rateSampleAt;
-        if (dt >= 250 && s.rateSampleAt !== 0) {
-            s.lastRate = (s.events - s.rateSampleEvents) / (dt / 1000);
-            s.rateSampleAt = now;
-            s.rateSampleEvents = s.events;
+        if (haveInsns) {
+            const dt = now - s.insnsSampleAt;
+            if (dt >= 250 && s.insnsSampleAt !== 0) {
+                s.lastRate = (s.insns - s.insnsSample) / (dt / 1000);
+                s.insnsSampleAt = now;
+                s.insnsSample = s.insns;
+            } else if (s.insnsSampleAt === 0) {
+                s.insnsSampleAt = now;
+                s.insnsSample = s.insns;
+            }
+        } else {
+            const dt = now - s.rateSampleAt;
+            if (dt >= 250 && s.rateSampleAt !== 0) {
+                s.lastRate = (s.events - s.rateSampleEvents) / (dt / 1000);
+                s.rateSampleAt = now;
+                s.rateSampleEvents = s.events;
+            }
         }
     }
     $('m-rate').textContent = s.lastRate == null ? '—' : fmtRate(s.lastRate);
@@ -1053,6 +1075,15 @@ function resetT86Stats() {
         endWall: 0,
         rateSampleAt: 0,
         rateSampleEvents: 0,
+        // Retired-instruction count from turbo86's perf_event_open on
+        // the guest PID, refreshed on each MemUpdate. `insns` is the
+        // latest sample; `insnsSample` / `insnsSampleAt` anchor the
+        // 250 ms rate window. Stays 0 (and the rate stays at the
+        // event-rate fallback) when the kernel denied perf_event_open
+        // so the cards keep moving on a paranoid kernel too.
+        insns: 0,
+        insnsSample: 0,
+        insnsSampleAt: 0,
         lastRate: null,
         halt: null,
         exit: null,
@@ -1269,6 +1300,15 @@ async function doSendToTurbo86() {
                     applied += state.vm.writeMem(r.addr, r.bytes);
                 }
                 turbo86.stats.lastMemUpdateBytes = applied;
+                // Record the cumulative retired-instruction count
+                // turbo86 sampled via perf_event_open on this tick.
+                // `renderMetaFromTurbo86` prefers `insns` over `events`
+                // when it's non-zero, so the cards show native
+                // execution rate instead of the off-by-orders-of-
+                // magnitude event-stand-in.
+                if (msg.insns > 0) {
+                    turbo86.stats.insns = msg.insns;
+                }
                 break;
             }
         }

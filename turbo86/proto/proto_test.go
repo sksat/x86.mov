@@ -152,6 +152,20 @@ func TestOutboundRoundTrip(t *testing.T) {
 				{Addr: 0x000B_0000, Bytes: []byte{0x05, 0x06}},
 			}},
 		},
+		{
+			// MemUpdate carries a retired-instruction count sampled
+			// from perf_event_open on the guest PID. Frontend uses
+			// this for the `total mov / mov per sec` cards instead
+			// of substituting Outbound event count (which was off by
+			// orders of magnitude).
+			"MemUpdate with insn count",
+			MemUpdate{
+				Regions: []MemRegion{
+					{Addr: 0x000A_0000, Bytes: []byte{0xff, 0x00, 0x00, 0xff}},
+				},
+				Insns: 12_345_678,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
