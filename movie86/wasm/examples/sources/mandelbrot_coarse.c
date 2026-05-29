@@ -26,6 +26,11 @@
 typedef int fp_t;   /* Q16.16 */
 
 extern void set_video_mode(unsigned mode);
+#ifdef __LCC__
+extern void exit(int status);                                  /* LCC: bare extern */
+#else
+extern void exit(int status) __attribute__((noreturn));         /* clang: drop ret */
+#endif
 
 static fp_t fmul(fp_t a, fp_t b)
 {
@@ -83,5 +88,19 @@ int main(void)
         }
     }
 
-    return 0;
+    /* Tail-call into the stubs' `exit(0)` instead of `return 0`. This
+     * has two effects:
+     *
+     *   - llvm-mov path (issue #42): the `noreturn` attribute below
+     *     tells clang the function never returns, so the epilogue
+     *     `pop ebp; ret` is dropped. Combined with `_start_llvm.s`'s
+     *     `jmp main` (no `call`), the resulting ELF has zero call
+     *     and zero ret in .text.
+     *   - movfuscator path: LCC doesn't grok `__attribute__`, so the
+     *     #ifdef leaves the extern bare. LCC still emits the
+     *     `return 0` cleanup, but crt0's wrapper is the one that
+     *     handles the eventual exit. exit(0) here just lands earlier.
+     */
+    exit(0);
+    return 0;  /* unreachable on both paths; kept for type-checker */
 }

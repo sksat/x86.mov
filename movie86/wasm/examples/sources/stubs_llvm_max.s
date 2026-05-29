@@ -12,7 +12,18 @@
 set_video_mode:
     mov eax, [esp + 4]
     int 0x10
-    ret
+    /* `ret` rewritten to `pop ecx ; jmp ecx` — see stubs_llvm.s. */
+    pop ecx
+    jmp ecx
+
+/* See stubs_llvm.s for the issue #42 rationale: noreturn exit() means
+ * main's tail-call to it (rewritten to mov-only by llvm-mov 7d3)
+ * eliminates the last `ret` from .text. */
+.globl exit
+exit:
+    mov eax, 1
+    mov ebx, [esp + 4]
+    int 0x80
 
 /* 800 * 600 * 4 = 1,920,000 bytes RGBA framebuffer. */
 .section .fb6Ah, "aw", @nobits

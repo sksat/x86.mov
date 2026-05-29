@@ -21,6 +21,11 @@
 typedef int fp_t;
 
 extern void set_video_mode(unsigned mode);
+#ifdef __LCC__
+extern void exit(int status);
+#else
+extern void exit(int status) __attribute__((noreturn));
+#endif
 
 static fp_t fmul(fp_t a, fp_t b)
 {
@@ -68,5 +73,8 @@ int main(void)
         }
     }
 
+    /* Tail-call exit(0) — see mandelbrot_coarse.c for the issue #42
+     * rationale. */
+    exit(0);
     return 0;
 }
