@@ -234,6 +234,8 @@
       <option value="canvas_mandelbrot_hires">canvas_mandelbrot_hires — same, native 320×200 + MAX_ITER=24 (~40 min)</option>
       <option value="canvas_mandelbrot_max">canvas_mandelbrot_max — VESA 6Ah 800×600 native (~8 hours, overnight)</option>
       <option value="canvas_mandelbrot_mov">canvas_mandelbrot_mov — same C, movfuscator pipeline (~10 min, for comparison)</option>
+      <option value="png_decode">png_decode — 64×64 PNG full decode (stored block)</option>
+      <option value="bmp_decode">bmp_decode — 320×180 32bpp BMP full decode → FB buffer</option>
       <option value="upload">(upload your own ELF)</option>
     </select>
   </label>
@@ -356,6 +358,8 @@ const EXAMPLES = {
     canvas_mandelbrot_hires:  './examples/canvas_mandelbrot_hires.elf',
     canvas_mandelbrot_max:    './examples/canvas_mandelbrot_max.elf',
     canvas_mandelbrot_mov:    './examples/canvas_mandelbrot_mov.elf',
+    png_decode:               './examples/png_decode_64x64.elf',
+    bmp_decode:               './examples/bmp_decode_320x180.elf',
 };
 
 // Register file order matches movie86's `Reg32`: EAX, ECX, EDX, EBX,
