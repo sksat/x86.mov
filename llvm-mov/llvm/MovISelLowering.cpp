@@ -233,6 +233,19 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setLibcallImpl(RTLIB::FPEXT_F32_F64,  RTLIB::impl___extendsfdf2);
   setLibcallImpl(RTLIB::FPROUND_F64_F32, RTLIB::impl___truncdfsf2);
 
+  // Stage 7h2 — f64 fcmp. Same shape as f32 (each predicate routes
+  // through its compiler-rt-named helper; the bodies share a single
+  // three-way compare parameterised by the unord-return convention).
+  // No setOperationAction needed — SDAG's f64 SETCC legalizer
+  // already issues these as libcalls once the bindings are in place.
+  setLibcallImpl(RTLIB::OEQ_F64, RTLIB::impl___eqdf2);
+  setLibcallImpl(RTLIB::UNE_F64, RTLIB::impl___nedf2);
+  setLibcallImpl(RTLIB::OLT_F64, RTLIB::impl___ltdf2);
+  setLibcallImpl(RTLIB::OLE_F64, RTLIB::impl___ledf2);
+  setLibcallImpl(RTLIB::OGT_F64, RTLIB::impl___gtdf2);
+  setLibcallImpl(RTLIB::OGE_F64, RTLIB::impl___gedf2);
+  setLibcallImpl(RTLIB::UO_F64,  RTLIB::impl___unorddf2);
+
   // No `bswap` opcode either. Rust idioms like `u32::from_be(x)` or
   // `x.swap_bytes()` lower to ISD::BSWAP. Expand re-spells it as
   // the standard four-byte shuffle (`(x << 24) | ((x & 0xff00) << 8)

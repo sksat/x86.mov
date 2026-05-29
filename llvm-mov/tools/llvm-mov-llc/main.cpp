@@ -1094,6 +1094,161 @@ static void emitFloatCompareBody(Function *F, LLVMContext &Ctx,
   IR.CreateRet(Result);
 }
 
+// Stage 7h2 — IEEE-754 double-precision comparison body. Mirrors the
+// f32 `emitFloatCompareBody` but operates over the i64 bit pattern
+// expressed as a {hi, lo} pair of i32 values. The pair representation
+// keeps every op at i32 width, so the SELECT → bit-blend rewrite
+// stays on its i32-only path — the body emits no `select i64`.
+//
+// Compiler-rt return convention (identical to the f32 helpers):
+//   ordered, neither NaN:
+//     a == b → return  0
+//     a <  b → return -1
+//     a >  b → return +1
+//   unordered (either NaN):
+//     __eqdf2 / __nedf2 / __ltdf2 / __ledf2 → return +1
+//     __gtdf2 / __gedf2                      → return -1
+static void emitDoubleCompareBody(Function *F, LLVMContext &Ctx,
+                                  int32_t UnordReturn) {
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+
+  Argument *A = F->getArg(0); A->setName("a");
+  Argument *B = F->getArg(1); B->setName("b");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> IR(Entry);
+  auto C = [&](uint32_t V) { return IR.getInt32(V); };
+
+  Value *AI64 = IR.CreateBitCast(A, I64, "ai64");
+  Value *BI64 = IR.CreateBitCast(B, I64, "bi64");
+
+  // Split each i64 into (lo, hi) i32 halves via constant-amount i64
+  // lshr (the only i64 shift used here, lowers cleanly via SDAG's
+  // i64-to-i32-pair type legalization).
+  Value *AHi = IR.CreateTrunc(IR.CreateLShr(AI64, IR.getInt64(32)),
+                              I32, "ai_hi");
+  Value *ALo = IR.CreateTrunc(AI64, I32, "ai_lo");
+  Value *BHi = IR.CreateTrunc(IR.CreateLShr(BI64, IR.getInt64(32)),
+                              I32, "bi_hi");
+  Value *BLo = IR.CreateTrunc(BI64, I32, "bi_lo");
+
+  // Field extraction: hi[31] sign, hi[30..20] exp, hi[19..0] are the
+  // top 20 mantissa bits; lo[31..0] are the remaining 32 mantissa
+  // bits.
+  Value *SA = IR.CreateLShr(AHi, C(31));
+  Value *SB = IR.CreateLShr(BHi, C(31));
+  Value *EA = IR.CreateAnd(IR.CreateLShr(AHi, C(20)), C(0x7FFu));
+  Value *EB = IR.CreateAnd(IR.CreateLShr(BHi, C(20)), C(0x7FFu));
+  Value *MAtop = IR.CreateAnd(AHi, C(0xFFFFFu));
+  Value *MBtop = IR.CreateAnd(BHi, C(0xFFFFFu));
+
+  // NaN: exp == 0x7FF AND (mant_top != 0 OR mant_bot != 0).
+  Value *AExpMax = IR.CreateICmpEQ(EA, C(0x7FFu));
+  Value *AMantNZ = IR.CreateOr(IR.CreateICmpNE(MAtop, C(0)),
+                               IR.CreateICmpNE(ALo, C(0)));
+  Value *ANaN = IR.CreateAnd(AExpMax, AMantNZ);
+  Value *BExpMax = IR.CreateICmpEQ(EB, C(0x7FFu));
+  Value *BMantNZ = IR.CreateOr(IR.CreateICmpNE(MBtop, C(0)),
+                               IR.CreateICmpNE(BLo, C(0)));
+  Value *BNaN = IR.CreateAnd(BExpMax, BMantNZ);
+  Value *Unord = IR.CreateOr(ANaN, BNaN);
+
+  // BothZero: magnitude (sign-stripped hi == 0 and lo == 0) on both
+  // sides, so +0 / -0 compare equal.
+  Value *AMagHi = IR.CreateAnd(AHi, C(0x7FFFFFFFu));
+  Value *BMagHi = IR.CreateAnd(BHi, C(0x7FFFFFFFu));
+  Value *AIsZero = IR.CreateAnd(IR.CreateICmpEQ(AMagHi, C(0)),
+                                IR.CreateICmpEQ(ALo, C(0)));
+  Value *BIsZero = IR.CreateAnd(IR.CreateICmpEQ(BMagHi, C(0)),
+                                IR.CreateICmpEQ(BLo, C(0)));
+  Value *BothZero = IR.CreateAnd(AIsZero, BIsZero);
+
+  // Total-order key on each i32 half. For non-negatives keep the bits;
+  // for negatives flip everything below the sign bit (hi) and every
+  // bit in lo. Compute the sign mask as `0 - sign` (= 0 or 0xFFFFFFFF)
+  // and apply it via AND-with-magnitude-mask on the hi half.
+  Value *SAMask = IR.CreateSub(C(0), SA);
+  Value *SBMask = IR.CreateSub(C(0), SB);
+  Value *AKeyHi = IR.CreateXor(AHi, IR.CreateAnd(SAMask, C(0x7FFFFFFFu)));
+  Value *BKeyHi = IR.CreateXor(BHi, IR.CreateAnd(SBMask, C(0x7FFFFFFFu)));
+  Value *AKeyLo = IR.CreateXor(ALo, SAMask);
+  Value *BKeyLo = IR.CreateXor(BLo, SBMask);
+
+  // Ordered i64 compare via {signed hi, unsigned lo}:
+  //   a < b  iff  (a.hi <s b.hi)  OR  (a.hi == b.hi AND a.lo <u b.lo)
+  //   a > b  iff  (a.hi >s b.hi)  OR  (a.hi == b.hi AND a.lo >u b.lo)
+  Value *HiSLt = IR.CreateICmpSLT(AKeyHi, BKeyHi);
+  Value *HiSGt = IR.CreateICmpSGT(AKeyHi, BKeyHi);
+  Value *HiEq  = IR.CreateICmpEQ(AKeyHi, BKeyHi);
+  Value *LoULt = IR.CreateICmpULT(AKeyLo, BKeyLo);
+  Value *LoUGt = IR.CreateICmpUGT(AKeyLo, BKeyLo);
+  Value *Lt = IR.CreateOr(HiSLt, IR.CreateAnd(HiEq, LoULt));
+  Value *Gt = IR.CreateOr(HiSGt, IR.CreateAnd(HiEq, LoUGt));
+
+  // Ordered three-way result: -1 / 0 / +1.
+  Value *Pos1 = C(1);
+  Value *Neg1 = C(0xFFFFFFFFu);
+  Value *Ord = IR.CreateSelect(Lt, Neg1,
+                  IR.CreateSelect(Gt, Pos1, C(0)));
+  Value *OrdWithZero = IR.CreateSelect(BothZero, C(0), Ord);
+
+  // Unord-return convention is helper-specific (+1 for eq/ne/lt/le,
+  // -1 for gt/ge).
+  Value *UnordRet = C(static_cast<uint32_t>(UnordReturn));
+  Value *Result = IR.CreateSelect(Unord, UnordRet, OrdWithZero);
+  IR.CreateRet(Result);
+}
+
+static void injectDoubleCompareHelpers(Module &M, LLVMContext &Ctx) {
+  Type *F64 = Type::getDoubleTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(I32, {F64, F64}, /*isVarArg=*/false);
+
+  struct HelperSpec {
+    const char *Name;
+    int32_t UnordReturn;
+  };
+  static const HelperSpec Specs[] = {
+      {"__eqdf2", +1}, {"__nedf2", +1}, {"__ltdf2", +1}, {"__ledf2", +1},
+      {"__gtdf2", -1}, {"__gedf2", -1},
+  };
+  for (const auto &S : Specs) {
+    Function *F = makeOrPromoteHelper(M, S.Name, FnTy);
+    if (F)
+      emitDoubleCompareBody(F, Ctx, S.UnordReturn);
+  }
+
+  // __unorddf2 — returns 1 if either argument is NaN, 0 otherwise.
+  Function *UnordDf = makeOrPromoteHelper(M, "__unorddf2", FnTy);
+  if (UnordDf) {
+    Argument *A = UnordDf->getArg(0); A->setName("a");
+    Argument *B = UnordDf->getArg(1); B->setName("b");
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", UnordDf);
+    IRBuilder<> IR(BB);
+    auto C = [&](uint32_t V) { return IR.getInt32(V); };
+    Value *AI64 = IR.CreateBitCast(A, I64);
+    Value *BI64 = IR.CreateBitCast(B, I64);
+    Value *AHi = IR.CreateTrunc(IR.CreateLShr(AI64, IR.getInt64(32)), I32);
+    Value *ALo = IR.CreateTrunc(AI64, I32);
+    Value *BHi = IR.CreateTrunc(IR.CreateLShr(BI64, IR.getInt64(32)), I32);
+    Value *BLo = IR.CreateTrunc(BI64, I32);
+    Value *EA = IR.CreateAnd(IR.CreateLShr(AHi, C(20)), C(0x7FFu));
+    Value *EB = IR.CreateAnd(IR.CreateLShr(BHi, C(20)), C(0x7FFu));
+    Value *MAtop = IR.CreateAnd(AHi, C(0xFFFFFu));
+    Value *MBtop = IR.CreateAnd(BHi, C(0xFFFFFu));
+    Value *AMantNZ = IR.CreateOr(IR.CreateICmpNE(MAtop, C(0)),
+                                 IR.CreateICmpNE(ALo, C(0)));
+    Value *BMantNZ = IR.CreateOr(IR.CreateICmpNE(MBtop, C(0)),
+                                 IR.CreateICmpNE(BLo, C(0)));
+    Value *ANaN = IR.CreateAnd(IR.CreateICmpEQ(EA, C(0x7FFu)), AMantNZ);
+    Value *BNaN = IR.CreateAnd(IR.CreateICmpEQ(EB, C(0x7FFu)), BMantNZ);
+    Value *Unord = IR.CreateOr(ANaN, BNaN);
+    IR.CreateRet(IR.CreateZExt(Unord, I32));
+  }
+}
+
 static void injectFloatCompareHelpers(Module &M, LLVMContext &Ctx) {
   Type *F32 = Type::getFloatTy(Ctx);
   Type *I32 = Type::getInt32Ty(Ctx);
@@ -1644,6 +1799,21 @@ static bool moduleNeedsTruncDfSf2(Module &M) {
   return false;
 }
 
+// Stage 7h2 — scan for `fcmp double` (any predicate) so the f64
+// compare helpers are only injected when actually used.
+static bool moduleNeedsDoubleCompare(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if (I.getOpcode() == Instruction::FCmp &&
+          I.getOperand(0)->getType()->getScalarType()->isDoubleTy())
+        return true;
+    }
+  }
+  return false;
+}
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
 
@@ -1794,6 +1964,11 @@ int main(int argc, char **argv) {
     injectExtendSfDf2Helper(*M, Ctx);
   if (moduleNeedsTruncDfSf2(*M))
     injectTruncDfSf2Helper(*M, Ctx);
+  // Stage 7h2 — f64 compare helpers. Independent of the conversion
+  // helpers; only the modules that actually `fcmp double` pay for
+  // the body.
+  if (moduleNeedsDoubleCompare(*M))
+    injectDoubleCompareHelpers(*M, Ctx);
 
   // Stage 6d2 — pre-Scalarizer lowering of `llvm.vector.reduce.*`.
   //
