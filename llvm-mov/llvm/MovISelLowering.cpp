@@ -253,6 +253,14 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setLibcallImpl(RTLIB::FPTOSINT_F64_I32, RTLIB::impl___fixdfsi);
   setLibcallImpl(RTLIB::FPTOUINT_F64_I32, RTLIB::impl___fixunsdfsi);
 
+  // Stage 7h4 — f64 fadd / fsub. Helper bodies emulate variable-
+  // amount i64 shifts via the i32-pair clamped-arm split technique
+  // established by stage-7h3's `__floatsidf` / `__fixdfsi`.
+  setOperationAction(ISD::FADD, MVT::f64, LibCall);
+  setOperationAction(ISD::FSUB, MVT::f64, LibCall);
+  setLibcallImpl(RTLIB::ADD_F64, RTLIB::impl___adddf3);
+  setLibcallImpl(RTLIB::SUB_F64, RTLIB::impl___subdf3);
+
   // No `bswap` opcode either. Rust idioms like `u32::from_be(x)` or
   // `x.swap_bytes()` lower to ISD::BSWAP. Expand re-spells it as
   // the standard four-byte shuffle (`(x << 24) | ((x & 0xff00) << 8)

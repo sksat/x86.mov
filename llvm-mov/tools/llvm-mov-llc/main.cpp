@@ -1735,6 +1735,369 @@ static void injectFixdfsiHelpers(Module &M, LLVMContext &Ctx) {
     emitDoubleToInt32Body(F, Ctx, /*IsSigned=*/false);
 }
 
+// Stage 7h4 — variable-amount i64 shift utilities. The backend can't
+// select `shl_parts` directly, so we emulate variable-amount i64
+// shifts via clamped i32-pair operations (same technique as stage
+// 7h3's i32 ↔ f64 conversions). The shift amount must be ≤ 63;
+// arms are clamped so each individual i32 shift stays in [0, 31].
+//
+// These helpers emit IR that:
+//   1. splits X into (hi, lo) via `lshr X, 32` + trunc
+//   2. computes the result hi/lo on each arm (amt < 32 and amt ≥ 32)
+//      with shift counts clamped to a defined range
+//   3. selects between the arms with i32 selects (bit-blended)
+//   4. recombines into i64 via constant-amount shl + or
+static Value *emitLshrI64ByI32(IRBuilder<> &B, Value *X, Value *Amt) {
+  LLVMContext &Ctx = B.getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Value *C32_32 = ConstantInt::get(I32, 32);
+  Value *C32_31 = ConstantInt::get(I32, 31);
+  Value *C32_1 = ConstantInt::get(I32, 1);
+  Value *C32_0 = ConstantInt::get(I32, 0);
+
+  Value *Hi = B.CreateTrunc(B.CreateLShr(X, ConstantInt::get(I64, 32)), I32);
+  Value *Lo = B.CreateTrunc(X, I32);
+
+  auto Clamp31 = [&](Value *V) {
+    return B.CreateSelect(B.CreateICmpUGT(V, C32_31), C32_31, V);
+  };
+  Value *Big = B.CreateICmpUGE(Amt, C32_32);
+  // Codex-review P1: when Amt == 0 the small-arm cross-half shift
+  // amount is (32 - 0) = 32, which the i32 clamp folds to 31, so
+  // the bit-blended `lshr X, 0` would OR `Hi << 31` into the
+  // result low half. Force the cross-half contribution to zero
+  // when Amt is zero.
+  Value *AmtIsZero = B.CreateICmpEQ(Amt, C32_0);
+
+  Value *SmallShiftR = Clamp31(B.CreateSelect(Big, C32_1, Amt));
+  Value *SmallShiftL = Clamp31(B.CreateSelect(
+      Big, C32_0, B.CreateSub(C32_32, Amt)));
+  Value *SmallCross = B.CreateSelect(AmtIsZero, C32_0,
+                                     B.CreateShl(Hi, SmallShiftL));
+  Value *SmallLo = B.CreateOr(B.CreateLShr(Lo, SmallShiftR), SmallCross);
+  Value *SmallHi = B.CreateLShr(Hi, SmallShiftR);
+
+  Value *BigShift = Clamp31(B.CreateSelect(
+      Big, B.CreateSub(Amt, C32_32), C32_0));
+  Value *BigLo = B.CreateLShr(Hi, BigShift);
+  Value *BigHi = C32_0;
+
+  Value *ResLo = B.CreateSelect(Big, BigLo, SmallLo);
+  Value *ResHi = B.CreateSelect(Big, BigHi, SmallHi);
+
+  return B.CreateOr(
+      B.CreateShl(B.CreateZExt(ResHi, I64), ConstantInt::get(I64, 32)),
+      B.CreateZExt(ResLo, I64));
+}
+
+static Value *emitShlI64ByI32(IRBuilder<> &B, Value *X, Value *Amt) {
+  LLVMContext &Ctx = B.getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Value *C32_32 = ConstantInt::get(I32, 32);
+  Value *C32_31 = ConstantInt::get(I32, 31);
+  Value *C32_1 = ConstantInt::get(I32, 1);
+  Value *C32_0 = ConstantInt::get(I32, 0);
+
+  Value *Hi = B.CreateTrunc(B.CreateLShr(X, ConstantInt::get(I64, 32)), I32);
+  Value *Lo = B.CreateTrunc(X, I32);
+
+  auto Clamp31 = [&](Value *V) {
+    return B.CreateSelect(B.CreateICmpUGT(V, C32_31), C32_31, V);
+  };
+  Value *Big = B.CreateICmpUGE(Amt, C32_32);
+  // Same Amt == 0 cross-half gate as `emitLshrI64ByI32` above.
+  Value *AmtIsZero = B.CreateICmpEQ(Amt, C32_0);
+
+  Value *SmallShiftL = Clamp31(B.CreateSelect(Big, C32_1, Amt));
+  Value *SmallShiftR = Clamp31(B.CreateSelect(
+      Big, C32_0, B.CreateSub(C32_32, Amt)));
+  Value *SmallCross = B.CreateSelect(AmtIsZero, C32_0,
+                                     B.CreateLShr(Lo, SmallShiftR));
+  Value *SmallHi = B.CreateOr(B.CreateShl(Hi, SmallShiftL), SmallCross);
+  Value *SmallLo = B.CreateShl(Lo, SmallShiftL);
+
+  Value *BigShift = Clamp31(B.CreateSelect(
+      Big, B.CreateSub(Amt, C32_32), C32_0));
+  Value *BigHi = B.CreateShl(Lo, BigShift);
+  Value *BigLo = C32_0;
+
+  Value *ResHi = B.CreateSelect(Big, BigHi, SmallHi);
+  Value *ResLo = B.CreateSelect(Big, BigLo, SmallLo);
+
+  return B.CreateOr(
+      B.CreateShl(B.CreateZExt(ResHi, I64), ConstantInt::get(I64, 32)),
+      B.CreateZExt(ResLo, I64));
+}
+
+// ctlz of an i64 value, computed via two i32 ctlz calls. Returns an
+// i32 in [0, 64].
+static Value *emitCtlzI64(IRBuilder<> &B, Module &M, Value *X) {
+  LLVMContext &Ctx = B.getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+
+  Function *Ctlz =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::ctlz, {I32});
+
+  Value *Hi = B.CreateTrunc(B.CreateLShr(X, ConstantInt::get(I64, 32)), I32);
+  Value *Lo = B.CreateTrunc(X, I32);
+
+  Value *HiNonZero = B.CreateICmpNE(Hi, ConstantInt::get(I32, 0));
+  Value *LzHi = B.CreateCall(Ctlz, {Hi, ConstantInt::getFalse(Ctx)});
+  Value *LzLo = B.CreateCall(Ctlz, {Lo, ConstantInt::getFalse(Ctx)});
+  Value *LzLoPlus32 = B.CreateAdd(LzLo, ConstantInt::get(I32, 32));
+  return B.CreateSelect(HiNonZero, LzHi, LzLoPlus32);
+}
+
+// Stage 7h4 — `__adddf3 (a, b) -> double`. IEEE-754 double-precision
+// addition. Mirrors `__addsf3` in structure but operates on the
+// 53-bit mantissa (plus 3-bit guard region for rounding) packed into
+// i64 values. Variable-amount i64 shifts use the
+// `emitLshrI64ByI32` / `emitShlI64ByI32` clamped-arm split helpers.
+//
+// Limitations (carried over from `__addsf3`):
+//   - Inf / NaN handling: 7g4-style override at the tail
+//   - Denormal inputs flush to zero, denormal results flush to zero
+//   - Rounding: round-to-nearest, ties-to-even with guard / round /
+//     sticky bits
+//
+// Bit positions in MSum (the post-add mantissa, in i64):
+//   bit 56 = post-add carry-out      (ctlz == 7)
+//   bit 55 = normal-form MSB          (ctlz == 8)
+//   bit < 55 = subtraction left-normalises by (8 - ctlz)
+static void injectAddDf3Helper(Module &M, LLVMContext &Ctx) {
+  Type *F64 = Type::getDoubleTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(F64, {F64, F64}, /*isVarArg=*/false);
+
+  Function *F = makeOrPromoteHelper(M, "__adddf3", FnTy);
+  if (!F)
+    return;
+
+  F->getArg(0)->setName("a");
+  F->getArg(1)->setName("b");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+  auto C64 = [&](uint64_t V) { return ConstantInt::get(I64, V); };
+  auto C32 = [&](uint32_t V) { return ConstantInt::get(I32, V); };
+
+  Value *AI = B.CreateBitCast(F->getArg(0), I64, "ai");
+  Value *BI = B.CreateBitCast(F->getArg(1), I64, "bi");
+
+  // i64 compare lowering on this backend is slow (default SDAG
+  // expansion creates many branchy SETCC nodes whose interaction
+  // with the bit-blended selects pushes DAG-ISel into multi-minute
+  // compile times; observed on stage-7h4 bring-up). Express each
+  // i64 compare as a manual {hi, lo} i32 pair compare, mirroring
+  // the 7h2 f64 fcmp pattern.
+  auto SplitLoHi = [&](Value *X) -> std::pair<Value *, Value *> {
+    Value *Hi = B.CreateTrunc(B.CreateLShr(X, C64(32)), I32);
+    Value *Lo = B.CreateTrunc(X, I32);
+    return {Lo, Hi};
+  };
+  auto IsNonZeroI64 = [&](Value *X) {
+    auto [Lo, Hi] = SplitLoHi(X);
+    return B.CreateOr(B.CreateICmpNE(Lo, C32(0)),
+                      B.CreateICmpNE(Hi, C32(0)));
+  };
+  auto IsZeroI64 = [&](Value *X) {
+    auto [Lo, Hi] = SplitLoHi(X);
+    return B.CreateAnd(B.CreateICmpEQ(Lo, C32(0)),
+                       B.CreateICmpEQ(Hi, C32(0)));
+  };
+  auto EqI64Const = [&](Value *X, uint64_t K) {
+    auto [Lo, Hi] = SplitLoHi(X);
+    return B.CreateAnd(
+        B.CreateICmpEQ(Hi, C32(static_cast<uint32_t>(K >> 32))),
+        B.CreateICmpEQ(Lo, C32(static_cast<uint32_t>(K))));
+  };
+  auto UgeI64 = [&](Value *A, Value *Bv) {
+    auto [aLo, aHi] = SplitLoHi(A);
+    auto [bLo, bHi] = SplitLoHi(Bv);
+    Value *HiGt = B.CreateICmpUGT(aHi, bHi);
+    Value *HiEq = B.CreateICmpEQ(aHi, bHi);
+    Value *LoUge = B.CreateICmpUGE(aLo, bLo);
+    return B.CreateOr(HiGt, B.CreateAnd(HiEq, LoUge));
+  };
+
+  // Field extraction.
+  Value *SA = B.CreateLShr(AI, C64(63));
+  Value *SB = B.CreateLShr(BI, C64(63));
+  Value *EA64 = B.CreateAnd(B.CreateLShr(AI, C64(52)), C64(0x7FFull));
+  Value *EB64 = B.CreateAnd(B.CreateLShr(BI, C64(52)), C64(0x7FFull));
+  Value *EA = B.CreateTrunc(EA64, I32, "ea");
+  Value *EB = B.CreateTrunc(EB64, I32, "eb");
+  Value *MARaw = B.CreateAnd(AI, C64(0xFFFFFFFFFFFFFull));
+  Value *MBRaw = B.CreateAnd(BI, C64(0xFFFFFFFFFFFFFull));
+
+  // Implicit-1 + 3-bit guard region. MSB now at bit 55.
+  Value *MAN = B.CreateOr(MARaw, C64(0x10000000000000ull));   // 1 << 52
+  Value *MBN = B.CreateOr(MBRaw, C64(0x10000000000000ull));
+  Value *MAG = B.CreateShl(MAN, C64(3), "ma_g");
+  Value *MBG = B.CreateShl(MBN, C64(3), "mb_g");
+
+  // Order by magnitude via i32-pair compare (see SplitLoHi rationale
+  // above). Sign-stripped i64 compare would otherwise route through
+  // the slow SDAG default.
+  Value *AMag = B.CreateAnd(AI, C64(0x7FFFFFFFFFFFFFFFull));
+  Value *BMag = B.CreateAnd(BI, C64(0x7FFFFFFFFFFFFFFFull));
+  Value *AGeB = UgeI64(AMag, BMag);
+
+  Value *ReInit = B.CreateSelect(AGeB, EA, EB, "re_init");
+  Value *EDab = B.CreateSub(EA, EB);
+  Value *EDba = B.CreateSub(EB, EA);
+  Value *EDraw = B.CreateSelect(AGeB, EDab, EDba, "ed_raw");
+  Value *EDtooBig = B.CreateICmpUGT(EDraw, C32(63u));
+  Value *ED = B.CreateSelect(EDtooBig, C32(63u), EDraw, "ed");
+
+  Value *MLarge = B.CreateSelect(AGeB, MAG, MBG, "m_large");
+  Value *MSmall = B.CreateSelect(AGeB, MBG, MAG, "m_small");
+  Value *SLarge = B.CreateSelect(AGeB, SA, SB);
+  Value *SSmall = B.CreateSelect(AGeB, SB, SA);
+
+  // Right-shift smaller mantissa by ED, with sticky.
+  Value *MSmallShifted = emitLshrI64ByI32(B, MSmall, ED);
+  Value *MSmallShiftedBack = emitShlI64ByI32(B, MSmallShifted, ED);
+  Value *Discarded = B.CreateSub(MSmall, MSmallShiftedBack);
+  Value *StickyI1 = IsNonZeroI64(Discarded);
+  Value *MSmallNonZero = IsNonZeroI64(MSmall);
+  Value *ExtraSticky = B.CreateAnd(EDtooBig, MSmallNonZero);
+  Value *StickyAll = B.CreateOr(StickyI1, ExtraSticky);
+  Value *StickyBit64 = B.CreateZExt(StickyAll, I64);
+  Value *MSmallWithSticky = B.CreateOr(MSmallShifted, StickyBit64);
+
+  // Same-sign add, different-sign subtract.
+  Value *SignsEqual = B.CreateICmpEQ(SLarge, SSmall);
+  Value *SumAdd = B.CreateAdd(MLarge, MSmallWithSticky);
+  Value *SumSub = B.CreateSub(MLarge, MSmallWithSticky);
+  Value *MSum = B.CreateSelect(SignsEqual, SumAdd, SumSub, "m_sum");
+
+  // Cancel-to-zero.
+  Value *CancelZero = B.CreateAnd(B.CreateNot(SignsEqual),
+                                  IsZeroI64(MSum));
+
+  // Normalize via ctlz. MSum has MSB:
+  //   bit 56 = post-add carry-out (lz == 7)
+  //   bit 55 = normal             (lz == 8)
+  //   bit < 55 = subtraction left-normalises by (8 - lz)
+  Value *LZ = emitCtlzI64(B, M, MSum);
+
+  // Overflow path (lz == 7).
+  Value *LzEq7 = B.CreateICmpEQ(LZ, C32(7u));
+  Value *StickyOvf = B.CreateAnd(MSum, C64(1));
+  Value *MSumOvf = B.CreateOr(B.CreateLShr(MSum, C64(1)), StickyOvf);
+  Value *ReOvf = B.CreateAdd(ReInit, C32(1u));
+
+  // Underflow path (lz > 8).
+  Value *LzGt8 = B.CreateICmpUGT(LZ, C32(8u));
+  Value *LzMinus8Safe = B.CreateSelect(LzGt8,
+                                       B.CreateSub(LZ, C32(8u)), C32(0u));
+  Value *MaxShift = B.CreateSub(ReInit, C32(1u));
+  Value *ShiftA = B.CreateSelect(
+      B.CreateICmpULT(LzMinus8Safe, MaxShift), LzMinus8Safe, MaxShift);
+  // Final shift-width clamp: 55 fully normalises any 56-bit mantissa.
+  Value *ShiftCap = B.CreateSelect(
+      B.CreateICmpULT(ShiftA, C32(55u)), ShiftA, C32(55u));
+  Value *MSumUnf = emitShlI64ByI32(B, MSum, ShiftCap);
+  Value *ReUnf = B.CreateSub(ReInit, ShiftCap);
+
+  // Combine normalize paths.
+  Value *MSumPost = B.CreateSelect(LzEq7, MSumOvf,
+                       B.CreateSelect(LzGt8, MSumUnf, MSum));
+  Value *RePost = B.CreateSelect(LzEq7, ReOvf,
+                       B.CreateSelect(LzGt8, ReUnf, ReInit));
+
+  // Round to nearest, ties to even.
+  Value *GuardBit = B.CreateAnd(B.CreateLShr(MSumPost, C64(2)), C64(1));
+  Value *RoundBit = B.CreateAnd(B.CreateLShr(MSumPost, C64(1)), C64(1));
+  Value *StickyBit2 = B.CreateAnd(MSumPost, C64(1));
+  Value *MSumTrunc = B.CreateLShr(MSumPost, C64(3));
+  Value *Lsb = B.CreateAnd(MSumTrunc, C64(1));
+  Value *RoundOrSticky = B.CreateOr(RoundBit, StickyBit2);
+  Value *RoundOrLsb = B.CreateOr(RoundOrSticky, Lsb);
+  Value *NeedRoundUp = B.CreateAnd(GuardBit, RoundOrLsb);
+  Value *MSumRounded = B.CreateAdd(MSumTrunc, NeedRoundUp);
+
+  // Round may bump mantissa to 1 << 53 → shift right and exp + 1.
+  Value *RoundedOvf = EqI64Const(MSumRounded, 0x20000000000000ull);
+  Value *MSumFinal = B.CreateSelect(RoundedOvf,
+                                    B.CreateLShr(MSumRounded, C64(1)),
+                                    MSumRounded);
+  Value *ReFinalRaw = B.CreateSelect(RoundedOvf, B.CreateAdd(RePost, C32(1u)),
+                                     RePost);
+
+  // Pack the IEEE-754 fields back into i64.
+  Value *MantField = B.CreateAnd(MSumFinal, C64(0xFFFFFFFFFFFFFull));
+  Value *ReFinal64 = B.CreateZExt(ReFinalRaw, I64);
+  Value *ExpField = B.CreateAnd(B.CreateShl(ReFinal64, C64(52)),
+                                C64(0x7FF0000000000000ull));
+  Value *SignField = B.CreateShl(SLarge, C64(63));
+  Value *Packed = B.CreateOr(SignField, B.CreateOr(ExpField, MantField));
+
+  // Exponent overflow → signed Inf.
+  Value *ExpOvf = B.CreateICmpUGE(ReFinalRaw, C32(2047u));
+  Value *InfBits = B.CreateOr(B.CreateShl(SLarge, C64(63)),
+                              C64(0x7FF0000000000000ull));
+  Value *PostOvf = B.CreateSelect(ExpOvf, InfBits, Packed);
+
+  // Zero / denormal pass-through, then cancel-to-zero.
+  Value *AIsZero = B.CreateICmpEQ(EA, C32(0u));
+  Value *BIsZero = B.CreateICmpEQ(EB, C32(0u));
+  Value *Step1 = B.CreateSelect(AIsZero, BI, PostOvf);
+  Value *Step2 = B.CreateSelect(BIsZero, AI, Step1);
+  Value *Step3 = B.CreateSelect(CancelZero, C64(0), Step2);
+
+  // Stage 7g4-style Inf / NaN propagation.
+  Value *EAMax = B.CreateICmpEQ(EA, C32(0x7FFu));
+  Value *EBMax = B.CreateICmpEQ(EB, C32(0x7FFu));
+  Value *MANonZero = IsNonZeroI64(MARaw);
+  Value *MBNonZero = IsNonZeroI64(MBRaw);
+  Value *AIsNaN = B.CreateAnd(EAMax, MANonZero);
+  Value *BIsNaN = B.CreateAnd(EBMax, MBNonZero);
+  Value *AIsInf = B.CreateAnd(EAMax, B.CreateNot(MANonZero));
+  Value *BIsInf = B.CreateAnd(EBMax, B.CreateNot(MBNonZero));
+  Value *BothInf = B.CreateAnd(AIsInf, BIsInf);
+  Value *SignSame = B.CreateICmpEQ(SA, SB);
+  Value *InfMinusInf = B.CreateAnd(BothInf, B.CreateNot(SignSame));
+  Value *EitherNaN = B.CreateOr(AIsNaN, BIsNaN);
+  Value *NaNCase = B.CreateOr(EitherNaN, InfMinusInf);
+  Value *AnyInf = B.CreateOr(AIsInf, BIsInf);
+  Value *InfBitsPick = B.CreateSelect(AIsInf, AI, BI);
+
+  Value *WithInf = B.CreateSelect(AnyInf, InfBitsPick, Step3);
+  Value *WithNaN = B.CreateSelect(NaNCase, C64(0x7FF8000000000000ull),
+                                  WithInf);
+
+  B.CreateRet(B.CreateBitCast(WithNaN, F64));
+}
+
+// Stage 7h4 — `__subdf3 (a, b)` = `__adddf3 (a, -b)`. Flip the sign
+// bit (bit 63) of `b` and delegate. Same shape as `__subsf3`.
+static void injectSubDf3Helper(Module &M, LLVMContext &Ctx) {
+  Type *F64 = Type::getDoubleTy(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  FunctionType *FnTy = FunctionType::get(F64, {F64, F64}, /*isVarArg=*/false);
+  Function *F = makeOrPromoteHelper(M, "__subdf3", FnTy);
+  if (!F)
+    return;
+  F->getArg(0)->setName("a");
+  F->getArg(1)->setName("b");
+
+  FunctionCallee AddDf3 = M.getOrInsertFunction("__adddf3", FnTy);
+
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  Value *BI = B.CreateBitCast(F->getArg(1), I64);
+  Value *NegBI = B.CreateXor(BI, ConstantInt::get(I64, 0x8000000000000000ull));
+  Value *NegB = B.CreateBitCast(NegBI, F64);
+  Value *R = B.CreateCall(AddDf3, {F->getArg(0), NegB});
+  B.CreateRet(R);
+}
+
 // Stage 7h1 — `__extendsfdf2 (float a) -> double`. Lossless f32 → f64
 // conversion. Algorithm:
 //   - decode {sign, exp32, mant32_raw} from the f32 bit pattern
@@ -2067,6 +2430,21 @@ static bool moduleNeedsFixdfsi(Module &M) {
   return false;
 }
 
+// Stage 7h4 — scan for `fadd double` / `fsub double`.
+static bool moduleNeedsAddDf3(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if ((I.getOpcode() == Instruction::FAdd ||
+           I.getOpcode() == Instruction::FSub) &&
+          I.getOperand(0)->getType()->getScalarType()->isDoubleTy())
+        return true;
+    }
+  }
+  return false;
+}
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
 
@@ -2228,6 +2606,12 @@ int main(int argc, char **argv) {
     injectFloatsidfHelpers(*M, Ctx);
   if (moduleNeedsFixdfsi(*M))
     injectFixdfsiHelpers(*M, Ctx);
+  // Stage 7h4 — f64 fadd / fsub. `__adddf3` first since `__subdf3`
+  // tail-calls it.
+  if (moduleNeedsAddDf3(*M)) {
+    injectAddDf3Helper(*M, Ctx);
+    injectSubDf3Helper(*M, Ctx);
+  }
 
   // Stage 6d2 — pre-Scalarizer lowering of `llvm.vector.reduce.*`.
   //
