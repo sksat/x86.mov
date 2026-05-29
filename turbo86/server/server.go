@@ -22,19 +22,40 @@ import (
 
 // Handler returns an http.Handler that upgrades GET requests to
 // WebSocket and runs a guest session per connection.
-func Handler() http.Handler {
-	return http.HandlerFunc(serve)
+//
+// `originPatterns` extends the default Origin == Host check with
+// additional allow-listed Origin host patterns (filepath.Match syntax
+// against the Origin URL's `Host`, including port for non-default
+// ports). Pass `nil` to keep the strict default — used by the in-
+// process tests where the dial client doesn't send Origin at all, and
+// keeps the policy locked down by default for new callers.
+//
+// The browser frontend (movie86/wasm) is served from a different
+// origin than the loopback turbo86 listener (`https://x86.mov` or
+// `https://*.x86-mov.pages.dev` vs. `ws://127.0.0.1:1234`), so a
+// production deploy MUST pass the frontend origin pattern here — the
+// default would refuse the upgrade. cmd/turbo86/main.go wires this
+// through a `--allow-origin` flag.
+func Handler(originPatterns []string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serve(w, r, originPatterns)
+	})
 }
 
-func serve(w http.ResponseWriter, r *http.Request) {
+func serve(w http.ResponseWriter, r *http.Request, originPatterns []string) {
 	// Defaults from coder/websocket: if the client sends an Origin
-	// header, it must match the Host. Tests using github.com/coder/websocket
-	// don't set Origin, so they pass; browser cross-origin attempts
-	// fail. This endpoint accepts arbitrary guest bytes and runs them
-	// natively, so we deliberately do NOT set InsecureSkipVerify —
-	// turning it on would let any web page open ws://127.0.0.1:1234
-	// and drive turbo86 (cross-site RCE).
-	ws, err := websocket.Accept(w, r, nil)
+	// header, it must match the Host or one of `OriginPatterns`.
+	// Tests using github.com/coder/websocket don't set Origin, so they
+	// pass; browser cross-origin attempts only pass when Origin host
+	// is in `originPatterns`. This endpoint accepts arbitrary guest
+	// bytes and runs them natively, so we deliberately do NOT set
+	// InsecureSkipVerify — turning it on would let any web page open
+	// ws://127.0.0.1:1234 and drive turbo86 (cross-site RCE).
+	var opts *websocket.AcceptOptions
+	if len(originPatterns) > 0 {
+		opts = &websocket.AcceptOptions{OriginPatterns: originPatterns}
+	}
+	ws, err := websocket.Accept(w, r, opts)
 	if err != nil {
 		return
 	}

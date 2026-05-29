@@ -81,7 +81,18 @@ Both ship today; pick by what you want from the call.
 The demo's "Send to local turbo86" button packages the live Vm state
 as the canonical `movie86::context::Context` schema (same shape the
 CLI's handover uses) and ships it over WebSocket to a local turbo86
-process. Three pieces:
+process. Four pieces:
+
+- **turbo86 `--allow-origin`** is what makes the cross-origin browser
+  handshake actually succeed. The frontend is served from
+  `https://x86.mov` or `https://<branch>.x86-mov.pages.dev` while
+  turbo86 listens on `ws://127.0.0.1:1234` — those Origins must be on
+  the allow-list or coder/websocket's default `Origin == Host` policy
+  rejects the upgrade with 403. `cmd/turbo86/main.go`'s default already
+  includes `x86.mov`, `*.x86-mov.pages.dev`, and `localhost(:*)` /
+  `127.0.0.1(:*)`, so a stock `./turbo86` works with prod, every PR
+  preview, and `make serve` without extra config. See turbo86
+  `DESIGN.md` for the InsecureSkipVerify doctrine this replaces.
 
 - **`vm.snapshotContext()`** — Rust-side. Builds a `ContextSnapshot`
   by combining `Regs::from_cpu(&self.cpu)` with

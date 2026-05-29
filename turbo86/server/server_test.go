@@ -4,6 +4,7 @@ package server_test
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
@@ -22,7 +23,7 @@ import (
 // back over the wire. Exercises proto + runner + stub + server in one
 // pass.
 func TestE2E_ExitFortyTwo_OverWebSocket(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -61,7 +62,7 @@ func TestE2E_ExitFortyTwo_OverWebSocket(t *testing.T) {
 // SYS_exit with status 42) and a single int 0x80 instruction, and the
 // session exits as 42 without the guest code ever touching eax/ebx.
 func TestE2E_LoadContext_OverWebSocket(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -101,7 +102,7 @@ func TestE2E_LoadContext_OverWebSocket(t *testing.T) {
 // Sequence: Code + Code(data) + Start → recv Stdout("A") → Code(post-
 // Start, unused address) → recv Exit{42}.
 func TestE2E_PostStartCodeStreaming(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -158,7 +159,7 @@ func TestE2E_PostStartCodeStreaming(t *testing.T) {
 // dropping the WebSocket. Sends Stop after letting the loop spin
 // briefly, then reads the resulting Paused(SIGKILL).
 func TestE2E_StopMessageInterruptsTightLoop(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -203,7 +204,7 @@ func TestE2E_StopMessageInterruptsTightLoop(t *testing.T) {
 // Context via its own resume path; this test stops at "the WS round
 // trip works".
 func TestE2E_PauseMessageEmitsPausedWithContext(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -255,7 +256,7 @@ func TestE2E_PauseMessageEmitsPausedWithContext(t *testing.T) {
 // runaway guest would leave the handler blocked on the events channel
 // forever — and httptest.Server.Close() would hang waiting for it.
 func TestE2E_ClientDisconnectStopsTightLoop(t *testing.T) {
-	srv := httptest.NewServer(server.Handler())
+	srv := httptest.NewServer(server.Handler(nil))
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -317,6 +318,91 @@ func sendInbound(t *testing.T, ctx context.Context, ws *websocket.Conn, msg prot
 	}
 	if err := ws.Write(ctx, websocket.MessageText, data); err != nil {
 		t.Fatalf("write %T: %v", msg, err)
+	}
+}
+
+// TestHandler_RejectsCrossOriginWithoutAllowList pins the security
+// boundary: with `Handler(nil)` (no allow list configured) and a
+// browser-like cross-origin handshake (Origin set, mismatching Host),
+// the upgrade MUST fail. This is the "any visited page can drive
+// local turbo86 over ws://127.0.0.1" attack surface — the default
+// coder/websocket Origin == Host policy is what protects us, and a
+// regression here silently re-opens the cross-site RCE described in
+// DESIGN.md.
+func TestHandler_RejectsCrossOriginWithoutAllowList(t *testing.T) {
+	srv := httptest.NewServer(server.Handler(nil))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"https://attacker.example"}},
+	})
+	if err == nil {
+		t.Fatal("expected handshake rejection, got success")
+	}
+	if resp != nil && resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected HTTP 403, got %d", resp.StatusCode)
+	}
+}
+
+// TestHandler_AcceptsPatternMatchedOrigin verifies the allow-list path
+// works: a wildcard pattern matches a typical CF Pages preview Origin
+// (head-ref slug subdomain), and the resulting session runs cleanly to
+// completion. Uses the LoadContext path (no separate Start needed) so
+// the test is short and stays focused on the handshake.
+func TestHandler_AcceptsPatternMatchedOrigin(t *testing.T) {
+	srv := httptest.NewServer(server.Handler([]string{
+		"x86.mov",
+		"*.x86-mov.pages.dev",
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"https://my-branch.x86-mov.pages.dev"}},
+	})
+	if err != nil {
+		t.Fatalf("expected handshake success, got: %v", err)
+	}
+	defer ws.CloseNow()
+
+	const entry uint32 = 0x08048000
+	sendInbound(t, ctx, ws, proto.LoadContext{Context: proto.Context{
+		Regs: proto.Regs{Eax: 1, Ebx: 7, Esp: 0x701FFFF0, Eip: entry},
+		Regions: []proto.MemRegion{
+			{Addr: entry, Bytes: []byte{0xCD, 0x80}},
+		},
+	}})
+	got := readAllEvents(t, ctx, ws)
+	want := []proto.Outbound{proto.Exit{Code: 7}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", got, want)
+	}
+}
+
+// TestHandler_RejectsOriginOutsideAllowList completes the security
+// triangle: even with an allow list configured, an Origin that doesn't
+// match any pattern is still rejected. Otherwise a typo in the
+// `--allow-origin` flag could accidentally widen the door.
+func TestHandler_RejectsOriginOutsideAllowList(t *testing.T) {
+	srv := httptest.NewServer(server.Handler([]string{"x86.mov"}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"https://evil.example"}},
+	})
+	if err == nil {
+		t.Fatal("expected handshake rejection, got success")
+	}
+	if resp != nil && resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected HTTP 403, got %d", resp.StatusCode)
 	}
 }
 
