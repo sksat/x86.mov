@@ -1,9 +1,11 @@
-// turbo86 handover E2E.
+// turbo86 handover E2E (backend selector).
 //
-// Verifies the explorer's side of the handover protocol — the Vm
-// snapshot it builds, the JSON `LoadContext` message it sends over the
-// WebSocket, and the UI's reaction to a turbo86 `Stdout` / `Exit`
-// Outbound reply. We deliberately do **not** open a real cross-origin
+// Verifies the explorer's side of the handover protocol driven through
+// the execution-backend *selector*: selecting turbo86 + Run forwards a
+// Vm snapshot as a JSON `LoadContext`, a turbo86 `Stdout` Outbound joins
+// the console, and switching back to movie86 mid-run sends a `Pause` and
+// absorbs the `Paused` snapshot back into the local Vm (reverse
+// handover). We deliberately do **not** open a real cross-origin
 // WS in this test: Playwright's headless Chromium enforces a stricter
 // secure-origin policy than production Chrome and blocks `ws://127.
 // 0.0.1` from `https://*.pages.dev` even with PNA + web-security
@@ -25,7 +27,7 @@ test.skip(!process.env.E2E_BASE_URL, 'set E2E_BASE_URL to run this spec');
 
 test.setTimeout(120_000);
 
-test('explorer builds a LoadContext payload and handles turbo86 Outbound replies', async ({
+test('explorer forwards on backend-select+Run and reverses on switch-back', async ({
     page,
 }) => {
     const consoleErrors: string[] = [];
@@ -109,14 +111,20 @@ test('explorer builds a LoadContext payload and handles turbo86 Outbound replies
     });
     await expect(page.getByTestId('vm-run')).toBeEnabled({ timeout: 10_000 });
 
-    // Drive handover. URL field defaults to ws://127.0.0.1:1234 — the
-    // stubbed WebSocket accepts anything, so we leave it.
-    await page.getByTestId('turbo86-send').click();
+    // Select turbo86 as the execution backend. The Vm is stopped, so
+    // this just records the choice (deferred handover) and reveals the
+    // turbo86 connection strip — no socket opens yet.
+    await page.getByTestId('backend-opt-turbo86').click();
+    await expect(page.getByTestId('turbo86-handover')).toBeVisible();
 
-    // The status flips through `sent LoadContext: N regions, mode=trap`
-    // once the stub fires `open` and the page calls send().
+    // Run on the turbo86 backend == forward handover. URL defaults to
+    // ws://127.0.0.1:1234; the stubbed WebSocket accepts anything.
+    await page.getByTestId('vm-run').click();
+
+    // Status flips to `forwarded: N regions, mode=trap` once the stub
+    // fires `open` and the page snapshots + sends LoadContext.
     await expect(page.getByTestId('turbo86-status')).toContainText(
-        /sent LoadContext/,
+        /forwarded:/,
         { timeout: 5_000 },
     );
 
@@ -147,9 +155,8 @@ test('explorer builds a LoadContext payload and handles turbo86 Outbound replies
         expect(region.bytes).toMatch(/^[A-Za-z0-9+/]+=*$/);
     }
 
-    // Now play turbo86's role: send an Outbound `stdout` event back
-    // through the stub. The page should flip turbo86-status to
-    // `turbo86 → stdout`.
+    // Play turbo86's role: send a `stdout` Outbound back through the
+    // stub. It joins the same Console the local movie86 run feeds.
     await page.evaluate(() => {
         const inst = (
             globalThis as unknown as {
@@ -164,13 +171,40 @@ test('explorer builds a LoadContext payload and handles turbo86 Outbound replies
             }),
         });
     });
-    await expect(page.getByTestId('turbo86-status')).toContainText(
-        /turbo86 → stdout/,
+    await expect(page.getByTestId('stdout')).toContainText(
+        /hello from turbo86/,
         { timeout: 2_000 },
     );
 
-    // And again with an `exit` event — same path, different topic.
-    await page.evaluate(() => {
+    // Reverse handover: switch back to movie86 *while turbo86 runs*.
+    // The page must send a `{type:'pause'}` Inbound and then absorb the
+    // `Paused` Outbound back into the local Vm. We echo the captured
+    // forward context as the Paused frame so loadContextInto has a
+    // valid (regs + regions) snapshot to restore.
+    await page.getByTestId('backend-opt-movie86').click();
+    await expect
+        .poll(
+            () =>
+                page.evaluate(() => {
+                    const s = (
+                        globalThis as unknown as {
+                            __t86Spy: { sent: string[] };
+                        }
+                    ).__t86Spy.sent;
+                    return s.some((f) => {
+                        try {
+                            return JSON.parse(f).type === 'pause';
+                        } catch {
+                            return false;
+                        }
+                    });
+                }),
+            { timeout: 5_000 },
+        )
+        .toBe(true);
+
+    await page.evaluate((forward) => {
+        const ctx = JSON.parse(forward).context;
         const inst = (
             globalThis as unknown as {
                 __t86Spy: { instance: { emit: (ev: object) => void } };
@@ -178,12 +212,18 @@ test('explorer builds a LoadContext payload and handles turbo86 Outbound replies
         ).__t86Spy.instance;
         inst.emit({
             type: 'message',
-            data: JSON.stringify({ type: 'exit', code: 42 }),
+            data: JSON.stringify({
+                type: 'paused',
+                regs: ctx.regs,
+                regions: ctx.regions,
+                signal: 0,
+                reason: 'test',
+            }),
         });
-    });
+    }, sent[0]!);
     await expect(page.getByTestId('turbo86-status')).toContainText(
-        /turbo86 → exit/,
-        { timeout: 2_000 },
+        /reverse: applied/,
+        { timeout: 5_000 },
     );
 
     // No unhandled errors during the round-trip.

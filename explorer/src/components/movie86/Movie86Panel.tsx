@@ -14,15 +14,22 @@ import { Disassembly } from './Disassembly';
 import { Memory } from './Memory';
 import { Canvas } from './Canvas';
 import { Console } from './Console';
+import { BackendSelector } from '@/components/BackendSelector';
+import { Turbo86Controls } from '@/components/Turbo86Controls';
 import { fmt32, fmtBytes } from '@/lib/utils';
 import type { UseMovie86VmReturn } from '@/hooks/useMovie86Vm';
+import type { UseTurbo86SessionReturn } from '@/hooks/useTurbo86Session';
+import type { UseExecBackendReturn } from '@/hooks/useExecBackend';
 
 interface Movie86PanelProps {
     elf: Uint8Array | null;
     movie86Vm: UseMovie86VmReturn;
-    /** Trailing actions slot — used for the turbo86 handover button so
-     *  it sits inside the engine card without taking another row. */
-    actions?: React.ReactNode;
+    /** Backend selector coordinator — drives the segmented toggle and
+     *  the backend-aware Run / Stop. */
+    exec: UseExecBackendReturn;
+    /** turbo86 session — its connection controls render inline when
+     *  turbo86 is selected, and its stdout joins the console. */
+    turbo86: UseTurbo86SessionReturn;
 }
 
 /**
@@ -52,22 +59,14 @@ interface Movie86PanelProps {
  * stuffing pre-built fixtures into a preset dropdown, which would push
  * the explorer's intent away from "run what you compiled".
  */
-export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
-    const {
-        vm,
-        tick,
-        running,
-        run,
-        step,
-        stop,
-        reset,
-        loadElf,
-        drainOutput,
-        follow,
-        setFollow,
-        delayMs,
-        setDelayMs,
-    } = movie86Vm;
+export function Movie86Panel({ elf, movie86Vm, exec, turbo86 }: Movie86PanelProps) {
+    const { vm, tick, step, reset, loadElf, drainOutput, follow, setFollow, delayMs, setDelayMs } =
+        movie86Vm;
+    // Run / Stop / running are backend-aware (movie86 loop vs turbo86
+    // forward handover); Step is movie86-only. follow / delayMs stay
+    // movie86-only (the local Run loop's live cadence controls).
+    const { backend, running, run, stop } = exec;
+    const onTurbo86 = backend === 'turbo86';
 
     const [stdout, setStdout] = useState('');
     const [stderr, setStderr] = useState('');
@@ -87,6 +86,7 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
         if (!elf || !movie86Ready) return;
         setStdout('');
         setStderr('');
+        turbo86.clearOutput();
         setLoadError(null);
         loadElf(elf).catch((e) => {
             const msg = (e as Error).message ?? String(e);
@@ -99,6 +99,7 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
     const loadFromBytes = async (bytes: Uint8Array) => {
         setStdout('');
         setStderr('');
+        turbo86.clearOutput();
         setLoadError(null);
         try {
             await loadElf(bytes);
@@ -130,13 +131,18 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
             <CardHeader className="pb-2">
                 <div className="flex items-center justify-between gap-3 flex-wrap">
                     <div>
-                        <CardTitle className="text-base">Run · movie86</CardTitle>
+                        <CardTitle className="text-base">Run · {backend}</CardTitle>
                         <CardDescription>
-                            In-browser ELF32 i386 emulator. The latest compile
-                            auto-loads here; click Run to step until halt.
+                            {onTurbo86
+                                ? 'Native ptrace backend over WebSocket. Run forwards the live state; switch back to movie86 to pull it home.'
+                                : 'In-browser ELF32 i386 emulator. The latest compile auto-loads here; click Run to step until halt.'}
                         </CardDescription>
                     </div>
                     <div className="flex items-center gap-2">
+                        <BackendSelector
+                            backend={backend}
+                            onSelect={exec.selectBackend}
+                        />
                         <Button
                             variant="ghost"
                             size="sm"
@@ -157,41 +163,49 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
                             <RefreshCw className="h-3.5 w-3.5" />
                             Reset
                         </Button>
-                        <label
-                            className="flex items-center gap-1.5 text-xs text-muted-foreground select-none"
-                            title="Follow: step one instruction per frame and redraw every step (watch each mov land). Off: run in fast batches and refresh periodically. Toggle any time — including mid-run."
-                        >
-                            <input
-                                type="checkbox"
-                                className="h-3.5 w-3.5 accent-primary"
-                                checked={follow}
-                                onChange={(e) => setFollow(e.target.checked)}
-                                data-testid="vm-follow"
-                            />
-                            Follow
-                        </label>
-                        <label
-                            className="flex items-center gap-1 text-xs text-muted-foreground"
-                            title="Step delay (ms) between instructions while Follow is on."
-                        >
-                            delay
-                            <input
-                                type="number"
-                                min={0}
-                                step={50}
-                                value={delayMs}
-                                onChange={(e) => setDelayMs(Number(e.target.value))}
-                                disabled={!follow}
-                                className="w-14 rounded-md border bg-background px-1.5 py-0.5 text-xs tabular-nums disabled:opacity-50"
-                                data-testid="vm-delay"
-                            />
-                            ms
-                        </label>
+                        {/* Follow / delay drive the local movie86 Run loop's
+                            cadence — meaningless once turbo86 runs natively,
+                            so hide them there (same as Step). */}
+                        {!onTurbo86 && (
+                            <>
+                                <label
+                                    className="flex items-center gap-1.5 text-xs text-muted-foreground select-none"
+                                    title="Follow: step one instruction per frame and redraw every step (watch each mov land). Off: run in fast batches and refresh periodically. Toggle any time — including mid-run."
+                                >
+                                    <input
+                                        type="checkbox"
+                                        className="h-3.5 w-3.5 accent-primary"
+                                        checked={follow}
+                                        onChange={(e) => setFollow(e.target.checked)}
+                                        data-testid="vm-follow"
+                                    />
+                                    Follow
+                                </label>
+                                <label
+                                    className="flex items-center gap-1 text-xs text-muted-foreground"
+                                    title="Step delay (ms) between instructions while Follow is on."
+                                >
+                                    delay
+                                    <input
+                                        type="number"
+                                        min={0}
+                                        step={50}
+                                        value={delayMs}
+                                        onChange={(e) => setDelayMs(Number(e.target.value))}
+                                        disabled={!follow}
+                                        className="w-14 rounded-md border bg-background px-1.5 py-0.5 text-xs tabular-nums disabled:opacity-50"
+                                        data-testid="vm-delay"
+                                    />
+                                    ms
+                                </label>
+                            </>
+                        )}
                         <Button
                             variant="outline"
                             size="sm"
                             onClick={step}
-                            disabled={!vm || !!tick?.haltReason}
+                            disabled={!vm || onTurbo86 || !!tick?.haltReason}
+                            title={onTurbo86 ? 'Step is movie86-only' : undefined}
                             data-testid="vm-step"
                         >
                             <StepForward className="h-3.5 w-3.5" />
@@ -211,14 +225,13 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
                             <Button
                                 size="sm"
                                 onClick={() => run()}
-                                disabled={!vm || !!tick?.haltReason}
+                                disabled={!vm || (!onTurbo86 && !!tick?.haltReason)}
                                 data-testid="vm-run"
                             >
                                 <Play className="h-3.5 w-3.5" />
                                 Run
                             </Button>
                         )}
-                        {actions}
                     </div>
                 </div>
             </CardHeader>
@@ -235,6 +248,9 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
                     }}
                     data-testid="elf-upload-input"
                 />
+                {onTurbo86 && (
+                    <Turbo86Controls turbo86={turbo86} locked={turbo86.connected} />
+                )}
                 {loadError && (
                     <div
                         className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs"
@@ -288,7 +304,13 @@ export function Movie86Panel({ elf, movie86Vm, actions }: Movie86PanelProps) {
                     <Canvas vm={vm} tick={tick} movie86={movie86Vm.movie86} />
                 </Pane>
 
-                <Console stdout={stdout} stderr={stderr} />
+                {/* movie86's drained output first, then turbo86's — a
+                    handover only ever moves execution forward in time, so
+                    concatenation keeps the console chronological. */}
+                <Console
+                    stdout={stdout + turbo86.stdout}
+                    stderr={stderr + turbo86.stderr}
+                />
             </CardContent>
         </Card>
     );

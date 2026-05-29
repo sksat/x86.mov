@@ -21,7 +21,6 @@ import { CodeViewer } from '@/components/CodeViewer';
 import { CompilerControls } from '@/components/CompilerControls';
 import { CompileOutput } from '@/components/CompileOutput';
 import { Movie86Panel } from '@/components/movie86/Movie86Panel';
-import { Turbo86Handover } from '@/components/Turbo86Handover';
 import {
     compile,
     type CompileResult,
@@ -30,6 +29,8 @@ import {
 } from '@/lib/compiler';
 import { loadMovfuscator, type MovfuscatorWrapper } from '@/lib/wrappers';
 import { useMovie86Vm } from '@/hooks/useMovie86Vm';
+import { useTurbo86Session } from '@/hooks/useTurbo86Session';
+import { useExecBackend } from '@/hooks/useExecBackend';
 import { DEFAULT_PRESET, PRESETS } from '@/lib/presets';
 
 /**
@@ -61,6 +62,8 @@ export function App() {
     }>({ kind: 'idle', text: 'ready' });
 
     const movie86Vm = useMovie86Vm();
+    const turbo86 = useTurbo86Session();
+    const exec = useExecBackend(movie86Vm, turbo86);
 
     // Lazy-load the ELF parser when the page first renders so the
     // header pane can render the moment a compile completes.
@@ -236,10 +239,9 @@ export function App() {
                 <Movie86Panel
                     elf={elf}
                     movie86Vm={movie86Vm}
-                    actions={null}
+                    exec={exec}
+                    turbo86={turbo86}
                 />
-
-                <Turbo86Handover vm={movie86Vm.vm} movie86={movie86Vm.movie86} />
 
                 <Footer />
             </main>

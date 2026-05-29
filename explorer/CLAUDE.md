@@ -7,8 +7,12 @@ A Compiler-Explorer-style page for the x86.mov stack. Lets a user
 edit C, pick **movfuscator-wasm** or **llvm-mov clang** as the
 toolchain, inspect the produced IR (llvm-mov path only) + the mov-only
 asm + the linked ELF side-by-side, then run the result in an embedded
-movie86 emulator. A handover button packages the live Vm state and
-ships it to a local turbo86 over WebSocket.
+movie86 emulator. A segmented **execution-backend selector** (movie86 |
+turbo86) chooses where the program runs: picking turbo86 while running
+forward-hands the live Vm state to a local turbo86 over WebSocket;
+switching back to movie86 while running reverse-hands it home (Pause →
+Paused → loadContext). Picking while stopped just records the choice;
+the next Run acts on it.
 
 ## Operating model
 
@@ -36,6 +40,15 @@ ships it to a local turbo86 over WebSocket.
    [`src/lib/compiler.ts`](src/lib/compiler.ts) wires the real wrappers
    in for production calls. **Don't fork the algorithm into the React
    layer** — update `explorer.mjs` instead, the suite gates on it.
+
+   The same split applies to the **execution-backend selector**: the
+   movie86-vs-turbo86 switch *rules* (defer-vs-handover, forward vs
+   reverse) live in [`backend.mjs`](backend.mjs) and are pinned by
+   [`tests/backend.test.mjs`](tests/backend.test.mjs);
+   [`src/hooks/useExecBackend.ts`](src/hooks/useExecBackend.ts) only
+   *dispatches* those decisions onto the two concrete backends
+   (`useMovie86Vm` + `useTurbo86Session`). Don't bake the rule table
+   into a component.
 
 4. **Reuse, don't extend, the parent subprojects.** The embedded
    movie86 panes (Registers, Disassembly, Memory, Canvas, Console)
@@ -72,21 +85,26 @@ explorer/
   tailwind.config.js            shadcn-aligned tokens
   postcss.config.js
   index.html                    Vite entry
-  explorer.mjs                  ← framework-free orchestration (tested in Node)
-  explorer.d.mts                ← sidecar TS types for explorer.mjs
+  explorer.mjs                  ← framework-free compile orchestration (tested in Node)
+  explorer.d.mts                sidecar TS types for explorer.mjs
   runloop.mjs                   ← framework-free Run loop (tested in Node)
-  runloop.d.mts                 ← sidecar TS types for runloop.mjs
+  runloop.d.mts                 sidecar TS types for runloop.mjs
+  backend.mjs                   ← framework-free backend-selector decisions (tested in Node)
+  backend.d.mts                 sidecar TS types for backend.mjs
   src/
     main.tsx
     App.tsx                     Top-level layout / state owner
     index.css                   shadcn CSS variables + tailwind directives
     lib/
       compiler.ts               TS facade over explorer.mjs
+      backend.ts                TS facade over backend.mjs
       wrappers.ts               Runtime dynamic loaders for sibling wasm modules
       utils.ts                  cn(), hex helpers
       presets.ts                Bundled C snippets
     hooks/
-      useMovie86Vm.ts           Vm lifecycle + Run/Step/Reset/Follow state
+      useMovie86Vm.ts           movie86 Vm lifecycle + Run/Step/Reset/Follow state
+      useTurbo86Session.ts      persistent turbo86 WebSocket (forward + reverse handover)
+      useExecBackend.ts         coordinator: backend.mjs decisions → side effects
     components/
       ui/                       shadcn primitives (Button, Card, Select, …)
       SourceEditor.tsx          CodeMirror + cpp lang
@@ -94,7 +112,8 @@ explorer/
       CompilerControls.tsx
       CompileOutput.tsx
       ElfSummary.tsx
-      Turbo86Handover.tsx
+      BackendSelector.tsx       segmented movie86 | turbo86 toggle
+      Turbo86Controls.tsx       turbo86 URL / mode / status strip
       movie86/
         Movie86Panel.tsx
         Registers.tsx
@@ -103,8 +122,9 @@ explorer/
         Canvas.tsx
         Console.tsx
   tests/
-    unit.test.mjs               Node --test: orchestration surface
+    unit.test.mjs               Node --test: compile orchestration surface
     runloop.test.mjs            Node --test: Run-loop / live Follow toggle
+    backend.test.mjs            Node --test: backend-selector decision rules
     e2e/structure.spec.ts       Playwright: structural smoke
   scripts/
     stage-deploy.sh
@@ -115,7 +135,7 @@ explorer/
 
 | target | what it asserts | dependency |
 |---|---|---|
-| `make test-unit` | `explorer.mjs` orchestration: compiler dispatch, normalized result shape, error path | none |
+| `make test-unit` | `explorer.mjs` orchestration + `backend.mjs` selector rules (compiler dispatch, normalized result shape, error path; backend switch decision table) | none |
 | `make typecheck` | TS strict + erasable-syntax passes | `node_modules` |
 | `make build` | Vite production build emits `../dist/explorer/` | `node_modules` |
 | `make test-e2e` | Playwright structural smoke against `vite preview` | `make build` |
