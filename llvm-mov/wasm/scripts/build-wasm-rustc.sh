@@ -141,6 +141,15 @@ sysconfdir = "etc"
 [rust]
 debug-logging = false
 codegen-units = 1
+
+# Force a local LLVM build instead of downloading prebuilt CI
+# artefacts. The download path walks git history to find the
+# commit that last touched the LLVM submodule, which fails on the
+# `--depth 1` shallow clone we do above ("could not find commit
+# hash for downloading LLVM"). Building LLVM locally adds ~1-2
+# hours but works deterministically off the shallow tree.
+[llvm]
+download-ci-llvm = false
 EOF
 
 env \
