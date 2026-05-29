@@ -235,8 +235,25 @@ function assertSafeExtraInputPath(p, userObjPaths) {
 }
 
 /**
- * Link one or more ELF32 i386 relocatable objects into a
- * dynamically-linked mov-only ELF executable.
+ * Link one or more ELF32 i386 relocatable objects into a mov-only ELF
+ * executable.
+ *
+ * Two link modes:
+ *  - **dynamic** (default) — the historical shape. `ld` is invoked with
+ *    `-dynamic-linker /lib/ld-linux.so.2` and the default
+ *    `-lgcc -lc -lm`, so the produced ELF depends on glibc + ld.so at
+ *    runtime. Suitable for any program that calls into libc.
+ *  - **static** (`opts.static = true`) — `ld -static` over just the
+ *    movfuscator runtime (crt0 + crtf + crtd + softfloat32) and the
+ *    user objects. **No `-l...` defaults**, because the runtime is
+ *    self-contained for `int 0x80` / mov-only-ABI programs (the same
+ *    recipe used by `movie86/wasm/examples/sources/build-mandelbrot.sh`
+ *    to produce the canvas_mandelbrot_mov.elf fixture). The output is
+ *    free of PT_INTERP / PT_DYNAMIC so it can be loaded by movie86,
+ *    which rejects dynamic ELFs at `Vm::new`. If the caller's program
+ *    *does* need libc, they can re-introduce `extraLibs: ['c', ...]`
+ *    plus a staged libc.a via `extraInputs` — the wrapper deliberately
+ *    doesn't ship one to keep the default bundle the same size.
  *
  * @param {Uint8Array | Uint8Array[] | Record<string,Uint8Array>} objs
  *   - Uint8Array: single .o (the original shape). Staged at
@@ -251,12 +268,14 @@ function assertSafeExtraInputPath(p, userObjPaths) {
  *   caches it.
  * @param {{
  *   name?: string,
+ *   static?: boolean,
  *   extraLibs?: string[],
  *   searchPaths?: string[],
  *   extraInputs?: Record<string,Uint8Array>,
  * }} [opts]
  *   - `name`: only used when `objs` is a single Uint8Array. Default `a.out.o`.
- *   - `extraLibs`: appended as `-l<name>` (after the default `-lgcc -lc -lm`).
+ *   - `static`: link statically (see above). Default `false`.
+ *   - `extraLibs`: appended as `-l<name>` (after the per-mode defaults).
  *   - `searchPaths`: appended as `-L<path>` (after the default `-L/movfuscator
  *     -L/usr/lib32 -L/lib32`).
  *   - `extraInputs`: absolute MEMFS path → bytes, written before ld runs.
@@ -267,6 +286,7 @@ function assertSafeExtraInputPath(p, userObjPaths) {
 export async function link(objs, libs, opts = {}) {
     const {
         name = 'a.out.o',
+        static: staticLink = false,
         extraLibs = [],
         searchPaths = [],
         extraInputs = {},
@@ -280,6 +300,9 @@ export async function link(objs, libs, opts = {}) {
     }
     if (!Array.isArray(extraLibs) || !Array.isArray(searchPaths)) {
         throw new TypeError('extraLibs / searchPaths must be arrays');
+    }
+    if (typeof staticLink !== 'boolean') {
+        throw new TypeError('opts.static must be boolean');
     }
 
     if (!libs) {
@@ -314,12 +337,21 @@ export async function link(objs, libs, opts = {}) {
     // crt0 first, user objects in caller-given order, then crtf/crtd/softfloat.
     // -L/movfuscator covers the crt + softfloat objects and libgcc.a (staged
     // together) so the wrapper isn't tied to a particular gcc release.
+    //
+    // Mode switch:
+    //   - dynamic: `-dynamic-linker /lib/ld-linux.so.2 ... -lgcc -lc -lm`
+    //   - static : `-static` only, no default `-l...`. Mirrors the host
+    //     recipe in movie86/wasm/examples/sources/build-mandelbrot.sh.
+    const modeArgs = staticLink
+        ? ['-static']
+        : ['-dynamic-linker', '/lib/ld-linux.so.2'];
+    const defaultLibArgs = staticLink ? [] : ['-lgcc', '-lc', '-lm'];
     const cmd = [
         '-m', 'elf_i386', '--hash-style=gnu',
-        '-dynamic-linker', '/lib/ld-linux.so.2',
+        ...modeArgs,
         '-L/movfuscator', '-L/usr/lib32', '-L/lib32',
         ...searchPaths.map(p => `-L${p}`),
-        '-lgcc', '-lc', '-lm',
+        ...defaultLibArgs,
         ...extraLibs.map(l => `-l${l}`),
         '/movfuscator/crt0.o',
         ...userObjs.map(({ name: n }) => `/${n}`),

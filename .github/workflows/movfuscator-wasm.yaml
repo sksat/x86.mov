@@ -90,6 +90,7 @@ jobs:
       #   test-as       .s → .o          (wasm as vs committed .o goldens)
       #   test-ld       .o → ELF         (wasm ld vs host /usr/bin/ld, dynamic)
       #   test-multi    multi-.o → ELF   (multi-input link + extraLibs/extraInputs)
+      #   test-static   .o → ELF         (wasm ld -static vs host ld -static + run check)
       #   test-browser  full chain via the JS wrapper used in the browser demo
       - name: test (node pipeline, .c → .s)
         run: make test
@@ -102,6 +103,9 @@ jobs:
 
       - name: test-multi (multi-input link + extraLibs)
         run: make test-multi
+
+      - name: test-static (static-link byte-identical + run check)
+        run: make test-static
 
       - name: test-browser (full chain via wrapper)
         run: make test-browser
