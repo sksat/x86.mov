@@ -60,21 +60,10 @@ fn mandel_iter(cx: f64, cy: f64, max_iter: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn mandelbrot_main() -> i32 {
     // Accumulate in f64 so the loop exercises `uitofp` on the iter
-    // count and `to_int_unchecked` at the tail exercises raw `fptosi`.
-    // 337 fits exactly in an f64 mantissa, so the round-trip is
-    // bit-exact.
-    //
-    // We use `to_int_unchecked` (which lowers to a plain LLVM
-    // `fptosi`) instead of `as i32` (which Rust 1.45+ lowers to
-    // `llvm.fptosi.sat.i32.f64`). Our backend has no Custom
-    // FP_TO_SINT_SAT lowering yet, so SDAG falls back to expanding
-    // the saturating intrinsic into a NaN/range compare-cascade of
-    // libcall fcmps — which combines so poorly with the bit-blended
-    // selects that compilation times out. The `to_int_unchecked`
-    // form is sound here because the score is bounded by 32×16 = 512
-    // (well inside i32 range) and never NaN. (Lifting the FP_TO_SINT_
-    // SAT restriction is a backend follow-up; once it's done, `as
-    // i32` will work without the safety dance.)
+    // count and `as i32` at the tail exercises `fptosi` (with
+    // saturating semantics, via the 7h8 `llvm.fptosi.sat` → plain
+    // `fptosi` IR-level rewrite). 337 fits exactly in an f64 mantissa,
+    // so the round-trip is bit-exact.
     let mut score: f64 = 0.0;
     let mut i: i32 = 0;
     while i < 16 {
@@ -84,7 +73,5 @@ pub extern "C" fn mandelbrot_main() -> i32 {
         score = score + (iter as f64);
         i += 1;
     }
-    // SAFETY: score ≤ 512 (< i32::MAX) and is not NaN by construction
-    // (all inputs are exact rationals).
-    unsafe { score.to_int_unchecked::<i32>() }
+    score as i32
 }

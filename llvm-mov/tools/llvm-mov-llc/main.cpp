@@ -1501,6 +1501,14 @@ static void emitFloatToInt32Body(Function *F, LLVMContext &Ctx,
 
   // Final underflow gate.
   Result = B.CreateSelect(Underflow, C(0), Result);
+  // Stage 7h8 — NaN → 0 (matches the `llvm.fptosi.sat` /
+  // `llvm.fptoui.sat` convention so Custom-lowering them to plain
+  // FP_TO_SINT / FP_TO_UINT preserves the saturating semantics).
+  // NaN: exp == 0xFF AND mant != 0.
+  Value *ExpIsMaxF = B.CreateICmpEQ(Exp, C(0xFFu));
+  Value *MantNZF = B.CreateICmpNE(B.CreateAnd(VI, C(0x7FFFFFu)), C(0u));
+  Value *IsNaNF = B.CreateAnd(ExpIsMaxF, MantNZF);
+  Result = B.CreateSelect(IsNaNF, C(0), Result);
   B.CreateRet(Result);
 }
 
@@ -1722,6 +1730,16 @@ static void emitDoubleToInt32Body(Function *F, LLVMContext &Ctx,
   }
 
   Result = B.CreateSelect(Underflow, C(0), Result);
+  // Stage 7h8 — NaN → 0 (matches `llvm.fptosi.sat` / `llvm.fptoui.
+  // sat` convention; lets MovISelLowering's Custom lowering re-emit
+  // these intrinsics as plain FP_TO_SINT / FP_TO_UINT without
+  // breaking the NaN→0 semantics). NaN: exp == 0x7FF AND mant
+  // (top OR bot) != 0.
+  Value *ExpIsMaxD = B.CreateICmpEQ(Exp, C(0x7FFu));
+  Value *MantNZD = B.CreateOr(B.CreateICmpNE(MantTop, C(0u)),
+                              B.CreateICmpNE(MantBot, C(0u)));
+  Value *IsNaND = B.CreateAnd(ExpIsMaxD, MantNZD);
+  Result = B.CreateSelect(IsNaND, C(0), Result);
   B.CreateRet(Result);
 }
 
@@ -3076,6 +3094,54 @@ int main(int argc, char **argv) {
   if (EC) {
     WithColor::error(errs(), argv[0]) << EC.message() << "\n";
     return 1;
+  }
+
+  // Stage 7h8 — rewrite `llvm.fptosi.sat.*` / `llvm.fptoui.sat.*`
+  // intrinsics into plain `fptosi` / `fptoui` instructions. Rust
+  // 1.45+ emits these saturating intrinsics for `as iN` casts on
+  // floats; SDAG's default Expand of them decomposes into a NaN /
+  // range compare-cascade of libcall fcmps surrounded by selects,
+  // which combines so badly with the i32 bit-blend that compilation
+  // stalls (observed ≥ 9 min on the mandelbrot crate). Our injected
+  // `__fixsfsi` / `__fixdfsi` / `__fixunssfsi` / `__fixunsdfsi`
+  // helpers already saturate (out-of-range → INT_MIN / INT_MAX /
+  // UINT_MAX, NaN → 0 as of this stage), so the saturating
+  // semantics are preserved by routing through the regular FP→int
+  // path. Doing the swap at the IR level sidesteps SDAG's soft-float
+  // legalizer eagerly expanding the saturating node before any
+  // Custom action can fire.
+  for (Function &F : *M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<IntrinsicInst *, 4> SatCalls;
+    for (Instruction &I : instructions(F)) {
+      if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+        Intrinsic::ID Id = II->getIntrinsicID();
+        if (Id != Intrinsic::fptosi_sat && Id != Intrinsic::fptoui_sat)
+          continue;
+        // Codex-review P2: the "helper saturates to INT_MIN/MAX/UINT_
+        // MAX" preservation argument only holds for i32 results,
+        // because the injected `__fix*si` helpers all return 32-bit
+        // values. Narrower destinations (`f32 as i8` etc.) need
+        // clamping to the destination's own range, so leave those
+        // intrinsics in place and let SDAG's default expansion
+        // handle them; wider destinations (i64) are deferred along
+        // with general i64 FP_TO_*INT support.
+        if (!II->getType()->isIntegerTy(32))
+          continue;
+        SatCalls.push_back(II);
+      }
+    }
+    for (IntrinsicInst *II : SatCalls) {
+      IRBuilder<> B(II);
+      Value *Src = II->getArgOperand(0);
+      Type *DstTy = II->getType();
+      Value *Replacement = (II->getIntrinsicID() == Intrinsic::fptosi_sat)
+                               ? B.CreateFPToSI(Src, DstTy)
+                               : B.CreateFPToUI(Src, DstTy);
+      II->replaceAllUsesWith(Replacement);
+      II->eraseFromParent();
+    }
   }
 
   // Stage 7f2 — inject `__udivsi3 / __umodsi3 / __divsi3 / __modsi3`

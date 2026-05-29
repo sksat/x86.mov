@@ -103,6 +103,12 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // emit pure SUB / XOR / LSHR / SRL combinations that produce
   // the 0/1 ZeroOrOneBooleanContent result the legalizer expects.
   setOperationAction(ISD::SETCC,  MVT::i32,   Custom);
+
+  // Stage 7h8 — `llvm.fptosi.sat.*` / `llvm.fptoui.sat.*` are
+  // pre-rewritten to plain `fptosi` / `fptoui` IR by the driver
+  // (`rewriteFpToIntSatIntrinsics` in tools/llvm-mov-llc/main.cpp);
+  // by the time SDAG runs, no ISD::FP_TO_SINT_SAT nodes appear, so
+  // no Custom action needs registering here.
   // Note: no Custom action for SIGN_EXTEND / ZERO_EXTEND / ANY_EXTEND.
   // The IR-rewrite pass in tools/llvm-mov-llc/main.cpp materialises
   // all branchless 0/1 → 0/-1 masks via `(0 - zext)` rather than
