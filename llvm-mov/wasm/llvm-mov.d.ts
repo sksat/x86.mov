@@ -24,7 +24,13 @@ export type ProgressEvent =
     | { stage: 'instantiate-clang' }
     | { stage: 'instantiate-llc' }
     | { stage: 'compile-c' }
-    | { stage: 'compile-ir' };
+    | { stage: 'compile-ir' }
+    // Rust-frontend (rsToIR) stages. Fire in order on a cold cache;
+    // a warm cache skips `fetch-rustc` / `fetch-sysroot` (the marker
+    // files in build/rustc-cache/<versionKey>/ short-circuit them).
+    | { stage: 'fetch-rustc' }
+    | { stage: 'fetch-sysroot' }
+    | { stage: 'run-rustc' };
 
 export type ProgressCallback = (ev: ProgressEvent) => void;
 
@@ -81,3 +87,73 @@ export function cToIR(source: string, opts?: CompileCOptions): Promise<string>;
  * cToIR(source, opts))` with the basenames lined up.
  */
 export function compileC(source: string, opts?: CompileCOptions): Promise<string>;
+
+/**
+ * One row of the rustc registry. See `RUSTC_VERSIONS`. Adding a new
+ * Rust version means adding one entry here; no wrapper / test changes.
+ */
+export interface RustcVersionSpec {
+    /** Rust version this artefact reports at startup (e.g. `1.83.0-dev`). */
+    rustVersion: string;
+    /** Editions accepted by this rustc. */
+    editions: ReadonlyArray<'2015' | '2018' | '2021' | '2024'>;
+    /** Triples this artefact ships sysroots for. */
+    supportedTargets: ReadonlyArray<string>;
+    /** Artefact URLs (overridable per-call via `opts.artefacts`). */
+    artefacts: {
+        rustcWasm: string;
+        /** Per-target sysroot lives at `${sysrootBase}/${triple}.tar.br`. */
+        sysrootBase: string;
+        compression: 'brotli';
+    };
+    /**
+     * Parity-test hint: which `rustup` channel matches this artefact's
+     * Rust version closely enough for native-vs-wasm diff to be useful.
+     */
+    nativeRustup: string;
+}
+
+/** Default rustcVersion when `rsToIR` is called without one. */
+export const DEFAULT_RUSTC_VERSION: string;
+
+/**
+ * Catalogue of selectable rustc.wasm artefacts. The single source of
+ * truth for "which Rust versions does this wrapper know about?". Keys
+ * are the values consumers pass as `opts.rustcVersion` to `rsToIR`.
+ */
+export const RUSTC_VERSIONS: Readonly<Record<string, RustcVersionSpec>>;
+
+export interface RsToIROptions {
+    /** Basename of the MEMFS input file. Defaults to `main.rs`. */
+    name?: string;
+    /** Key into `RUSTC_VERSIONS`. Defaults to `DEFAULT_RUSTC_VERSION`. */
+    rustcVersion?: string;
+    /** Must be in the chosen version's `supportedTargets`. */
+    target?: string;
+    /** Must be in the chosen version's `editions`. Defaults to `2021`. */
+    edition?: '2015' | '2018' | '2021' | '2024';
+    /** Forwarded as `-C opt-level=…`. */
+    optLevel?: OptLevel;
+    /**
+     * Override the chosen version's default artefact URLs. Use this
+     * to pin a self-hosted mirror without editing the registry.
+     */
+    artefacts?: {
+        rustcWasm?: string;
+        sysrootBase?: string;
+    };
+    /** Status callback; see ProgressEvent for the stage sequence. */
+    onProgress?: ProgressCallback;
+}
+
+/**
+ * Compile a single Rust source file to LLVM IR text via a wasm-hosted
+ * rustc. Drives the artefact pointed at by `RUSTC_VERSIONS[opts.rustcVersion]`
+ * through the `wasmtime` CLI (Node mode).
+ *
+ * Returns rustc's `--emit=llvm-ir` output. To feed the IR into the mov
+ * backend (`compile()`), the artefact's target / data layout must
+ * match what `llvm-mov-llc` accepts (currently `mov-...` / i386 ABI);
+ * `wasm32-wasip1` output won't lower without an i686 sysroot artefact.
+ */
+export function rsToIR(source: string, opts?: RsToIROptions): Promise<string>;

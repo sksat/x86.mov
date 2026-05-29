@@ -49,6 +49,32 @@ async function exists(p) {
     catch { return false; }
 }
 
+// In-process dedup for cold-cache artefact preparation. Two concurrent
+// `rsToIR()` calls on the same versionKey would otherwise both kick
+// off the same fetch (wasting bandwidth at best; race-renaming the
+// same .tmp file at worst). Keying by absolute marker path lets us
+// share the single Promise for as long as it's in flight; the entry
+// drops on settle so the next cold start can retry on failure.
+const _inFlight = new Map();
+function once(key, fn) {
+    const pending = _inFlight.get(key);
+    if (pending) return pending;
+    const p = (async () => fn())().finally(() => {
+        if (_inFlight.get(key) === p) _inFlight.delete(key);
+    });
+    _inFlight.set(key, p);
+    return p;
+}
+
+// Per-process unique suffix for the staging .tmp file. Even across
+// processes (e.g. two `make test-rust` runs sharing the same cache),
+// each writes to its own staging path; the final rename is the only
+// shared step, and POSIX rename is atomic.
+function stagingPath(destPath) {
+    const suffix = `${process.pid}.${(Math.random() * 0xffffffff) | 0}`;
+    return `${destPath}.${suffix}.tmp`;
+}
+
 // Locate wasmtime. PATH wins; fall back to the user-local install
 // location at ~/.local/wasmtime/ (where our README's setup instructions
 // place it).
@@ -72,18 +98,28 @@ async function resolveWasmtime() {
     );
 }
 
-// Decompress brotli stream → file at destPath, atomically via *.tmp rename.
+// Decompress brotli stream → file at destPath, atomically via a per-PID
+// random-suffixed *.tmp rename. Concurrent callers in the same process
+// are dedup'd one layer up via `once()`; concurrent callers in
+// *different* processes each write to their own staging path and the
+// final rename picks a winner (POSIX rename is atomic, so the file at
+// destPath is always intact).
 async function downloadAndDecompressBrotli(url, destPath) {
     await fsp.mkdir(path.dirname(destPath), { recursive: true });
     const res = await fetch(url);
     if (!res.ok) throw new Error(`fetch ${url}: ${res.status} ${res.statusText}`);
-    const tmpPath = destPath + '.tmp';
-    await pipeline(
-        Readable.fromWeb(res.body),
-        zlib.createBrotliDecompress(),
-        createWriteStream(tmpPath),
-    );
-    await fsp.rename(tmpPath, destPath);
+    const tmpPath = stagingPath(destPath);
+    try {
+        await pipeline(
+            Readable.fromWeb(res.body),
+            zlib.createBrotliDecompress(),
+            createWriteStream(tmpPath),
+        );
+        await fsp.rename(tmpPath, destPath);
+    } catch (e) {
+        await fsp.unlink(tmpPath).catch(() => {});
+        throw e;
+    }
 }
 
 // Stream brotli-decompress → tar -x into destDir. Uses the system `tar`
@@ -110,19 +146,27 @@ async function downloadAndExtractSysroot(url, destDir, target) {
 async function ensureRustcWasm(versionDir, artefacts, onProgress) {
     const marker = path.join(versionDir, '.complete-rustc');
     if (await exists(marker)) return;
-    onProgress?.({ stage: 'fetch-rustc' });
-    const wasmPath = path.join(versionDir, 'dist', 'bin', 'rustc.wasm');
-    await downloadAndDecompressBrotli(artefacts.rustcWasm, wasmPath);
-    await fsp.writeFile(marker, '');
+    await once(`rustc:${marker}`, async () => {
+        // Re-check after potentially awaiting another in-flight call —
+        // the dedup'd peer may have completed the work for us.
+        if (await exists(marker)) return;
+        onProgress?.({ stage: 'fetch-rustc' });
+        const wasmPath = path.join(versionDir, 'dist', 'bin', 'rustc.wasm');
+        await downloadAndDecompressBrotli(artefacts.rustcWasm, wasmPath);
+        await fsp.writeFile(marker, '');
+    });
 }
 
 async function ensureSysroot(versionDir, artefacts, target, onProgress) {
     const marker = path.join(versionDir, `.complete-sysroot-${target}`);
     if (await exists(marker)) return;
-    onProgress?.({ stage: 'fetch-sysroot' });
-    const url = `${artefacts.sysrootBase}/${target}.tar.br`;
-    await downloadAndExtractSysroot(url, path.join(versionDir, 'dist'), target);
-    await fsp.writeFile(marker, '');
+    await once(`sysroot:${marker}`, async () => {
+        if (await exists(marker)) return;
+        onProgress?.({ stage: 'fetch-sysroot' });
+        const url = `${artefacts.sysrootBase}/${target}.tar.br`;
+        await downloadAndExtractSysroot(url, path.join(versionDir, 'dist'), target);
+        await fsp.writeFile(marker, '');
+    });
 }
 
 function runWasmtime(wasmtime, versionDir, runDir, args, source) {
