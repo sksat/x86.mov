@@ -25,6 +25,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.2
 
+      # Pure-logic unit test for the interactive Run loop — no wasm/build
+      # needed, so run it first for fast feedback. Pins that the loop
+      # re-reads the Follow toggle each iteration (live mid-run switching).
+      - name: runloop unit test (node, no build)
+        run: node tests/runloop.mjs
+
       # Pin the toolchain like the movie86 workflow does — wasm32 is the
       # only target we actually build for here.
       - name: setup rust (stable + wasm32 target)

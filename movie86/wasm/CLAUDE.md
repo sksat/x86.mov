@@ -80,7 +80,9 @@ Both ship today; pick by what you want from the call.
   `vm.regs` / `vm.eip` / `vm.steps` / `vm.haltReason` between batches
   and pulling I/O via `vm.drainStdout` / `vm.drainStderr`. Used by
   the demo's interactive Run / Step / Follow controls — see the
-  follow-vs-batch loop in `index.html` for the two refresh strategies.
+  follow-vs-batch loop in [`runloop.mjs`](runloop.mjs) for the two
+  refresh strategies (`doRun` in `index.html` just wires the DOM
+  controls / Vm into it).
 - **`vm.disasmAt(addr) -> DecodedInsn`** — same `movie86::decode` the
   CPU uses, but exposed so the demo can render a "next-N-instructions"
   pane with the current EIP highlighted. The decoded text is the
@@ -195,9 +197,9 @@ pair brings the session back into the local Vm. Six pieces:
 
 ## Display strategy: follow vs periodic
 
-The demo's "Follow execution" checkbox switches between two loop shapes.
-Both yield to the browser each iteration so the **Stop** button stays
-responsive.
+The demo's "Follow execution" checkbox switches between two display
+strategies. Both yield to the browser each iteration so the **Stop**
+button stays responsive.
 
 - **Follow**: `vm.stepN(1)` + `render()` per loop. One instruction per
   frame. Slow on purpose — for watching individual moves land.
@@ -211,6 +213,19 @@ following all execution state optional. If not following, just dump
 periodically." Don't collapse the two modes into a single render-rate
 slider — they answer different questions ("show me each step" vs
 "keep me roughly informed while it runs hot").
+
+**The two strategies live in ONE loop ([`runloop.mjs`](runloop.mjs)),
+not two `while` shapes chosen up front.** `runLoop` re-reads the controls
+(`follow` / `delay` / `batch` / `refresh`) via the injected
+`readControls()` on *every* iteration, so flipping Follow — or retuning
+the cadence — mid-run takes effect on the next step. The earlier code
+snapshotted `follow` into a `const` at the top of `doRun` and branched
+into one of two loops, which locked the strategy for the whole run; that
+was the "can't toggle Follow while it's running" bug. Keep the
+per-iteration read: it's the seam that makes the toggle live, and
+[`tests/runloop.mjs`](tests/runloop.mjs) (pure-logic, no wasm) pins it.
+The disasm/mem "follow EIP" toggles were already live because they're
+read inside `render()`; this brings the master Follow toggle in line.
 
 ## Things future Claude shouldn't relearn
 

@@ -343,6 +343,7 @@ import {
     makeLoadContextMessage,
     parseOutboundMessage,
 } from './movie86.mjs';
+import { runLoop } from './runloop.mjs';
 
 const $ = (id) => document.getElementById(id);
 
@@ -907,34 +908,27 @@ async function doRun() {
     setEngine('local');
     const myRun = ++state.runId;
     setRunButton(true);
-    const follow = $('follow').checked;
-    const batchSize = BigInt(Math.max(1, Math.floor(Number($('batch').value) || 50000)));
-    const refreshMs = Math.max(0, Math.floor(Number($('refresh').value) || 100));
-    // Follow-mode step delay — sleep this long between steps so the
-    // user can actually watch the highlight move. 0 = as-fast-as-the-
-    // -browser-allows (setTimeout(0) still yields ~4 ms in practice).
-    const delayMs = Math.max(0, Math.floor(Number($('delay').value) || 0));
     const startWall = performance.now();
     try {
-        if (follow) {
-            while (myRun === state.runId && !vm.haltReason) {
-                vm.stepN(1n);
-                render();
-                await new Promise(r => setTimeout(r, delayMs));
-            }
-        } else {
-            let lastRender = performance.now();
-            while (myRun === state.runId && !vm.haltReason) {
-                vm.stepN(batchSize);
-                const now = performance.now();
-                if (now - lastRender >= refreshMs) {
-                    render();
-                    lastRender = now;
-                }
-                await new Promise(r => setTimeout(r, 0));
-            }
-            render();
-        }
+        // The controls are read FRESH each iteration inside runLoop, so
+        // the user can flip Follow / retune delay-batch-refresh mid-run
+        // and have it take effect on the next step. `delayMs` is the
+        // follow-mode step delay (0 = as-fast-as-the-browser-allows;
+        // setTimeout(0) still yields ~4 ms in practice).
+        await runLoop({
+            shouldContinue: () => myRun === state.runId && !vm.haltReason,
+            readControls: () => ({
+                follow: $('follow').checked,
+                delayMs: Math.max(0, Math.floor(Number($('delay').value) || 0)),
+                batchSize: BigInt(Math.max(1, Math.floor(Number($('batch').value) || 50000))),
+                refreshMs: Math.max(0, Math.floor(Number($('refresh').value) || 100)),
+            }),
+            stepOne: () => vm.stepN(1n),
+            stepBatch: (n) => vm.stepN(n),
+            render,
+            sleep: (ms) => new Promise(r => setTimeout(r, ms)),
+            now: () => performance.now(),
+        });
     } finally {
         if (myRun === state.runId) setRunButton(false);
         const wall = Math.round(performance.now() - startWall);
