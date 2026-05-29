@@ -203,6 +203,8 @@
       <option value="cycle">cycle — print "1 2 3 4 5" forever (CALL/RET loop)</option>
       <option value="canvas_bars">canvas_bars — mode 13h SMPTE-ish color bars</option>
       <option value="canvas_smile">canvas_smile — mode 13h smiley face</option>
+      <option value="canvas_modes">canvas_modes — switch mode 13h → 12h mid-run</option>
+      <option value="canvas_mandelbrot">canvas_mandelbrot — Mandelbrot fractal (precomputed)</option>
       <option value="upload">(upload your own ELF)</option>
     </select>
   </label>
@@ -275,8 +277,10 @@ const EXAMPLES = {
     hello:        './examples/hello.elf',
     call_greet:   './examples/call_greet.elf',
     cycle:        './examples/cycle.elf',
-    canvas_bars:  './examples/canvas_bars.elf',
-    canvas_smile: './examples/canvas_smile.elf',
+    canvas_bars:       './examples/canvas_bars.elf',
+    canvas_smile:      './examples/canvas_smile.elf',
+    canvas_modes:      './examples/canvas_modes.elf',
+    canvas_mandelbrot: './examples/canvas_mandelbrot.elf',
 };
 
 // Register file order matches movie86's `Reg32`: EAX, ECX, EDX, EBX,

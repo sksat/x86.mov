@@ -200,6 +200,42 @@ try {
     failed++;
 }
 
+// --- Mode-switch smoke ---
+//
+// canvas_modes sets VGA mode 13h, paints a red rect, then `int 0x10`-
+// switches to mode 12h, paints a blue rect, exits. After the run:
+//   - vm.activeVideoMode must be 0x12 (the *last* mode set)
+//   - mode 13h's region must show red at its drawing center
+//   - mode 12h's region must show blue at its drawing center
+// Catches bios_call mode-set being a one-shot, the wrong region
+// getting written, or a stale `active_video_mode` after a second
+// `int 0x10`.
+try {
+    const elf = new Uint8Array(await readFile(`${root}/examples/canvas_modes.elf`));
+    const vm = new mod.Vm(elf);
+    try {
+        while (!vm.haltReason) vm.stepN(50000n);
+        assert.equal(vm.exitCode, 0,
+            `canvas_modes should exit 0, got ${vm.exitCode} (halt=${vm.haltReason})`);
+        assert.equal(vm.activeVideoMode, 0x12,
+            `canvas_modes ends with mode 12h set — activeVideoMode = ${vm.activeVideoMode}`);
+        // Mode 13h center (320×200, red rect at (160,100)).
+        const m13 = vm.readMem(0xA0000 + (100 * 320 + 160) * 4, 4);
+        assert.deepEqual(Array.from(m13), [220, 60, 60, 255],
+            `canvas_modes mode-13h center = ${Array.from(m13).join(',')} (expected 220,60,60,255)`);
+        // Mode 12h center (640×480, blue rect at (320,240)).
+        const m12 = vm.readMem(0x100000 + (240 * 640 + 320) * 4, 4);
+        assert.deepEqual(Array.from(m12), [60, 120, 240, 255],
+            `canvas_modes mode-12h center = ${Array.from(m12).join(',')} (expected 60,120,240,255)`);
+        console.log('ok  canvas_modes  active=0x12 red@13h blue@12h');
+    } finally {
+        vm.free();
+    }
+} catch (e) {
+    console.error(`FAIL canvas_modes: ${e.message}`);
+    failed++;
+}
+
 if (failed > 0) {
     console.error(`${failed} smoke test(s) failed`);
     process.exit(1);
