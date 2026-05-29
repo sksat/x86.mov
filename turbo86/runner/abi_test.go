@@ -53,6 +53,67 @@ func TestRunOnce_AbiSetVideoMode(t *testing.T) {
 	}
 }
 
+// TestRunOnce_AbiLoadContext_AutoMmapsOutOfRangeRegions verifies that
+// a LoadContext carrying a region OUTSIDE the stub's static guestRegions
+// triggers a dynamic mmap2 before the region's bytes are written via
+// /proc/PID/mem. Without it, snapshots from a movie86 wasm Vm with a
+// `.fb13h` PT_LOAD at 0xA0000 would fail at LoadContext time with
+// `write /proc/PID/mem: input/output error` (the actual symptom of the
+// canvas-mandelbrot handover regression #28 set out to fix).
+//
+// Setup: hand-built guest at 0x08048000 that exits(42). The LoadContext
+// carries a SECOND region at 0x00100000 (mode 12h FB address — well
+// outside the stub's static mapping) with a small payload. The runner
+// must mmap that page and write the payload; the guest then writes back
+// a known byte at the same address and exits. Reading the byte back
+// proves the auto-mmap worked end-to-end.
+func TestRunOnce_AbiLoadContext_AutoMmapsOutOfRangeRegions(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	const entry uint32 = 0x08048000
+	const fbAddr uint32 = 0x00100000
+
+	// Guest: write 0x42 to [fbAddr], then exit(42).
+	//   B0 42                 mov al, 0x42
+	//   A2 00 00 10 00        mov [0x00100000], al
+	//   B8 01 00 00 00        mov eax, 1
+	//   BB 2A 00 00 00        mov ebx, 42
+	//   CD 80                 int 0x80
+	code := []byte{
+		0xB0, 0x42,
+		0xA2, 0x00, 0x00, 0x10, 0x00,
+		0xB8, 0x01, 0x00, 0x00, 0x00,
+		0xBB, 0x2A, 0x00, 0x00, 0x00,
+		0xCD, 0x80,
+	}
+	// FB-region payload (pretend non-zero "snapshot" bytes). 5 bytes,
+	// enough to verify the write landed; the rest of the page stays
+	// zero after the kernel-supplied anonymous mapping.
+	fbPayload := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE}
+
+	r, err := New(stub.Bytes)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer r.Close()
+	ch := r.RunWithContextAndMode(proto.Context{
+		Regs: proto.Regs{Eip: entry, Esp: testStackTop},
+		Regions: []proto.MemRegion{
+			{Addr: entry, Bytes: code},
+			{Addr: fbAddr, Bytes: fbPayload},
+		},
+	}, proto.ModeHost)
+	var events []proto.Outbound
+	for ev := range ch {
+		events = append(events, ev)
+	}
+	want := []proto.Outbound{proto.Exit{Code: 42}}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events:\n  got:  %#v\n  want: %#v", events, want)
+	}
+}
+
 // TestRunOnce_AbiMmapRequest grows the guest's address space at runtime
 // via the mov-only ABI: the guest packs an (addr, size) pair into EAX
 // and writes it to the mmap_request slot (call 0x020). The runner

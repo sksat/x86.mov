@@ -600,6 +600,21 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 	}
 	if msg.withCtx {
 		for _, region := range msg.ctx.Regions {
+			// Regions outside the stub's static guestRegions
+			// (canvas framebuffers from a wasm snapshot, etc.) need a
+			// dynamic mmap before /proc/PID/mem can write them. Same
+			// mechanism the mov-only ABI mmap_request uses at runtime;
+			// applying it here at LoadContext time lets the receiving
+			// engine accept snapshots whose memory map is wider than
+			// what the stub statically reserves.
+			if !regionFitsStaticGuest(region.Addr, uint32(len(region.Bytes))) {
+				if err := r.mmapRegionForLoadContext(region.Addr, uint32(len(region.Bytes)), &regs); err != nil {
+					r.emitFault(fmt.Sprintf(
+						"mmap context region 0x%x..0x%x: %v",
+						region.Addr, region.Addr+uint32(len(region.Bytes)), err))
+					return
+				}
+			}
 			if err := r.mem.WriteAt(region.Addr, region.Bytes); err != nil {
 				r.emitFault(fmt.Sprintf("write context region 0x%x: %v", region.Addr, err))
 				return
@@ -812,6 +827,49 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 		return false
 	}
 	return true
+}
+
+// regionFitsStaticGuest reports whether [addr, addr+size) lies entirely
+// inside one of the stub's static guestRegions. Used by LoadContext to
+// decide which snapshot regions need a dynamic mmap before write.
+func regionFitsStaticGuest(addr, size uint32) bool {
+	for _, gr := range guestRegions {
+		if addr >= gr.addr && addr+size <= gr.addr+gr.size {
+			return true
+		}
+	}
+	return false
+}
+
+// mmapRegionForLoadContext page-aligns the requested range, injects an
+// mmap2 syscall via ptrace, and records the new region in extraRegions
+// so the snapshot path picks it up too. Used during LoadContext setup
+// to extend the address space for canvas FB regions that the stub
+// doesn't statically map.
+//
+// Reuses the runtime ABI's injectSyscall helper — same trampoline,
+// same ptrace mechanics. Only difference is *when* it's called (init
+// vs mid-execution); the child is stopped in both cases.
+func (r *Runner) mmapRegionForLoadContext(addr, size uint32, regs *regs32) error {
+	if len(r.extraRegions) >= mmapMaxRegions {
+		return fmt.Errorf("too many dynamic regions (cap=%d)", mmapMaxRegions)
+	}
+	pageAddr := addr & mmapAddrMask
+	pageEnd := (addr + size + 0xFFF) & mmapAddrMask
+	if pageEnd <= pageAddr {
+		return fmt.Errorf("region size 0x%x wraps", size)
+	}
+	pageSize := pageEnd - pageAddr
+	ret, err := r.injectSyscall(regs, sysMmap2,
+		pageAddr, pageSize, mmapProtRWX, mmapFlagsFixed, ^uint32(0), 0)
+	if err != nil {
+		return err
+	}
+	if ret != pageAddr {
+		return fmt.Errorf("mmap returned 0x%x, asked for 0x%x", ret, pageAddr)
+	}
+	r.extraRegions = append(r.extraRegions, struct{ addr, size uint32 }{pageAddr, pageSize})
+	return nil
 }
 
 // handleMmapRequest unpacks the (addr, size) pair the guest packed into
