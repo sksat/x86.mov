@@ -218,6 +218,21 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setLibcallImpl(RTLIB::FPTOSINT_F32_I32, RTLIB::impl___fixsfsi);
   setLibcallImpl(RTLIB::FPTOUINT_F32_I32, RTLIB::impl___fixunssfsi);
 
+  // Stage 7h1 — first beachhead for f64. No FPU, and f64 has no
+  // register class (same minimal-plumbing stance as f32 in 7g0), so
+  // SDAG soft-float legalizes f64 nodes through libcalls into i64,
+  // and then auto-expands i64 ops to i32-pair sequences. The only
+  // f64 ops wired this round are the f32 ↔ f64 conversions — they're
+  // the necessary entrypoint for any subsequent f64 arithmetic (the
+  // user only sees f64 through `fpext` / `fptrunc` until those land)
+  // and the helper bodies don't need variable-amount i64 shifts, so
+  // they fit inside the current backend without a runtime i64 shift
+  // libcall infra.
+  setOperationAction(ISD::FP_EXTEND, MVT::f64, LibCall);
+  setOperationAction(ISD::FP_ROUND,  MVT::f32, LibCall);
+  setLibcallImpl(RTLIB::FPEXT_F32_F64,  RTLIB::impl___extendsfdf2);
+  setLibcallImpl(RTLIB::FPROUND_F64_F32, RTLIB::impl___truncdfsf2);
+
   // No `bswap` opcode either. Rust idioms like `u32::from_be(x)` or
   // `x.swap_bytes()` lower to ISD::BSWAP. Expand re-spells it as
   // the standard four-byte shuffle (`(x << 24) | ((x & 0xff00) << 8)

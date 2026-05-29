@@ -386,6 +386,64 @@ above sidesteps all of that.
   scope rather than NaN, like the other helpers); `er ≤ 0` →
   signed zero; `er ≥ 255` → signed Inf.
 
+### 7h — double-precision floating-point (beachhead)
+
+- **7h1** f32 ↔ f64 conversions via `__extendsfdf2` /
+  `__truncdfsf2`, injected as IR. Same shape as the 7g* helpers but
+  the type axis widens: f64 has no register class either, so SDAG
+  soft-floats it to i64, then the type legalizer expands i64 ops to
+  i32 pairs. Both helper bodies use only constant-amount i64 shifts
+  (by 29 / 32 / 52 / 63), so they fit inside the current backend
+  without a runtime i64 variable-shift libcall infrastructure.
+
+  `__extendsfdf2` rebiases the exponent (`f64 = f32 + (1023 - 127) =
+  f32 + 896`) and left-shifts the 23-bit mantissa into bits 51..29 of
+  the f64 field. Inf / NaN sidestep the rebias and write `0x7FF`
+  directly. f32 zero / denormal flush to f64 signed-zero (no
+  re-normalize — the f32 helpers already flush, so the f64 result
+  inherits that scope).
+
+  `__truncdfsf2` is the reverse with round-to-nearest-ties-to-even.
+  The 52-bit mantissa splits as a 20-bit top half (in the i64-hi
+  i32) plus a 32-bit bottom half (in the i64-lo i32); the f32
+  mantissa takes the top 23 bits, the next bit is the guard, the
+  remaining 28 bits feed the sticky OR. Inf / NaN / zero / out-of-
+  range gates mirror the 7g* envelope.
+
+  Two pieces of backend infra had to bend for this:
+
+  - **i64 `select` joins the SELECT → bit-blend rewrite** (`tools/
+    llvm-mov-llc/main.cpp`), gated to helper functions. Just the
+    conversion helpers' Inf / NaN / zero overrides emit i64-typed
+    `select`s. Leaving them on default Expand reproduces the
+    multi-minute DAG-ISel pathology that motivated the i32 rewrite
+    in stage 6d3e — observed as a 3.7-hour hang on
+    `f64_extend_inf.ll` during bring-up. The rewrite shape
+    (`(a & sext(c)) | (b & ~sext(c))`) is identical at i64; the
+    resulting i64 and / or / not / sub legalize cleanly to i32-pair
+    sequences. The i64 case is gated on the `llvm-mov-bit-blend-
+    safe` function attribute (set by `makeOrPromoteHelper` for
+    every injected helper), so user IR keeps default `select i64`
+    Expand — the bit-blend materialises both arms, which is unsafe
+    when an unchosen arm is poison (e.g. from an `nsw` overflow).
+    Helper bodies emit only safe arms by construction.
+
+  - **`legalizeRetEpilogueTail` preserves caller-EDX** (`llvm/
+    MovOnlyLegalize.cpp`). The mov-only `pop ebp + ret` rewrite
+    uses EDX as a scratch register to load the return address from
+    `[esp + 4]`, then later loads the SaveEdxDisp slot back into
+    EDX. The old rewrite filled SaveEdxDisp with `Undef` between
+    those two steps, so any value that RetCC_Mov had placed in EDX
+    (the i64 high half, or the second i32 of a Rust `(usize,
+    usize)` return) was silently destroyed. Fixed by stashing
+    caller-EDX into SaveEdxDisp *before* clobbering EDX for the RA
+    load, so the post-chain reload restores the correct high half.
+
+    The bug was latent until 7h1: every existing EDX:EAX return
+    path went through caller code that transferred EDX to EAX
+    early (`mov eax, edx`) before the rewrite epilogue ran, so
+    the clobber was unobservable.
+
 ### Stage 7 gates
 
 [`test/MovOnly/run.sh`](test/MovOnly/run.sh) is the objdump gate.
