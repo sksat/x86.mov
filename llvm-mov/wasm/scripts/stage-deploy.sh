@@ -89,6 +89,20 @@ cp "$here/build/llvm-mov-llc.js"   \
 fn="$dist/functions/llvm-mov/build/clang.wasm.js"
 cp "$here/functions/clang.wasm.template.js" "$fn"
 
+# `_routes.json` opts the proxy path explicitly into the Functions
+# runtime. Without this, the project's SPA-fallback setting (serving
+# `dist/index.html` for any unmatched path) intercepts the request
+# before the function gets a chance to run. We only `include` the one
+# path we care about; everything else still goes through the default
+# (static asset → SPA fallback).
+cat > "$dist/_routes.json" <<'EOF'
+{
+    "version": 1,
+    "include": ["/llvm-mov/build/clang.wasm"],
+    "exclude": []
+}
+EOF
+
 if [ -n "${CLANG_WASM_URL:-}" ]; then
     # URL safety: reject anything that isn't an https:// URL pointing at a
     # known asset host. The substitution lands inside a JS string literal,
