@@ -16,7 +16,7 @@
 // non-reusable. Same shape as movfuscator-wasm's wrappers.
 
 import createMovLlc from './build/llvm-mov-llc.js';
-import { CLANG_WASM_CHUNKS, CLANG_WASM_VERSION } from './wasm-config.js';
+import { CLANG_WASM_VERSION } from './wasm-config.js';
 
 // Clang is lazy-loaded so callers who only need `.ll → .s` (i.e. the
 // `compile()` API) can run without the 80 MB clang.wasm artifact
@@ -30,95 +30,116 @@ async function loadClang() {
     return _createMovClang;
 }
 
-// Cloudflare Pages rejects single files larger than 25 MiB at upload.
-// The deploy splits clang.wasm into `CLANG_WASM_CHUNKS` smaller
-// `clang.wasm.part-N` files; we fetch them in parallel, concatenate,
-// and feed the bytes to Emscripten via `Module.wasmBinary` (which
-// suppresses the default `clang.wasm` fetch). When the const is null
-// (the committed default — i.e. local dev + tests), the loader's
-// default behaviour (fetching the single `./build/clang.wasm`) is
-// untouched.
-let _chunkedWasm = null;
-async function fetchChunkedClangWasm(count, onProgress) {
-    if (_chunkedWasm) return _chunkedWasm;
-    const base = new URL('./build/', import.meta.url);
-    // Deployed chunks carry a content-hash in their filename
-    // (clang.wasm-{hash}.part-i) so a binary bump invalidates the
-    // browser's immutable HTTP cache automatically. Local dev (where
-    // CLANG_WASM_VERSION stays null) uses the unhashed names.
-    const filename = (i) =>
-        CLANG_WASM_VERSION
-            ? `clang.wasm-${CLANG_WASM_VERSION}.part-${i}`
-            : `clang.wasm.part-${i}`;
+// Cloudflare Pages rejects single files larger than 25 MiB at upload,
+// so the deploy ships `clang.wasm-{version}.zst` instead (~14 MiB on
+// the wire, 5.8× smaller than the original wasm). The `_headers` rule
+// sets `Content-Encoding: zstd` on that path — modern browsers
+// (Chrome 123+/Firefox 126+/Edge 123+) decompress at the network
+// layer for free; other browsers (Safari today) pass the raw zstd
+// bytes through, and we decompress in JS with `fzstd` (a 24 KB
+// pure-JS zstd decoder we vendor next to clang.js).
+//
+// We tell the two cases apart by looking at the first four bytes:
+//   - `\0asm` (00 61 73 6D) ⇒ wasm magic, the browser already
+//     decompressed; use the buffer directly.
+//   - `28 B5 2F FD`         ⇒ zstd magic, our turn to decompress.
+//
+// The decompressed buffer goes to Emscripten via `Module.wasmBinary`
+// which suppresses the default `clang.wasm` fetch.
+//
+// When the const is null (the committed default — i.e. local dev +
+// tests), Emscripten's default loader fetches the uncompressed
+// `./build/clang.wasm` sibling to clang.js, untouched.
 
-    // Aggregate byte counters so the demo can show overall download
-    // progress across the parallel chunk fetches. `totalBytes` only
-    // becomes reliable once every response header has landed; before
-    // then we send `0` so the UI can fall back to chunk-only progress.
-    const bytesPerChunk  = new Array(count).fill(0);
-    const totalPerChunk  = new Array(count).fill(0);
-    let chunksDone = 0;
+const WASM_MAGIC = [0x00, 0x61, 0x73, 0x6d];
+const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
+
+function magicMatch(buf, magic) {
+    if (buf.length < 4) return false;
+    for (let i = 0; i < 4; i++) if (buf[i] !== magic[i]) return false;
+    return true;
+}
+
+let _zstdDecompress = null;
+async function loadZstd() {
+    if (_zstdDecompress) return _zstdDecompress;
+    // stage-deploy copies node_modules/fzstd/esm/index.mjs to
+    // ./build/fzstd.mjs so this dynamic import resolves with no
+    // bundler step. Local dev (CLANG_WASM_VERSION=null) never reaches
+    // this path so a missing fzstd.mjs there is fine.
+    const m = await import('./build/fzstd.mjs');
+    _zstdDecompress = m.decompress;
+    return _zstdDecompress;
+}
+
+let _cachedClangWasm = null;
+async function fetchClangWasm(onProgress) {
+    if (_cachedClangWasm) return _cachedClangWasm;
+
+    // Kick off the fzstd loader in parallel with the download — even
+    // if we end up not needing it (native browser decoded the body),
+    // it's a ~24 KB no-op and the parallel work hides the import
+    // latency on browsers that DO need it.
+    const zstdPromise = loadZstd();
+
+    const url = new URL(
+        `./build/clang.wasm-${CLANG_WASM_VERSION}.zst`,
+        import.meta.url,
+    );
+    const r = await fetch(url);
+    if (!r.ok) {
+        throw new Error(`fetch ${url}: ${r.status} ${r.statusText}`);
+    }
+    const lenHeader = r.headers.get('Content-Length');
+    const totalBytes = lenHeader ? parseInt(lenHeader, 10) : 0;
+    let bytes = 0;
     let lastEmit = 0;
     const emit = (force) => {
         const now = performance.now();
-        // Throttle to ≈20 Hz so a fast LAN doesn't drown the UI thread
-        // in fetch-clang events. Always emit on chunk completion so
-        // the count-based progress line ticks promptly.
         if (!force && (now - lastEmit) < 50) return;
         lastEmit = now;
-        const bytes = bytesPerChunk.reduce((s, n) => s + n, 0);
-        const totalBytes = totalPerChunk.reduce((s, n) => s + n, 0);
-        onProgress?.({
-            stage: 'fetch-clang',
-            done: chunksDone,
-            total: count,
-            bytes,
-            totalBytes,
-        });
+        onProgress?.({ stage: 'fetch-clang', bytes, totalBytes });
     };
     emit(true);
-
-    const buffers = await Promise.all(
-        Array.from({ length: count }, async (_, i) => {
-            const url = new URL(filename(i), base);
-            const r = await fetch(url);
-            if (!r.ok) {
-                throw new Error(`fetch ${url}: ${r.status} ${r.statusText}`);
-            }
-            const lenHeader = r.headers.get('Content-Length');
-            totalPerChunk[i] = lenHeader ? parseInt(lenHeader, 10) : 0;
-            const reader = r.body.getReader();
-            const parts = [];
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                parts.push(value);
-                bytesPerChunk[i] += value.byteLength;
-                emit(false);
-            }
-            const buf = new Uint8Array(bytesPerChunk[i]);
-            let off = 0;
-            for (const p of parts) { buf.set(p, off); off += p.byteLength; }
-            chunksDone += 1;
-            emit(true);
-            return buf;
-        }),
-    );
-
-    const total = buffers.reduce((s, b) => s + b.byteLength, 0);
-    const merged = new Uint8Array(total);
-    let offset = 0;
-    for (const b of buffers) {
-        merged.set(b, offset);
-        offset += b.byteLength;
+    const reader = r.body.getReader();
+    const parts = [];
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value);
+        bytes += value.byteLength;
+        emit(false);
     }
-    _chunkedWasm = merged.buffer;
-    return _chunkedWasm;
+    emit(true);
+    const merged = new Uint8Array(bytes);
+    let off = 0;
+    for (const p of parts) { merged.set(p, off); off += p.byteLength; }
+
+    if (magicMatch(merged, WASM_MAGIC)) {
+        // Browser handled the Content-Encoding: zstd already; merged
+        // is the raw wasm binary, ready to hand to Emscripten.
+        _cachedClangWasm = merged.buffer;
+        return _cachedClangWasm;
+    }
+    if (!magicMatch(merged, ZSTD_MAGIC)) {
+        throw new Error(
+            `clang.wasm bytes start with neither wasm nor zstd magic ` +
+            `(got ${[...merged.slice(0, 4)].map(b => b.toString(16).padStart(2, '0')).join(' ')})`,
+        );
+    }
+
+    // Browser didn't decode zstd for us — do it in JS. fzstd takes
+    // ~1 s on ~14 MiB → ~80 MiB on a recent laptop.
+    onProgress?.({ stage: 'decompress-clang' });
+    const decompress = await zstdPromise;
+    const decompressed = decompress(merged);
+    _cachedClangWasm = decompressed.slice().buffer;
+    return _cachedClangWasm;
 }
 
 async function clangModuleOpts(base, onProgress) {
-    if (CLANG_WASM_CHUNKS == null) return base;
-    const wasmBinary = await fetchChunkedClangWasm(CLANG_WASM_CHUNKS, onProgress);
+    if (CLANG_WASM_VERSION == null) return base;
+    const wasmBinary = await fetchClangWasm(onProgress);
     return { ...base, wasmBinary };
 }
 

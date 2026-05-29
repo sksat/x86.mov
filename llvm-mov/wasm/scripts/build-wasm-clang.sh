@@ -134,26 +134,41 @@ if [ ! -f "$out/clang.wasm" ]; then
     exit 1
 fi
 
-# Split clang.wasm into ≤24 MiB chunks for the deploy. Cloudflare Pages
-# rejects single files larger than 25 MiB at upload time, and the demo
-# preview is the front-door for this subproject. The chunks live next
-# to the single file so local dev keeps using clang.wasm via the
-# Emscripten loader's default fetch; stage-deploy.sh decides whether
-# the static deploy should include the single file or the chunks.
+# Zstandard-compress clang.wasm for the deploy. clang.wasm itself is
+# ~80 MiB, well over Cloudflare Pages' 25 MiB/file upload cap.
+# `zstd -19 --long=23` brings it to ~16 MiB (5×) — fits in one file
+# and ~25 % smaller than gzip -9. The browser handles decompression
+# natively (`Content-Encoding: zstd` set in `_headers` at stage-deploy
+# time; Chrome 123+/Firefox 126+/Edge 123+ all ship it), so the
+# wrapper just fetches the .zst URL and feeds the bytes Emscripten
+# without touching any decompression library.
 #
-# `-d -a 1` numeric 1-digit suffix → clang.wasm.part-0..N (≤10 chunks).
-# clang.wasm is ~80 MiB → 4 chunks today. The wrapper enumerates by
-# `CLANG_WASM_CHUNKS` (the count), injected by stage-deploy.sh.
-rm -f "$out"/clang.wasm.part-*
-( cd "$out" && split -b 24M -d -a 1 clang.wasm clang.wasm.part- )
+# Window-size cap: `Content-Encoding: zstd` is governed by RFC 8878,
+# which lets clients reject frames with a window size > 8 MiB
+# (2^23). Chromium enforces that cap as a hard `net::ERR_ZSTD_
+# WINDOW_SIZE_TOO_BIG` — anything larger gets refused at the network
+# layer before our wrapper sees a single byte. `--long=23` pins the
+# encoder to that ceiling. Browsers without native zstd take the
+# fzstd JS path instead, which doesn't share the limit, but we still
+# encode for the strictest consumer so a single artefact serves both.
+#
+# The original .wasm stays in place for local dev (Emscripten's
+# default loader fetches the uncompressed clang.wasm next to clang.js
+# when the wrapper has no version pinned in wasm-config.js).
+#
+# (We used to ship `clang.wasm.part-{0..N}` chunks with a client-side
+# concat, then briefly used .gz; clean up either flavour so a fresh
+# build doesn't leave stale ones behind.)
+rm -f "$out"/clang.wasm.part-* "$out/clang.wasm.gz" "$out/clang.wasm.zst"
+zstd -19 --long=23 -f -o "$out/clang.wasm.zst" "$out/clang.wasm"
 
 # Content-hash of clang.wasm (first 12 hex of SHA-256). stage-deploy.sh
-# embeds this in the deployed chunk filenames so the URLs change on a
-# content bump — the browser's HTTP cache (with `Cache-Control:
-# immutable` set via `_headers`) then keeps the bytes forever between
-# page loads, and a real binary update naturally invalidates the
-# cache via the new URL. Local dev doesn't care about caching, so
-# this file is informational here.
+# embeds this in the deployed .zst filename so the URL changes on a
+# content bump — the browser's HTTP cache (`Cache-Control: immutable`
+# set via `_headers`) then keeps the bytes forever between page loads,
+# and a real binary update naturally invalidates the cache via the new
+# URL. Local dev doesn't care about caching, so this file is
+# informational here.
 sha256sum "$out/clang.wasm" | awk '{ print substr($1, 1, 12) }' > "$out/clang.wasm.hash"
 
 # Reuse the {"type":"module"} marker produced by the llvm-mov-llc
@@ -164,4 +179,4 @@ if [ ! -f "$out/package.json" ]; then
 fi
 
 echo "wasm clang build complete:"
-ls -la "$out"/clang.{js,wasm} "$out"/clang.wasm.part-*
+ls -la "$out"/clang.{js,wasm} "$out/clang.wasm.zst" "$out/clang.wasm.hash"
