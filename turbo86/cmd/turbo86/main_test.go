@@ -4,8 +4,30 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
+
+// TestSecurityBanner pins the startup warning. turbo86 executes
+// untrusted guest machine code natively on the host CPU (see
+// DESIGN.md threat model), so the banner has to scream that loudly
+// enough that nobody runs a stock build outside a sandbox by
+// accident. We assert intent, not the exact ASCII art: a non-empty
+// multi-line banner that names the danger ("SUPER INSECURE"), the
+// reason (untrusted code runs natively), and the mitigation (sandbox
+// only).
+func TestSecurityBanner(t *testing.T) {
+	lines := securityBanner()
+	if len(lines) == 0 {
+		t.Fatal("securityBanner() returned no lines")
+	}
+	joined := strings.ToLower(strings.Join(lines, "\n"))
+	for _, want := range []string{"super insecure", "untrusted", "nativ", "sandbox"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("securityBanner() missing %q; got:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
 
 func TestParseOriginPatterns(t *testing.T) {
 	cases := []struct {
