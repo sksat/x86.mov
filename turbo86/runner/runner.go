@@ -427,6 +427,16 @@ type Runner struct {
 	tickerStop chan struct{}
 	tickerWg   sync.WaitGroup
 
+	// memUpdateEnabled mirrors "the caller asked for periodic MemUpdate
+	// events" (interval > 0). When set, the terminal path flushes one
+	// final MemUpdate at session end so a progressive-display consumer
+	// (the explorer canvas) sees the guest's last frame — the periodic
+	// ticker can otherwise be up to one interval stale, and a trap-mode
+	// guest paints via the mov-only video ABI right up to CALL_EXIT.
+	// Sessions that didn't opt in (interval 0, e.g. RunOnce) emit no
+	// trailing MemUpdate, so their exact event-sequence goldens hold.
+	memUpdateEnabled bool
+
 	// extraRegionsMu guards extraRegions against concurrent access
 	// between the tracer goroutine (which appends in the mmap_request
 	// ABI path) and the MemUpdate ticker goroutine (which iterates the
@@ -754,6 +764,7 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 	// closing eventsCh so the ticker can't panic on a closed
 	// channel.
 	if msg.memUpdateInterval > 0 {
+		r.memUpdateEnabled = true
 		r.tickerWg.Add(1)
 		go func() {
 			defer r.tickerWg.Done()
@@ -892,7 +903,27 @@ func (r *Runner) bootstrap(stubBytes []byte) error {
 }
 
 func (r *Runner) emitFault(reason string) {
+	r.emitFinalMemUpdate()
 	r.eventsCh <- proto.Fault{Reason: reason}
+}
+
+// emitFinalMemUpdate flushes one last MemUpdate so a progressive-display
+// consumer mirrors the guest's final frame at session end. Best-effort
+// and only for sessions that opted into periodic MemUpdate (interval >
+// 0) — RunOnce-style sessions keep their exact terminal event sequence.
+// Callers must already be at a ptrace stop (the snapshot reads guest
+// memory); the two call sites — CALL_EXIT dispatch and emitFault — both
+// run while the child is stopped. A nil mem / failed-or-empty snapshot
+// just skips, so a setup-time fault (no guest memory yet) is harmless.
+func (r *Runner) emitFinalMemUpdate() {
+	if !r.memUpdateEnabled || r.mem == nil {
+		return
+	}
+	regions, err := r.snapshotMemory()
+	if err != nil || len(regions) == 0 {
+		return
+	}
+	r.eventsCh <- proto.MemUpdate{Regions: regions}
 }
 
 // syscallPending holds the runner's state between a syscall-entry stop
@@ -1013,7 +1044,10 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 	case abiCallExit:
 		// Mirrors `int 0x80 / SYS_exit` semantics: emit the Exit event
 		// and stop the syscall loop. EIP isn't advanced because the
-		// session ends here — the next instruction never runs.
+		// session ends here — the next instruction never runs. Flush a
+		// final frame first (no-op unless MemUpdate was enabled) so the
+		// canvas reflects the guest's last paint before it exits.
+		r.emitFinalMemUpdate()
 		r.eventsCh <- proto.Exit{Code: int32(call.arg)}
 		return false
 	default:
