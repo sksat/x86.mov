@@ -1,0 +1,13 @@
+# Vite / TS build outputs.
+node_modules/
+dist/
+
+# tsc -b cache.
+*.tsbuildinfo
+
+# Playwright artefacts.
+test-results/
+playwright-report/
+
+# Editor / OS noise.
+.DS_Store

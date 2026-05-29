@@ -211,6 +211,18 @@ jobs:
         working-directory: llvm-mov/wasm
         run: make stage-deploy
 
+      # ----------------------- explorer side -------------------------------
+
+      - name: explorer build (Vite + React)
+        working-directory: explorer
+        run: |
+          npm ci
+          npm run build
+
+      - name: stage explorer into dist/explorer/
+        working-directory: explorer
+        run: make stage-deploy
+
       # ----------------------- upload + comment ----------------------------
 
       - name: upload to Cloudflare Pages
@@ -240,7 +252,7 @@ jobs:
             // thread from accumulating one comment per push.
             const marker = '<!-- cloudflare-pages-preview -->';
             const url = process.env.URL;
-            const body = `${marker}\n🚀 **Preview deployed**: ${url}\n\n- Root: ${url}/\n- movfuscator-wasm demo: ${url}/movfuscator-wasm/\n- movie86 demo: ${url}/movie86/\n- llvm-mov demo: ${url}/llvm-mov/\n`;
+            const body = `${marker}\n🚀 **Preview deployed**: ${url}\n\n- Root: ${url}/\n- movfuscator-wasm demo: ${url}/movfuscator-wasm/\n- movie86 demo: ${url}/movie86/\n- llvm-mov demo: ${url}/llvm-mov/\n- explorer: ${url}/explorer/\n`;
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
             const comments = await github.paginate(
