@@ -171,6 +171,11 @@ sysconfdir = "etc"
 [rust]
 debug-logging = false
 codegen-units = 1
+# bjorn3 wasm20 carries patches that emit unused-variable warnings
+# (e.g. RUSTC_RETRY_LINKER_ON_SEGFAULT lookup that's dead on WASI).
+# x.py install denies warnings by default for `compiler` profile and
+# bjorn3's branch defaults — disable to let those land.
+deny-warnings = false
 
 # Local LLVM build. The CI download path is incompatible with the
 # --depth 1 shallow clone (needs git history to find the matching
