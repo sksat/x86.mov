@@ -90,7 +90,11 @@ for (const name of Object.keys(EXAMPLES)) {
             const pageErrors = [];
             page.on('pageerror', (e) => pageErrors.push(String(e)));
 
-            await page.goto('/');
+            // `index.html` (not `/`) so the path component of baseURL
+            // is preserved. A leading slash would resolve against the
+            // host root and bypass the `/llvm-mov/` prefix that the
+            // deployed preview lives under.
+            await page.goto('index.html');
             await page.locator('#example').selectOption(name);
             await page.locator('#optLevel').selectOption(opt);
 
