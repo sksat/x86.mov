@@ -1,0 +1,2 @@
+# Stage 7h5 — `call __muldf3` rewritten to dispatcher-jmp shape.
+jmp
