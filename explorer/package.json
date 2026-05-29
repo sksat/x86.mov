@@ -1,0 +1,49 @@
+{
+  "name": "x86mov-explorer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Compiler Explorer-style page for x86.mov: pick movfuscator-wasm or llvm-mov clang, see source / IR / mov-only asm side-by-side, then run the result in an embedded movie86 and hand it off to a local turbo86.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host",
+    "test:unit": "node --test tests/unit.test.mjs",
+    "test:e2e": "playwright test",
+    "test": "npm run test:unit",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "@types/node": "^22.10.5",
+    "@types/react": "^19.0.7",
+    "@types/react-dom": "^19.0.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "tailwindcss-animate": "^1.0.7",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7"
+  },
+  "dependencies": {
+    "@codemirror/lang-cpp": "^6.0.3",
+    "@codemirror/language": "^6.10.8",
+    "@codemirror/legacy-modes": "^6.4.3",
+    "@codemirror/state": "^6.5.1",
+    "@codemirror/view": "^6.36.1",
+    "@radix-ui/react-label": "^2.1.1",
+    "@radix-ui/react-select": "^2.1.4",
+    "@radix-ui/react-separator": "^1.1.1",
+    "@radix-ui/react-slot": "^1.1.1",
+    "@radix-ui/react-tabs": "^1.1.2",
+    "@radix-ui/react-tooltip": "^1.1.6",
+    "@uiw/react-codemirror": "^4.23.7",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.469.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwind-merge": "^2.6.0"
+  }
+}

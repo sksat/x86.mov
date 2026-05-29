@@ -1,0 +1,128 @@
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Download } from 'lucide-react';
+import { downloadBlob, fmtBytes, hexDump } from '@/lib/utils';
+
+interface ElfSummaryProps {
+    elf: Uint8Array | null;
+    obj: Uint8Array | null;
+    /** parseElfHeader from movfuscator-wasm. Caller resolves the lazy
+     *  import and threads the function in to keep this component pure. */
+    parseElfHeader?: (bytes: Uint8Array) => null | { raw: string } | {
+        class: 'ELF32';
+        data: 'little-endian';
+        type: string;
+        machine: string;
+        entry: string;
+        sections: number;
+    };
+}
+
+/**
+ * The "Binary" pane. Shows a parsed ELF32 header summary if available,
+ * a hex dump of the first ~4 KiB, plus Download buttons for the .o
+ * (relocatable) and the linked ELF.
+ *
+ * Kept separate from CodeViewer because the rendering is structurally
+ * different (header summary on top, dump below) and the data is
+ * bytes-not-text.
+ */
+export function ElfSummary({ elf, obj, parseElfHeader }: ElfSummaryProps) {
+    const parsed = elf && parseElfHeader ? parseElfHeader(elf) : null;
+
+    return (
+        <Card className="flex flex-col h-full">
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                <CardTitle className="text-base">Binary</CardTitle>
+                <div className="flex gap-2">
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                            obj && downloadBlob('explorer.o', obj, 'application/x-object')
+                        }
+                        disabled={!obj}
+                    >
+                        <Download className="h-3.5 w-3.5" />
+                        .o
+                    </Button>
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                            elf &&
+                            downloadBlob('explorer.elf', elf, 'application/x-executable')
+                        }
+                        disabled={!elf}
+                    >
+                        <Download className="h-3.5 w-3.5" />
+                        ELF
+                    </Button>
+                </div>
+            </CardHeader>
+            <CardContent className="flex-1 flex flex-col gap-3 font-mono text-xs min-h-0">
+                {parsed && 'class' in parsed ? (
+                    <ElfHeaderTable
+                        header={parsed}
+                        size={elf ? elf.length : 0}
+                    />
+                ) : parsed && 'raw' in parsed ? (
+                    <pre className="rounded border bg-muted/30 p-2 whitespace-pre-wrap">
+                        {parsed.raw}
+                    </pre>
+                ) : elf ? (
+                    <p className="text-muted-foreground">
+                        (parser unavailable — load movfuscator-wasm)
+                    </p>
+                ) : (
+                    <p className="text-muted-foreground">
+                        Compile a source to produce an ELF.
+                    </p>
+                )}
+                {elf && (
+                    <pre
+                        className="rounded border bg-muted/30 p-2 overflow-auto flex-1 min-h-0 whitespace-pre"
+                        data-testid="elf-hexdump"
+                    >
+                        {hexDump(elf)}
+                    </pre>
+                )}
+            </CardContent>
+        </Card>
+    );
+}
+
+function ElfHeaderTable({
+    header,
+    size,
+}: {
+    header: {
+        class: 'ELF32';
+        data: 'little-endian';
+        type: string;
+        machine: string;
+        entry: string;
+        sections: number;
+    };
+    size: number;
+}) {
+    const rows: [string, string][] = [
+        ['size', `${fmtBytes(size)} bytes`],
+        ['class', header.class],
+        ['data', header.data],
+        ['type', header.type],
+        ['machine', header.machine],
+        ['entry', header.entry],
+        ['sections', header.sections.toString()],
+    ];
+    return (
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-xs">
+            {rows.map(([k, v]) => (
+                <div key={k} className="contents">
+                    <dt className="text-muted-foreground">{k}</dt>
+                    <dd>{v}</dd>
+                </div>
+            ))}
+        </dl>
+    );
+}

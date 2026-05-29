@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>x86.mov Explorer</title>
+    <meta name="description" content="Compile C to mov-only x86 with movfuscator or llvm-mov, inspect IR + asm + ELF side-by-side, then run in-browser through movie86." />
+    <meta property="og:title" content="x86.mov Explorer" />
+    <meta property="og:description" content="Browser Compiler Explorer for mov-only x86: movfuscator + llvm-mov, with an embedded movie86 emulator and turbo86 handover." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://x86.mov/explorer/" />
+  </head>
+  <body class="bg-background text-foreground antialiased">
+    <noscript>
+      <p style="padding: 1rem; font-family: ui-monospace, monospace">
+        This page is a client-side compile + run sandbox; it needs
+        JavaScript enabled.
+      </p>
+    </noscript>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
