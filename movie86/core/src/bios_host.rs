@@ -78,11 +78,7 @@ pub trait BiosHost {
     ///
     /// # Errors
     /// Faults propagate to the CPU and end the run.
-    fn bios_call(
-        &mut self,
-        _args: &BiosArgs,
-        _mem: &mut dyn Memory,
-    ) -> Result<BiosResult, Fault> {
+    fn bios_call(&mut self, _args: &BiosArgs, _mem: &mut dyn Memory) -> Result<BiosResult, Fault> {
         Err(Fault::UnsupportedInterrupt(0x10))
     }
 }

@@ -396,7 +396,10 @@ pub fn run_elf(bytes: &[u8]) -> RunOutcome {
 /// Same as [`run_elf`] but with a caller-supplied host. Lets integration
 /// tests substitute a recording host (capture stdout, assert no syscall
 /// happens, etc.) without spawning a subprocess.
-pub fn run_elf_with_host<H: SysHost + LibcHost + BiosHost>(bytes: &[u8], host: &mut H) -> RunOutcome {
+pub fn run_elf_with_host<H: SysHost + LibcHost + BiosHost>(
+    bytes: &[u8],
+    host: &mut H,
+) -> RunOutcome {
     run_elf_with_debug(bytes, host, &DebugConfig::default())
 }
 
