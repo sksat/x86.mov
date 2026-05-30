@@ -36,10 +36,16 @@ import sys
 # movie86.mjs FRAMEBUFFER_MODES). Used to validate --res choices.
 VALID_RES = {
     "320x200", "640x480", "640x350", "800x600",
-    "480x270", "960x540", "1280x720", "1920x1080",
+    "320x180", "480x270", "960x540", "1280x720", "1920x1080",
 }
-DEFAULT_FIRST_RES = "480x270"   # cheap 16:9 — the slow-then-boost setup
-DEFAULT_RES = "1280x720"        # heavy 16:9 — where the boost pays off
+# Resolution compromise: a 1280x720 deck bakes ~160 MiB of RGBA into the
+# ELF's .rodata, which overruns turbo86's 16 MiB stub region on the
+# acceleration-boost handover (see simd/test-deck-size.py). 320x180 keeps
+# the whole deck under that budget so the boost works on stock turbo86 —
+# lower-res, but still true 16:9 (no letterboxing). Both defaults are the
+# same so the deck is uniform; bump --res once turbo86 grows its region.
+DEFAULT_FIRST_RES = "320x180"   # 16:9, fits the boost region
+DEFAULT_RES = "320x180"         # 16:9, fits the boost region
 
 
 def parse_res(s):

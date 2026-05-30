@@ -65,14 +65,32 @@ static void show(int i)
 
 int main(void)
 {
-    int idx, prev, k, i;
+    int idx, prev, k, i, j;
     int cur_mode;
 
-    /* Reserve every distinct framebuffer region up front. On movie86
+    /* Reserve every *distinct* framebuffer region up front. On movie86
      * (wasm) the FB pages are PT_LOAD-mapped already so this is a no-op;
-     * on turbo86 the mmap is what keeps the first write from faulting. */
+     * on turbo86 the mmap is what keeps the first write from faulting.
+     *
+     * Dedup by address: a deck reuses one FB region per resolution, so a
+     * uniform N-slide deck shares a single slide_addr across all slides.
+     * Issuing mmap_request once per slide would record N identical
+     * Reservations in the movie86→turbo86 handover snapshot, and turbo86
+     * caps dynamic regions (runner.go mmapMaxRegions = 32) — a 46-slide
+     * deck overruns it and the acceleration boost faults on arrival
+     * ("mmap context reservation … too many dynamic regions"). One
+     * mmap_request per distinct address keeps the snapshot well under the
+     * cap. (Same address ⇒ same mode ⇒ same npix, so the size matches.) */
     for (i = 0; i < n_slides; i++) {
-        mmap_request(ABI_MMAP_PACK(slide_addr[i], pages_for(slide_npix[i] * 4)));
+        int seen = 0;
+        for (j = 0; j < i; j++) {
+            if (slide_addr[j] == slide_addr[i]) {
+                seen = 1;
+            }
+        }
+        if (!seen) {
+            mmap_request(ABI_MMAP_PACK(slide_addr[i], pages_for(slide_npix[i] * 4)));
+        }
     }
 
     idx = 0;

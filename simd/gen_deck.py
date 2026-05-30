@@ -49,6 +49,9 @@ MODES = {
     (960, 540): (0x71, 0x00A00000),
     (1280, 720): (0x72, 0x00C00000),
     (1920, 1080): (0x73, 0x01000000),
+    # Low-res 16:9 — a whole deck of these fits turbo86's 16 MiB stub
+    # region, so the acceleration boost (handover) works unmodified.
+    (320, 180): (0x74, 0x01800000),
 }
 
 
