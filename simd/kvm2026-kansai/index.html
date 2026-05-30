@@ -83,9 +83,19 @@
     .boost-status.boosted .dot { background: #46d160; box-shadow: 0 0 8px #46d16088; }
     .boost-status.error   .dot { background: #ff5d5d; }
     @keyframes pulse { 50% { opacity: 0.3; } }
-    .boost-btn img { display: block; width: 100%; height: auto; }
+    .boost-btn img { display: block; width: 100%; height: auto; border-radius: 3px; }
     .boost-btn:hover { border-color: #8ab4f8; }
-    .boost-btn.on { border-color: #ffcc00; box-shadow: 0 0 10px #ffcc0066; }
+    /* Boosted: frame the image with a flowing rainbow. The 4px padding
+       reveals the animated gradient behind the (rounded) image. */
+    .boost-btn.on {
+      border-color: transparent; padding: 4px;
+      background: linear-gradient(90deg,
+        #ff0040, #ff9000, #ffe000, #20d060, #00a8ff, #8040ff, #ff0040);
+      background-size: 300% 100%;
+      animation: rainbow 1.6s linear infinite;
+      box-shadow: 0 0 12px #ffffff55;
+    }
+    @keyframes rainbow { to { background-position: 300% 0; } }
     footer { flex: 0 0 auto; flex-shrink: 0; padding: 4px 12px; border-top: 1px solid #2a2a3a; color: #777; font-size: 12px; }
     /* Input log: a thin strip under the slide so you can see a keypress
        was actually accepted (and which engine it went to) — useful while
