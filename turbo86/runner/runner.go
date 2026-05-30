@@ -318,21 +318,46 @@ func (r *Runner) snapshotMemory() ([]proto.MemRegion, error) {
 		return nil
 	}
 	// When the session declared watch regions (the large-deck LoadElf
-	// path), the periodic snapshot scans ONLY those page-aligned ranges
-	// — not the full static + extra map. A SIMD86 deck bakes ~160 MiB of
-	// immutable slide pixels into .rodata; re-streaming all of it every
-	// interval would swamp the wire, so the frontend watches just the
-	// framebuffer range that actually changes. Empty watchRegions falls
-	// back to the original "walk every mapped region" behaviour below.
+	// path), the periodic snapshot scans ONLY those ranges — not the full
+	// static + extra map. A SIMD86 deck bakes ~160 MiB of immutable slide
+	// pixels into .rodata; re-streaming all of it every interval would
+	// swamp the wire, so the frontend watches just the framebuffer range
+	// that actually changes. Empty watchRegions falls back to the original
+	// "walk every mapped region" behaviour below.
+	//
+	// The frontend watches EVERY known framebuffer mode address, but a
+	// deck only mmaps the FB(s) it actually uses — so most watch ranges
+	// point at unmapped guest memory. A bare walk of an unmapped range
+	// short-reads /proc/PID/mem and would fault the whole boost session.
+	// Intersect each watch range with the regions that are actually mapped
+	// (the static guestRegions + runtime mmap_request grants in
+	// extraRegions) and walk only the overlap; unmapped watch ranges are
+	// silently skipped.
 	if len(r.watchRegions) > 0 {
+		mapped := append([]struct{ addr, size uint32 }(nil), guestRegions...)
+		r.extraRegionsMu.RLock()
+		mapped = append(mapped, r.extraRegions...)
+		r.extraRegionsMu.RUnlock()
 		for _, w := range r.watchRegions {
-			pageAddr := w.Addr & mmapAddrMask
-			pageEnd := (w.Addr + w.Size + (pageSize - 1)) & mmapAddrMask
-			if pageEnd <= pageAddr {
+			wStart := w.Addr & mmapAddrMask
+			wEnd := (w.Addr + w.Size + (pageSize - 1)) & mmapAddrMask
+			if wEnd <= wStart {
 				continue // zero-size or wrapping watch range — skip
 			}
-			if err := walk(pageAddr, pageEnd-pageAddr); err != nil {
-				return nil, err
+			for _, m := range mapped {
+				start, end := wStart, wEnd
+				if m.addr > start {
+					start = m.addr
+				}
+				if m.addr+m.size < end {
+					end = m.addr + m.size
+				}
+				if start >= end {
+					continue // no overlap with this mapped region
+				}
+				if err := walk(start, end-start); err != nil {
+					return nil, err
+				}
 			}
 		}
 		return out, nil
@@ -720,9 +745,18 @@ func (r *Runner) LoadElf(img []byte, mode proto.Mode, memUpdateMs uint32, watch 
 			return fmt.Errorf("LoadElf: open gzip reader: %w", err)
 		}
 		defer gr.Close()
-		decompressed, err := io.ReadAll(gr)
+		// Cap the inflated size so a malformed/hostile gzip can't OOM the
+		// process. turbo86 is a localhost dev tool, but the bound is cheap
+		// insurance. 512 MiB matches the server's WS read limit and leaves
+		// ample room over the ~160 MiB deck. Read one extra byte to detect
+		// (rather than silently truncate) an over-cap image.
+		const maxElfImageBytes = 512 << 20
+		decompressed, err := io.ReadAll(io.LimitReader(gr, maxElfImageBytes+1))
 		if err != nil {
 			return fmt.Errorf("LoadElf: gunzip image: %w", err)
+		}
+		if len(decompressed) > maxElfImageBytes {
+			return fmt.Errorf("LoadElf: decompressed image exceeds %d bytes", maxElfImageBytes)
 		}
 		img = decompressed
 	}
