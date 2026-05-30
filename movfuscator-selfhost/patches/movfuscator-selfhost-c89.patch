@@ -1,0 +1,45 @@
+diff --git a/movfuscator/movfuscator.c b/movfuscator/movfuscator.c
+index 6963c46..29f4f15 100644
+--- a/movfuscator/movfuscator.c
++++ b/movfuscator/movfuscator.c
+@@ -191,6 +191,21 @@ Battelle Memorial Institute.
+ #include <stdarg.h>
+ #include <signal.h>
+ 
++/* Self-host: lcc's C89 front-end forbids declarations after statements, so the
++ * two `extern` declarations that upstream tucks mid-function (the gen.c emitter
++ * hook and error.c's errcnt) are hoisted to file scope here — semantically
++ * identical, both refer to globals defined in other translation units. */
++extern unsigned (*emitter)(Node, int);
++extern int errcnt;
++
++/* Self-host: SA_NODEFER lives behind glibc's _DEFAULT_SOURCE/_GNU_SOURCE
++ * feature gate, but the rest of lcc's source only parses under the strict ANSI
++ * header shape (__STRICT_ANSI__). Provide the Linux value directly so the
++ * signal setup below compiles without widening the feature macros. */
++#ifndef SA_NODEFER
++#define SA_NODEFER 0x40000000
++#endif
++
+ /* M/o/Vfuscation options */
+ static int quiet=           0;
+ #define QUIET_FLAG          "--q"
+@@ -2979,8 +2994,7 @@ static void progbeg(int argc, char *argv[])
+ 		fprint(stderr, "M/o/Vfuscation started...\n\n");
+ 	}
+ 
+-	/* override the default emitter in src/gen.c */
+-	extern unsigned (*emitter)(Node, int);
++	/* override the default emitter in src/gen.c (extern hoisted to file scope) */
+ 	emitter=mov_emitter;
+ 
+ 	/* create the registers available to the compiler */
+@@ -3108,7 +3122,7 @@ static void progend(void)
+ 		data_setup();
+ 	}
+ 
+-	extern int errcnt;
++	/* errcnt extern hoisted to file scope */
+ 	if (!quiet) {
+ 		if (errcnt==0) {
+ 			fprint(stderr, "\nM/o/Vfuscation complete.\n\n");

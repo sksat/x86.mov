@@ -1,32 +1,58 @@
 #!/usr/bin/env bash
-# Self-host experiment harness.
+# movfuscator self-host survey.
 #
 # Question: can the mov-only compiler (rcc + M/o/Vfuscator backend) compile
-# *its own* C source through the wasm pipeline?
+# *its own* C source through the mov pipeline?
 #
-# Milestone 1 (this script): the mov backend codegens every translation unit
-# that makes up rcc. For each unit:
-#   1. wasm cpp  → .i   (build/cpp.js, lcc's own preprocessor)
-#   2. wasm rcc  → .s   (build/rcc.js -target=x86/mov, the mov backend)
-#   3. wasm as   → .o   (build/as.js)
+# This subproject reuses the sibling movfuscator-wasm toolchain (its wasm
+# cpp/rcc/as and its vendored movfuscator sources) and drives every translation
+# unit of rcc through it:
+#   1. wasm cpp  → .i   (lcc's own preprocessor)
+#   2. wasm rcc  → .s   (rcc -target=x86/mov, the mov backend)
+#   3. wasm as   → .o
 # A unit counts as PASS only when the mov backend prints
 # "M/o/Vfuscation complete." AND `as` produces an object. NB: on failure the
 # backend still emits a partial .s and exits 0, so a non-empty .s is NOT a
 # success signal — the completion banner is the only honest gate.
-#
-# This is the feasibility map for full self-host: if the mov backend cannot
-# codegen the compiler's own translation units, a self-hosted rcc is out of
-# reach.
 
 set -uo pipefail
 
-here="$(cd "$(dirname "$0")/../.." && pwd)"
-vendor="$here/vendor/movfuscator"
+here="$(cd "$(dirname "$0")" && pwd)"
+wasm="$here/../movfuscator-wasm"
+vendor="$wasm/vendor/movfuscator"
 src="$vendor/lcc/src"
 bld="$vendor/build"          # lburg-generated backend .c live here
-cppjs="$here/build/cpp.js"
-rccjs="$here/build/rcc.js"
-asjs="$here/build/as.js"
+cppjs="$wasm/build/cpp.js"
+rccjs="$wasm/build/rcc.js"
+asjs="$wasm/build/as.js"
+patch="$here/patches/movfuscator-selfhost-c89.patch"
+
+for required in "$cppjs" "$rccjs" "$asjs"; do
+    if [ ! -f "$required" ]; then
+        echo "FAIL: $required missing; build the sibling toolchain first:" >&2
+        echo "  (cd $wasm && make build-wasm build-wasm-as)" >&2
+        exit 1
+    fi
+done
+if [ ! -d "$src" ]; then
+    echo "FAIL: $src missing; fetch the sibling vendor first:" >&2
+    echo "  (cd $wasm && make setup)" >&2
+    exit 1
+fi
+
+# Apply the self-host C89 patch to the vendored backend source (idempotent).
+# It clears the two easy walls (mid-block externs + SA_NODEFER); behaviour is
+# neutral for rcc so the prebuilt toolchain stays valid.
+if [ -f "$patch" ]; then
+    if git -C "$vendor" apply --check -R "$patch" 2>/dev/null; then
+        :   # already applied
+    elif git -C "$vendor" apply --check "$patch" 2>/dev/null; then
+        git -C "$vendor" apply "$patch"
+        echo "applied $(basename "$patch")"
+    else
+        echo "warn: $(basename "$patch") neither applies nor is already applied" >&2
+    fi
+fi
 
 # The translation units that form rcc (mirrors the native makefile's RCCOBJS +
 # backend EXTRAOBJS). Front-end units are committed lcc/src/*.c; the per-arch
@@ -40,32 +66,27 @@ GENBACK=(alpha mips sparc x86 x86linux dagcheck mov)
 
 # Known holdout: mov.c (#includes the M/o/Vfuscator backend movfuscator.c).
 # The backend source is written for gcc/C99 and trips lcc's stricter C89
-# front-end. The first wall is a mid-block `extern` declaration
-# (movfuscator.c:2983 `extern unsigned (*emitter)(Node,int);`) — C99 mixed
-# declarations/statements that the C89 front-end rejects. Past it lie a couple
-# more (a second mid-block extern, SA_NODEFER needing _GNU_SOURCE, and several
-# `static T x[];` forward incomplete-array tentative definitions). Every other
-# translation unit of rcc compiles mov-only cleanly.
+# front-end. The patch above already clears the first two walls (mid-block
+# `extern` declarations hoisted to file scope; SA_NODEFER provided directly so
+# the strict-ANSI header shape suffices). The remaining wall is structural:
+# movfuscator.c forward-declares the lburg tables as `static short *_nts[];`
+# etc. (incomplete arrays, completed later in the generated mov.c), and lcc's
+# front-end rejects `static` incomplete-array tentative definitions outright.
+# Clearing it needs an lcc front-end leniency change + a rebuilt wasm rcc, so
+# it stays XFAIL until the toolchain is rebuilt. Every other translation unit
+# of rcc compiles mov-only cleanly.
 XFAIL=(mov)
 
-for required in "$cppjs" "$rccjs" "$asjs"; do
-    if [ ! -f "$required" ]; then
-        echo "FAIL: $required missing; run 'make build-wasm build-wasm-as' first" >&2
-        exit 1
-    fi
-done
-
-# Same predefined macros / include order as the native lcc driver, plus the
-# lcc src + build dirs so the compiler's own c.h and the lburg tables are
-# found. The __STRICT_ANSI__/_POSIX_SOURCE pair keeps glibc's headers in their
-# ANSI shape — lcc's front-end cannot parse the GNU-extension declarations
-# (__attribute__, __inline, ...) that _GNU_SOURCE would expose, so the strict
-# environment is what lets the front-end units compile at all.
+# Same predefined macros / include order as the native lcc driver, plus the lcc
+# src + build dirs so the compiler's own c.h and the lburg tables are found.
+# The __STRICT_ANSI__/_POSIX_SOURCE pair keeps glibc's headers in their ANSI
+# shape — lcc's front-end cannot parse the GNU-extension declarations that
+# _GNU_SOURCE would expose.
 #
 # NB: __LCC__ is deliberately NOT defined. lcc's own c.h is the only consumer
 # of __LCC__ in the tree, using it to `#define __STDC__` — which lcc's own cpp
 # rejects as redefining a reserved builtin. The native build never hits this
-# (rcc is built with gcc; lcc-cpp only ever preprocesses user code that never
+# (rcc is built with gcc; lcc-cpp only preprocesses user code that never
 # includes c.h). Dropping __LCC__ skips that block.
 CPP_FLAGS=(
     -U__GNUC__ -D_POSIX_SOURCE -D__STRICT_ANSI__
@@ -123,7 +144,7 @@ for name in "${GENBACK[@]}"; do run_unit "$name" "$bld/$name.c"; done
 
 total=$(( ${#FRONT[@]} + ${#GENBACK[@]} ))
 echo
-echo "self-host milestone 1: $pass/$total units mov-only compiled (PASS $pass, FAIL $fail, XFAIL $xfail, XPASS $xpass)"
+echo "movfuscator self-host: $pass/$total units mov-only compiled (PASS $pass, FAIL $fail, XFAIL $xfail, XPASS $xpass)"
 # Gate: every non-xfail unit must compile, and no xfail may unexpectedly pass
 # without us updating the list.
 [ "$fail" -eq 0 ] && [ "$xpass" -eq 0 ]
