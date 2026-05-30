@@ -278,6 +278,29 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setLibcallImpl(RTLIB::FPTOSINT_F32_I64, RTLIB::impl___fixsfdi);
   setLibcallImpl(RTLIB::FPTOUINT_F32_I64, RTLIB::impl___fixunssfdi);
 
+  // Stage 7h11 — floor / ceil / trunc / round on f32 and f64.
+  // SDAG legalizes these as libcalls; helper bodies (libm names
+  // `floor` / `ceil` / `trunc` / `round` and the `f` variants) are
+  // injected by the driver. Implementation is bit-twiddling on the
+  // mantissa per IEEE-754 — no real iteration, all 8 helpers share
+  // the same skeleton parameterised by op + type.
+  setOperationAction(ISD::FFLOOR, MVT::f32, LibCall);
+  setOperationAction(ISD::FCEIL,  MVT::f32, LibCall);
+  setOperationAction(ISD::FTRUNC, MVT::f32, LibCall);
+  setOperationAction(ISD::FROUND, MVT::f32, LibCall);
+  setOperationAction(ISD::FFLOOR, MVT::f64, LibCall);
+  setOperationAction(ISD::FCEIL,  MVT::f64, LibCall);
+  setOperationAction(ISD::FTRUNC, MVT::f64, LibCall);
+  setOperationAction(ISD::FROUND, MVT::f64, LibCall);
+  setLibcallImpl(RTLIB::FLOOR_F32, RTLIB::impl_floorf);
+  setLibcallImpl(RTLIB::CEIL_F32,  RTLIB::impl_ceilf);
+  setLibcallImpl(RTLIB::TRUNC_F32, RTLIB::impl_truncf);
+  setLibcallImpl(RTLIB::ROUND_F32, RTLIB::impl_roundf);
+  setLibcallImpl(RTLIB::FLOOR_F64, RTLIB::impl_floor);
+  setLibcallImpl(RTLIB::CEIL_F64,  RTLIB::impl_ceil);
+  setLibcallImpl(RTLIB::TRUNC_F64, RTLIB::impl_trunc);
+  setLibcallImpl(RTLIB::ROUND_F64, RTLIB::impl_round);
+
   // Stage 7h4 / 7h5 / 7h6 — f64 fadd / fsub / fmul / fdiv. Helper
   // bodies emulate variable-amount i64 shifts via the i32-pair
   // clamped-arm split technique established by stage-7h3's
