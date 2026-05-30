@@ -901,12 +901,25 @@ func (r *Runner) mapSegmentGaps(start, end uint32, regs *regs32) error {
 // trampoline + ptrace stop to work with. regs is the live register set;
 // mmap injection mutates and restores it.
 func (r *Runner) applyElfPlan(plan *elfPlan, regs *regs32) error {
+	// Two phases, and the order is load-bearing. Phase 1 maps every
+	// out-of-arena segment via injectSyscall, which hijacks the guest EIP
+	// onto the trampoline's `CD 80` at trapTrampolineAddr (0x09040000).
+	// Phase 2 then writes all the segment bytes. They MUST NOT interleave:
+	// the SIMD86 deck's ~160 MiB read-only .rodata starts inside the static
+	// arena and runs past 0x09040000, so writing it clobbers the
+	// trampoline. If a later segment (e.g. .bss above the arena) still
+	// needed an mmap after that write, its injectSyscall would jump onto
+	// the overwritten bytes and the guest would take SIGILL. Doing every
+	// mmap first — while the trampoline is still intact — removes that
+	// ordering hazard regardless of PT_LOAD order in the file.
 	for _, s := range plan.segments {
 		if !s.inArena {
 			if err := r.mapSegmentGaps(s.mapStart, s.mapEnd, regs); err != nil {
 				return fmt.Errorf("mmap ELF segment 0x%x..0x%x: %w", s.mapStart, s.mapEnd, err)
 			}
 		}
+	}
+	for _, s := range plan.segments {
 		// Write file bytes in <= elfWriteChunk pieces: a single huge
 		// process_vm_writev can short-write, so chunk the SIMD86 deck's
 		// multi-MiB segments.
