@@ -67,3 +67,8 @@ jobs:
       # binding (JS ↔ Rust) regressing in a way `cargo build` would miss.
       - name: smoke test (node + samples)
         run: node tests/smoke.mjs
+
+      # Pure-JS regression for the large-snapshot base64 path (no wasm):
+      # serializing a ~160 MiB deck handover must not overflow btoa.
+      - name: large-handover serialization test
+        run: node --max-old-space-size=4096 tests/large_handover.mjs

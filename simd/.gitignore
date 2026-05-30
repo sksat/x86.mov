@@ -1,0 +1,11 @@
+# Generated deck artifacts — the source of truth is deck.pdf (or a
+# hand-written deck.toml + images). build-deck.sh / pdf_to_deck.py
+# regenerate these; deploy/CI builds them fresh, so they're not committed.
+kvm2026-kansai/deck.elf
+kvm2026-kansai/deck.elf.zst
+kvm2026-kansai/deck.bin
+kvm2026-kansai/deck_data.s
+# PDF-rendered page images (slideNN.png). Hand-authored slide images
+# referenced by a committed deck.toml are NOT matched by this (they'd be
+# named whatever the toml says, e.g. title.png) — add them explicitly.
+kvm2026-kansai/slide[0-9]*.png

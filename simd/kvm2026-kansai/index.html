@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SIMD86 — Kernel/VM 2026 Kansai</title>
+  <meta property="og:title" content="SIMD86 — Kernel/VM 2026 Kansai" />
+  <meta property="og:description" content="A slide deck executed by a mov-only program inside the movie86 emulator." />
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      background: #15151f; color: #cdd0e0;
+      font: 14px/1.5 system-ui, sans-serif;
+      display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+    }
+    header {
+      padding: 6px 12px; display: flex; align-items: baseline; gap: 12px;
+      border-bottom: 1px solid #2a2a3a; flex: 0 0 auto;
+    }
+    header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+    header .load { color: #ffcc66; font-size: 12px; font-variant-numeric: tabular-nums; }
+    header .load.done { display: none; }
+    header .hint { margin-left: auto; color: #777; font-size: 12px; }
+
+    /* Side-by-side: slide pane | draggable divider | movie86 pane. */
+    #split { flex: 1 1 auto; display: flex; min-height: 0; }
+    #slide-pane {
+      position: relative;
+      flex: 1 1 0; min-width: 120px; display: flex;
+      align-items: center; justify-content: center;
+      background: #0b0b12; overflow: hidden;
+    }
+    /* Canvas keeps its native backing store (set per slide to the mode's
+       resolution); CSS fills the pane and lets object-fit: contain scale
+       the bitmap up *or* down to fit, preserving its intrinsic aspect
+       ratio. So a low-res 320x200 slide is enlarged to roughly the same
+       on-screen size as an 800x600 one (letterboxed if ratios differ)
+       instead of showing tiny. Pixelated so the upscale stays crisp. */
+    #screen {
+      width: 100%; height: 100%;
+      object-fit: contain;
+      image-rendering: pixelated;
+      background: #000;
+    }
+    /* Current resolution, top-center of the slide area. */
+    #res-badge {
+      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.6); color: #e6e8f2;
+      font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums;
+      padding: 4px 14px; border-radius: 6px; pointer-events: none;
+    }
+    #divider {
+      flex: 0 0 6px; cursor: col-resize; background: #2a2a3a;
+    }
+    #divider:hover { background: #3a3a5a; }
+    #movie86-pane {
+      flex: 0 0 320px; min-width: 160px; max-width: 60%;
+      padding: 12px; overflow: auto; border-left: 1px solid #2a2a3a;
+    }
+    #movie86-pane h2 { font-size: 12px; color: #888; margin: 0 0 8px; letter-spacing: .05em; }
+    .stat { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dotted #2a2a3a; }
+    .stat .k { color: #888; }
+    .stat .v { font-variant-numeric: tabular-nums; }
+    .boost {
+      margin-top: 16px; padding: 10px; border: 1px solid #2a2a3a; border-radius: 6px;
+      background: #1b1b28;
+    }
+    .boost .note { color: #777; font-size: 12px; margin-top: 6px; }
+    .boost-field { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #aab; margin-bottom: 6px; }
+    .boost-field input, .boost-field select {
+      flex: 1 1 auto; min-width: 0; background: #11111a; color: #cdd0e0;
+      border: 1px solid #2a2a3a; border-radius: 4px; padding: 3px 6px;
+      font: 12px ui-monospace, monospace;
+    }
+    .boost-btn { display: block; width: 100%; padding: 0; border: 2px solid #2a2a3a; border-radius: 6px; background: #c9ccd6; cursor: pointer; overflow: hidden; }
+    /* Boost status: a coloured dot + label, distinct per state. */
+    .boost-status { display: flex; align-items: center; gap: 7px; margin-top: 8px; font-size: 12px; font-weight: 600; }
+    .boost-status .dot { width: 9px; height: 9px; border-radius: 50%; background: #667; flex: 0 0 auto; }
+    .boost-status.off     .dot { background: #667; }
+    .boost-status.connecting .dot { background: #ffcc66; animation: pulse 1s infinite; }
+    .boost-status.boosted .dot { background: #46d160; box-shadow: 0 0 8px #46d16088; }
+    .boost-status.error   .dot { background: #ff5d5d; }
+    @keyframes pulse { 50% { opacity: 0.3; } }
+    .boost-btn img { display: block; width: 100%; height: auto; border-radius: 3px; }
+    .boost-btn:hover { border-color: #8ab4f8; }
+    /* Boosted: frame the image with a flowing rainbow. The 4px padding
+       reveals the animated gradient behind the (rounded) image. */
+    .boost-btn.on {
+      border-color: transparent; padding: 4px;
+      background: linear-gradient(90deg,
+        #ff0040, #ff9000, #ffe000, #20d060, #00a8ff, #8040ff, #ff0040);
+      background-size: 300% 100%;
+      animation: rainbow 1.6s linear infinite;
+      box-shadow: 0 0 12px #ffffff55;
+    }
+    @keyframes rainbow { to { background-position: 300% 0; } }
+    footer { flex: 0 0 auto; flex-shrink: 0; padding: 4px 12px; border-top: 1px solid #2a2a3a; color: #777; font-size: 12px; }
+    /* Input log: a thin strip under the slide so you can see a keypress
+       was actually accepted (and which engine it went to) — useful while
+       a slow blit is still painting and the slide hasn't visibly changed
+       yet. Newest entry first, capped to a few lines. */
+    #log {
+      flex: 0 0 auto; flex-shrink: 0; height: 2.6em; overflow: hidden;
+      padding: 3px 12px; border-top: 1px solid #2a2a3a;
+      background: #0e0e16; color: #9aa;
+      font: 12px/1.25 ui-monospace, monospace; white-space: pre;
+    }
+    #log .none { color: #555; }
+    a { color: #8ab4f8; }
+
+    /* movie86 pane minimize: click the header to collapse the pane to a
+       compact bar. mov count + mov/sec stay visible even when minimized
+       (the "everything is a mov" signal shouldn't disappear). */
+    .m86-head {
+      display: flex; align-items: center; gap: 8px; width: 100%;
+      margin: 0 0 8px; padding: 0; background: none; border: none;
+      color: inherit; font: inherit; text-align: left; cursor: pointer;
+    }
+    .m86-head h2 { margin: 0; }
+    .m86-head .caret { color: #888; transition: transform .15s; }
+    .m86-mini { margin-left: auto; display: none; color: #9aa; font-size: 12px; font-variant-numeric: tabular-nums; }
+    #split.m86-min #divider { display: none; }
+    /* Minimized: collapse to a slim right-edge rail. Only a "‹ movie86"
+       toggle + the mov count remain, rotated vertical so the slide gets
+       almost the whole width back. */
+    #split.m86-min #movie86-pane {
+      flex: 0 0 auto; width: auto; min-width: 0; max-width: none;
+      padding: 6px 2px; border-left: 1px solid #2a2a3a;
+    }
+    #split.m86-min .m86-body { display: none; }
+    #split.m86-min .m86-head {
+      writing-mode: vertical-rl; gap: 6px; margin: 0; width: auto;
+    }
+    #split.m86-min .m86-head h2 { writing-mode: vertical-rl; }
+    #split.m86-min .m86-head .caret { transform: rotate(90deg); }
+    #split.m86-min .m86-mini { display: inline; margin: 0; writing-mode: vertical-rl; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>SIMD86</h1>
+    <span class="load" id="load">デックを読み込み中…</span>
+    <span class="hint">スライド領域にカーソルを乗せて ← → / Space / Enter で操作</span>
+  </header>
+
+  <!-- Default collapsed (m86-min): the slide gets the width; click the
+       movie86 rail to expand the stats pane. -->
+  <div id="split" class="m86-min">
+    <div id="slide-pane">
+      <div id="res-badge">—</div>
+      <canvas id="screen" width="320" height="200"></canvas>
+    </div>
+    <div id="divider" title="ドラッグで分割サイズ変更"></div>
+    <aside id="movie86-pane">
+      <button class="m86-head" id="m86-toggle" type="button" aria-expanded="false" title="クリックで最小化 / 展開">
+        <span class="caret">▾</span><h2>movie86</h2>
+        <span class="m86-mini" id="m86-mini">—</span>
+      </button>
+      <div class="m86-body">
+      <div class="stat"><span class="k">engine</span><span class="v" id="s-engine">movie86 (wasm)</span></div>
+      <div class="stat"><span class="k">total mov</span><span class="v" id="s-steps">0</span></div>
+      <div class="stat"><span class="k">mov / sec</span><span class="v" id="s-rate">—</span></div>
+      <div class="stat"><span class="k">video mode</span><span class="v" id="s-mode">—</span></div>
+      <div class="stat"><span class="k">halt</span><span class="v" id="s-halt">running</span></div>
+
+      <div class="boost">
+        <label class="boost-field">turbo86
+          <input type="text" id="t86-url" value="ws://127.0.0.1:1234" spellcheck="false">
+        </label>
+        <label class="boost-field">mode
+          <select id="t86-mode">
+            <option value="host" selected>host</option>
+            <option value="trap">trap</option>
+          </select>
+        </label>
+        <button id="boost" class="boost-btn" type="button"
+                title="アクセラレーションブースト — ローカル turbo86 にハンドオーバーしてネイティブ速度で実行">
+          <img src="./acceleration-boost.png" alt="アクセラレーションブースト" />
+        </button>
+        <div class="boost-status" id="boost-status">
+          <span class="dot" id="boost-dot"></span><span id="boost-state">movie86 (wasm)</span>
+        </div>
+        <div class="note" id="boost-note">押すとローカル turbo86 にハンドオーバーしてネイティブ速度で実行(default off)。</div>
+      </div>
+      </div><!-- .m86-body -->
+    </aside>
+  </div>
+
+  <div id="log"><span class="none">入力ログ — スライド領域にカーソルを乗せてキーを押すとここに出ます</span></div>
+
+  <footer>
+    このスライドは <strong>mov 命令だけ</strong>で描かれています。デック本体は movfuscator/llvm-mov 系の
+    mov-only ELF で、<a href="/movie86/">movie86</a> エミュレータが実行しています。
+    全ピクセルが <code>mov</code> で計算される。 ·
+    <a href="/">x86.mov</a>
+  </footer>
+
+  <script type="module">
+    import { runDeck } from '../simd.mjs';
+
+    const canvas = document.getElementById('screen');
+    const $ = (id) => document.getElementById(id);
+
+    // Live "mov / sec" needs a sampled rate, not a cumulative average.
+    let prevSteps = 0n, prevT = performance.now(), rate = 0;
+
+    function fmt(n) { return Number(n).toLocaleString(); }
+
+    function mib(n) { return `${(n / 1048576).toFixed(1)} MiB`; }
+
+    const deck = await runDeck(canvas, './deck.elf', {
+      onStatus(s) {
+        // Two payload shapes share onStatus: deck-load progress (from
+        // fetchDeck) before the Vm exists, then per-frame run status.
+        if (s.loading) {
+          const el = $('load');
+          // Note: when the browser transparently decodes Content-Encoding:
+          // zstd, content-length is the *compressed* size but the stream
+          // yields decompressed bytes, so loadedBytes can exceed
+          // totalBytes — only show a % while it's still meaningful.
+          if (s.decompressing) el.textContent = 'デック展開中…';
+          else if (s.totalBytes && s.loadedBytes <= s.totalBytes) el.textContent =
+            `デック読み込み中… ${mib(s.loadedBytes)} / ${mib(s.totalBytes)} `
+            + `(${Math.floor(s.loadedBytes / s.totalBytes * 100)}%)`;
+          else el.textContent = `デック読み込み中… ${mib(s.loadedBytes)}`;
+          return;
+        }
+        $('load').classList.add('done'); // loaded — hide the indicator
+        const { steps, mode, width, height, halt } = s;
+        $('s-steps').textContent = fmt(steps);
+        const now = performance.now();
+        const dt = now - prevT;
+        if (dt >= 250) {
+          const dSteps = Number(steps - prevSteps);
+          rate = dSteps / (dt / 1000);
+          prevSteps = steps; prevT = now;
+        }
+        const rateStr = rate >= 1e6 ? `${(rate / 1e6).toFixed(1)}M` : fmt(Math.round(rate));
+        $('s-rate').textContent = rateStr;
+        $('s-mode').textContent = mode == null ? '—' : `0x${mode.toString(16)}`;
+        $('s-halt').textContent = halt ?? 'running';
+        // Current resolution + video mode, shown at the top of the slide.
+        $('res-badge').textContent = (width && height)
+          ? `${width}×${height} · mode 0x${mode.toString(16)}`
+          : '—';
+        // Keep mov count + mov/sec visible even when the pane is minimized.
+        $('m86-mini').textContent = `${fmt(steps)} mov · ${rateStr}/s`;
+      },
+      // ?turbo86=ws://host:port overrides the local turbo86 address.
+      turbo86Url: new URLSearchParams(location.search).get('turbo86') || 'ws://127.0.0.1:1234',
+      onEngine(eng, info) {
+        $('s-engine').textContent = eng === 'turbo86' ? 'turbo86 (native)' : 'movie86 (wasm)';
+        $('boost').classList.toggle('on', eng === 'turbo86');
+        if (info) $('boost-note').textContent = info;
+        if (info) logLine(`[${eng}] ${info}`);
+      },
+      onInput({ name, engine }) {
+        // Show the keypress was accepted and where it went. On movie86 the
+        // slide may take a moment to repaint (the blit is the slow part) —
+        // this line confirms input landed even before the画面 changes.
+        logLine(`key ${name} → ${engine}`);
+      },
+    });
+
+    // Newest-first input log, capped to a few lines.
+    const logLines = [];
+    function logLine(s) {
+      const t = new Date().toLocaleTimeString();
+      logLines.unshift(`${t}  ${s}`);
+      logLines.length = Math.min(logLines.length, 2);
+      $('log').textContent = logLines.join('\n');
+    }
+
+    // Draggable divider: resize the movie86 pane by setting its flex-basis.
+    const divider = $('divider');
+    const pane = $('movie86-pane');
+    let dragging = false;
+    divider.addEventListener('pointerdown', (e) => {
+      dragging = true; divider.setPointerCapture(e.pointerId);
+    });
+    divider.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const w = Math.max(160, window.innerWidth - e.clientX - 3);
+      pane.style.flexBasis = `${Math.min(w, window.innerWidth * 0.6)}px`;
+    });
+    divider.addEventListener('pointerup', (e) => {
+      dragging = false; divider.releasePointerCapture(e.pointerId);
+    });
+
+    // Click the movie86 header to minimize / restore the pane. Minimized,
+    // it collapses to a thin bar but still shows mov count + mov/sec.
+    // A dragged width lives in the pane's inline flex-basis, which would
+    // override the .m86-min CSS (inline beats stylesheet) and stop it
+    // collapsing — so stash + clear it on minimize, restore on expand.
+    let savedBasis = '';
+    $('m86-toggle').addEventListener('click', () => {
+      const min = $('split').classList.toggle('m86-min');
+      $('m86-toggle').setAttribute('aria-expanded', String(!min));
+      if (min) {
+        savedBasis = pane.style.flexBasis;
+        pane.style.flexBasis = '';
+      } else if (savedBasis) {
+        pane.style.flexBasis = savedBasis;
+      }
+    });
+
+    // Acceleration boost: hand off to the turbo86 at the address box,
+    // with the selected mode.
+    $('boost').addEventListener('click', () => deck.boost({
+      url: $('t86-url').value.trim(),
+      mode: $('t86-mode').value,
+    }));
+
+    window.addEventListener('beforeunload', () => deck.stop());
+  </script>
+</body>
+</html>

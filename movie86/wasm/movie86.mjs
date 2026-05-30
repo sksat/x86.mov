@@ -61,6 +61,14 @@ export const FRAMEBUFFER_MODES = Object.freeze([
     { id: 'mode 12h', modeNumber: 0x12, addr: 0x0010_0000, width: 640, height: 480 }, // 1.2 MB  — VGA 16c
     { id: 'mode 10h', modeNumber: 0x10, addr: 0x0030_0000, width: 640, height: 350 }, //  875 KB — EGA/VGA mid-res
     { id: 'VESA 6Ah', modeNumber: 0x6A, addr: 0x0040_0000, width: 800, height: 600 }, // 1.9 MB  — VESA VBE 1.0 SVGA
+    // 16:9 widescreen modes (not real VGA/VESA numbers — "spirit of VGA"
+    // extensions for slide decks authored at 16:9 so they're not
+    // letterboxed). Addresses sit well past the 4:3/8:5 block above and
+    // don't overlap each other.
+    { id: '16:9 qHD-',  modeNumber: 0x70, addr: 0x0080_0000, width: 480,  height: 270 },  //  518 KB
+    { id: '16:9 qHD',   modeNumber: 0x71, addr: 0x00A0_0000, width: 960,  height: 540 },  //  2.0 MB
+    { id: '16:9 HD',    modeNumber: 0x72, addr: 0x00C0_0000, width: 1280, height: 720 },  //  3.5 MB
+    { id: '16:9 FHD',   modeNumber: 0x73, addr: 0x0100_0000, width: 1920, height: 1080 }, //  7.9 MB
 ].map(m => Object.freeze({
     ...m,
     bytesPerPixel: 4,
@@ -326,12 +334,26 @@ export function snapshotContext(vm) {
 // end), this is more than fast enough; a future optimization could
 // drop down to a manual encoder if it ever shows up in a profile.
 function bytesToBase64(u8) {
-    const CHUNK = 0x8000;
-    let s = '';
+    // btoa() the array in 3-byte-aligned chunks and concatenate the
+    // base64 outputs, rather than building one giant binary string and
+    // btoa()-ing it whole. A single btoa() over a ~160 MiB binary string
+    // (the SIMD86 deck snapshot) tries to allocate the ~213 MiB output
+    // contiguously and throws "allocation size overflow" in Firefox; the
+    // per-chunk form keeps every transient allocation ~64 KiB and the
+    // result accrues as a rope. CHUNK must be a multiple of 3 so each
+    // btoa() lands on a base64 boundary (no '=' padding mid-stream).
+    const CHUNK = 0x8000 * 3; // 98304, divisible by 3
+    let out = '';
     for (let i = 0; i < u8.length; i += CHUNK) {
-        s += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+        const slice = u8.subarray(i, i + CHUNK);
+        let s = '';
+        const SUB = 0x8000;
+        for (let j = 0; j < slice.length; j += SUB) {
+            s += String.fromCharCode.apply(null, slice.subarray(j, j + SUB));
+        }
+        out += btoa(s);
     }
-    return btoa(s);
+    return out;
 }
 
 function base64ToBytes(b64) {

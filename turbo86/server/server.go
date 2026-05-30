@@ -25,6 +25,17 @@ import (
 	"github.com/sksat/x86.mov/turbo86/stub"
 )
 
+// MaxReadBytes is the per-frame WebSocket read cap (coder/websocket's
+// default is 32 KiB). LoadContext frames are dominated by base64-encoded
+// memory regions; a SIMD86 deck snapshot carries the deck's mmap'd
+// framebuffers (mode 0x72 = 1280x720x4 ≈ 3.5 MiB each) plus its code, so
+// a multi-slide snapshot's JSON runs to hundreds of MiB. 512 MiB leaves
+// generous headroom. turbo86 is a localhost dev tool the user points at
+// their own browser (the WS handshake is Origin-locked), so a large read
+// is bounded by their own RAM, not an exposed-service DoS. Exported so
+// the WS tests can raise their client-side read limit to match.
+const MaxReadBytes = 512 << 20
+
 // sessionLogger wraps `*log.Logger` with a short per-connection id so
 // concurrent sessions can be traced in the interleaved log output.
 // Format is `[<id>] <event>: <details>` — line-oriented, grep-friendly,
@@ -110,15 +121,16 @@ func serve(w http.ResponseWriter, r *http.Request, originPatterns []string) {
 	defer ws.CloseNow()
 
 	// Raise the per-frame read cap above coder/websocket's 32 KiB default.
-	// LoadContext frames are dominated by base64-encoded `Bytes` arrays;
-	// the bundled `canvas_mandelbrot*.elf` examples ship code regions of
-	// ~0.9 MiB (llvm-mov pipeline) up to ~6.6 MiB (movfuscator pipeline),
-	// so leaving the default in place silently caps every non-trivial
-	// browser handover at the wire layer (StatusMessageTooBig 1009).
-	// 16 MiB matches the stub's RWX code region — a snapshot whose code
-	// section is bigger than the stub's mapping wouldn't fit in the
-	// guest anyway, so the cap mirrors the actual address space.
-	ws.SetReadLimit(16 << 20)
+	// LoadContext frames are dominated by base64-encoded `Bytes` arrays.
+	// The earlier 16 MiB cap matched the stub's static RWX code region,
+	// but a SIMD86 deck snapshot legitimately carries far more: the deck
+	// mmap's framebuffer regions (mode 0x72 = 1280x720x4 ≈ 3.5 MiB each)
+	// outside the static region via the mov-only mmap ABI, so a multi-
+	// slide snapshot's base64 JSON runs to hundreds of MiB. Cap generously
+	// — this is a localhost dev tool the user runs against their own
+	// browser, not an exposed service, so the DoS surface of a big read
+	// is their own tab. See MaxReadBytes.
+	ws.SetReadLimit(MaxReadBytes)
 
 	slog := newSessionLogger(nil)
 	slog.logf("connect: remote=%s origin=%q",
