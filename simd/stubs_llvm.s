@@ -58,3 +58,11 @@ _fb70_region:
 .globl _fb72_region
 _fb72_region:
 .skip 3686400
+
+# 16:9 qnHD (mode 0x74) — 320*180*4 = 230400 bytes at 0x1800000. The
+# low-res mode the boost-compromise deck renders at, so the whole slide
+# blob fits turbo86's 16 MiB stub region (see gen_deck MODES / build-deck).
+.section .fb74, "aw", @nobits
+.globl _fb74_region
+_fb74_region:
+.skip 230400

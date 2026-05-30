@@ -1,16 +1,16 @@
 // End-to-end test for a SIMD86 deck on movie86: load the mov-only
 // deck.elf, drive it with key input, and assert the framebuffer shows
-// the right slide — including the mid-deck resolution change (slide 1
-// switches video mode 13h → 6Ah). Proves the whole flip + set_video_mode
-// path: pushInput → CALL_POLL_INPUT → deck.c index move → (mode change) →
-// blit of the new slide at its framebuffer address.
+// the right slide. Proves the whole flip path: pushInput →
+// CALL_POLL_INPUT → deck.c index move → blit of the new slide at its
+// framebuffer address.
 //
-// Content-agnostic: slides are real images now, so instead of pinning
-// exact background colours the test asserts (a) the active video mode per
-// slide and (b) that the framebuffer *content changes* when paging (a
-// rolling checksum differs), which proves a new slide was blitted. Mirror
-// kvm2026-kansai/deck.toml: slide 0 @ 320x200 (mode 13h), slide 1 @
-// 800x600 (mode 6Ah).
+// The shipped deck is uniform 320x180 (mode 0x74, 16:9) — the
+// resolution compromise that keeps the whole slide blob inside
+// turbo86's 16 MiB boost region (see test-deck-size.py). So there's no
+// mid-deck mode change to assert; instead, content-agnostic: the test
+// asserts (a) the deck reaches the expected video mode and (b) the
+// framebuffer *content changes* when paging (a rolling checksum
+// differs), which proves a new slide was blitted.
 //
 // Run against the movie86 wasm build (../movie86/wasm/build/browser);
 // `make -C movie86/wasm build-wasm` first. Standalone: node test-deck.mjs
@@ -28,9 +28,10 @@ const mod = await import(`${m86}/build/browser/movie86_wasm.js`);
 await mod.default({ module_or_path: wasm });
 const { KEY, modeForNumber } = await import(`${m86}/movie86.mjs`);
 
-const EXPECT_MODE = [0x70, 0x72]; // slide 0 480x270, slide 1 1280x720 (16:9)
+const MODE = 0x74; // every slide is 320x180 (mode 0x74, 16:9) — uniform deck
 
-// 800x600 blits ~480k px through the wasm emulator, so give it room.
+// Each 320x180 slide blits ~58k px through the wasm emulator; the step
+// budget is generous so a slow CI box still finishes a transition.
 const BUDGET = 800_000_000n;
 const BATCH = 8_000_000n;
 
@@ -82,33 +83,36 @@ function settleHash(label) {
 
 let failed = 0;
 try {
-    // Slide 0: mode 13h (320x200), some content drawn.
-    assert.ok(stepUntil(() => vm.activeVideoMode === EXPECT_MODE[0], 'mode 13h'),
-        'slide 0 never reached mode 13h');
+    // Slide 0: reaches mode 0x74 (320x180), some content drawn.
+    assert.ok(stepUntil(() => vm.activeVideoMode === MODE, 'mode 0x74'),
+        'slide 0 never reached mode 0x74');
     const h0 = settleHash('slide 0');
     assert.notEqual(h0, 0, 'slide 0 framebuffer stayed blank');
 
-    // Right → slide 1: resolution change to mode 6Ah (800x600).
+    // Right → slide 1: same mode (uniform deck), but a different slide is
+    // blitted, so the framebuffer content (rolling hash) must change.
     vm.pushInput(KEY.RIGHT);
-    assert.ok(stepUntil(() => vm.activeVideoMode === EXPECT_MODE[1], 'mode 6Ah'),
-        'Right did not switch slide 1 to mode 6Ah (800x600)');
+    assert.ok(stepUntil(() => fbHash() !== h0, 'slide 1 content'),
+        'Right did not blit a new slide (framebuffer unchanged)');
     const h1 = settleHash('slide 1');
-    assert.notEqual(h1, 0, 'slide 1 framebuffer stayed blank');
+    assert.notEqual(h1, h0, 'slide 1 content matches slide 0');
+    assert.equal(vm.activeVideoMode, MODE, 'slide 1 left mode 0x74');
 
-    // Left → back to slide 0: mode returns to 13h and content differs
-    // from slide 1 (proves the back-nav re-blitted slide 0).
+    // Left → back to slide 0: content returns to slide 0 (differs from
+    // slide 1), proving the back-nav re-blitted.
     vm.pushInput(KEY.LEFT);
-    assert.ok(stepUntil(() => vm.activeVideoMode === EXPECT_MODE[0], 'back to mode 13h'),
-        'Left did not return to slide 0 (mode 13h)');
+    assert.ok(stepUntil(() => fbHash() !== h1, 'back to slide 0 content'),
+        'Left did not re-blit slide 0');
     const h0b = settleHash('slide 0 again');
-    assert.notEqual(h0b, 0, 'slide 0 (return) framebuffer stayed blank');
+    assert.notEqual(h0b, h1, 'back-nav content still matches slide 1');
+    assert.equal(h0b, h0, 're-blitted slide 0 differs from the first time');
 
-    // Enter is a fallback for "next" — should advance to slide 1 again.
+    // Enter is a fallback for "next" — should advance off slide 0 again.
     vm.pushInput(KEY.ENTER);
-    assert.ok(stepUntil(() => vm.activeVideoMode === EXPECT_MODE[1], 'Enter → mode 6Ah'),
-        'Enter did not advance to slide 1');
+    assert.ok(stepUntil(() => fbHash() !== h0b, 'Enter advances'),
+        'Enter did not advance to the next slide');
 
-    console.log(`ok  deck  mode 0x70 ⇄ 0x72 via Right/Left/Enter, slides blit  steps=${vm.steps}`);
+    console.log(`ok  deck  mode 0x74 uniform, Right/Left/Enter blit new slides  steps=${vm.steps}`);
 } catch (e) {
     console.error(`FAIL deck: ${e.message}`);
     failed = 1;

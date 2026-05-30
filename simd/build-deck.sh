@@ -68,6 +68,20 @@ fi
 echo "[gen] $(basename "$DECK_TOML")"
 uv run "$HERE/gen_deck.py" "$DECK_TOML" -o "$TMP"
 
+# Guard: the slide blob is baked into the ELF's .rodata (slides_data),
+# which lands in turbo86's 16 MiB guest region at 0x08048000 when the
+# acceleration boost hands the session over. Too big a blob overruns it
+# (past 0x09048000) and the boost breaks — so fail the build early,
+# before the slow llvm-mov compile, rather than ship an unboostable deck.
+# Mirrors simd/test-deck-size.py; lower the deck resolution to fix.
+BLOB_BYTES=$(stat -c %s "$TMP/deck.bin")
+BUDGET=$(( 16 * 1024 * 1024 - 1024 * 1024 ))   # 16 MiB region, minus code/header headroom
+if [ "$BLOB_BYTES" -gt "$BUDGET" ]; then
+    echo "deck.bin ${BLOB_BYTES} B exceeds turbo86 boost budget ${BUDGET} B" >&2
+    echo "  → lower the deck resolution (pdf_to_deck.py --res / deck.toml)" >&2
+    exit 1
+fi
+
 echo "[llvm-mov] $(basename "$SRC_C")"
 # -O2: this deck legalizes to ~99.5% mov at every opt level (the only
 # non-mov left is jmp), and -O2 is both the highest (99.52%) and the
@@ -85,6 +99,7 @@ mkdir -p "$(dirname "$OUT")"
 ld -m elf_i386 -static --hash-style=gnu \
     --section-start=.fb70=0x800000 --undefined=_fb70_region \
     --section-start=.fb72=0xC00000 --undefined=_fb72_region \
+    --section-start=.fb74=0x1800000 --undefined=_fb74_region \
     "$TMP/start.o" "$TMP/deck.o" "$TMP/deck_data.o" "$TMP/stubs.o" \
     -o "$OUT"
 strip --strip-all "$OUT"

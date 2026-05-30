@@ -69,6 +69,7 @@ export const FRAMEBUFFER_MODES = Object.freeze([
     { id: '16:9 qHD',   modeNumber: 0x71, addr: 0x00A0_0000, width: 960,  height: 540 },  //  2.0 MB
     { id: '16:9 HD',    modeNumber: 0x72, addr: 0x00C0_0000, width: 1280, height: 720 },  //  3.5 MB
     { id: '16:9 FHD',   modeNumber: 0x73, addr: 0x0100_0000, width: 1920, height: 1080 }, //  7.9 MB
+    { id: '16:9 qnHD',  modeNumber: 0x74, addr: 0x0180_0000, width: 320,  height: 180 },  //  230 KB — low-res 16:9; a whole deck of these fits turbo86's 16 MiB boost region
 ].map(m => Object.freeze({
     ...m,
     bytesPerPixel: 4,
