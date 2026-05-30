@@ -205,8 +205,15 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
     }
     raf = requestAnimationFrame(frame);
 
-    function boost(url = turbo86Url) {
+    function boost(arg = turbo86Url) {
         if (engine === 'turbo86') return;
+        // Accept either a plain ws:// URL string or a { url, mode } object —
+        // the deck viewer wires the address box + mode <select> as an object
+        // (deck.boost({ url, mode })), while the default arg / programmatic
+        // callers pass a string. Without this, `new WebSocket({url,mode})`
+        // stringifies the object to "[object Object]" and never connects.
+        const url = typeof arg === 'string' ? arg : (arg?.url ?? turbo86Url);
+        const mode = (arg && typeof arg === 'object' && arg.mode) ? arg.mode : 'host';
         opts.onEngine?.('local', `connecting ${url}…`);
         try {
             ws = new WebSocket(url);
@@ -241,7 +248,7 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
                 return;
             }
             try {
-                ws.send(makeLoadElfMessage(payload, 'host', memUpdateMs));
+                ws.send(makeLoadElfMessage(payload, mode, memUpdateMs));
             } catch (e) {
                 opts.onEngine?.('local', `send failed: ${e.message || e}`);
                 return;
