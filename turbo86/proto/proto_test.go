@@ -81,6 +81,26 @@ func TestInboundRoundTrip(t *testing.T) {
 				},
 			}},
 		},
+		{
+			// LoadElf is the large-deck handover: ship the compact
+			// ELF image instead of migrating ~160 MiB of baked-in
+			// slide pixels. WatchRegions pins MemUpdate to the
+			// framebuffer so mid-run snapshots don't re-stream the
+			// immutable .rodata.
+			"LoadElf with watch regions",
+			LoadElf{
+				Elf:                 []byte{0x7F, 'E', 'L', 'F', 0x01, 0x01, 0x01, 0x00},
+				Mode:                ModeHost,
+				MemUpdateIntervalMs: 100,
+				WatchRegions: []WatchRegion{
+					{Addr: 0x0080_0000, Size: 480 * 270 * 4},
+				},
+			},
+		},
+		{
+			"LoadElf minimal (no watch regions, no cadence)",
+			LoadElf{Elf: []byte{0x7F, 'E', 'L', 'F'}},
+		},
 		{"Stop", Stop{}},
 		{"Pause", Pause{}},
 		{"KeyInput Right", KeyInput{Code: 0x81}},
