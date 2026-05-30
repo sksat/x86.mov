@@ -16,10 +16,14 @@
 # re-issues set_video_mode whenever the resolution changes between
 # slides.
 
+# Same title image twice — slide 1 low-res (320x200), slide 2 the same
+# picture at high res (800x600). Paging from 1→2 shows the identical
+# content sharpen up; the heavier blit is where the acceleration boost
+# earns its keep.
 [[slides]]
 image = "slide1-title.png"
 resolution = "320x200"
 
 [[slides]]
-image = "slide2.png"
+image = "slide1-title.png"
 resolution = "800x600"
