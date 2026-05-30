@@ -21,9 +21,5 @@ image = "slide1-title.png"
 resolution = "320x200"
 
 [[slides]]
-image = "color:482a18"
-resolution = "800x600"
-
-[[slides]]
-image = "color:5a1e2e"
+image = "slide2.png"
 resolution = "800x600"
