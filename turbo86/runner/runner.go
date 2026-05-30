@@ -13,6 +13,7 @@ package runner
 
 import (
 	"bytes"
+	"compress/gzip"
 	"debug/elf"
 	"errors"
 	"fmt"
@@ -703,7 +704,28 @@ type elfPlan struct {
 // LoadElf rejects an image whose mapped segments would collide with the
 // trap restorer trampoline (0x09040000), rather than silently
 // overwriting it.
+//
+// The image may arrive gzip-compressed (detected by the 1F 8B magic):
+// the SIMD86 deck bakes ~160 MiB of raw RGBA into .rodata, which the
+// browser gzips with CompressionStream before sending so a few-MiB
+// payload crosses the WebSocket instead of a ~213 MiB base64 string.
+// A gzip image is inflated here before the ELF parse; a raw ELF (7F 'E'
+// 'L' 'F') is parsed directly, so existing raw-ELF callers are unaffected.
 func (r *Runner) LoadElf(img []byte, mode proto.Mode, memUpdateMs uint32, watch []proto.WatchRegion) error {
+	// gzip magic (1F 8B) distinguishes a compressed image from a raw ELF
+	// (7F 45 4C 46). Inflate before parsing; raw ELFs fall straight through.
+	if len(img) >= 2 && img[0] == 0x1f && img[1] == 0x8b {
+		gr, err := gzip.NewReader(bytes.NewReader(img))
+		if err != nil {
+			return fmt.Errorf("LoadElf: open gzip reader: %w", err)
+		}
+		defer gr.Close()
+		decompressed, err := io.ReadAll(gr)
+		if err != nil {
+			return fmt.Errorf("LoadElf: gunzip image: %w", err)
+		}
+		img = decompressed
+	}
 	f, err := elf.NewFile(bytes.NewReader(img))
 	if err != nil {
 		return fmt.Errorf("LoadElf: parse ELF: %w", err)
