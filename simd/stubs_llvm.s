@@ -47,14 +47,14 @@ exit:
 # they cost nothing in the file image. Add a section here (and a
 # --section-start in build-deck.sh) when a deck introduces a new mode.
 
-# mode 13h — 320*200*4 = 256000 bytes at 0xA0000.
-.section .fb13h, "aw", @nobits
-.globl _fb13h_region
-_fb13h_region:
-.skip 256000
+# 16:9 qHD- (mode 0x70) — 480*270*4 = 518400 bytes at 0x800000.
+.section .fb70, "aw", @nobits
+.globl _fb70_region
+_fb70_region:
+.skip 518400
 
-# VESA 6Ah — 800*600*4 = 1920000 bytes at 0x400000.
-.section .fb6Ah, "aw", @nobits
-.globl _fb6Ah_region
-_fb6Ah_region:
-.skip 1920000
+# 16:9 HD (mode 0x72) — 1280*720*4 = 3686400 bytes at 0xC00000.
+.section .fb72, "aw", @nobits
+.globl _fb72_region
+_fb72_region:
+.skip 3686400

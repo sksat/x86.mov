@@ -28,7 +28,7 @@ const mod = await import(`${m86}/build/browser/movie86_wasm.js`);
 await mod.default({ module_or_path: wasm });
 const { KEY, modeForNumber } = await import(`${m86}/movie86.mjs`);
 
-const EXPECT_MODE = [0x13, 0x6a]; // slide 0 320x200, slide 1 800x600
+const EXPECT_MODE = [0x70, 0x72]; // slide 0 480x270, slide 1 1280x720 (16:9)
 
 // 800x600 blits ~480k px through the wasm emulator, so give it room.
 const BUDGET = 800_000_000n;

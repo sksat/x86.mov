@@ -61,6 +61,14 @@ export const FRAMEBUFFER_MODES = Object.freeze([
     { id: 'mode 12h', modeNumber: 0x12, addr: 0x0010_0000, width: 640, height: 480 }, // 1.2 MB  — VGA 16c
     { id: 'mode 10h', modeNumber: 0x10, addr: 0x0030_0000, width: 640, height: 350 }, //  875 KB — EGA/VGA mid-res
     { id: 'VESA 6Ah', modeNumber: 0x6A, addr: 0x0040_0000, width: 800, height: 600 }, // 1.9 MB  — VESA VBE 1.0 SVGA
+    // 16:9 widescreen modes (not real VGA/VESA numbers — "spirit of VGA"
+    // extensions for slide decks authored at 16:9 so they're not
+    // letterboxed). Addresses sit well past the 4:3/8:5 block above and
+    // don't overlap each other.
+    { id: '16:9 qHD-',  modeNumber: 0x70, addr: 0x0080_0000, width: 480,  height: 270 },  //  518 KB
+    { id: '16:9 qHD',   modeNumber: 0x71, addr: 0x00A0_0000, width: 960,  height: 540 },  //  2.0 MB
+    { id: '16:9 HD',    modeNumber: 0x72, addr: 0x00C0_0000, width: 1280, height: 720 },  //  3.5 MB
+    { id: '16:9 FHD',   modeNumber: 0x73, addr: 0x0100_0000, width: 1920, height: 1080 }, //  7.9 MB
 ].map(m => Object.freeze({
     ...m,
     bytesPerPixel: 4,

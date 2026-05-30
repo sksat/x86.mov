@@ -16,18 +16,19 @@
 # re-issues set_video_mode whenever the resolution changes between
 # slides.
 
-# slide 1: title at low res (320x200). slide 2: the SAME title at high
-# res (800x600) — identical content, sharper, and a much heavier blit
-# (this is the slow one on movie86, where the acceleration boost helps).
-# slide 3: the "速くなりましたね" payoff, also high res.
+# All slides are 16:9 (matches the source images, so no letterbox/squash).
+# slide 1: title at low res (480x270). slide 2: the SAME title at high res
+# (1280x720) — identical content, sharper, and a much heavier blit (the
+# slow one on movie86, where the acceleration boost helps). slide 3: the
+# "速くなりましたね" payoff, also high res.
 [[slides]]
 image = "slide1-title.png"
-resolution = "320x200"
+resolution = "480x270"
 
 [[slides]]
 image = "slide1-title.png"
-resolution = "800x600"
+resolution = "1280x720"
 
 [[slides]]
 image = "slide3.png"
-resolution = "800x600"
+resolution = "1280x720"

@@ -64,8 +64,8 @@ as --32 -mx86-used-note=no -o "$TMP/stubs.o" "$HERE/stubs_llvm.s"
 
 mkdir -p "$(dirname "$OUT")"
 ld -m elf_i386 -static --hash-style=gnu \
-    --section-start=.fb13h=0xA0000 --undefined=_fb13h_region \
-    --section-start=.fb6Ah=0x400000 --undefined=_fb6Ah_region \
+    --section-start=.fb70=0x800000 --undefined=_fb70_region \
+    --section-start=.fb72=0xC00000 --undefined=_fb72_region \
     "$TMP/start.o" "$TMP/deck.o" "$TMP/deck_data.o" "$TMP/stubs.o" \
     -o "$OUT"
 strip --strip-all "$OUT"
