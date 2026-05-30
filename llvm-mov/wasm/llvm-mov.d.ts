@@ -99,12 +99,23 @@ export interface RustcVersionSpec {
     editions: ReadonlyArray<'2015' | '2018' | '2021' | '2024'>;
     /** Triples this artefact ships sysroots for. */
     supportedTargets: ReadonlyArray<string>;
-    /** Artefact URLs (overridable per-call via `opts.artefacts`). */
+    /**
+     * Artefact source. Two shapes:
+     *  - Remote (`local` absent / false): driver fetches `rustcWasm`
+     *    and `${sysrootBase}/${triple}.tar.br`, decompresses per
+     *    `compression`, and populates the cache.
+     *  - Local (`local: true`): driver skips fetch; the cache must
+     *    already be populated by an out-of-band step (currently
+     *    `scripts/build-wasm-rustc.sh`). The other fields are
+     *    documentary only — `rustcWasm` typically uses a `local:`
+     *    sentinel URL to make the layout self-explanatory.
+     */
     artefacts: {
+        local?: boolean;
         rustcWasm: string;
         /** Per-target sysroot lives at `${sysrootBase}/${triple}.tar.br`. */
         sysrootBase: string;
-        compression: 'brotli';
+        compression: 'brotli' | 'none';
     };
     /**
      * Parity-test hint: which `rustup` channel matches this artefact's

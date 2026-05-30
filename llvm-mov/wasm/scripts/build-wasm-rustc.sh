@@ -112,13 +112,24 @@ chmod +x "$linker_wrapper"
 
 # Tell x.py to install into our cache dir directly. The bjorn3 fork
 # honours --prefix.
+#
+# `target = [...]` must match the TARGETS array above — those are the
+# sysroots step 5/6 expect to find under dist/lib/rustlib/<triple>/lib/.
+# The load-bearing one for the mov pipeline is i686-unknown-linux-gnu
+# (the rubrc artefact lacks it); the others mirror what rubrc ships
+# so this row is a superset.
 cat > "$rust_src/config.toml" <<EOF
 profile = "compiler"
 change-id = 0
 
 [build]
-target = ["wasm32-wasip1-threads"]
 build = "x86_64-unknown-linux-gnu"
+target = [
+    "i686-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "wasm32-wasip1",
+    "wasm32-wasip1-threads",
+]
 extended = false
 docs = false
 
