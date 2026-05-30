@@ -81,18 +81,24 @@ which is the property milestone 3 will lean on.
 
 ## Roadmap
 
-1. **survey** — mov-compile every rcc translation unit. *(done: 35/36)*
-2. **link** — combine the `.o` into a mov-only `rcc` ELF. The link recipe
-   mirrors [`../movfuscator-wasm/tests/run-multi.mjs`](../movfuscator-wasm/tests/run-multi.mjs)
-   (crt0/crtf/crtd + softfloat + `-lgcc -lc -lm`). Blocked on wall #3 for a
-   *fully* mov-only rcc; a hybrid (front-end mov + native `mov.o`) is linkable
-   sooner.
-3. **run** — execute that `rcc` (natively or in movie86) to compile a real
-   program.
+1. **survey** — mov-compile every rcc translation unit. **done: 35/36**
+   (`run.sh`).
+2. **link** — combine the `.o` into a self-hosted `rcc` ELF. **done**
+   (`link.sh`). 38 of 39 units are mov-compiled — the entire lcc front-end, six
+   backend selectors, and the liblcc runtime (assert/yynull/bbexit); only the
+   mov backend selector `mov.c` is native i386 (wall #3). The result links and
+   starts in both the default mov-flow (~46 MB) and the `--no-mov-flow`
+   (`MOV_FLOW=0`, ~29 MB) variants.
+3. **run** — execute that `rcc` to compile a real program. **open.** The
+   self-hosted rcc loads and runs (CPU-active, no crash) but does not finish a
+   compilation in practical time — it stalls in the mov-compiled front-end
+   before code generation even prints its banner. The native rcc compiles the
+   same input instantly, so the inputs/invocation are fine; the open question
+   is whether this is pure mov slowness or a miscompile in one front-end unit.
 4. **triple** — the classic LCC self-host proof: rcc → 1rcc → 2rcc, asserting
    `1rcc` and `2rcc` are byte-identical (the upstream makefile's `triple`
    target).
 
 Scale note: the backends are huge — `x86linux.c` alone is ~1.39M lines of `.s`
-/ ~907k mov instructions / a ~10.8 MB object. A full mov-only rcc will be
-enormous and slow.
+/ ~907k mov instructions / a ~10.8 MB object. A full mov-only rcc is enormous
+and slow.
