@@ -424,6 +424,15 @@ type Runner struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
+	// inputCh is the runner's input queue feeding the CALL_POLL_INPUT
+	// ABI. The orchestrating goroutine (WS handler) PushInputs key codes
+	// onto it; the tracer goroutine drains one per poll, non-blocking
+	// both ways. Buffered so a burst of keystrokes between polls isn't
+	// lost; a full buffer drops the oldest-unread excess (a held arrow
+	// key spamming faster than the guest polls is the only way to hit
+	// it, and dropping there is the right behaviour — see PushInput).
+	inputCh chan uint8
+
 	// tickerStop is closed by the tracer goroutine's defer to signal
 	// the MemUpdate ticker (if running) to wind down, and tickerWg
 	// is the join handle the defer waits on **before** closing
@@ -497,6 +506,10 @@ func New(stubBytes []byte) (*Runner, error) {
 		done:       make(chan struct{}),
 		tickerStop: make(chan struct{}),
 		perfFd:     -1,
+		// Buffered: keystrokes arrive on the WS goroutine and are drained
+		// on the tracer goroutine at poll time. 256 is plenty for human
+		// input between polls; overflow drops excess (PushInput).
+		inputCh: make(chan uint8, 256),
 	}
 
 	bootErr := make(chan error, 1)
@@ -627,6 +640,34 @@ func (r *Runner) Pause() error {
 		return err
 	}
 	return nil
+}
+
+// PushInput enqueues one generic input key code for the guest to read
+// via the CALL_POLL_INPUT ABI. Safe to call from the orchestrating
+// goroutine (the WS handler) while the tracer goroutine is running —
+// the channel is the synchronisation point.
+//
+// Non-blocking: if the buffer is full (a key held down spamming faster
+// than the guest polls) the code is dropped rather than stalling the WS
+// reader. Dropping is the right call for input — a slideshow that's
+// behind on a held arrow key wants to land on the latest reachable
+// slide, not replay a backlog.
+func (r *Runner) PushInput(code uint8) {
+	select {
+	case r.inputCh <- code:
+	default:
+	}
+}
+
+// popInput returns the next queued key code, or keyNone if the queue is
+// empty. Called only from the tracer goroutine (the poll dispatch).
+func (r *Runner) popInput() uint8 {
+	select {
+	case code := <-r.inputCh:
+		return code
+	default:
+		return keyNone
+	}
 }
 
 // tracerLoop owns the OS thread that did exec.Cmd.Start. All ptrace
@@ -1043,12 +1084,12 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 		return r.handleMmapRequest(call, regs)
 	case abiCallPollInput:
 		// Poll for one pending input event. The guest's written value
-		// (the trigger) is ignored; we hand a key code back in EAX, the
-		// same "return through EAX" shape abiCallWrite uses. No input
-		// source is wired yet, so this always reports keyNone — the
-		// EIP-advance + SetRegs at the bottom of the switch writes the
-		// updated EAX back to the guest.
-		regs.Eax = uint32(keyNone)
+		// (the trigger) is ignored; we pop one key code off the input
+		// queue (keyNone if empty) and hand it back in EAX — the same
+		// "return through EAX" shape abiCallWrite uses. Keys arrive from
+		// the frontend over the wire as proto.KeyInput; the EIP-advance
+		// + SetRegs at the bottom of the switch writes EAX back.
+		regs.Eax = uint32(r.popInput())
 	case abiCallWrite:
 		// Mirrors the int 0x80 SYS_write ABI: fd in ebx, buf in ecx,
 		// len in edx. eax (the "value" the guest wrote to trigger the

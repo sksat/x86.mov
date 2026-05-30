@@ -166,6 +166,21 @@ type Pause struct{}
 
 func (Pause) inboundKind() string { return "pause" }
 
+// KeyInput delivers one generic input key code to a running guest. The
+// runner enqueues it; the guest reads it via the mov-only CALL_POLL_INPUT
+// ABI (one code per poll, KEY_NONE when the queue is empty). Codes match
+// movie86's KEY_* alphabet (printable ASCII pass through; non-printable
+// keys use the 0x80+ block) — the same byte the local movie86 Vm would
+// see via pushInput, so a deck behaves identically before and after a
+// turbo86 handover. This is what makes native-speed slide advance work:
+// the frontend forwards keydowns over the wire and the guest blits at
+// full native speed instead of crawling through the wasm emulator.
+type KeyInput struct {
+	Code uint8 `json:"code"`
+}
+
+func (KeyInput) inboundKind() string { return "key_input" }
+
 // MarshalInbound encodes an Inbound as a JSON object with a "type" field.
 func MarshalInbound(msg Inbound) ([]byte, error) {
 	switch m := msg.(type) {
@@ -192,6 +207,11 @@ func MarshalInbound(msg Inbound) ([]byte, error) {
 		return json.Marshal(struct {
 			Type string `json:"type"`
 		}{m.inboundKind()})
+	case KeyInput:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			KeyInput
+		}{m.inboundKind(), m})
 	default:
 		return nil, fmt.Errorf("proto: unknown Inbound type %T", msg)
 	}
@@ -229,6 +249,12 @@ func UnmarshalInbound(data []byte) (Inbound, error) {
 		return Stop{}, nil
 	case "pause":
 		return Pause{}, nil
+	case "key_input":
+		var m KeyInput
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, fmt.Errorf("proto: parsing KeyInput payload: %w", err)
+		}
+		return m, nil
 	default:
 		return nil, fmt.Errorf("proto: unknown Inbound type %q", probe.Type)
 	}

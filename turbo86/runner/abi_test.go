@@ -178,6 +178,50 @@ func TestRunOnce_AbiPollInput(t *testing.T) {
 	}
 }
 
+// TestRunOnce_AbiPollInput_ReturnsQueuedKey drives the input *source*:
+// a key code pushed onto the runner before the guest runs must come
+// back from the poll in EAX. This is what makes native-speed slide
+// advance work — the frontend's keydown becomes a proto.KeyInput, the
+// runner queues it, and the guest reads it through the same ABI slot.
+//
+// Guest:
+//
+//	A2 40 00 FE 1F      mov [0x1FFE0040], al  ; poll → EAX = queued key
+//	A3 FE 00 FE 1F      mov [0x1FFE00FE], eax ; exit(EAX)
+func TestRunOnce_AbiPollInput_ReturnsQueuedKey(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	const entry uint32 = 0x08048000
+	const keyRight uint8 = 0x81 // movie86 KEY_RIGHT
+	code := []byte{
+		0xA2, 0x40, 0x00, 0xFE, 0x1F,
+		0xA3, 0xFE, 0x00, 0xFE, 0x1F,
+	}
+
+	r, err := New(stub.Bytes)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer r.Close()
+
+	// Queue the key before the guest starts; the poll must dequeue it.
+	r.PushInput(keyRight)
+
+	ch := r.RunWithContextAndMode(proto.Context{
+		Regs:    proto.Regs{Eip: entry, Esp: testStackTop},
+		Regions: []proto.MemRegion{{Addr: entry, Bytes: code}},
+	}, proto.ModeHost)
+	var events []proto.Outbound
+	for ev := range ch {
+		events = append(events, ev)
+	}
+	want := []proto.Outbound{proto.Exit{Code: int32(keyRight)}}
+	if !reflect.DeepEqual(events, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", events, want)
+	}
+}
+
 // TestRunOnce_AbiLoadContext_AutoMmapsOutOfRangeRegions verifies that
 // a LoadContext carrying a region OUTSIDE the stub's static guestRegions
 // triggers a dynamic mmap2 before the region's bytes are written via

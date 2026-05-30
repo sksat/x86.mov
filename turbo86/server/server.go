@@ -247,6 +247,9 @@ func handleSession(ctx context.Context, ws *websocket.Conn, slog *sessionLogger)
 					readDone <- fmt.Errorf("pause: %w", err)
 					return
 				}
+			case proto.KeyInput:
+				slog.logf("inbound KeyInput: code=%#x", m.Code)
+				r.PushInput(m.Code)
 			default:
 				readDone <- fmt.Errorf("unexpected inbound %T after Start/LoadContext", msg)
 				return

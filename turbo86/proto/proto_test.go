@@ -83,6 +83,9 @@ func TestInboundRoundTrip(t *testing.T) {
 		},
 		{"Stop", Stop{}},
 		{"Pause", Pause{}},
+		{"KeyInput Right", KeyInput{Code: 0x81}},
+		{"KeyInput printable", KeyInput{Code: 'a'}},
+		{"KeyInput zero", KeyInput{Code: 0}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
