@@ -63,16 +63,20 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
     let raf = 0;
 
     // Keyboard → the live engine: turbo86 over the WS as proto.KeyInput
-    // while boosted, otherwise the local Vm's input queue. Gated to canvas
-    // hover (off-canvas keystrokes stay with the page). Reads `engine`/`ws`
-    // live so the same handler follows the boost flip without re-attaching.
+    // while boosted, otherwise the local Vm's input queue. Reads `engine`/
+    // `ws` live so the same handler follows the boost flip without
+    // re-attaching. Gated to hover over the whole slide *area* (the
+    // canvas's parent pane), not just the canvas: object-fit letterboxes
+    // the canvas, so a pointer over the margin should still drive slides.
+    // Off-area keystrokes stay with the page.
+    const hoverEl = opts.hoverEl ?? canvas.parentElement ?? canvas;
     const detach = attachKeyboard((code) => {
         if (engine === 'turbo86' && ws && ws.readyState === WebSocket.OPEN) {
             ws.send(makeKeyInputMessage(code));
         } else {
             vm.pushInput(code);
         }
-    }, canvas);
+    }, hoverEl);
 
     // Render the active mode's framebuffer. Reads from the local Vm for
     // both engines — turbo86's MemUpdate is written back into it.

@@ -32,12 +32,14 @@
       background: #0b0b12; overflow: hidden;
     }
     /* Canvas keeps its native backing store (set per slide to the mode's
-       resolution); CSS scales it to the pane via max-width/height,
-       keeping the canvas's *intrinsic* ratio (so 320x200 and 800x600
-       both render undistorted). Pixelated so small art stays crisp. */
+       resolution); CSS fills the pane and lets object-fit: contain scale
+       the bitmap up *or* down to fit, preserving its intrinsic aspect
+       ratio. So a low-res 320x200 slide is enlarged to roughly the same
+       on-screen size as an 800x600 one (letterboxed if ratios differ)
+       instead of showing tiny. Pixelated so the upscale stays crisp. */
     #screen {
-      max-width: 100%; max-height: 100%;
-      width: auto; height: auto;
+      width: 100%; height: 100%;
+      object-fit: contain;
       image-rendering: pixelated;
       background: #000;
     }
@@ -101,7 +103,7 @@
   <header>
     <h1>SIMD86</h1>
     <span class="tag">Single Instruction, Multiple Decks</span>
-    <span class="hint">canvas にカーソルを乗せて ← → / Space で操作</span>
+    <span class="hint">スライド領域にカーソルを乗せて ← → / Space / Enter で操作</span>
   </header>
 
   <div id="split">
