@@ -195,8 +195,15 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
     }
     raf = requestAnimationFrame(frame);
 
-    function boost(url = turbo86Url) {
+    function boost(arg = turbo86Url) {
         if (engine === 'turbo86') return;
+        // Accept both shapes: boost('ws://…') and the page's
+        // boost({url, mode}) from the address box + mode selector. Coercing
+        // an object straight into `new WebSocket` stringifies it to
+        // "[object Object]", which resolves against the page origin and 404s
+        // instead of reaching turbo86 — so normalise here.
+        const url = (typeof arg === 'string' ? arg : arg?.url) || turbo86Url;
+        const mode = (arg && typeof arg === 'object' && arg.mode) || 'host';
         let snap;
         try {
             snap = snapshotContext(vm);
@@ -215,7 +222,7 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
         ws.onopen = () => {
             // Ask turbo86 to stream the framebuffer back so the canvas
             // keeps updating at native speed.
-            ws.send(makeLoadContextMessage(snap, 'host', memUpdateMs));
+            ws.send(makeLoadContextMessage(snap, mode, memUpdateMs));
             engine = 'turbo86';
             opts.onEngine?.('turbo86');
         };
