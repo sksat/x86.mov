@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -786,6 +787,13 @@ func (r *Runner) LoadElf(img []byte, mode proto.Mode, memUpdateMs uint32, watch 
 		if mapEnd <= mapStart {
 			return fmt.Errorf("LoadElf: segment at 0x%x size 0x%x wraps", vaddr, memsz)
 		}
+		// A valid ELF has filesz <= memsz; the reverse would have us write
+		// more bytes (filesz) than the region is mapped for (sized from
+		// memsz), overrunning the mapping. Reject malformed images.
+		if uint32(p.Filesz) > memsz {
+			return fmt.Errorf("LoadElf: segment at 0x%x filesz 0x%x exceeds memsz 0x%x",
+				vaddr, p.Filesz, memsz)
+		}
 		// Read the first p_filesz bytes via the program header (handles
 		// p_offset / compression / the file image). The Memsz-Filesz BSS
 		// tail needs no write: in-arena pages start zero, and an anon
@@ -833,6 +841,59 @@ func (r *Runner) LoadElf(img []byte, mode proto.Mode, memUpdateMs uint32, watch 
 	return nil
 }
 
+// mapSegmentGaps backs [start,end) (page-aligned guest addresses) with
+// guest memory, mmapping ONLY the pages not already mapped — by the
+// stub's static guestRegions or a previously-mapped segment recorded in
+// extraRegions. This matters when PT_LOAD segments share a page, or a
+// segment partially overlaps the static arena (the deck's .rodata starts
+// inside the arena and runs past it): a blanket MAP_FIXED mmap of the
+// whole range would re-map — and zero — pages an earlier segment already
+// wrote, and would waste the mmapMaxRegions budget on redundant mappings.
+// Gaps are mmap'd via mmapRegionForLoadContext (the same injectSyscall
+// path), so they land in extraRegions and the snapshot walk picks them
+// up. Caller must be on the tracer thread with the child stopped.
+func (r *Runner) mapSegmentGaps(start, end uint32, regs *regs32) error {
+	type iv struct{ a, b uint32 }
+	var mapped []iv
+	for _, gr := range guestRegions {
+		mapped = append(mapped, iv{gr.addr, gr.addr + gr.size})
+	}
+	r.extraRegionsMu.RLock()
+	for _, er := range r.extraRegions {
+		mapped = append(mapped, iv{er.addr, er.addr + er.size})
+	}
+	r.extraRegionsMu.RUnlock()
+	sort.Slice(mapped, func(i, j int) bool { return mapped[i].a < mapped[j].a })
+
+	cur := start
+	for _, m := range mapped {
+		if cur >= end {
+			break
+		}
+		if m.b <= cur || m.a >= end {
+			continue // no overlap with the remaining [cur,end)
+		}
+		if m.a > cur {
+			gapEnd := m.a
+			if gapEnd > end {
+				gapEnd = end
+			}
+			if err := r.mmapRegionForLoadContext(cur, gapEnd-cur, regs); err != nil {
+				return err
+			}
+		}
+		if m.b > cur {
+			cur = m.b
+		}
+	}
+	if cur < end {
+		if err := r.mmapRegionForLoadContext(cur, end-cur, regs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // applyElfPlan maps and writes the staged PT_LOAD segments into the
 // stopped guest. Called once from tracerLoop after the trampoline is
 // written and before the syscall loop starts, so injectSyscall (used by
@@ -842,7 +903,7 @@ func (r *Runner) LoadElf(img []byte, mode proto.Mode, memUpdateMs uint32, watch 
 func (r *Runner) applyElfPlan(plan *elfPlan, regs *regs32) error {
 	for _, s := range plan.segments {
 		if !s.inArena {
-			if err := r.mmapRegionForLoadContext(s.mapStart, s.mapEnd-s.mapStart, regs); err != nil {
+			if err := r.mapSegmentGaps(s.mapStart, s.mapEnd, regs); err != nil {
 				return fmt.Errorf("mmap ELF segment 0x%x..0x%x: %w", s.mapStart, s.mapEnd, err)
 			}
 		}
