@@ -20,6 +20,8 @@
       border-bottom: 1px solid #2a2a3a; flex: 0 0 auto;
     }
     header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+    header .load { color: #ffcc66; font-size: 12px; font-variant-numeric: tabular-nums; }
+    header .load.done { display: none; }
     header .hint { margin-left: auto; color: #777; font-size: 12px; }
 
     /* Side-by-side: slide pane | draggable divider | movie86 pane. */
@@ -116,6 +118,7 @@
 <body>
   <header>
     <h1>SIMD86</h1>
+    <span class="load" id="load">デックを読み込み中…</span>
     <span class="hint">スライド領域にカーソルを乗せて ← → / Space / Enter で操作</span>
   </header>
 
@@ -170,8 +173,27 @@
 
     function fmt(n) { return Number(n).toLocaleString(); }
 
+    function mib(n) { return `${(n / 1048576).toFixed(1)} MiB`; }
+
     const deck = await runDeck(canvas, './deck.elf', {
-      onStatus({ steps, mode, width, height, halt }) {
+      onStatus(s) {
+        // Two payload shapes share onStatus: deck-load progress (from
+        // fetchDeck) before the Vm exists, then per-frame run status.
+        if (s.loading) {
+          const el = $('load');
+          // Note: when the browser transparently decodes Content-Encoding:
+          // zstd, content-length is the *compressed* size but the stream
+          // yields decompressed bytes, so loadedBytes can exceed
+          // totalBytes — only show a % while it's still meaningful.
+          if (s.decompressing) el.textContent = 'デック展開中…';
+          else if (s.totalBytes && s.loadedBytes <= s.totalBytes) el.textContent =
+            `デック読み込み中… ${mib(s.loadedBytes)} / ${mib(s.totalBytes)} `
+            + `(${Math.floor(s.loadedBytes / s.totalBytes * 100)}%)`;
+          else el.textContent = `デック読み込み中… ${mib(s.loadedBytes)}`;
+          return;
+        }
+        $('load').classList.add('done'); // loaded — hide the indicator
+        const { steps, mode, width, height, halt } = s;
         $('s-steps').textContent = fmt(steps);
         const now = performance.now();
         const dt = now - prevT;
