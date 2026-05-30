@@ -1,103 +1,127 @@
-#!/usr/bin/env python3
-"""Generate a placeholder SIMD86 deck as raw RGBA + an asm blob.
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pillow"]
+# ///
+"""Convert a SIMD86 deck spec (+ images) into the guest memory image.
 
-SIMD86 slides are just image data; the mov-only renderer (deck.c) blits
-the current one to movie86's mode-13h framebuffer. This script makes a
-few procedurally-drawn 320x200 placeholder slides so the flip mechanism
-can be built and tested before any real slide art exists — swap in real
-images later by pointing the build at PNG-derived RGBA instead.
+Run with uv (`uv run gen_deck.py ...`) — the PEP 723 header above pins
+Python + Pillow so the toolchain is reproducible without a manual venv.
 
-Outputs (into the dir given as argv[1], default cwd):
-  - deck.bin       raw RGBA, n_slides * 320*200*4 bytes, slide-major
-  - deck_data.s    `.incbin "deck.bin"` + an `n_slides` long, so the C
-                   side sees `extern const unsigned slides_data[]` and
-                   `extern const int n_slides` without the compiler ever
-                   parsing a giant array literal.
+Input:  a deck.toml listing slides top-to-bottom, each with an image and
+        a resolution (see deck.toml for the format).
+Output (into the dir given as -o, default cwd):
+  - deck.bin     raw RGBA, one frame per slide, concatenated. This is the
+                 "memory image" the renderer blits from.
+  - deck_data.s  `.incbin "deck.bin"` + a slide table the mov-only
+                 renderer (deck.c) indexes:
+                   n_slides   : .long  slide count
+                   slide_mode : .long[] video mode byte per slide
+                   slide_addr : .long[] framebuffer guest address per slide
+                   slide_npix : .long[] pixel count (w*h) per slide
+                   slide_off  : .long[] byte offset into slides_data
 
-Pixel byte order is R,G,B,A (little-endian u32 0xAABBGGRR) — what the
-canvas examples and JS putImageData expect.
+Pixel byte order is R,G,B,A (little-endian u32 0xAABBGGRR) — what movie86
+and JS putImageData expect.
+
+Resolution -> (video mode, framebuffer address) must match movie86's
+FRAMEBUFFER_MODES (movie86.mjs). When the resolution changes between
+slides the renderer re-issues set_video_mode with the new mode byte.
+
+Usage:  gen_deck.py DECK_TOML -o OUT_DIR
 """
 
-import sys
+import argparse
+import os
 import struct
+import sys
+import tomllib
 
-W, H = 320, 200
-
-# Distinct opaque background colours, one per slide. (R, G, B)
-BACKGROUNDS = [
-    (30, 30, 46),    # slide 1 — dark indigo
-    (40, 54, 24),    # slide 2 — deep green
-    (60, 30, 30),    # slide 3 — maroon
-    (24, 40, 54),    # slide 4 — steel blue
-]
-FG = (220, 220, 220)  # marker / border colour
-
-
-def px(r, g, b, a=255):
-    return struct.pack("<BBBB", r, g, b, a)
+# (width, height) -> (mode byte, framebuffer guest addr). Mirrors
+# movie86.mjs FRAMEBUFFER_MODES; keep in sync.
+MODES = {
+    (320, 200): (0x13, 0x000A0000),
+    (640, 480): (0x12, 0x00100000),
+    (640, 350): (0x10, 0x00300000),
+    (800, 600): (0x6A, 0x00400000),
+}
 
 
-def make_slide(index, n):
-    """Build one slide: solid background, a light border, and `index+1`
-    filled squares along the top — a dead-simple 'which slide am I'
-    indicator that's obvious even without text rendering."""
-    bg = BACKGROUNDS[index % len(BACKGROUNDS)]
-    bg_px = px(*bg)
-    fg_px = px(*FG)
-    buf = bytearray(bg_px * (W * H))
+def parse_color(spec):
+    """`color:RRGGBB` -> opaque RGBA bytes for one pixel."""
+    hexs = spec[len("color:"):]
+    if len(hexs) != 6:
+        raise ValueError(f"color must be RRGGBB, got {spec!r}")
+    r, g, b = (int(hexs[i:i + 2], 16) for i in (0, 2, 4))
+    return struct.pack("<BBBB", r, g, b, 255)
 
-    def put(x, y, p):
-        if 0 <= x < W and 0 <= y < H:
-            off = (y * W + x) * 4
-            buf[off:off + 4] = p
 
-    # 2px border.
-    for x in range(W):
-        for t in range(2):
-            put(x, t, fg_px)
-            put(x, H - 1 - t, fg_px)
-    for y in range(H):
-        for t in range(2):
-            put(t, y, fg_px)
-            put(W - 1 - t, y, fg_px)
-
-    # index+1 filled 16x16 markers across the top-left.
-    sq = 16
-    gap = 8
-    for m in range(index + 1):
-        x0 = 16 + m * (sq + gap)
-        y0 = 24
-        for dy in range(sq):
-            for dx in range(sq):
-                put(x0 + dx, y0 + dy, fg_px)
-
-    return bytes(buf)
+def slide_rgba(image, w, h, base_dir):
+    """Produce w*h*4 RGBA bytes for one slide."""
+    if image.startswith("color:"):
+        return parse_color(image) * (w * h)
+    from PIL import Image  # provided by the PEP 723 dependency
+    path = image if os.path.isabs(image) else os.path.join(base_dir, image)
+    return Image.open(path).convert("RGBA").resize((w, h)).tobytes()
 
 
 def main():
-    out_dir = sys.argv[1] if len(sys.argv) > 1 else "."
-    n = int(sys.argv[2]) if len(sys.argv) > 2 else 4
-    n = max(1, min(n, len(BACKGROUNDS)))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("deck_toml")
+    ap.add_argument("-o", "--out-dir", default=".")
+    args = ap.parse_args()
 
-    blob = b"".join(make_slide(i, n) for i in range(n))
-    with open(f"{out_dir}/deck.bin", "wb") as f:
+    base_dir = os.path.dirname(os.path.abspath(args.deck_toml))
+    with open(args.deck_toml, "rb") as f:
+        spec = tomllib.load(f)
+    slides = spec.get("slides", [])
+    if not slides:
+        sys.exit(f"gen_deck: no [[slides]] in {args.deck_toml}")
+
+    blob = bytearray()
+    modes, addrs, npix, offs = [], [], [], []
+    for i, s in enumerate(slides, start=1):
+        res = s["resolution"]
+        try:
+            w, h = (int(x) for x in res.lower().split("x"))
+        except ValueError:
+            sys.exit(f"gen_deck: slide {i}: bad resolution {res!r}")
+        if (w, h) not in MODES:
+            sys.exit(f"gen_deck: slide {i}: resolution {res} is not a "
+                     f"movie86 framebuffer mode {sorted(MODES)}")
+        mode, addr = MODES[(w, h)]
+        data = slide_rgba(s["image"], w, h, base_dir)
+        assert len(data) == w * h * 4
+        offs.append(len(blob))
+        blob.extend(data)
+        modes.append(mode)
+        addrs.append(addr)
+        npix.append(w * h)
+
+    with open(f"{args.out_dir}/deck.bin", "wb") as f:
         f.write(blob)
 
-    with open(f"{out_dir}/deck_data.s", "w") as f:
+    def longs(name, vals):
+        body = "".join(f"    .long {v}\n" for v in vals)
+        return f".globl {name}\n.align 4\n{name}:\n{body}"
+
+    with open(f"{args.out_dir}/deck_data.s", "w") as f:
         f.write(
-            "/* Generated by gen_deck.py — do not edit. Raw RGBA slide\n"
-            " * data linked straight in via .incbin so the C compiler\n"
-            " * never sees a giant array literal. */\n"
+            "/* Generated by gen_deck.py — do not edit. Slide memory image\n"
+            " * (.incbin) + slide table. */\n"
             ".section .rodata\n"
-            ".globl slides_data\n"
-            ".align 4\n"
-            "slides_data:\n"
+            ".globl slides_data\n.align 4\nslides_data:\n"
             '    .incbin "deck.bin"\n'
-            ".globl n_slides\n"
-            ".align 4\n"
-            f"n_slides:\n    .long {n}\n"
+            + longs("n_slides", [len(slides)])
+            + longs("slide_mode", modes)
+            + longs("slide_addr", addrs)
+            + longs("slide_npix", npix)
+            + longs("slide_off", offs)
         )
-    print(f"gen_deck: {n} slides, {len(blob)} bytes → {out_dir}/deck.bin")
+
+    print(f"gen_deck: {len(slides)} slides, {len(blob)} bytes "
+          f"({', '.join(f'{m:#x}@{a:#x}' for m, a in zip(modes, addrs))}) "
+          f"-> {args.out_dir}/deck.bin")
 
 
 if __name__ == "__main__":

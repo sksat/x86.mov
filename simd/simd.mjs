@@ -1,26 +1,48 @@
 // SIMD86 deck runtime — Single Instruction, Multiple Decks.
 //
 // Loads a deck ELF (a mov-only flipbook built by build-deck.sh) into the
-// movie86 emulator and drives it: an rAF step loop, mode-13h framebuffer
-// → canvas blit, and keyboard input gated to canvas hover. The deck guest
-// itself does the slide logic (poll input, move index, blit the current
-// slide) — this module is just the browser harness around movie86.
+// movie86 emulator and drives it: an rAF step loop, framebuffer → canvas
+// blit, and keyboard input gated to canvas hover. The deck guest itself
+// does the slide logic (poll input, move index, set_video_mode on a
+// resolution change, blit the current slide) — this module is just the
+// browser harness.
+//
+// "Acceleration boost": hand the live session off to a local turbo86 over
+// WebSocket so the deck runs at native speed. We keep the local movie86 Vm
+// around as a display buffer + mode tracker — turbo86's MemUpdate frames
+// are written back into it via writeMem and its VideoMode events via
+// setActiveVideoMode, so the SAME render path shows either engine. Keys go
+// to turbo86 as proto.KeyInput while boosted, back to the local Vm
+// otherwise.
 //
 // movie86 is imported from its deployed sibling namespace (/movie86/), the
 // same cross-subproject pattern explorer uses, so we don't duplicate the
-// ~110 KB wasm. On x86.mov and on PR previews the absolute path resolves;
-// movie86.mjs's own `./build/browser/...` fetches stay under /movie86/.
-import { loadVm, modeForNumber, attachKeyboard } from '/movie86/movie86.mjs';
+// ~110 KB wasm.
+import {
+    loadVm,
+    modeForNumber,
+    attachKeyboard,
+    snapshotContext,
+    makeLoadContextMessage,
+    makeKeyInputMessage,
+    parseOutboundMessage,
+} from '/movie86/movie86.mjs';
 
 /**
- * Run a deck in `canvas`, returning a handle with `stop()` and the live
- * `vm` (for a future "hand off to turbo86" button).
+ * Run a deck in `canvas`. Returns a handle:
+ *   - `vm`           the live movie86 Vm
+ *   - `stop()`       tear down (rAF + keyboard + WS + Vm)
+ *   - `boost(url?)`  hand off to a local turbo86 for native speed
+ *   - `engine()`     'local' | 'turbo86'
  *
  * @param {HTMLCanvasElement} canvas
  * @param {string} deckUrl  URL of the deck ELF (e.g. './deck.elf')
  * @param {object} [opts]
- * @param {number} [opts.batch=2_000_000]  guest insns stepped per frame
- * @param {(s:{steps:bigint,mode:number|undefined,halt:string|undefined})=>void} [opts.onStatus]
+ * @param {number} [opts.batch=2_000_000]  guest insns stepped per local frame
+ * @param {string} [opts.turbo86Url='ws://127.0.0.1:1234']
+ * @param {number} [opts.memUpdateMs=100]  turbo86 framebuffer stream cadence
+ * @param {(s:object)=>void} [opts.onStatus]
+ * @param {(engine:string, info?:string)=>void} [opts.onEngine]
  */
 export async function runDeck(canvas, deckUrl, opts = {}) {
     const res = await fetch(deckUrl);
@@ -28,17 +50,32 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
     const bytes = new Uint8Array(await res.arrayBuffer());
     const vm = await loadVm(bytes);
 
-    // Keyboard → guest input queue, but only while the pointer is over the
-    // canvas. The deck maps Right/Space/PageDown → next, Left/PageUp →
-    // prev, Home/End → ends (see deck.c); movie86 just delivers the codes.
-    const detach = attachKeyboard(vm, canvas);
-
     const ctx = canvas.getContext('2d');
     const batch = BigInt(opts.batch ?? 2_000_000);
+    const turbo86Url = opts.turbo86Url ?? 'ws://127.0.0.1:1234';
+    const memUpdateMs = opts.memUpdateMs ?? 100;
+
+    let engine = 'local';   // 'local' (movie86 wasm) | 'turbo86' (native)
+    let ws = null;
+    let nativeInsns = 0n;    // turbo86's retired-instruction count (MemUpdate)
     let imageData = null;
     let curMode = -1;
     let raf = 0;
 
+    // Keyboard → the live engine: turbo86 over the WS as proto.KeyInput
+    // while boosted, otherwise the local Vm's input queue. Gated to canvas
+    // hover (off-canvas keystrokes stay with the page). Reads `engine`/`ws`
+    // live so the same handler follows the boost flip without re-attaching.
+    const detach = attachKeyboard((code) => {
+        if (engine === 'turbo86' && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(makeKeyInputMessage(code));
+        } else {
+            vm.pushInput(code);
+        }
+    }, canvas);
+
+    // Render the active mode's framebuffer. Reads from the local Vm for
+    // both engines — turbo86's MemUpdate is written back into it.
     function render() {
         const mode = modeForNumber(vm.activeVideoMode);
         if (!mode) return;
@@ -56,18 +93,95 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
     }
 
     function frame() {
-        if (!vm.haltReason) vm.stepN(batch);
+        // Only the local engine steps the Vm; under boost the Vm is a
+        // passive display buffer fed by turbo86's MemUpdate frames.
+        if (engine === 'local' && !vm.haltReason) vm.stepN(batch);
         render();
-        opts.onStatus?.({ steps: vm.steps, mode: vm.activeVideoMode, halt: vm.haltReason });
+        const m = modeForNumber(vm.activeVideoMode);
+        opts.onStatus?.({
+            engine,
+            steps: engine === 'turbo86' ? nativeInsns : vm.steps,
+            mode: vm.activeVideoMode,
+            width: m?.width,
+            height: m?.height,
+            halt: vm.haltReason,
+        });
         raf = requestAnimationFrame(frame);
     }
     raf = requestAnimationFrame(frame);
 
+    function boost(url = turbo86Url) {
+        if (engine === 'turbo86') return;
+        let snap;
+        try {
+            snap = snapshotContext(vm);
+        } catch (e) {
+            opts.onEngine?.('local', `snapshot failed: ${e.message || e}`);
+            return;
+        }
+        opts.onEngine?.('local', `connecting ${url}…`);
+        try {
+            ws = new WebSocket(url);
+        } catch (e) {
+            opts.onEngine?.('local', `bad URL: ${e.message || e}`);
+            ws = null;
+            return;
+        }
+        ws.onopen = () => {
+            // Ask turbo86 to stream the framebuffer back so the canvas
+            // keeps updating at native speed.
+            ws.send(makeLoadContextMessage(snap, 'host', memUpdateMs));
+            engine = 'turbo86';
+            opts.onEngine?.('turbo86');
+        };
+        ws.onmessage = (e) => {
+            let msg;
+            try {
+                msg = parseOutboundMessage(e.data);
+            } catch {
+                return;
+            }
+            switch (msg.type) {
+                case 'video_mode':
+                    // Mirror the guest's set_video_mode so render() picks
+                    // the right framebuffer region (+ updates the badge).
+                    vm.setActiveVideoMode(msg.mode & 0xff);
+                    break;
+                case 'mem_update':
+                    for (const r of msg.regions) vm.writeMem(r.addr, r.bytes);
+                    if (msg.insns) nativeInsns = BigInt(msg.insns);
+                    break;
+                case 'paused':
+                    for (const r of msg.regions) vm.writeMem(r.addr, r.bytes);
+                    break;
+                case 'fault':
+                    opts.onEngine?.('turbo86', `turbo86 fault: ${msg.reason}`);
+                    break;
+                case 'exit':
+                    opts.onEngine?.('turbo86', `turbo86 exit ${msg.code}`);
+                    break;
+                default:
+                    break;
+            }
+        };
+        ws.onerror = () => {
+            opts.onEngine?.(engine, 'turbo86 connection error (is it running?)');
+        };
+        ws.onclose = () => {
+            ws = null;
+            engine = 'local';
+            opts.onEngine?.('local', 'turbo86 disconnected — back on movie86');
+        };
+    }
+
     return {
         vm,
+        engine: () => engine,
+        boost,
         stop() {
             cancelAnimationFrame(raf);
             detach();
+            if (ws) { try { ws.close(); } catch { /* ignore */ } }
             vm.free();
         },
     };

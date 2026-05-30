@@ -26,19 +26,27 @@
     /* Side-by-side: slide pane | draggable divider | movie86 pane. */
     #split { flex: 1 1 auto; display: flex; min-height: 0; }
     #slide-pane {
+      position: relative;
       flex: 1 1 0; min-width: 120px; display: flex;
       align-items: center; justify-content: center;
       background: #0b0b12; overflow: hidden;
     }
-    /* Canvas keeps its native 320x200 backing store; CSS scales it to the
-       pane, smoothly, preserving aspect ratio. Pixelated so the small
-       deck art stays crisp instead of blurring when scaled up. */
+    /* Canvas keeps its native backing store (set per slide to the mode's
+       resolution); CSS scales it to the pane via max-width/height,
+       keeping the canvas's *intrinsic* ratio (so 320x200 and 800x600
+       both render undistorted). Pixelated so small art stays crisp. */
     #screen {
       max-width: 100%; max-height: 100%;
       width: auto; height: auto;
-      aspect-ratio: 320 / 200;
       image-rendering: pixelated;
       background: #000;
+    }
+    /* Current resolution, top-center of the slide area. */
+    #res-badge {
+      position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.55); color: #cdd0e0;
+      font-size: 12px; font-variant-numeric: tabular-nums;
+      padding: 2px 8px; border-radius: 4px; pointer-events: none;
     }
     #divider {
       flex: 0 0 6px; cursor: col-resize; background: #2a2a3a;
@@ -58,8 +66,30 @@
     }
     .boost label { display: flex; align-items: center; gap: 8px; font-weight: 600; }
     .boost .note { color: #777; font-size: 12px; margin-top: 6px; }
+    .boost-btn { display: block; width: 100%; padding: 0; border: 2px solid #2a2a3a; border-radius: 6px; background: none; cursor: pointer; overflow: hidden; }
+    .boost-btn img { display: block; width: 100%; height: auto; }
+    .boost-btn:hover { border-color: #8ab4f8; }
+    .boost-btn.on { border-color: #ffcc00; box-shadow: 0 0 10px #ffcc0066; }
     footer { flex: 0 0 auto; padding: 4px 12px; border-top: 1px solid #2a2a3a; color: #777; font-size: 12px; }
     a { color: #8ab4f8; }
+
+    /* movie86 pane minimize: click the header to collapse the pane to a
+       compact bar. mov count + mov/sec stay visible even when minimized
+       (the "everything is a mov" signal shouldn't disappear). */
+    .m86-head {
+      display: flex; align-items: center; gap: 8px; width: 100%;
+      margin: 0 0 8px; padding: 0; background: none; border: none;
+      color: inherit; font: inherit; text-align: left; cursor: pointer;
+    }
+    .m86-head h2 { margin: 0; }
+    .m86-head .caret { color: #888; transition: transform .15s; }
+    .m86-mini { margin-left: auto; display: none; color: #9aa; font-size: 12px; font-variant-numeric: tabular-nums; }
+    #split.m86-min #divider { display: none; }
+    #split.m86-min #movie86-pane { flex: 0 0 auto; min-width: 0; max-width: none; padding: 12px; }
+    #split.m86-min .m86-body { display: none; }
+    #split.m86-min .m86-mini { display: inline; }
+    #split.m86-min .m86-head { margin: 0; }
+    #split.m86-min .m86-head .caret { transform: rotate(-90deg); }
   </style>
 </head>
 <body>
@@ -71,11 +101,16 @@
 
   <div id="split">
     <div id="slide-pane">
+      <div id="res-badge">—</div>
       <canvas id="screen" width="320" height="200"></canvas>
     </div>
     <div id="divider" title="ドラッグで分割サイズ変更"></div>
     <aside id="movie86-pane">
-      <h2>movie86</h2>
+      <button class="m86-head" id="m86-toggle" type="button" aria-expanded="true" title="クリックで最小化 / 展開">
+        <span class="caret">▾</span><h2>movie86</h2>
+        <span class="m86-mini" id="m86-mini">—</span>
+      </button>
+      <div class="m86-body">
       <div class="stat"><span class="k">engine</span><span class="v" id="s-engine">movie86 (wasm)</span></div>
       <div class="stat"><span class="k">total mov</span><span class="v" id="s-steps">0</span></div>
       <div class="stat"><span class="k">mov / sec</span><span class="v" id="s-rate">—</span></div>
@@ -83,10 +118,13 @@
       <div class="stat"><span class="k">halt</span><span class="v" id="s-halt">running</span></div>
 
       <div class="boost">
-        <label><input type="checkbox" id="boost" disabled /> アクセラレーションブースト</label>
-        <div class="note">ON でローカル turbo86 にハンドオーバーしてネイティブ速度で実行。
-          <br>(準備中 — turbo86 WS キー入力配線後に有効化)</div>
+        <button id="boost" class="boost-btn" type="button"
+                title="アクセラレーションブースト — ローカル turbo86 にハンドオーバーしてネイティブ速度で実行">
+          <img src="./acceleration-boost.png" alt="アクセラレーションブースト" />
+        </button>
+        <div class="note" id="boost-note">押すとローカル turbo86 にハンドオーバーしてネイティブ速度で実行(default off)。</div>
       </div>
+      </div><!-- .m86-body -->
     </aside>
   </div>
 
@@ -109,7 +147,7 @@
     function fmt(n) { return Number(n).toLocaleString(); }
 
     const deck = await runDeck(canvas, './deck.elf', {
-      onStatus({ steps, mode, halt }) {
+      onStatus({ steps, mode, width, height, halt }) {
         $('s-steps').textContent = fmt(steps);
         const now = performance.now();
         const dt = now - prevT;
@@ -117,10 +155,22 @@
           const dSteps = Number(steps - prevSteps);
           rate = dSteps / (dt / 1000);
           prevSteps = steps; prevT = now;
-          $('s-rate').textContent = rate >= 1e6 ? `${(rate / 1e6).toFixed(1)}M` : fmt(Math.round(rate));
         }
-        $('s-mode').textContent = mode == null ? '—' : `0x${mode.toString(16)} (13h)`;
+        const rateStr = rate >= 1e6 ? `${(rate / 1e6).toFixed(1)}M` : fmt(Math.round(rate));
+        $('s-rate').textContent = rateStr;
+        $('s-mode').textContent = mode == null ? '—' : `0x${mode.toString(16)}`;
         $('s-halt').textContent = halt ?? 'running';
+        // Current resolution, shown at the top of the slide area.
+        $('res-badge').textContent = (width && height) ? `${width}×${height}` : '—';
+        // Keep mov count + mov/sec visible even when the pane is minimized.
+        $('m86-mini').textContent = `${fmt(steps)} mov · ${rateStr}/s`;
+      },
+      // ?turbo86=ws://host:port overrides the local turbo86 address.
+      turbo86Url: new URLSearchParams(location.search).get('turbo86') || 'ws://127.0.0.1:1234',
+      onEngine(eng, info) {
+        $('s-engine').textContent = eng === 'turbo86' ? 'turbo86 (native)' : 'movie86 (wasm)';
+        $('boost').classList.toggle('on', eng === 'turbo86');
+        if (info) $('boost-note').textContent = info;
       },
     });
 
@@ -139,6 +189,16 @@
     divider.addEventListener('pointerup', (e) => {
       dragging = false; divider.releasePointerCapture(e.pointerId);
     });
+
+    // Click the movie86 header to minimize / restore the pane. Minimized,
+    // it collapses to a bar but still shows mov count + mov/sec.
+    $('m86-toggle').addEventListener('click', () => {
+      const min = $('split').classList.toggle('m86-min');
+      $('m86-toggle').setAttribute('aria-expanded', String(!min));
+    });
+
+    // Acceleration boost: hand the live session off to a local turbo86.
+    $('boost').addEventListener('click', () => deck.boost());
 
     window.addEventListener('beforeunload', () => deck.stop());
   </script>

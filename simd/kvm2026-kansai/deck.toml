@@ -1,0 +1,29 @@
+# SIMD86 deck spec — slides top to bottom (= slide 1, 2, 3, ...).
+#
+# gen_deck.py turns this file + the referenced images into the guest
+# "memory image": deck.bin (raw RGBA, one frame per slide, concatenated)
+# plus a slide table (deck_data.s) the mov-only renderer indexes.
+#
+#   image:      a PNG path (relative to this file), or "color:RRGGBB" for
+#               a solid-colour placeholder (content doesn't matter yet —
+#               this is a switching / resolution test).
+#   resolution: one of movie86's framebuffer modes (FRAMEBUFFER_MODES in
+#               movie86.mjs): 320x200, 640x480, 640x350, 800x600.
+#
+# Scenario: start light at 320x200 so movie86 (wasm) stays bearable,
+# then bump the resolution on slide 2 — the heavier blit is where the
+# "acceleration boost" (turbo86 handover) earns its keep. deck.c
+# re-issues set_video_mode whenever the resolution changes between
+# slides.
+
+[[slides]]
+image = "color:303048"
+resolution = "320x200"
+
+[[slides]]
+image = "color:482a18"
+resolution = "800x600"
+
+[[slides]]
+image = "color:5a1e2e"
+resolution = "800x600"
