@@ -8,13 +8,21 @@
 # master_loop dispatch doesn't run to completion on turbo86 yet — see
 # the GitHub issue on running movfuscator output natively on turbo86.
 #
-#   gen_deck.py deck.toml → deck.bin + deck_data.s  (memory image + table)
+#   deck.pdf → pdf_to_deck.py → slideNN.png + deck.toml  (if no deck.toml)
+#   deck.toml → gen_deck.py   → deck.bin + deck_data.s   (memory image)
 #   deck.c                → clang -emit-llvm → llvm-mov-llc → deck.s → deck.o
 #   link: start.o + deck.o + deck_data.o + stubs_llvm.o, FB regions pinned
 #
+# Deck source: a deck is authored as either a deck.toml (+ image files) or
+# a deck.pdf. When DECK_TOML doesn't exist but a deck.pdf sits next to it,
+# this script renders the PDF into a scratch dir via pdf_to_deck.py and
+# builds from that — so CI only needs to commit the PDF, not the (large)
+# rendered PNGs or the deck.elf.
+#
 # Usage:  ./build-deck.sh [OUT_ELF] [DECK_TOML] [SRC_C]
 #   OUT_ELF    default: kvm2026-kansai/deck.elf
-#   DECK_TOML  default: kvm2026-kansai/deck.toml
+#   DECK_TOML  default: kvm2026-kansai/deck.toml (or generated from
+#              kvm2026-kansai/deck.pdf if absent)
 #   SRC_C      default: deck.c   (pass deck_bench.c for the bench build)
 #
 # FB sections: each video mode the deck uses needs its .fbNNN section
@@ -45,6 +53,17 @@ fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+# Resolve the deck spec. If there's no deck.toml but a deck.pdf sits in
+# the same dir, render the PDF into a scratch dir (slideNN.png + deck.toml)
+# and build from there. images in deck.toml are relative to its own dir,
+# so gen_deck below runs against whichever dir won.
+DECK_DIR="$(dirname "$DECK_TOML")"
+if [ ! -f "$DECK_TOML" ] && [ -f "$DECK_DIR/deck.pdf" ]; then
+    echo "[pdf] $(basename "$DECK_DIR/deck.pdf") → deck.toml + slides"
+    uv run "$HERE/pdf_to_deck.py" "$DECK_DIR/deck.pdf" -o "$TMP/deck"
+    DECK_TOML="$TMP/deck/deck.toml"
+fi
 
 echo "[gen] $(basename "$DECK_TOML")"
 uv run "$HERE/gen_deck.py" "$DECK_TOML" -o "$TMP"

@@ -108,7 +108,7 @@ try {
     assert.ok(stepUntil(() => vm.activeVideoMode === EXPECT_MODE[1], 'Enter → mode 6Ah'),
         'Enter did not advance to slide 1');
 
-    console.log(`ok  deck  mode 13h ⇄ 6Ah via Right/Left/Enter, slides blit  steps=${vm.steps}`);
+    console.log(`ok  deck  mode 0x70 ⇄ 0x72 via Right/Left/Enter, slides blit  steps=${vm.steps}`);
 } catch (e) {
     console.error(`FAIL deck: ${e.message}`);
     failed = 1;

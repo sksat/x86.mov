@@ -63,7 +63,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              gcc-multilib libc6-dev-i386 time make patch
+              gcc-multilib libc6-dev-i386 time make patch zstd
+
+      # uv runs the simd deck generators (gen_deck.py / pdf_to_deck.py),
+      # whose PEP 723 headers pin Python + Pillow + PyMuPDF — no manual
+      # venv needed.
+      - name: install uv
+        uses: astral-sh/setup-uv@v6.1.0
 
       # llvm-22-dev provides llvm-tblgen-22 (used by the emcmake LLVM
       # build) and the native llvm-mov-llc reference (via the sibling
@@ -262,11 +268,18 @@ jobs:
 
       # ----------------------- simd side -----------------------------------
       #
-      # SIMD86 is static: the deck ELF (a mov-only flipbook) is committed
-      # like the other example binaries, so there's nothing to build here
-      # — just copy the page + runtime + deck into dist/simd/. The deck
-      # page imports /movie86/movie86.mjs at runtime, which is already
-      # staged above; don't move this before the movie86 stage step.
+      # SIMD86's deck is built from kvm2026-kansai/deck.pdf at deploy time
+      # (the rendered slides + multi-MB deck.elf aren't committed): PDF →
+      # pdf_to_deck.py → gen_deck.py → llvm-mov-llc → deck.elf, then
+      # stage-deploy zstd-compresses it (~50x) and ships deck.elf.zst.
+      # Needs the native llvm-mov-llc (built above), clang-22, binutils
+      # 32-bit, uv, and zstd — all installed earlier. The deck page imports
+      # /movie86/movie86.mjs + fzstd at runtime; movie86 / llvm-mov are
+      # staged above, so don't move this before them.
+
+      - name: build simd deck (PDF → mov-only deck.elf)
+        working-directory: simd
+        run: ./build-deck.sh
 
       - name: stage simd into dist/simd/
         working-directory: simd

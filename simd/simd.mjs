@@ -28,6 +28,72 @@ import {
     parseOutboundMessage,
 } from '/movie86/movie86.mjs';
 
+// --- deck fetch (zstd-aware, mirrors llvm-mov's clang.wasm loader) ---
+//
+// The deck.elf is large uncompressed (a 1280x720 deck is ~160 MB of raw
+// RGBA) but compresses ~50x with zstd because slides are mostly flat
+// colour. Deploy ships `deck.elf.zst` with `Content-Encoding: zstd`:
+//   - Modern Chromium/Firefox/Edge decode it at the network layer, so
+//     fetch() hands us the raw ELF (magic 7F 45 4C 46).
+//   - Other browsers (Safari today) pass the zstd bytes through (magic
+//     28 B5 2F FD) and we decompress in JS with fzstd.
+// Local dev (`make serve` over plain HTTP, no _headers) just serves the
+// uncompressed deck.elf — fetchDeck falls back to it when .zst is 404.
+const ELF_MAGIC = [0x7f, 0x45, 0x4c, 0x46];
+const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
+
+function magicMatch(buf, magic) {
+    if (buf.length < 4) return false;
+    for (let i = 0; i < 4; i++) if (buf[i] !== magic[i]) return false;
+    return true;
+}
+
+let _zstd = null;
+async function loadZstd() {
+    if (_zstd) return _zstd;
+    // stage-deploy copies fzstd next to simd.mjs as ./fzstd.mjs.
+    const m = await import('./fzstd.mjs');
+    _zstd = m.decompress;
+    return _zstd;
+}
+
+// Fetch the deck, streaming for progress, transparently handling the
+// zstd / raw cases. `deckUrl` points at the uncompressed deck.elf; we
+// try `${deckUrl}.zst` first and fall back to the plain file.
+async function fetchDeck(deckUrl, onStatus) {
+    let url = `${deckUrl}.zst`;
+    let r = await fetch(url);
+    if (!r.ok) {
+        url = deckUrl; // local dev: no .zst staged
+        r = await fetch(url);
+    }
+    if (!r.ok) throw new Error(`fetch ${url}: ${r.status} ${r.statusText}`);
+
+    const total = Number(r.headers.get('content-length')) || 0;
+    const chunks = [];
+    let got = 0;
+    const reader = r.body.getReader();
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        got += value.length;
+        onStatus?.({ loading: true, loadedBytes: got, totalBytes: total });
+    }
+    let buf = new Uint8Array(got);
+    let off = 0;
+    for (const c of chunks) { buf.set(c, off); off += c.length; }
+
+    if (magicMatch(buf, ELF_MAGIC)) return buf;          // already decoded
+    if (magicMatch(buf, ZSTD_MAGIC)) {                   // decode in JS
+        onStatus?.({ loading: true, decompressing: true });
+        const decompress = await loadZstd();
+        return decompress(buf);
+    }
+    // Unknown magic — hand it to the loader anyway (it'll error clearly).
+    return buf;
+}
+
 // Human-readable name for a movie86 KEY_* code (for the input log).
 // Printable ASCII shows as itself; the navigation block gets words.
 const KEY_NAMES = {
@@ -61,9 +127,7 @@ function keyName(code) {
  *        page can log that input was received and where it went.
  */
 export async function runDeck(canvas, deckUrl, opts = {}) {
-    const res = await fetch(deckUrl);
-    if (!res.ok) throw new Error(`fetch ${deckUrl}: ${res.status}`);
-    const bytes = new Uint8Array(await res.arrayBuffer());
+    const bytes = await fetchDeck(deckUrl, opts.onStatus);
     const vm = await loadVm(bytes);
 
     const ctx = canvas.getContext('2d');
