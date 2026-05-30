@@ -86,55 +86,15 @@ if [ ! -d "$wasi_sdk" ]; then
     rm "$tarball"
 fi
 
-# ── 3. Stage local-path dependencies that the rustc workspace
-#       expects ─────────────────────────────────────────────────────────
-#
-# bjorn3's wasm20 branch carries a `[patch.crates-io]` line
-#   libwild = { path = "wild/libwild" }
-# in the workspace Cargo.toml, but the `wild/` tree itself isn't in
-# the rust repo — it's expected to be cloned in alongside. Without it
-# stage1 fails with "failed to read wild/libwild/Cargo.toml". The
-# Cargo.lock pins the matching libwild git source to a specific SHA;
-# we clone wild at that SHA so the local-path patch resolves.
-wild_sha="9a7ad7cb05bce0487a7089bffe95452b43d07cfb"
-if [ ! -f "$rust_src/wild/libwild/Cargo.toml" ]; then
-    echo "==> cloning wild-linker/wild @ $wild_sha into vendor/rust/wild"
-    git clone --depth 1 https://github.com/wild-linker/wild.git "$rust_src/wild"
-    ( cd "$rust_src/wild" \
-        && git fetch --depth 1 origin "$wild_sha" \
-        && git checkout "$wild_sha" )
-fi
-
-# Apply local patches. Two scopes:
-#   patches/wasm-rustc/      → applied at vendor/rust/ (rust-lang/rust)
-#   patches/wasm-rustc-llvm/ → applied at vendor/rust/src/llvm-project/
-#
-# `git apply --reverse --check` detects already-applied so re-running
-# across cached vendor trees doesn't die. Order matters lexicographically.
-#
-# Current set:
-#   wasm-rustc/0001-llvm_target-wasm32-wasi-threads.patch
-#     wasm32-wasip1-threads spec: switch llvm_target to "wasm32-wasi-threads"
-#     so the produced rustc reports the threads-aware LLVM triple.
-#   wasm-rustc-llvm/0002-llvm-bit-h-treat-wasi-like-linux.patch
-#     llvm/ADT/bit.h: treat __wasi__ like __linux__ so it pulls
-#     <endian.h> (which exists in wasi-sysroot) instead of the BSD
-#     <machine/endian.h> (which doesn't).
-apply_patches_from() {
-    local dir="$1" cwd="$2"
-    [ -d "$dir" ] || return 0
-    for p in "$dir"/*.patch; do
+# ── 3. Apply local patches (none yet — placeholder hook) ─────────────
+patch_dir="$root/patches/wasm-rustc"
+if [ -d "$patch_dir" ]; then
+    for p in "$patch_dir"/*.patch; do
         [ -f "$p" ] || continue
-        if ( cd "$cwd" && git apply --reverse --check "$p" 2>/dev/null ); then
-            echo "==> skip $(basename "$p") — already applied"
-        else
-            echo "==> applying $(basename "$p") (in $(basename "$cwd"))"
-            ( cd "$cwd" && git apply --check "$p" && git apply "$p" )
-        fi
+        echo "==> applying $(basename "$p")"
+        ( cd "$rust_src" && git apply --check "$p" 2>/dev/null && git apply "$p" )
     done
-}
-apply_patches_from "$root/patches/wasm-rustc"      "$rust_src"
-apply_patches_from "$root/patches/wasm-rustc-llvm" "$rust_src/src/llvm-project"
+fi
 
 # ── 4. Build + install via ./x.py ────────────────────────────────────
 install_dir="$cache/dist"
@@ -150,62 +110,15 @@ exec "$wasi_sdk/bin/clang++" "\$@"
 EOF
 chmod +x "$linker_wrapper"
 
-# wasm32-wasip1-threads cc/cxx wrappers: the cc-rs crate normalises
-# `wasm32-wasip1-threads` → `wasm32-wasi` in its target table
-# (cc-1.2.62/src/target/generated.rs:276), so even with a patched
-# rustc target spec the LLVM-for-wasm CMake try-compile gets
-# `--target=wasm32-wasi -pthread` and wasm-ld fails on errno.o
-# missing atomics. Rewrite that flag on the way in.
-threads_cc_wrapper="$cache/wrapper-wasi-threads-cc.sh"
-threads_cxx_wrapper="$cache/wrapper-wasi-threads-cxx.sh"
-make_threads_wrapper() {
-    local out="$1" exe="$2"
-    cat > "$out" <<WRAPPER_EOF
-#!/usr/bin/env bash
-args=()
-for a in "\$@"; do
-    case "\$a" in
-        --target=wasm32-wasi) args+=(--target=wasm32-wasi-threads);;
-        *) args+=("\$a");;
-    esac
-done
-exec "$wasi_sdk/bin/$exe" "\${args[@]}"
-WRAPPER_EOF
-    chmod +x "$out"
-}
-make_threads_wrapper "$threads_cc_wrapper" "wasm32-wasip1-threads-clang"
-make_threads_wrapper "$threads_cxx_wrapper" "wasm32-wasip1-threads-clang++"
-
-# config.toml — bootstrap shape:
-#   build = the box we're invoking x.py from (this dev machine).
-#   host  = where the produced rustc will *run*. We want it to run in
-#           WASI, so wasm32-wasip1-threads.
-#   target = which targets the produced rustc can *codegen for*. The
-#           load-bearing one is i686-unknown-linux-gnu (the gating
-#           sysroot for the mov-backend pipeline). The others match
-#           what rubrc ships so the registry row covers the same
-#           surface plus the i686 delta.
-# Note on path: this branch reads `bootstrap.toml` as the primary,
-# `config.toml` as a deprecated fallback. Writing the primary so
-# nothing else can shadow our settings.
-#
-# `profile = "..."` deliberately omitted: the `compiler` profile
-# carries `[llvm] download-ci-llvm = true` as its default, which
-# is hostile for a --depth 1 shallow clone (the bootstrap then walks
-# git history looking for the LLVM submodule's last upstream commit
-# and dies with "could not find commit hash for downloading LLVM").
-# Going profile-less keeps the merge clean.
-cat > "$rust_src/bootstrap.toml" <<EOF
+# Tell x.py to install into our cache dir directly. The bjorn3 fork
+# honours --prefix.
+cat > "$rust_src/config.toml" <<EOF
+profile = "compiler"
 change-id = 0
 
 [build]
+target = ["wasm32-wasip1-threads"]
 build = "x86_64-unknown-linux-gnu"
-host = ["wasm32-wasip1-threads"]
-target = [
-    "i686-unknown-linux-gnu",
-    "x86_64-unknown-linux-gnu",
-    "wasm32-wasip1",
-]
 extended = false
 docs = false
 
@@ -216,34 +129,7 @@ sysconfdir = "etc"
 [rust]
 debug-logging = false
 codegen-units = 1
-# bjorn3 wasm20 carries patches that emit unused-variable warnings
-# (e.g. RUSTC_RETRY_LINKER_ON_SEGFAULT lookup that's dead on WASI).
-# x.py install denies warnings by default for `compiler` profile and
-# bjorn3's branch defaults — disable to let those land.
-deny-warnings = false
-
-# Local LLVM build. The CI download path is incompatible with the
-# --depth 1 shallow clone (needs git history to find the matching
-# upstream LLVM commit). Local build adds ~1-2 hours but is the
-# deterministic option from a shallow tree.
-[llvm]
-download-ci-llvm = false
-
-# Route wasm32-wasip1-threads C/C++ through wrappers that rewrite
-# cc-rs's --target=wasm32-wasi flag to --target=wasm32-wasi-threads
-# (see the wrapper-wasi-threads-cc.sh creation above for why).
-[target.wasm32-wasip1-threads]
-cc = "$threads_cc_wrapper"
-cxx = "$threads_cxx_wrapper"
-linker = "$threads_cc_wrapper"
-ar = "$wasi_sdk/bin/llvm-ar"
-ranlib = "$wasi_sdk/bin/llvm-ranlib"
-wasi-root = "$wasi_sdk/share/wasi-sysroot"
 EOF
-# Sweep any leftover config.toml from earlier runs so its (possibly
-# stale) settings can't shadow bootstrap.toml via the deprecated
-# fallback path.
-rm -f "$rust_src/config.toml"
 
 env \
     WASI_SDK_PATH="$wasi_sdk" \
