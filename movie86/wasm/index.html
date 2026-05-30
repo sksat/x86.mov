@@ -342,6 +342,7 @@ import {
     snapshotContext,
     loadContextInto,
     makeLoadContextMessage,
+    makeKeyInputMessage,
     parseOutboundMessage,
     attachKeyboard,
 } from './movie86.mjs';
@@ -445,15 +446,32 @@ async function fetchExample(name) {
     return new Uint8Array(await r.arrayBuffer());
 }
 
+// Keyboard sink shared by attachKeyboard: forward to turbo86 over the WS
+// while a session is handed off there, else into the local Vm. Reads the
+// live engine/ws each call so it follows the engine flip without
+// re-attaching the listener.
+function routeKeyToEngine(code) {
+    if (state.engine === 'turbo86' && turbo86.ws && turbo86.ws.readyState === WebSocket.OPEN) {
+        turbo86.ws.send(makeKeyInputMessage(code));
+        return;
+    }
+    state.vm?.pushInput(code);
+}
+
 async function loadFromBytes(bytes, label) {
     if (state.detachKeyboard) { state.detachKeyboard(); state.detachKeyboard = null; }
     if (state.vm) { state.vm.free(); state.vm = null; }
     state.elfBytes = bytes;
     state.vm = await loadVm(bytes);
-    // Route keyboard into the guest's input queue, but only while the
-    // pointer is over the canvas area — off-canvas keystrokes stay with
-    // the page. Examples that never poll just never drain the queue.
-    state.detachKeyboard = attachKeyboard(state.vm, $('canvases'));
+    // Route keyboard input to whichever engine is live: while a session
+    // is handed off to turbo86, keys go over the WS as proto.KeyInput so
+    // the native guest's CALL_POLL_INPUT reads them; otherwise into the
+    // local Vm's queue. Either way only while the pointer is over the
+    // canvas area — off-canvas keystrokes stay with the page. Examples
+    // that never poll just never drain the queue. The sink is stable;
+    // it reads `state.engine` / `turbo86.ws` live so the same handler
+    // follows the engine flip without re-attaching.
+    state.detachKeyboard = attachKeyboard(routeKeyToEngine, $('canvases'));
     state.prevRegs = null;
     state.prevEip = null;
     state.stdoutBuf = '';
