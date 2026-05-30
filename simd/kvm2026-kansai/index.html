@@ -73,6 +73,17 @@
     .boost-btn:hover { border-color: #8ab4f8; }
     .boost-btn.on { border-color: #ffcc00; box-shadow: 0 0 10px #ffcc0066; }
     footer { flex: 0 0 auto; padding: 4px 12px; border-top: 1px solid #2a2a3a; color: #777; font-size: 12px; }
+    /* Input log: a thin strip under the slide so you can see a keypress
+       was actually accepted (and which engine it went to) — useful while
+       a slow blit is still painting and the slide hasn't visibly changed
+       yet. Newest entry first, capped to a few lines. */
+    #log {
+      flex: 0 0 auto; height: 3.6em; overflow: hidden;
+      padding: 3px 12px; border-top: 1px solid #2a2a3a;
+      background: #0e0e16; color: #9aa;
+      font: 12px/1.3 ui-monospace, monospace; white-space: pre;
+    }
+    #log .none { color: #555; }
     a { color: #8ab4f8; }
 
     /* movie86 pane minimize: click the header to collapse the pane to a
@@ -135,6 +146,8 @@
     </aside>
   </div>
 
+  <div id="log"><span class="none">入力ログ — スライド領域にカーソルを乗せてキーを押すとここに出ます</span></div>
+
   <footer>
     このスライドは <strong>mov 命令だけ</strong>で描かれています。デック本体は movfuscator/llvm-mov 系の
     mov-only ELF で、<a href="/movie86/">movie86</a> エミュレータが実行しています。
@@ -180,8 +193,24 @@
         $('s-engine').textContent = eng === 'turbo86' ? 'turbo86 (native)' : 'movie86 (wasm)';
         $('boost').classList.toggle('on', eng === 'turbo86');
         if (info) $('boost-note').textContent = info;
+        if (info) logLine(`[${eng}] ${info}`);
+      },
+      onInput({ name, engine }) {
+        // Show the keypress was accepted and where it went. On movie86 the
+        // slide may take a moment to repaint (the blit is the slow part) —
+        // this line confirms input landed even before the画面 changes.
+        logLine(`key ${name} → ${engine}`);
       },
     });
+
+    // Newest-first input log, capped to a few lines.
+    const logLines = [];
+    function logLine(s) {
+      const t = new Date().toLocaleTimeString();
+      logLines.unshift(`${t}  ${s}`);
+      logLines.length = Math.min(logLines.length, 3);
+      $('log').textContent = logLines.join('\n');
+    }
 
     // Draggable divider: resize the movie86 pane by setting its flex-basis.
     const divider = $('divider');

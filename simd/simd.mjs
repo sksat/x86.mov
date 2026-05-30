@@ -28,6 +28,19 @@ import {
     parseOutboundMessage,
 } from '/movie86/movie86.mjs';
 
+// Human-readable name for a movie86 KEY_* code (for the input log).
+// Printable ASCII shows as itself; the navigation block gets words.
+const KEY_NAMES = {
+    0x08: 'Backspace', 0x0d: 'Enter', 0x1b: 'Esc', 0x20: 'Space',
+    0x80: '←', 0x81: '→', 0x82: '↑', 0x83: '↓',
+    0x84: 'PageUp', 0x85: 'PageDown', 0x86: 'Home', 0x87: 'End',
+};
+function keyName(code) {
+    if (KEY_NAMES[code]) return KEY_NAMES[code];
+    if (code >= 0x21 && code <= 0x7e) return String.fromCharCode(code);
+    return `0x${code.toString(16)}`;
+}
+
 /**
  * Run a deck in `canvas`. Returns a handle:
  *   - `vm`           the live movie86 Vm
@@ -43,6 +56,9 @@ import {
  * @param {number} [opts.memUpdateMs=100]  turbo86 framebuffer stream cadence
  * @param {(s:object)=>void} [opts.onStatus]
  * @param {(engine:string, info?:string)=>void} [opts.onEngine]
+ * @param {(ev:{code:number, name:string, engine:string})=>void} [opts.onInput]
+ *        Fired for each accepted keypress (after the hover gate), so the
+ *        page can log that input was received and where it went.
  */
 export async function runDeck(canvas, deckUrl, opts = {}) {
     const res = await fetch(deckUrl);
@@ -76,6 +92,7 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
         } else {
             vm.pushInput(code);
         }
+        opts.onInput?.({ code, name: keyName(code), engine });
     }, hoverEl);
 
     // Render the active mode's framebuffer. Reads from the local Vm for
