@@ -85,11 +85,16 @@
     .m86-head .caret { color: #888; transition: transform .15s; }
     .m86-mini { margin-left: auto; display: none; color: #9aa; font-size: 12px; font-variant-numeric: tabular-nums; }
     #split.m86-min #divider { display: none; }
-    #split.m86-min #movie86-pane { flex: 0 0 auto; min-width: 0; max-width: none; padding: 12px; }
+    /* Minimized: a thin strip — just the header + stacked mov stats. */
+    #split.m86-min #movie86-pane {
+      flex: 0 0 auto; width: max-content; min-width: 0; max-width: 160px; padding: 8px;
+    }
     #split.m86-min .m86-body { display: none; }
-    #split.m86-min .m86-mini { display: inline; }
-    #split.m86-min .m86-head { margin: 0; }
+    #split.m86-min .m86-head { margin: 0; flex-wrap: wrap; }
     #split.m86-min .m86-head .caret { transform: rotate(-90deg); }
+    /* Stats drop below the title (no margin-left:auto push) so the strip
+       stays narrow. */
+    #split.m86-min .m86-mini { display: block; margin-left: 0; flex-basis: 100%; }
   </style>
 </head>
 <body>
@@ -160,8 +165,10 @@
         $('s-rate').textContent = rateStr;
         $('s-mode').textContent = mode == null ? '—' : `0x${mode.toString(16)}`;
         $('s-halt').textContent = halt ?? 'running';
-        // Current resolution, shown at the top of the slide area.
-        $('res-badge').textContent = (width && height) ? `${width}×${height}` : '—';
+        // Current resolution + video mode, shown at the top of the slide.
+        $('res-badge').textContent = (width && height)
+          ? `${width}×${height} · mode 0x${mode.toString(16)}`
+          : '—';
         // Keep mov count + mov/sec visible even when the pane is minimized.
         $('m86-mini').textContent = `${fmt(steps)} mov · ${rateStr}/s`;
       },
@@ -191,10 +198,20 @@
     });
 
     // Click the movie86 header to minimize / restore the pane. Minimized,
-    // it collapses to a bar but still shows mov count + mov/sec.
+    // it collapses to a thin bar but still shows mov count + mov/sec.
+    // A dragged width lives in the pane's inline flex-basis, which would
+    // override the .m86-min CSS (inline beats stylesheet) and stop it
+    // collapsing — so stash + clear it on minimize, restore on expand.
+    let savedBasis = '';
     $('m86-toggle').addEventListener('click', () => {
       const min = $('split').classList.toggle('m86-min');
       $('m86-toggle').setAttribute('aria-expanded', String(!min));
+      if (min) {
+        savedBasis = pane.style.flexBasis;
+        pane.style.flexBasis = '';
+      } else if (savedBasis) {
+        pane.style.flexBasis = savedBasis;
+      }
     });
 
     // Acceleration boost: hand the live session off to a local turbo86.
