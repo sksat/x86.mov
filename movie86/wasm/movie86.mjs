@@ -161,7 +161,15 @@ export function keyEventToCode(e) {
  * @param {Document|Window} [opts.target=window]  Where to bind keydown.
  * @returns {() => void}  Detach function removing all listeners.
  */
-export function attachKeyboard(vm, hoverEl, opts = {}) {
+export function attachKeyboard(vmOrSink, hoverEl, opts = {}) {
+    // First arg is either a Vm (push straight into its local input queue)
+    // or a sink `(code) => void` — the latter lets the caller route keys
+    // elsewhere, e.g. forward them to turbo86 over the WS as proto.KeyInput
+    // while a session is handed off. Keeps the original `(vm, hoverEl)`
+    // call working unchanged.
+    const push = typeof vmOrSink === 'function'
+        ? vmOrSink
+        : (code) => vmOrSink.pushInput(code);
     const target = opts.target ?? window;
     let hovered = false;
 
@@ -172,7 +180,7 @@ export function attachKeyboard(vm, hoverEl, opts = {}) {
         const code = keyEventToCode(e);
         if (code === null) return;
         if (SCROLL_KEYS.has(code)) e.preventDefault();
-        vm.pushInput(code);
+        push(code);
     };
 
     hoverEl.addEventListener('pointerenter', onEnter);
@@ -363,6 +371,21 @@ function base64ToBytes(b64) {
  * @param {number} [memUpdateIntervalMs=0]
  * @returns {string} JSON-encoded frame, ready for WebSocket.send().
  */
+/**
+ * Wire frame for one key input forwarded to a running turbo86 session,
+ * matching `proto.KeyInput` (`{type:"key_input", code}`). The frontend
+ * sends this over the WS while engine == 'turbo86' so the guest's
+ * mov-only `CALL_POLL_INPUT` reads it — the same byte the local Vm
+ * would see via `vm.pushInput`, so a deck/game behaves identically
+ * before and after the handover.
+ *
+ * @param {number} code  a movie86 KEY_* code (0..255)
+ * @returns {string} JSON wire frame
+ */
+export function makeKeyInputMessage(code) {
+    return JSON.stringify({ type: 'key_input', code: code & 0xff });
+}
+
 export function makeLoadContextMessage(ctx, mode = 'host', memUpdateIntervalMs = 0) {
     const msg = {
         type: 'load_context',
