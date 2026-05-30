@@ -348,6 +348,54 @@ async function main() {
             failed++;
         }
 
+        // KeyInput path: forward a key over the WS as proto.KeyInput —
+        // the exact frame the browser sends in turbo86 mode
+        // (makeKeyInputMessage) — and assert the guest's mov-only
+        // CALL_POLL_INPUT reads it. The guest busy-polls until it gets a
+        // non-zero code, then exits with it, so the key can arrive any
+        // time after LoadContext without a race. This pins the browser →
+        // turbo86 keyboard half end-to-end against a real turbo86 (the
+        // runner side is unit-tested in runner/abi_test.go).
+        try {
+            const entry = 0x08048000;
+            const KEY_RIGHT = 0x81; // movie86 KEY_RIGHT
+            // poll: mov [0x1FFE0040],al ; test eax,eax ; jz poll ;
+            //       mov [0x1FFE00FE],eax  (exit with the polled key).
+            // jz rel8 = -9 loops back to poll until a non-zero key.
+            const code = new Uint8Array([
+                0xA2, 0x40, 0x00, 0xFE, 0x1F, // poll → eax
+                0x85, 0xC0,                   // test eax, eax
+                0x74, 0xF7,                   // jz poll (-9)
+                0xA3, 0xFE, 0x00, 0xFE, 0x1F, // exit(eax)
+            ]);
+            const keyCtx = {
+                regs: { ...ctx.regs, eip: entry },
+                regions: [{ addr: entry, bytes: code }],
+            };
+            const url = `ws://127.0.0.1:${port}/`;
+            const ws = new WebSocket(url);
+            const events = [];
+            await new Promise((resolve, reject) => {
+                ws.addEventListener('open', () => {
+                    ws.send(wrapper.makeLoadContextMessage(keyCtx, 'host'));
+                    // Forward the key the same way the browser does in
+                    // turbo86 mode; the guest is spinning on poll by now.
+                    setTimeout(() => ws.send(wrapper.makeKeyInputMessage(KEY_RIGHT)), 100);
+                }, { once: true });
+                ws.addEventListener('message', (e) => events.push(wrapper.parseOutboundMessage(e.data)));
+                ws.addEventListener('close', resolve, { once: true });
+                ws.addEventListener('error', reject, { once: true });
+            });
+            const exit = events.find(e => e.type === 'exit');
+            assert.ok(exit, `no exit event in ${events.length} events`);
+            assert.equal(exit.code, KEY_RIGHT,
+                `exit ${exit.code} != forwarded key ${KEY_RIGHT} — KeyInput didn't reach the guest`);
+            console.log('ok  real turbo86 KeyInput (forward key → poll → exit(key))');
+        } catch (e) {
+            console.error(`FAIL real turbo86 KeyInput: ${e.stack || e.message}`);
+            failed++;
+        }
+
         // VideoMode Outbound + setActiveVideoMode round-trip. This is
         // the canvas-rendering path: turbo86 catches a `mov [ABI+0x010],
         // al` (CALL_SET_VIDEO_MODE) and emits a VideoMode event; the
