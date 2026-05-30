@@ -89,12 +89,23 @@ which is the property milestone 3 will lean on.
    mov backend selector `mov.c` is native i386 (wall #3). The result links and
    starts in both the default mov-flow (~46 MB) and the `--no-mov-flow`
    (`MOV_FLOW=0`, ~29 MB) variants.
-3. **run** — execute that `rcc` to compile a real program. **open.** The
-   self-hosted rcc loads and runs (CPU-active, no crash) but does not finish a
-   compilation in practical time — it stalls in the mov-compiled front-end
-   before code generation even prints its banner. The native rcc compiles the
-   same input instantly, so the inputs/invocation are fine; the open question
-   is whether this is pure mov slowness or a miscompile in one front-end unit.
+3. **run** — execute that `rcc` to compile a real program. **open — but the
+   blocker is the runtime, not the mov compilation.** Bisection result:
+   - All-native (`gcc -m32`) rcc linked the *normal* way compiles `t.i`
+     instantly (712-line `.s`, correct mov-target output). So every rcc object
+     and the whole mov pipeline are correct.
+   - The same all-native objects linked against movfuscator's `crt0` runtime
+     hang at startup (high sys time, no progress) — exactly like the
+     mov-compiled build. So the stall is movfuscator's runtime starting up
+     **natively in this sandbox**, not a self-host miscompile and not mov
+     slowness.
+
+   movfuscator binaries are built to dispatch through SIGILL/SIGSEGV handlers;
+   their native startup needs cooperative signal handling that doesn't behave
+   here. The intended runtime is [`movie86`](../movie86/) (it wires the
+   dispatch in software), but movie86 would first need the libc surface a full
+   compiler uses (`fopen`/`fread`/`fprintf`/`malloc`/`getenv`/…). That libc
+   host work is the real path to a self-hosted rcc that *runs*.
 4. **triple** — the classic LCC self-host proof: rcc → 1rcc → 2rcc, asserting
    `1rcc` and `2rcc` are byte-identical (the upstream makefile's `triple`
    target).

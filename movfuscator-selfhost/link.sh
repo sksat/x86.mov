@@ -11,11 +11,14 @@
 #
 # Status of the result:
 #   - it LINKS and STARTS (milestone 2 = done).
-#   - it does NOT yet finish a compilation in practical time (milestone 3 is
-#     open): the mov-compiled front-end stalls before reaching code generation.
-#     Whether that is pure mov slowness or a miscompile in one front-end unit is
-#     the next thing to chase. The native rcc compiles the same input instantly,
-#     so the invocation/inputs are fine.
+#   - it does NOT yet finish a compilation (milestone 3 open), but the blocker
+#     is the RUNTIME, not the mov compilation. Bisection: the same rcc objects
+#     built all-native (gcc -m32) and linked the *normal* way compile the input
+#     instantly and correctly; linked against movfuscator's crt0 they hang at
+#     startup just like the mov build. So movfuscator's runtime starting up
+#     natively in this sandbox is the wall (its SIGILL/SIGSEGV dispatch needs
+#     cooperative signal handling). The real path forward is running under
+#     movie86, which needs the libc surface rcc uses (fopen/fread/fprintf/...).
 #
 # MOV_FLOW=0 builds the --no-mov-flow variant (real jumps for control flow, mov
 # only for data) against the `_cf` runtime — far less pathological to execute.
