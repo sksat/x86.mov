@@ -232,7 +232,20 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
                 opts.onEngine?.('local', `gzip failed: ${e.message || e}`);
                 return;
             }
-            ws.send(makeLoadElfMessage(payload, 'host', memUpdateMs));
+            // Compression can take a moment for the ~160 MiB deck; the
+            // socket may have closed in the meantime (user cancelled,
+            // turbo86 died). Sending on a non-open socket throws — bail
+            // quietly instead.
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                opts.onEngine?.('local', 'turbo86 closed before deck was sent');
+                return;
+            }
+            try {
+                ws.send(makeLoadElfMessage(payload, 'host', memUpdateMs));
+            } catch (e) {
+                opts.onEngine?.('local', `send failed: ${e.message || e}`);
+                return;
+            }
             engine = 'turbo86';
             opts.onEngine?.('turbo86', 'native from slide 0');
         };
