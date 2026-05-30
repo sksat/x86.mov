@@ -8,6 +8,7 @@
 #     kvm2026-kansai/
 #       index.html               (deck viewer: slide ⇿ movie86 side-by-side)
 #       deck.elf                 (the mov-only flipbook)
+#       acceleration-boost.png   (the boost button image)
 #
 # Like the sibling subprojects' stage scripts this does NOT clear the
 # parent dist/ — movfuscator-wasm's stage step runs first (rm -rf dist/
@@ -31,8 +32,9 @@ fi
 mkdir -p "${dest}/kvm2026-kansai"
 cp "${here}/index.html"                  "${dest}/index.html"
 cp "${here}/simd.mjs"                    "${dest}/simd.mjs"
-cp "${here}/kvm2026-kansai/index.html"   "${dest}/kvm2026-kansai/index.html"
-cp "${deck}"                             "${dest}/kvm2026-kansai/deck.elf"
+cp "${here}/kvm2026-kansai/index.html"        "${dest}/kvm2026-kansai/index.html"
+cp "${here}/kvm2026-kansai/acceleration-boost.png" "${dest}/kvm2026-kansai/acceleration-boost.png"
+cp "${deck}"                                  "${dest}/kvm2026-kansai/deck.elf"
 
 size=$(du -sh "${dest}" 2>/dev/null | awk '{print $1}')
 files=$(find "${dest}" -type f | wc -l)
