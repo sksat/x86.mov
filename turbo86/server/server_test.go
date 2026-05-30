@@ -147,6 +147,70 @@ func TestE2E_LoadContext_LargePayloadOverDefaultReadLimit(t *testing.T) {
 	}
 }
 
+// TestE2E_LoadContext_DeckSizedPayload pins the read limit at the scale a
+// real SIMD86 deck handover needs. The earlier 16 MiB cap matched only the
+// stub's static code region, but a deck snapshot also carries its mmap'd
+// framebuffers (mode 0x72 = 1280x720x4 ≈ 3.5 MiB per slide), so a handover
+// JSON runs to tens/hundreds of MiB. This sends a 24 MiB filler region —
+// above the old 16 MiB cap — at a deck framebuffer address; under the old
+// limit the WS closes with `message too big` (no Exit), under the raised
+// limit the session runs to Exit{42}. Guards the "boost a real deck"
+// path that the unit-sized tests above don't reach.
+func TestE2E_LoadContext_DeckSizedPayload(t *testing.T) {
+	srv := httptest.NewServer(server.Handler(nil))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer ws.CloseNow()
+	// The client must also accept a large frame back (Paused/MemUpdate can
+	// be big); raise its read limit too so the assertion isn't masked by a
+	// client-side cap.
+	ws.SetReadLimit(server.MaxReadBytes)
+
+	const entry uint32 = 0x08048000
+	// Two 10 MiB filler regions at the two deck framebuffer addresses
+	// (mode 0x70 @ 0x800000, mode 0x72 @ 0xC00000). Each region's own
+	// mmap stays under the runner's per-request page cap (16 MiB), but
+	// together with base64 inflation the whole LoadContext *frame* runs
+	// past the old 16 MiB WS read limit — so this isolates the read-limit
+	// raise from the unrelated per-mmap cap. The regions carry no executed
+	// code; the guest just exits 42.
+	const fb70 uint32 = 0x00800000
+	const fb72 uint32 = 0x00C00000
+	const fillSize = 10 * 1024 * 1024
+	sendInbound(t, ctx, ws, proto.LoadContext{Context: proto.Context{
+		Regs: proto.Regs{Eax: 1, Ebx: 42, Esp: 0x701FFFF0, Eip: entry},
+		Regions: []proto.MemRegion{
+			{Addr: entry, Bytes: []byte{
+				0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1  (SYS_exit)
+				0xBB, 0x2A, 0x00, 0x00, 0x00, // mov ebx, 42
+				0xCD, 0x80, // int 0x80
+			}},
+			{Addr: fb70, Bytes: make([]byte, fillSize)},
+			{Addr: fb72, Bytes: make([]byte, fillSize)},
+		},
+		// FB pages are outside the stub's static region, so they must be
+		// mmap'd before the bytes are written — same as a real deck.
+		Reservations: []proto.Reservation{
+			{Addr: fb70, Size: fillSize},
+			{Addr: fb72, Size: fillSize},
+		},
+	}})
+
+	got := readAllEvents(t, ctx, ws)
+	want := []proto.Outbound{proto.Exit{Code: 42}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("events:\n  got:  %#v\n  want: %#v", got, want)
+	}
+}
+
 // TestE2E_PostStartCodeStreaming exercises the streaming case: after
 // Start, the client keeps sending Code messages while the guest is
 // running. The server must apply them via runner.WriteCode without
