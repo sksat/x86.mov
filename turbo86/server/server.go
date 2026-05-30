@@ -216,6 +216,26 @@ func handleSession(ctx context.Context, ws *websocket.Conn, slog *sessionLogger)
 			} else {
 				events = r.RunWithContextAndMode(m.Context, mode)
 			}
+		case proto.LoadElf:
+			mode := m.Mode
+			if mode == "" {
+				mode = proto.ModeHost
+			}
+			slog.logf("inbound LoadElf: mode=%s elf_bytes=%d mem_update_ms=%d watch_regions=%d",
+				mode, len(m.Elf), m.MemUpdateIntervalMs, len(m.WatchRegions))
+			// LoadElf parses + validates synchronously (header checks,
+			// trampoline-collision guard); the actual mmap/write/EIP-ESP
+			// setup runs in the tracer goroutine when Run delivers the
+			// start message — same split as LoadContext. The Run entry
+			// point's entry arg is ignored (the tracer uses the ELF
+			// e_entry from the staged plan); ESP defaults to the top of
+			// the stub's static stack region (a fresh-process boot). The
+			// MemUpdate cadence rides on the Runner (set by LoadElf), so
+			// the plain Run entry point is enough here.
+			if err := r.LoadElf(m.Elf, mode, m.MemUpdateIntervalMs, m.WatchRegions); err != nil {
+				return fmt.Errorf("load elf: %w", err)
+			}
+			events = r.RunWithMode(0, runner.GuestStackTop, mode)
 		case proto.Stop:
 			slog.logf("inbound Stop (pre-run abort)")
 			return nil

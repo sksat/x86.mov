@@ -181,6 +181,47 @@ type KeyInput struct {
 
 func (KeyInput) inboundKind() string { return "key_input" }
 
+// WatchRegion is a guest address range the runner re-scans when taking
+// periodic MemUpdate snapshots. Addr and Size are guest bytes; the
+// runner page-aligns internally. It exists for the large-deck handover
+// (see LoadElf): the SIMD86 deck bakes ~160 MiB of slide pixels into a
+// read-only .rodata region that never changes at runtime, so the
+// default "walk every mapped page" MemUpdate scan would re-stream all
+// 160 MiB every interval. Restricting the scan to the framebuffer
+// range keeps mid-run updates to the pixels that actually move.
+type WatchRegion struct {
+	Addr uint32 `json:"addr"`
+	Size uint32 `json:"size"`
+}
+
+// LoadElf hands a complete mov-only ELF32 image to the runner, which
+// maps the program's PT_LOAD segments itself and begins execution from
+// the ELF entry point — no register/memory snapshot required.
+//
+// This is the large-deck handover path. The alternative, LoadContext,
+// migrates live guest memory: for the SIMD86 deck that means shipping
+// the ~160 MiB of slide pixels baked into .rodata over the wire (a
+// ~213 MiB base64 JSON). LoadElf instead ships the compact ELF itself
+// — the very bytes the frontend already fetched to feed movie86, a few
+// MiB — and turbo86 reconstructs the guest natively. The deck boots to
+// "slide 0, waiting for input", which is observationally identical to a
+// fresh movie86 start, so discarding the in-flight continuation state
+// costs the viewer nothing.
+//
+// WatchRegions, when non-empty, restricts periodic MemUpdate snapshots
+// to those ranges (typically just the framebuffer). Empty preserves the
+// original "scan all mapped ranges" behavior. Mode picks the execution
+// policy; empty defaults to "host". MemUpdateIntervalMs sets the
+// mid-run snapshot cadence (0 = disabled), same as Start.
+type LoadElf struct {
+	Elf                 []byte        `json:"elf"`
+	Mode                Mode          `json:"mode,omitempty"`
+	MemUpdateIntervalMs uint32        `json:"mem_update_interval_ms,omitempty"`
+	WatchRegions        []WatchRegion `json:"watch_regions,omitempty"`
+}
+
+func (LoadElf) inboundKind() string { return "load_elf" }
+
 // MarshalInbound encodes an Inbound as a JSON object with a "type" field.
 func MarshalInbound(msg Inbound) ([]byte, error) {
 	switch m := msg.(type) {
@@ -198,6 +239,11 @@ func MarshalInbound(msg Inbound) ([]byte, error) {
 		return json.Marshal(struct {
 			Type string `json:"type"`
 			LoadContext
+		}{m.inboundKind(), m})
+	case LoadElf:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			LoadElf
 		}{m.inboundKind(), m})
 	case Stop:
 		return json.Marshal(struct {
@@ -243,6 +289,12 @@ func UnmarshalInbound(data []byte) (Inbound, error) {
 		var m LoadContext
 		if err := json.Unmarshal(data, &m); err != nil {
 			return nil, fmt.Errorf("proto: parsing LoadContext payload: %w", err)
+		}
+		return m, nil
+	case "load_elf":
+		var m LoadElf
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, fmt.Errorf("proto: parsing LoadElf payload: %w", err)
 		}
 		return m, nil
 	case "stop":

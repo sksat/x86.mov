@@ -22,11 +22,21 @@ import {
     loadVm,
     modeForNumber,
     attachKeyboard,
-    snapshotContext,
-    makeLoadContextMessage,
+    makeLoadElfMessage,
     makeKeyInputMessage,
     parseOutboundMessage,
 } from '/movie86/movie86.mjs';
+
+// Compress bytes with the browser-native gzip CompressionStream. The deck
+// ELF bakes ~160 MiB of raw RGBA into .rodata, which gzips to a few MiB —
+// small enough to cross the WebSocket where the raw base64 (~213 MiB) would
+// trip the browser's allocation-size limit. turbo86 detects the 1F 8B magic
+// and inflates with compress/gzip before parsing the ELF.
+async function gzip(bytes) {
+    const cs = new CompressionStream('gzip');
+    const stream = new Blob([bytes]).stream().pipeThrough(cs);
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+}
 
 // --- deck fetch (zstd-aware, mirrors llvm-mov's clang.wasm loader) ---
 //
@@ -195,15 +205,15 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
     }
     raf = requestAnimationFrame(frame);
 
-    function boost(url = turbo86Url) {
+    function boost(arg = turbo86Url) {
         if (engine === 'turbo86') return;
-        let snap;
-        try {
-            snap = snapshotContext(vm);
-        } catch (e) {
-            opts.onEngine?.('local', `snapshot failed: ${e.message || e}`);
-            return;
-        }
+        // Accept either a plain ws:// URL string or a { url, mode } object —
+        // the deck viewer wires the address box + mode <select> as an object
+        // (deck.boost({ url, mode })), while the default arg / programmatic
+        // callers pass a string. Without this, `new WebSocket({url,mode})`
+        // stringifies the object to "[object Object]" and never connects.
+        const url = typeof arg === 'string' ? arg : (arg?.url ?? turbo86Url);
+        const mode = (arg && typeof arg === 'object' && arg.mode) ? arg.mode : 'host';
         opts.onEngine?.('local', `connecting ${url}…`);
         try {
             ws = new WebSocket(url);
@@ -212,12 +222,39 @@ export async function runDeck(canvas, deckUrl, opts = {}) {
             ws = null;
             return;
         }
-        ws.onopen = () => {
-            // Ask turbo86 to stream the framebuffer back so the canvas
-            // keeps updating at native speed.
-            ws.send(makeLoadContextMessage(snap, 'host', memUpdateMs));
+        // turbo86 boots the deck FRESH from slide 0 via LoadElf, rather than
+        // migrating the local Vm's live Context. That's equivalent for this
+        // deck (it boots to slide 0 + an input wait) and lets us ship a
+        // gzip-compressed ELF instead of a ~160 MiB memory snapshot. If the
+        // local Vm had advanced past slide 0 we do NOT fast-forward turbo86;
+        // it simply restarts at slide 0 (acceptable for now). The gzip'd ELF
+        // also asks turbo86 to stream the framebuffer back (memUpdateMs
+        // cadence) so the canvas keeps updating at native speed.
+        ws.onopen = async () => {
+            opts.onEngine?.('turbo86', 'compressing deck…');
+            let payload;
+            try {
+                payload = await gzip(bytes);
+            } catch (e) {
+                opts.onEngine?.('local', `gzip failed: ${e.message || e}`);
+                return;
+            }
+            // Compression can take a moment for the ~160 MiB deck; the
+            // socket may have closed in the meantime (user cancelled,
+            // turbo86 died). Sending on a non-open socket throws — bail
+            // quietly instead.
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                opts.onEngine?.('local', 'turbo86 closed before deck was sent');
+                return;
+            }
+            try {
+                ws.send(makeLoadElfMessage(payload, mode, memUpdateMs));
+            } catch (e) {
+                opts.onEngine?.('local', `send failed: ${e.message || e}`);
+                return;
+            }
             engine = 'turbo86';
-            opts.onEngine?.('turbo86');
+            opts.onEngine?.('turbo86', 'native from slide 0');
         };
         ws.onmessage = (e) => {
             let msg;

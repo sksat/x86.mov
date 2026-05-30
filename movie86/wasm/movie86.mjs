@@ -408,6 +408,51 @@ export function makeKeyInputMessage(code) {
     return JSON.stringify({ type: 'key_input', code: code & 0xff });
 }
 
+/**
+ * Build the turbo86 `LoadElf` Inbound frame: hand turbo86 a complete
+ * mov-only ELF32 image to boot natively from its entry point, instead of
+ * migrating a live movie86 Context. `elfBytes` is the ELF image as a
+ * Uint8Array; it MAY be gzip-compressed (turbo86's LoadElf detects the
+ * 1F 8B magic and inflates with compress/gzip) — that's how the SIMD86
+ * deck's ~160 MiB raw-RGBA .rodata crosses the WebSocket as a few MiB
+ * instead of a ~213 MiB base64 string.
+ *
+ * `watchRegions`, when omitted, defaults to one `{addr, size}` per known
+ * framebuffer mode (deduped by addr), limiting turbo86's periodic
+ * MemUpdate scan to the framebuffer(s) so the deck's immutable .rodata is
+ * never re-streamed every interval.
+ *
+ * Field names mirror the Go proto exactly (snake_case): `elf` is base64
+ * (same encoding `makeLoadContextMessage` uses for region bytes),
+ * `mem_update_interval_ms`, and `watch_regions` as `[{addr, size}]`.
+ *
+ * @param {Uint8Array} elfBytes  ELF image (optionally gzip-compressed).
+ * @param {'host'|'trap'} [mode='host']
+ * @param {number} [memUpdateMs=0]  periodic MemUpdate cadence (0 = off).
+ * @param {Array<{addr:number,size:number}>|null} [watchRegions=null]
+ * @returns {string} JSON-encoded frame, ready for WebSocket.send().
+ */
+export function makeLoadElfMessage(elfBytes, mode = 'host', memUpdateMs = 0, watchRegions = null) {
+    // elfBytes: Uint8Array of the ELF image (may be gzip-compressed; turbo86
+    // detects and inflates). watchRegions: optional [{addr,size}] limiting the
+    // periodic MemUpdate scan to the framebuffer(s); defaults to every known
+    // framebuffer mode region so turbo86 never re-streams the deck's immutable
+    // ~160 MiB .rodata.
+    const regions = watchRegions ?? FRAMEBUFFER_MODES.reduce((acc, m) => {
+        if (!acc.some(w => w.addr === m.addr)) {
+            acc.push({ addr: m.addr, size: m.byteLength });
+        }
+        return acc;
+    }, []);
+    return JSON.stringify({
+        type: 'load_elf',
+        elf: bytesToBase64(elfBytes),
+        mode,
+        mem_update_interval_ms: memUpdateMs,
+        watch_regions: regions,
+    });
+}
+
 export function makeLoadContextMessage(ctx, mode = 'host', memUpdateIntervalMs = 0) {
     const msg = {
         type: 'load_context',

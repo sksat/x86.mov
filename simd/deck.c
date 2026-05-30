@@ -66,13 +66,27 @@ static void show(int i)
 int main(void)
 {
     int idx, prev, k, i;
-    int cur_mode;
+    int cur_mode, seen;
 
-    /* Reserve every distinct framebuffer region up front. On movie86
-     * (wasm) the FB pages are PT_LOAD-mapped already so this is a no-op;
-     * on turbo86 the mmap is what keeps the first write from faulting. */
+    /* Reserve every *distinct* framebuffer region up front. Slides that
+     * share a resolution share a framebuffer address, so request each
+     * address only once: a naive per-slide request (n_slides times) would
+     * blow turbo86's dynamic-region cap (mmapMaxRegions = 32) — the deck's
+     * PT_LOAD segments already consume some of that budget when turbo86
+     * maps the ELF. On movie86 (wasm) the FB pages are PT_LOAD-mapped
+     * already so this is a no-op; on turbo86 the mmap is what keeps the
+     * first write from faulting. */
     for (i = 0; i < n_slides; i++) {
-        mmap_request(ABI_MMAP_PACK(slide_addr[i], pages_for(slide_npix[i] * 4)));
+        seen = 0;
+        for (k = 0; k < i; k++) {
+            if (slide_addr[k] == slide_addr[i]) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            mmap_request(ABI_MMAP_PACK(slide_addr[i], pages_for(slide_npix[i] * 4)));
+        }
     }
 
     idx = 0;

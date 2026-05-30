@@ -12,12 +12,16 @@
 package runner
 
 import (
+	"bytes"
+	"compress/gzip"
+	"debug/elf"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -218,6 +222,14 @@ var guestRegions = []struct{ addr, size uint32 }{
 	{0x70000000, 0x00200000}, // stack:      2 MiB well clear of the stub's own stack
 }
 
+// GuestStackTop is the initial ESP for a fresh guest boot — the top of
+// the stub's static stack region (0x70000000..0x70200000), 16 bytes
+// below the end so the first push lands in-region. Used by the LoadElf
+// handover, where the wire message carries no stack top (the deck boots
+// like a fresh process). The Start path takes the stack top from the
+// frontend instead. Matches the integration tests' testStackTop.
+const GuestStackTop uint32 = 0x701FFFF0
+
 // abiBase is the start of the mov-only ABI page. The page itself is
 // deliberately left unmapped in the stub, so any guest write into it
 // raises SIGSEGV; the runner intercepts that signal and interprets
@@ -306,6 +318,52 @@ func (r *Runner) snapshotMemory() ([]proto.MemRegion, error) {
 		}
 		return nil
 	}
+	// When the session declared watch regions (the large-deck LoadElf
+	// path), the periodic snapshot scans ONLY those ranges — not the full
+	// static + extra map. A SIMD86 deck bakes ~160 MiB of immutable slide
+	// pixels into .rodata; re-streaming all of it every interval would
+	// swamp the wire, so the frontend watches just the framebuffer range
+	// that actually changes. Empty watchRegions falls back to the original
+	// "walk every mapped region" behaviour below.
+	//
+	// The frontend watches EVERY known framebuffer mode address, but a
+	// deck only mmaps the FB(s) it actually uses — so most watch ranges
+	// point at unmapped guest memory. A bare walk of an unmapped range
+	// short-reads /proc/PID/mem and would fault the whole boost session.
+	// Intersect each watch range with the regions that are actually mapped
+	// (the static guestRegions + runtime mmap_request grants in
+	// extraRegions) and walk only the overlap; unmapped watch ranges are
+	// silently skipped.
+	if len(r.watchRegions) > 0 {
+		mapped := append([]struct{ addr, size uint32 }(nil), guestRegions...)
+		r.extraRegionsMu.RLock()
+		mapped = append(mapped, r.extraRegions...)
+		r.extraRegionsMu.RUnlock()
+		for _, w := range r.watchRegions {
+			wStart := w.Addr & mmapAddrMask
+			wEnd := (w.Addr + w.Size + (pageSize - 1)) & mmapAddrMask
+			if wEnd <= wStart {
+				continue // zero-size or wrapping watch range — skip
+			}
+			for _, m := range mapped {
+				start, end := wStart, wEnd
+				if m.addr > start {
+					start = m.addr
+				}
+				if m.addr+m.size < end {
+					end = m.addr + m.size
+				}
+				if start >= end {
+					continue // no overlap with this mapped region
+				}
+				if err := walk(start, end-start); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return out, nil
+	}
+
 	for _, gr := range guestRegions {
 		if err := walk(gr.addr, gr.size); err != nil {
 			return nil, err
@@ -475,6 +533,31 @@ type Runner struct {
 	// accurate. Only touched from the tracer goroutine.
 	extraRegions []struct{ addr, size uint32 }
 
+	// watchRegions, when non-empty, restricts the periodic-MemUpdate
+	// memory snapshot to just these guest ranges instead of walking
+	// every mapped region. Set by LoadElf for the large-deck handover:
+	// a SIMD86 deck bakes ~160 MiB of slide pixels into read-only
+	// .rodata that never changes at runtime, so the default "scan all
+	// mapped pages" walk would re-stream the whole deck every interval.
+	// Empty preserves the original full-scan behaviour. Page-aligned in
+	// snapshotMemory. Set before the tracer goroutine reads it (in
+	// LoadElf, before Run delivers the start message).
+	watchRegions []proto.WatchRegion
+
+	// loadElfPlan is the parsed PT_LOAD plan staged by LoadElf, applied
+	// by the tracer goroutine at start (inside tracerLoop, where the
+	// trampoline exists and injectSyscall's ptrace preconditions hold).
+	// nil for non-LoadElf sessions. Set before Run delivers the start
+	// message, read once by the tracer goroutine.
+	loadElfPlan *elfPlan
+
+	// memUpdateIntervalMs is the LoadElf-requested periodic MemUpdate
+	// cadence in milliseconds (0 = disabled). LoadElf records it here so
+	// the tracer goroutine can start the ticker even when the caller used
+	// the plain Run entry point (which carries no interval). 0 for
+	// non-LoadElf sessions, which pass the interval via startMsg instead.
+	memUpdateIntervalMs uint32
+
 	// (No periodic-snapshot flags — the MemUpdate ticker reads
 	// /proc/PID/mem from a separate goroutine without stopping the
 	// tracee, so it doesn't interact with the tracer's signal-stop
@@ -587,6 +670,290 @@ func (r *Runner) RunWithContextModeAndMemUpdate(
 		memUpdateInterval: memUpdateInterval,
 	}
 	return r.eventsCh
+}
+
+// guestArenaBase / guestArenaSize name the stub's static 16 MiB
+// code/data arena — the first entry of guestRegions. LoadElf segments
+// that fall entirely inside [guestArenaBase, guestArenaBase+guestArenaSize)
+// are already mapped by the stub and just need a write; anything outside
+// needs a dynamic mmap first (same path LoadContext / mmap_request use).
+const (
+	guestArenaBase uint32 = 0x08048000
+	guestArenaSize uint32 = 0x01000000
+)
+
+// elfWriteChunk caps a single writeMem call when loading a PT_LOAD
+// segment. process_vm_writev (under /proc/PID/mem) can short-write on a
+// huge single call, so we split large segments (the SIMD86 deck's
+// ~160 MiB .rodata) into <= 8 MiB pieces.
+const elfWriteChunk = 8 << 20
+
+// elfSegment is one page-aligned PT_LOAD plan entry: the bytes to write
+// at vaddr (filesz), the mapped span [mapStart, mapEnd) the loader must
+// ensure is present, and whether that span is fully inside the static
+// arena (no mmap needed) or must be dynamically mmap'd first.
+type elfSegment struct {
+	vaddr    uint32
+	data     []byte // first p_filesz bytes; BSS tail is anon-zero
+	mapStart uint32 // page-aligned segment start
+	mapEnd   uint32 // page-aligned segment end (exclusive)
+	inArena  bool   // mapStart..mapEnd entirely inside the static arena
+}
+
+// elfPlan is the parsed, validated PT_LOAD plan LoadElf stages for the
+// tracer goroutine to apply at start. entry is the ELF e_entry (becomes
+// guest EIP). The ptrace work (mmap + write + SetRegs) happens inside
+// tracerLoop, where the trampoline is materialised and injectSyscall's
+// "must be at a ptrace stop on the tracer thread" precondition holds.
+type elfPlan struct {
+	entry    uint32
+	segments []elfSegment
+}
+
+// LoadElf parses a complete mov-only ELF32 (i386) image and stages its
+// PT_LOAD segments for execution from the ELF entry point — the
+// "large-deck" handover that ships the compact ELF instead of migrating
+// ~160 MiB of live guest memory. The image is reconstructed natively:
+// segments inside the stub's static arena are written directly, segments
+// outside it are mmap'd into the guest (anon, RWX, MAP_FIXED) first.
+//
+// LoadElf does the parse / validation synchronously and records the plan
+// + session knobs (mode, watch regions, MemUpdate cadence) on the
+// Runner; the actual ptrace work (mmap injection, segment writes, EIP/ESP
+// setup) runs in the tracer goroutine when Run delivers the start
+// message — that's the only context where injectSyscall's preconditions
+// (trampoline present, child at a tracer-driven ptrace stop) hold. Like
+// LoadContext, LoadElf does NOT call Run; the caller (server) calls Run
+// afterwards to kick the syscall loop.
+//
+// Intended for host mode: a fresh deck boot uses host mode. In trap mode
+// LoadElf rejects an image whose mapped segments would collide with the
+// trap restorer trampoline (0x09040000), rather than silently
+// overwriting it.
+//
+// The image may arrive gzip-compressed (detected by the 1F 8B magic):
+// the SIMD86 deck bakes ~160 MiB of raw RGBA into .rodata, which the
+// browser gzips with CompressionStream before sending so a few-MiB
+// payload crosses the WebSocket instead of a ~213 MiB base64 string.
+// A gzip image is inflated here before the ELF parse; a raw ELF (7F 'E'
+// 'L' 'F') is parsed directly, so existing raw-ELF callers are unaffected.
+func (r *Runner) LoadElf(img []byte, mode proto.Mode, memUpdateMs uint32, watch []proto.WatchRegion) error {
+	// gzip magic (1F 8B) distinguishes a compressed image from a raw ELF
+	// (7F 45 4C 46). Inflate before parsing; raw ELFs fall straight through.
+	if len(img) >= 2 && img[0] == 0x1f && img[1] == 0x8b {
+		gr, err := gzip.NewReader(bytes.NewReader(img))
+		if err != nil {
+			return fmt.Errorf("LoadElf: open gzip reader: %w", err)
+		}
+		defer gr.Close()
+		// Cap the inflated size so a malformed/hostile gzip can't OOM the
+		// process. turbo86 is a localhost dev tool, but the bound is cheap
+		// insurance. 512 MiB matches the server's WS read limit and leaves
+		// ample room over the ~160 MiB deck. Read one extra byte to detect
+		// (rather than silently truncate) an over-cap image.
+		const maxElfImageBytes = 512 << 20
+		decompressed, err := io.ReadAll(io.LimitReader(gr, maxElfImageBytes+1))
+		if err != nil {
+			return fmt.Errorf("LoadElf: gunzip image: %w", err)
+		}
+		if len(decompressed) > maxElfImageBytes {
+			return fmt.Errorf("LoadElf: decompressed image exceeds %d bytes", maxElfImageBytes)
+		}
+		img = decompressed
+	}
+	f, err := elf.NewFile(bytes.NewReader(img))
+	if err != nil {
+		return fmt.Errorf("LoadElf: parse ELF: %w", err)
+	}
+	if f.Class != elf.ELFCLASS32 {
+		return fmt.Errorf("LoadElf: not ELFCLASS32 (got %s)", f.Class)
+	}
+	if f.Machine != elf.EM_386 {
+		return fmt.Errorf("LoadElf: not EM_386 (got %s)", f.Machine)
+	}
+	if f.Entry > 0xFFFFFFFF {
+		return fmt.Errorf("LoadElf: entry 0x%x out of 32-bit range", f.Entry)
+	}
+
+	plan := &elfPlan{entry: uint32(f.Entry)}
+	for _, p := range f.Progs {
+		if p.Type != elf.PT_LOAD {
+			continue
+		}
+		vaddr := uint32(p.Vaddr)
+		memsz := uint32(p.Memsz)
+		mapStart := vaddr & mmapAddrMask
+		mapEnd := (vaddr + memsz + (pageSize - 1)) & mmapAddrMask
+		if mapEnd <= mapStart {
+			return fmt.Errorf("LoadElf: segment at 0x%x size 0x%x wraps", vaddr, memsz)
+		}
+		// A valid ELF has filesz <= memsz; the reverse would have us write
+		// more bytes (filesz) than the region is mapped for (sized from
+		// memsz), overrunning the mapping. Reject malformed images.
+		if uint32(p.Filesz) > memsz {
+			return fmt.Errorf("LoadElf: segment at 0x%x filesz 0x%x exceeds memsz 0x%x",
+				vaddr, p.Filesz, memsz)
+		}
+		// Read the first p_filesz bytes via the program header (handles
+		// p_offset / compression / the file image). The Memsz-Filesz BSS
+		// tail needs no write: in-arena pages start zero, and an anon
+		// mmap is demand-zero.
+		data := make([]byte, p.Filesz)
+		if p.Filesz > 0 {
+			if _, err := io.ReadFull(p.Open(), data); err != nil {
+				return fmt.Errorf("LoadElf: read segment at 0x%x: %w", vaddr, err)
+			}
+		}
+		inArena := mapStart >= guestArenaBase &&
+			mapEnd <= guestArenaBase+guestArenaSize
+		plan.segments = append(plan.segments, elfSegment{
+			vaddr:    vaddr,
+			data:     data,
+			mapStart: mapStart,
+			mapEnd:   mapEnd,
+			inArena:  inArena,
+		})
+	}
+	if len(plan.segments) == 0 {
+		return errors.New("LoadElf: no PT_LOAD segments")
+	}
+
+	// Trap mode shares the guest address space with the rt_sigreturn
+	// restorer trampoline at trapTrampolineAddr; a deck whose segments
+	// reach that page would clobber it. LoadElf is intended for the
+	// fresh-deck host-mode boot, so reject the collision loudly rather
+	// than corrupt the trampoline.
+	if mode == proto.ModeTrap {
+		const trampPage = trapTrampolineAddr & mmapAddrMask
+		for _, s := range plan.segments {
+			if trampPage >= s.mapStart && trampPage < s.mapEnd {
+				return fmt.Errorf(
+					"LoadElf: trap-mode trampoline 0x%x collides with segment 0x%x..0x%x (use host mode)",
+					trapTrampolineAddr, s.mapStart, s.mapEnd)
+			}
+		}
+	}
+
+	r.mode = mode
+	r.memUpdateIntervalMs = memUpdateMs
+	r.watchRegions = watch
+	r.loadElfPlan = plan
+	return nil
+}
+
+// mapSegmentGaps backs [start,end) (page-aligned guest addresses) with
+// guest memory, mmapping ONLY the pages not already mapped — by the
+// stub's static guestRegions or a previously-mapped segment recorded in
+// extraRegions. This matters when PT_LOAD segments share a page, or a
+// segment partially overlaps the static arena (the deck's .rodata starts
+// inside the arena and runs past it): a blanket MAP_FIXED mmap of the
+// whole range would re-map — and zero — pages an earlier segment already
+// wrote, and would waste the mmapMaxRegions budget on redundant mappings.
+// Gaps are mmap'd via mmapRegionForLoadContext (the same injectSyscall
+// path), so they land in extraRegions and the snapshot walk picks them
+// up. Caller must be on the tracer thread with the child stopped.
+func (r *Runner) mapSegmentGaps(start, end uint32, regs *regs32) error {
+	type iv struct{ a, b uint32 }
+	var mapped []iv
+	for _, gr := range guestRegions {
+		mapped = append(mapped, iv{gr.addr, gr.addr + gr.size})
+	}
+	r.extraRegionsMu.RLock()
+	for _, er := range r.extraRegions {
+		mapped = append(mapped, iv{er.addr, er.addr + er.size})
+	}
+	r.extraRegionsMu.RUnlock()
+	sort.Slice(mapped, func(i, j int) bool { return mapped[i].a < mapped[j].a })
+
+	cur := start
+	for _, m := range mapped {
+		if cur >= end {
+			break
+		}
+		if m.b <= cur || m.a >= end {
+			continue // no overlap with the remaining [cur,end)
+		}
+		if m.a > cur {
+			gapEnd := m.a
+			if gapEnd > end {
+				gapEnd = end
+			}
+			if err := r.mmapRegionForLoadContext(cur, gapEnd-cur, regs); err != nil {
+				return err
+			}
+		}
+		if m.b > cur {
+			cur = m.b
+		}
+	}
+	if cur < end {
+		if err := r.mmapRegionForLoadContext(cur, end-cur, regs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyElfPlan maps and writes the staged PT_LOAD segments into the
+// stopped guest. Called once from tracerLoop after the trampoline is
+// written and before the syscall loop starts, so injectSyscall (used by
+// mmapRegionForLoadContext for out-of-arena segments) has a valid
+// trampoline + ptrace stop to work with. regs is the live register set;
+// mmap injection mutates and restores it.
+func (r *Runner) applyElfPlan(plan *elfPlan, regs *regs32) error {
+	// Two phases, and the order is load-bearing. Phase 1 maps every
+	// out-of-arena segment via injectSyscall, which hijacks the guest EIP
+	// onto the trampoline's `CD 80` at trapTrampolineAddr (0x09040000).
+	// Phase 2 then writes all the segment bytes. They MUST NOT interleave:
+	// the SIMD86 deck's ~160 MiB read-only .rodata starts inside the static
+	// arena and runs past 0x09040000, so writing it clobbers the
+	// trampoline. If a later segment (e.g. .bss above the arena) still
+	// needed an mmap after that write, its injectSyscall would jump onto
+	// the overwritten bytes and the guest would take SIGILL. Doing every
+	// mmap first — while the trampoline is still intact — removes that
+	// ordering hazard regardless of PT_LOAD order in the file.
+	for _, s := range plan.segments {
+		if !s.inArena {
+			if err := r.mapSegmentGaps(s.mapStart, s.mapEnd, regs); err != nil {
+				return fmt.Errorf("mmap ELF segment 0x%x..0x%x: %w", s.mapStart, s.mapEnd, err)
+			}
+		}
+	}
+	for _, s := range plan.segments {
+		// Write file bytes in <= elfWriteChunk pieces: a single huge
+		// process_vm_writev can short-write, so chunk the SIMD86 deck's
+		// multi-MiB segments.
+		for off := 0; off < len(s.data); off += elfWriteChunk {
+			end := off + elfWriteChunk
+			if end > len(s.data) {
+				end = len(s.data)
+			}
+			if err := r.writeMem(s.vaddr+uint32(off), s.data[off:end]); err != nil {
+				return fmt.Errorf("write ELF segment at 0x%x: %w", s.vaddr+uint32(off), err)
+			}
+		}
+	}
+
+	// Re-install the trampoline if any segment's written bytes covered
+	// it. tracerLoop materialises trapTrampolineBytes at trapTrampolineAddr
+	// (0x09040000) BEFORE applyElfPlan runs, but that address sits inside
+	// the static arena [0x08048000, 0x09048000) — a real SIMD86 deck's
+	// ~160 MiB read-only .rodata can easily span it, so the segment write
+	// above would clobber the `CD 80` injectSyscall depends on. Without
+	// this, the deck's own runtime mmap_request (and any other injected
+	// syscall) would jump onto the segment's bytes and fault. We rewrite
+	// the few trampoline bytes last so they win. Host mode only matters
+	// here: LoadElf rejects an overlapping segment in trap mode up front.
+	const trampPage = trapTrampolineAddr & mmapAddrMask
+	for _, s := range plan.segments {
+		if trampPage >= s.mapStart && trampPage < s.mapEnd {
+			if err := r.writeMem(trapTrampolineAddr, trapTrampolineBytes); err != nil {
+				return fmt.Errorf("re-install trampoline after ELF load: %w", err)
+			}
+			break
+		}
+	}
+	return nil
 }
 
 // Close signals shutdown and waits for the tracer goroutine to finish.
@@ -746,7 +1113,19 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 		r.emitFault(fmt.Sprintf("get i386 regs (init): %v", err))
 		return
 	}
-	if msg.withCtx {
+	if r.loadElfPlan != nil {
+		// Large-deck handover: map + write the ELF's PT_LOAD segments
+		// (out-of-arena ones get a dynamic mmap first), then set EIP to
+		// the ELF entry and ESP to the start message's stack top. The
+		// trampoline is already written above, so applyElfPlan's
+		// mmap injection has a valid syscall site.
+		if err := r.applyElfPlan(r.loadElfPlan, &regs); err != nil {
+			r.emitFault(fmt.Sprintf("apply ELF plan: %v", err))
+			return
+		}
+		regs.Eip = r.loadElfPlan.entry
+		regs.Esp = msg.stackTop
+	} else if msg.withCtx {
 		// Reservations come first. They cover address ranges the
 		// guest's mov-only ABI mmap_request handler already mapped
 		// on the sender — invisible in Regions when those pages
@@ -811,13 +1190,19 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 	// Start the periodic MemUpdate ticker, if the caller asked for
 	// one. tracerLoop's defer joins via `tickerWg.Wait()` before
 	// closing eventsCh so the ticker can't panic on a closed
-	// channel.
-	if msg.memUpdateInterval > 0 {
+	// channel. The LoadElf path carries its cadence on the Runner
+	// (r.memUpdateIntervalMs) rather than the start message, since the
+	// server kicks it with the plain Run entry point.
+	memUpdateInterval := msg.memUpdateInterval
+	if r.loadElfPlan != nil && r.memUpdateIntervalMs > 0 {
+		memUpdateInterval = time.Duration(r.memUpdateIntervalMs) * time.Millisecond
+	}
+	if memUpdateInterval > 0 {
 		r.memUpdateEnabled = true
 		r.tickerWg.Add(1)
 		go func() {
 			defer r.tickerWg.Done()
-			r.memUpdateTicker(msg.memUpdateInterval)
+			r.memUpdateTicker(memUpdateInterval)
 		}()
 	}
 
