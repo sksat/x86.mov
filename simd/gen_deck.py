@@ -56,13 +56,25 @@ def parse_color(spec):
     return struct.pack("<BBBB", r, g, b, 255)
 
 
-def slide_rgba(image, w, h, base_dir):
-    """Produce w*h*4 RGBA bytes for one slide."""
+def slide_rgba(image, w, h, base_dir, bg=(0, 0, 0)):
+    """Produce w*h*4 RGBA bytes for one slide.
+
+    Images are fit into (w, h) **preserving aspect ratio** and centered
+    (letterboxed with `bg`), so a 16:9 source isn't squashed into a 4:3
+    or 8:5 framebuffer mode. `color:` placeholders fill the whole frame.
+    """
     if image.startswith("color:"):
         return parse_color(image) * (w * h)
     from PIL import Image  # provided by the PEP 723 dependency
     path = image if os.path.isabs(image) else os.path.join(base_dir, image)
-    return Image.open(path).convert("RGBA").resize((w, h)).tobytes()
+    src = Image.open(path).convert("RGBA")
+    # Scale to fit inside (w, h) without distortion, then paste centered
+    # onto an opaque background of the target size.
+    fitted = src.copy()
+    fitted.thumbnail((w, h), Image.LANCZOS)
+    canvas = Image.new("RGBA", (w, h), (bg[0], bg[1], bg[2], 255))
+    canvas.paste(fitted, ((w - fitted.width) // 2, (h - fitted.height) // 2), fitted)
+    return canvas.tobytes()
 
 
 def main():
