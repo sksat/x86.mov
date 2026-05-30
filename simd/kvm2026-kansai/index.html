@@ -67,9 +67,22 @@
       margin-top: 16px; padding: 10px; border: 1px solid #2a2a3a; border-radius: 6px;
       background: #1b1b28;
     }
-    .boost label { display: flex; align-items: center; gap: 8px; font-weight: 600; }
     .boost .note { color: #777; font-size: 12px; margin-top: 6px; }
+    .boost-field { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #aab; margin-bottom: 6px; }
+    .boost-field input, .boost-field select {
+      flex: 1 1 auto; min-width: 0; background: #11111a; color: #cdd0e0;
+      border: 1px solid #2a2a3a; border-radius: 4px; padding: 3px 6px;
+      font: 12px ui-monospace, monospace;
+    }
     .boost-btn { display: block; width: 100%; padding: 0; border: 2px solid #2a2a3a; border-radius: 6px; background: #c9ccd6; cursor: pointer; overflow: hidden; }
+    /* Boost status: a coloured dot + label, distinct per state. */
+    .boost-status { display: flex; align-items: center; gap: 7px; margin-top: 8px; font-size: 12px; font-weight: 600; }
+    .boost-status .dot { width: 9px; height: 9px; border-radius: 50%; background: #667; flex: 0 0 auto; }
+    .boost-status.off     .dot { background: #667; }
+    .boost-status.connecting .dot { background: #ffcc66; animation: pulse 1s infinite; }
+    .boost-status.boosted .dot { background: #46d160; box-shadow: 0 0 8px #46d16088; }
+    .boost-status.error   .dot { background: #ff5d5d; }
+    @keyframes pulse { 50% { opacity: 0.3; } }
     .boost-btn img { display: block; width: 100%; height: auto; }
     .boost-btn:hover { border-color: #8ab4f8; }
     .boost-btn.on { border-color: #ffcc00; box-shadow: 0 0 10px #ffcc0066; }
@@ -143,10 +156,22 @@
       <div class="stat"><span class="k">halt</span><span class="v" id="s-halt">running</span></div>
 
       <div class="boost">
+        <label class="boost-field">turbo86
+          <input type="text" id="t86-url" value="ws://127.0.0.1:1234" spellcheck="false">
+        </label>
+        <label class="boost-field">mode
+          <select id="t86-mode">
+            <option value="host" selected>host</option>
+            <option value="trap">trap</option>
+          </select>
+        </label>
         <button id="boost" class="boost-btn" type="button"
                 title="アクセラレーションブースト — ローカル turbo86 にハンドオーバーしてネイティブ速度で実行">
           <img src="./acceleration-boost.png" alt="アクセラレーションブースト" />
         </button>
+        <div class="boost-status" id="boost-status">
+          <span class="dot" id="boost-dot"></span><span id="boost-state">movie86 (wasm)</span>
+        </div>
         <div class="note" id="boost-note">押すとローカル turbo86 にハンドオーバーしてネイティブ速度で実行(default off)。</div>
       </div>
       </div><!-- .m86-body -->
@@ -271,8 +296,12 @@
       }
     });
 
-    // Acceleration boost: hand the live session off to a local turbo86.
-    $('boost').addEventListener('click', () => deck.boost());
+    // Acceleration boost: hand off to the turbo86 at the address box,
+    // with the selected mode.
+    $('boost').addEventListener('click', () => deck.boost({
+      url: $('t86-url').value.trim(),
+      mode: $('t86-mode').value,
+    }));
 
     window.addEventListener('beforeunload', () => deck.stop());
   </script>
