@@ -334,12 +334,26 @@ export function snapshotContext(vm) {
 // end), this is more than fast enough; a future optimization could
 // drop down to a manual encoder if it ever shows up in a profile.
 function bytesToBase64(u8) {
-    const CHUNK = 0x8000;
-    let s = '';
+    // btoa() the array in 3-byte-aligned chunks and concatenate the
+    // base64 outputs, rather than building one giant binary string and
+    // btoa()-ing it whole. A single btoa() over a ~160 MiB binary string
+    // (the SIMD86 deck snapshot) tries to allocate the ~213 MiB output
+    // contiguously and throws "allocation size overflow" in Firefox; the
+    // per-chunk form keeps every transient allocation ~64 KiB and the
+    // result accrues as a rope. CHUNK must be a multiple of 3 so each
+    // btoa() lands on a base64 boundary (no '=' padding mid-stream).
+    const CHUNK = 0x8000 * 3; // 98304, divisible by 3
+    let out = '';
     for (let i = 0; i < u8.length; i += CHUNK) {
-        s += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+        const slice = u8.subarray(i, i + CHUNK);
+        let s = '';
+        const SUB = 0x8000;
+        for (let j = 0; j < slice.length; j += SUB) {
+            s += String.fromCharCode.apply(null, slice.subarray(j, j + SUB));
+        }
+        out += btoa(s);
     }
-    return btoa(s);
+    return out;
 }
 
 function base64ToBytes(b64) {
