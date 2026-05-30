@@ -41,8 +41,20 @@ exit:
     mov eax, [esp + 4]
     mov [0x1FFE00FE], eax
 
-# 320*200*4 = 256000 byte framebuffer BSS at 0xA0000 via --section-start.
+# Framebuffer BSS regions, one per video mode the deck uses, pinned to
+# the mode's guest address via --section-start at link time (must match
+# MODES in gen_deck.py / FRAMEBUFFER_MODES in movie86.mjs). @nobits so
+# they cost nothing in the file image. Add a section here (and a
+# --section-start in build-deck.sh) when a deck introduces a new mode.
+
+# mode 13h — 320*200*4 = 256000 bytes at 0xA0000.
 .section .fb13h, "aw", @nobits
 .globl _fb13h_region
 _fb13h_region:
 .skip 256000
+
+# VESA 6Ah — 800*600*4 = 1920000 bytes at 0x400000.
+.section .fb6Ah, "aw", @nobits
+.globl _fb6Ah_region
+_fb6Ah_region:
+.skip 1920000
