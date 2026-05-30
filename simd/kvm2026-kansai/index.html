@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SIMD86 — Kernel/VM 2026 Kansai</title>
+  <meta property="og:title" content="SIMD86 — Single Instruction, Multiple Decks" />
+  <meta property="og:description" content="A slide deck executed by a mov-only program inside the movie86 emulator." />
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      background: #15151f; color: #cdd0e0;
+      font: 14px/1.5 system-ui, sans-serif;
+      display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+    }
+    header {
+      padding: 6px 12px; display: flex; align-items: baseline; gap: 12px;
+      border-bottom: 1px solid #2a2a3a; flex: 0 0 auto;
+    }
+    header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+    header .tag { color: #888; font-size: 12px; }
+    header .hint { margin-left: auto; color: #777; font-size: 12px; }
+
+    /* Side-by-side: slide pane | draggable divider | movie86 pane. */
+    #split { flex: 1 1 auto; display: flex; min-height: 0; }
+    #slide-pane {
+      flex: 1 1 0; min-width: 120px; display: flex;
+      align-items: center; justify-content: center;
+      background: #0b0b12; overflow: hidden;
+    }
+    /* Canvas keeps its native 320x200 backing store; CSS scales it to the
+       pane, smoothly, preserving aspect ratio. Pixelated so the small
+       deck art stays crisp instead of blurring when scaled up. */
+    #screen {
+      max-width: 100%; max-height: 100%;
+      width: auto; height: auto;
+      aspect-ratio: 320 / 200;
+      image-rendering: pixelated;
+      background: #000;
+    }
+    #divider {
+      flex: 0 0 6px; cursor: col-resize; background: #2a2a3a;
+    }
+    #divider:hover { background: #3a3a5a; }
+    #movie86-pane {
+      flex: 0 0 320px; min-width: 160px; max-width: 60%;
+      padding: 12px; overflow: auto; border-left: 1px solid #2a2a3a;
+    }
+    #movie86-pane h2 { font-size: 12px; text-transform: uppercase; color: #888; margin: 0 0 8px; letter-spacing: .05em; }
+    .stat { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dotted #2a2a3a; }
+    .stat .k { color: #888; }
+    .stat .v { font-variant-numeric: tabular-nums; }
+    .boost {
+      margin-top: 16px; padding: 10px; border: 1px solid #2a2a3a; border-radius: 6px;
+      background: #1b1b28;
+    }
+    .boost label { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+    .boost .note { color: #777; font-size: 12px; margin-top: 6px; }
+    footer { flex: 0 0 auto; padding: 4px 12px; border-top: 1px solid #2a2a3a; color: #777; font-size: 12px; }
+    a { color: #8ab4f8; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>SIMD86</h1>
+    <span class="tag">Single Instruction, Multiple Decks</span>
+    <span class="hint">canvas にカーソルを乗せて ← → / Space で操作</span>
+  </header>
+
+  <div id="split">
+    <div id="slide-pane">
+      <canvas id="screen" width="320" height="200"></canvas>
+    </div>
+    <div id="divider" title="ドラッグで分割サイズ変更"></div>
+    <aside id="movie86-pane">
+      <h2>movie86</h2>
+      <div class="stat"><span class="k">engine</span><span class="v" id="s-engine">movie86 (wasm)</span></div>
+      <div class="stat"><span class="k">total mov</span><span class="v" id="s-steps">0</span></div>
+      <div class="stat"><span class="k">mov / sec</span><span class="v" id="s-rate">—</span></div>
+      <div class="stat"><span class="k">video mode</span><span class="v" id="s-mode">—</span></div>
+      <div class="stat"><span class="k">halt</span><span class="v" id="s-halt">running</span></div>
+
+      <div class="boost">
+        <label><input type="checkbox" id="boost" disabled /> アクセラレーションブースト</label>
+        <div class="note">ON でローカル turbo86 にハンドオーバーしてネイティブ速度で実行。
+          <br>(準備中 — turbo86 WS キー入力配線後に有効化)</div>
+      </div>
+    </aside>
+  </div>
+
+  <footer>
+    このスライドは <strong>mov 命令だけ</strong>で描かれています。デック本体は movfuscator/llvm-mov 系の
+    mov-only ELF で、<a href="/movie86/">movie86</a> エミュレータが実行しています。
+    全ピクセルが <code>mov</code> で計算される。 ·
+    <a href="/">x86.mov</a>
+  </footer>
+
+  <script type="module">
+    import { runDeck } from '../simd.mjs';
+
+    const canvas = document.getElementById('screen');
+    const $ = (id) => document.getElementById(id);
+
+    // Live "mov / sec" needs a sampled rate, not a cumulative average.
+    let prevSteps = 0n, prevT = performance.now(), rate = 0;
+
+    function fmt(n) { return Number(n).toLocaleString(); }
+
+    const deck = await runDeck(canvas, './deck.elf', {
+      onStatus({ steps, mode, halt }) {
+        $('s-steps').textContent = fmt(steps);
+        const now = performance.now();
+        const dt = now - prevT;
+        if (dt >= 250) {
+          const dSteps = Number(steps - prevSteps);
+          rate = dSteps / (dt / 1000);
+          prevSteps = steps; prevT = now;
+          $('s-rate').textContent = rate >= 1e6 ? `${(rate / 1e6).toFixed(1)}M` : fmt(Math.round(rate));
+        }
+        $('s-mode').textContent = mode == null ? '—' : `0x${mode.toString(16)} (13h)`;
+        $('s-halt').textContent = halt ?? 'running';
+      },
+    });
+
+    // Draggable divider: resize the movie86 pane by setting its flex-basis.
+    const divider = $('divider');
+    const pane = $('movie86-pane');
+    let dragging = false;
+    divider.addEventListener('pointerdown', (e) => {
+      dragging = true; divider.setPointerCapture(e.pointerId);
+    });
+    divider.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const w = Math.max(160, window.innerWidth - e.clientX - 3);
+      pane.style.flexBasis = `${Math.min(w, window.innerWidth * 0.6)}px`;
+    });
+    divider.addEventListener('pointerup', (e) => {
+      dragging = false; divider.releasePointerCapture(e.pointerId);
+    });
+
+    window.addEventListener('beforeunload', () => deck.stop());
+  </script>
+</body>
+</html>
