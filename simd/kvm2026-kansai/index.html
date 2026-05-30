@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SIMD86 — Kernel/VM 2026 Kansai</title>
-  <meta property="og:title" content="SIMD86 — Single Instruction, Multiple Decks" />
+  <meta property="og:title" content="SIMD86 — Kernel/VM 2026 Kansai" />
   <meta property="og:description" content="A slide deck executed by a mov-only program inside the movie86 emulator." />
   <style>
     :root { color-scheme: dark; }
@@ -20,7 +20,6 @@
       border-bottom: 1px solid #2a2a3a; flex: 0 0 auto;
     }
     header h1 { font-size: 14px; margin: 0; font-weight: 600; }
-    header .tag { color: #888; font-size: 12px; }
     header .hint { margin-left: auto; color: #777; font-size: 12px; }
 
     /* Side-by-side: slide pane | draggable divider | movie86 pane. */
@@ -98,33 +97,38 @@
     .m86-head .caret { color: #888; transition: transform .15s; }
     .m86-mini { margin-left: auto; display: none; color: #9aa; font-size: 12px; font-variant-numeric: tabular-nums; }
     #split.m86-min #divider { display: none; }
-    /* Minimized: a thin strip — just the header + stacked mov stats. */
+    /* Minimized: collapse to a slim right-edge rail. Only a "‹ movie86"
+       toggle + the mov count remain, rotated vertical so the slide gets
+       almost the whole width back. */
     #split.m86-min #movie86-pane {
-      flex: 0 0 auto; width: max-content; min-width: 0; max-width: 160px; padding: 8px;
+      flex: 0 0 auto; width: auto; min-width: 0; max-width: none;
+      padding: 6px 2px; border-left: 1px solid #2a2a3a;
     }
     #split.m86-min .m86-body { display: none; }
-    #split.m86-min .m86-head { margin: 0; flex-wrap: wrap; }
-    #split.m86-min .m86-head .caret { transform: rotate(-90deg); }
-    /* Stats drop below the title (no margin-left:auto push) so the strip
-       stays narrow. */
-    #split.m86-min .m86-mini { display: block; margin-left: 0; flex-basis: 100%; }
+    #split.m86-min .m86-head {
+      writing-mode: vertical-rl; gap: 6px; margin: 0; width: auto;
+    }
+    #split.m86-min .m86-head h2 { writing-mode: vertical-rl; }
+    #split.m86-min .m86-head .caret { transform: rotate(90deg); }
+    #split.m86-min .m86-mini { display: inline; margin: 0; writing-mode: vertical-rl; }
   </style>
 </head>
 <body>
   <header>
     <h1>SIMD86</h1>
-    <span class="tag">Single Instruction, Multiple Decks</span>
     <span class="hint">スライド領域にカーソルを乗せて ← → / Space / Enter で操作</span>
   </header>
 
-  <div id="split">
+  <!-- Default collapsed (m86-min): the slide gets the width; click the
+       movie86 rail to expand the stats pane. -->
+  <div id="split" class="m86-min">
     <div id="slide-pane">
       <div id="res-badge">—</div>
       <canvas id="screen" width="320" height="200"></canvas>
     </div>
     <div id="divider" title="ドラッグで分割サイズ変更"></div>
     <aside id="movie86-pane">
-      <button class="m86-head" id="m86-toggle" type="button" aria-expanded="true" title="クリックで最小化 / 展開">
+      <button class="m86-head" id="m86-toggle" type="button" aria-expanded="false" title="クリックで最小化 / 展開">
         <span class="caret">▾</span><h2>movie86</h2>
         <span class="m86-mini" id="m86-mini">—</span>
       </button>
