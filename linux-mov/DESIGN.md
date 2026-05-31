@@ -42,10 +42,11 @@ x86mov32 を独立 base ISA と定義した（spec §1）以上、Linux 側も *
 | Stage | profile | 内容 | 緑の判定 |
 |---|---|---|---|
 | **L0** | pv-min | movie86 に PV-MMIO ウィンドウ + PV-CONSOLE(`PUTC`)。spec §6.1 の x86-like 同期 fault（未マップ=fault）も実装 | 別 PV ページへの mov が console handler に届く単体 + base/pv-min conformance fixture（spec §8） |
-| **L0.5** | — | **Linux/x86mov32 feasibility kill-test**（コード変更なし）。実 Linux ソースに対し inline asm 形態・**`asm goto`・`"memory"` clobber・exception-table/fault fixup**・atomics・builtins・special sections・linker script・varargs/i64 を棚卸し。**kill 条件**: llvm-mov がコンパイラバリア + faultable asm/制御フロー fixup をモデル化できないと判明したら、ロードマップを再設計（atomics より先に詰む論点） | blocking list が spec 0.3 入力として確定 |
+| **L0.5** ✅ | — | **Linux/x86mov32 feasibility kill-test** → 結果 [`L0.5-KILLTEST.md`](./L0.5-KILLTEST.md)。**判定 SURVIVES**（二者独立検証）。config レベル BLOCKER なし（UP/nommu/no-SMC/no-jumplabel で難所は全て無効化 or 純 C 化）。残るは llvm-mov の限定作業（volatile codegen・空+operand バリア・i386 varargs・i64 helper lower・C irq-flag）。任意 inline asm は first boot 不要 | 完了 |
 | **L1** | pv-min | 自作極小カーネル（数百行 C, **inline asm 不使用**）を llvm-mov でビルドし `PUTC` に mov して `"Hello, x86mov32\n"` を出して停止 | E2E: ELF を movie86 で実行→期待出力。objdump で `.text` が mov(+jmp) のみ |
 | **L2** | pv-kernel | PV-CPU(`INTR_MASK`/`IDT_BASE`/`IRET`) + spec §6.3 trap frame + poll 型 PV-IRQ。協調スケジューラの土台 | trap frame 往復 / マスク制御 / tick 単体 + E2E + pv-kernel conformance（一部） |
-| **L3** | — | llvm-mov に **inline asm → mov**（mainline への分水嶺）。L0.5 の blocking list 順で、まず単純制約→`"memory"`/volatile→`asm goto` | 新規 inline-asm fixture が mov-only で通る |
+| **L3a** | — | **first boot 必須のコンパイラ作業**（L0.5 確定）: volatile load/store の codegen 正しさ、空+operand 付き memory バリア、i386 SysV varargs、i64 helper-call lower（除算は do_div 経由で libgcc 除算を emit しない）、memcpy/memset emit、C `arch_local_irq_save/restore` | 各 fixture が mov-only で通る |
+| **L3b** | — | **任意制約 inline asm → mov**（広い config / driver 用、first boot 不要に後退）。段階導入、対応不能形を列挙 | inline-asm fixture |
 | **L4** | — | atomics（UP 前提で `lock` 省略 + cmpxchg を mov 列に） | atomic fixture |
 | **L5** | pv-kernel | PV-MMU(`PGDIR`/`FLUSH`/`FAULT_ADDR`) + `PagedMemory`。demand paging / page fault 配送（spec §6.2/§7.7） | page fault → FAULT_ADDR / PGDIR で VA→PA |
 | **L6** | pv-kernel | 強制ジャンプ型割り込み（preemption） | タイマで別タスクへ切替 |
@@ -120,5 +121,6 @@ spec は profile 定義（pv-kernel は PV-CPU/IRQ/MMU を *含む*）、本書�
 - [x] TODO-7: **決定 — ターゲット名 `x86mov32`**
 - [x] TODO-8: **決定 — 主 template は arch/riscv(rv32)**。trap/CLINT/PLIC/SBI/DT を移植参考に（§1, spec §6.3/§7.4–§7.6/§7.10）
 - [x] TODO-9: **決定 — ハードウェア記述は device tree**。boot で DTB を渡す（spec §7.10/§9）
-- [ ] TODO-10: L0.5 kill-test の具体的チェックリストと判定基準を起こす（arch/riscv の inline asm/atomics/fixup の使い方も比較参照点に）（spec §10 → 0.3）
+- [x] TODO-10: **L0.5 kill-test 完了** → [`L0.5-KILLTEST.md`](./L0.5-KILLTEST.md)（二者独立検証, SURVIVES）。llvm-mov 要件と最小 config を確定
 - [ ] TODO-11: PV-* の DT binding（compatible 文字列・reg・interrupts）を起こす（spec §7.10）
+- [ ] TODO-12: arch/x86mov32 の defconfig 起点（SMP=n / PREEMPT_NONE / nommu uaccess / JUMP_LABEL=n / no ALTERNATIVE/FTRACE/KPROBES / GENERIC_ATOMIC64 / GENERIC_LIB_* / 無印 BUG）を起こす（L0.5 §ロードマップ帰結）

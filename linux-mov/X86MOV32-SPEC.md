@@ -248,4 +248,4 @@ read 専用レジスタへの write、write 専用への read、未定義オフ�
 
 - **凍結（0.x で変えない）**: §3 ISA、§4 レジスタ、§5 メモリ（マップ規約含む）、§6.1 同期 fault、§6.3 trap frame レイアウト、§9 boot。
 - **version 付きで進化**: §7.5–§7.7 の詳細意味論、ページテーブル形式、割り込み配送モデル、§7.8 テキストパッチ方針。
-- **0.3 への入力 = L0.5「Linux/x86mov32 feasibility kill-test」**（DESIGN.md）。単なる棚卸しでなく **kill-test** とする。最有力の致命要因は *命令選択ではなく* **inline asm の意味論** — `asm volatile`・`"memory"` clobber・`asm goto`・exception-table / fault fixup パターン。llvm-mov がコンパイラバリアと faultable asm/制御フロー fixup をモデル化できなければ、atomics 以前に詰む（UP atomics は当面ごまかせるが、barrier/fixup/asm-goto 契約はごまかせない）。
+- **0.3 への入力 = L0.5「Linux/x86mov32 feasibility kill-test」→ 完了**（[`L0.5-KILLTEST.md`](./L0.5-KILLTEST.md)、二者独立検証で **SURVIVES**）。結論: 最小 config（UP/nommu/no-SMC/no-jumplabel）にカーネル側 config BLOCKER は無く、難所は無効化 or 純 C 化できる。llvm-mov の irreducible 要件は **(1) volatile codegen 正しさ (2) 空+operand 付き memory バリア (3) i386 varargs (4) i64 helper lower（libgcc 除算は emit しない）(5) C/PV irq-flag**。任意制約 inline asm は first boot 不要。entry/特権パスは PV-MMIO mov 列として `arch/x86mov32` に手書き（link/boot 必須）。
