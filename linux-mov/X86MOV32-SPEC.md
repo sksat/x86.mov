@@ -65,12 +65,13 @@ movie86 は base + MMIO + PV-* を直接実装するリファレンス実装。c
 | **x86mov32-base** | §3 ISA + §4 レジスタ + §5 メモリ + §6 fault + §9 boot | 計算 + halt/exit。デバイス無し |
 | **x86mov32-pv-min** | base + §7.3 PV-CONSOLE + §7.4 PV-TIMER（割り込み無しの read） | 極小カーネルが print / tick poll |
 | **x86mov32-pv-kernel** | pv-min + §7.5 PV-CPU + §7.6 PV-IRQ + §7.7 PV-MMU + §6.3 trap 配送 | Linux/x86mov32 級（demand paging・割り込み・preemption）|
-| **x86mov32-compat-movfuscator** | base + 旧 movfuscator 互換（`int 0x80` syscall・SIGILL/SIGSEGV dispatch・segment-mov 経路）| 既存 movie86 資産（movfuscator-wasm 等）の後方互換 |
+| **x86mov32-compat-movfuscator** | base + 旧 movfuscator 互換（`int 0x80` syscall・SIGILL/SIGSEGV dispatch・segment-mov 経路）| 既存 movie86 資産の互換。**optional・best-effort**（design stance 参照） |
 
 **規則**:
 - 「X は x86mov32-pv-min を狙う」と profile 名で書く。movie86 は各 profile のリファレンス実装。
 - **x86-host 実行層**は profile ではなく「実 x86/qemu 上で指定 profile を供給する層」。同名 profile の §8 テストを通すか、通らない差分を conformance gap として文書化した場合のみ「その profile を host できる」と言える。
 - 互換ハック（§3.3）は **base に入れない**。`x86mov32-compat-movfuscator` に隔離する。
+- **design stance: movie86 の AS-IS 仕様は維持制約ではない**。movie86 を x86mov32 のリファレンス機械へ再形成する際、現行の userspace-runner 挙動・movfuscator 実行・寛容な flat メモリ・`0x1FFE_0000` ABI を保存する義務はない。`x86mov32-compat-movfuscator` は **optional な legacy モード**であって x86mov32 の設計を縛らない。既存資産（movfuscator-wasm / explorer 等）の互換は best-effort で、必要になった時だけ legacy モードとして供給する。
 
 ## 3. ISA サブセット（base, 凍結）
 
