@@ -108,7 +108,8 @@ base / pv に **観測可能な EFLAGS は存在しない**。許可命令はフ
 ## 5. メモリモデル（base, 凍結）
 
 - フラット 32bit バイトアドレス空間、リトルエンディアン。
-- **マップ規約（Codex round-2 対応）**: x86mov32 は **明示的にマップされた領域のみ**有効。base/pv-min では「PT_LOAD + BSS（§9）+ 宣言された PV-MMIO 領域（§7）」だけがマップされ、それ以外へのアクセスは fault（§6.1）。bare-metal 物理メモリモデルではない。
+- **マップ規約（Codex round-2 対応）**: x86mov32 は **明示的にマップされた領域のみ**有効。base/pv-min では「PT_LOAD + BSS（§9）+ boot stack（§9 で確保する実装定義領域）+ 宣言された PV-MMIO 領域（§7）」だけがマップされ、それ以外へのアクセスは fault（§6.1）。bare-metal 物理メモリモデルではない。
+  - **実装モデル（L0）**: movie86 は現状の flat 配列を **interval map**（マップ済み区間の集合）に置き換え、区間外を fault とする。base/pv-min L0 では **presence（マップの有無）判定で十分**で、W^X / `p_flags` の権限強制は後段（保護を導入する pv-kernel）まで不要。
 - **アラインメント**: 非整列アクセスは許可（`#AC` 相当は発生しない）。
 - **自己書き換えコード**: base では **不許可**（W^X 前提）。Linux のテストパッチ機構（alternatives / static-keys / jump-label / ftrace / kprobes / paravirt-patch）は §7.8 PV-TEXTPATCH か「対象 config で全テキスト改変を無効化」のいずれかで扱う（§10 未確定、ただし mainline 移植の必須検討事項）。
 - **MMIO は唯一の I/O 機構**（ポート I/O は持たない, §1b）。MMIO 領域（§7）アクセスは strong ordering（プログラム順, x86 の UC メモリ型相当 — この機構と順序は x86 と共有する）。UP・単一スレッド前提、投機・並べ替え無し。
@@ -147,7 +148,8 @@ offset  field
 
 - **EFLAGS は含めない**（§3.4 と整合）。x86mov32 は x86 の exception frame を模さず、自前の frame を定義する。Linux/x86mov32 の `pt_regs` 相当はこの frame に合わせて新規定義する（arch/x86mov32 側の責務）。
 - `IRET`（§7.5）はこの frame から GPR/EIP/ESP を復帰する。割り込みは resume 点まで masked のまま（原子的再開）。
-- **frame の置き場所と trap stack（round-4）**: 機械はゲストが事前に登録した **trap stack** に frame を積み、ハンドラ進入時に **ESP=その trap stack** とする。trap stack は PV-CPU `TRAP_STACK` レジスタ（§7.5）でゲストが設定する。これにより、割り込み元の ESP が不正/ユーザ空間でも既知良好スタックでハンドラが回り、ハンドラ本体は純 mov で書ける（ハンドラ prologue に非-mov なスタック確立は不要）。
+- **frame の置き場所と trap stack（round-4, 詳細は L2 で確定）**: 機械はゲストが事前に登録した **trap stack** に frame を積み、ハンドラ進入時に **ESP=その trap stack** とする。trap stack は PV-CPU `TRAP_STACK` レジスタ（§7.5）でゲストが設定する。これにより、割り込み元の ESP が不正/ユーザ空間でも既知良好スタックでハンドラが回り、ハンドラ本体は純 mov で書ける（ハンドラ prologue に非-mov なスタック確立は不要）。
+  - **未確定（draft, L2 で決める, round-5）**: `TRAP_STACK` が top-of-stack か frame base か / 機械が frame サイズ分 decrement するか / **nested trap**（trap stack 上で再 fault した場合に frame を上書きするか別領域か）/ frame 構築の前後で async IRQ を mask するタイミング。pv-min（割り込み無し）では未使用なので L0 はブロックしない。
 - **RISC-V との対応**: `saved EIP`↔`sepc`、`trap_kind`/`error_code`↔`scause`、`fault_addr`↔`stval`、`IRET`↔`sret`、`TRAP_STACK`↔`sscratch`（カーネルスタック退避）。frame レイアウトの確定はこの既知モデルを踏襲しており、arch/riscv の trap 処理が移植の参考になる。
 
 ## 7. PV-MMIO ABI
@@ -234,6 +236,8 @@ read 専用レジスタへの write、write 専用への read、未定義オフ�
 
 **pv-min 必須**: PUTC 出力 / STATUS / TICKS 単調増加 / MMIO 不正オフセット fault / DISCOVERY 各フィールド。
 
+**L0 具体 fixture（実装の最初のテストセット）**: `putc_ok`（PUTC 出力が host に届く）/ `status_read_ok` / `putc_read_fault`（W 専用を read→fault）/ `status_write_fault`（R 専用を write→fault）/ `mmio_byte_fault`（PUTC へ byte store→fault, 4byte 自然整列のみ有効）/ `mmio_unaligned_fault` / `mmio_bad_offset_fault` / `unmapped_load_fault` / `unmapped_fetch_fault` / `exit_ok`。各 fixture は tiny ELF + 期待する stdout または fault record。
+
 **pv-kernel 必須**（0.2 で枠、意味確定後に具体化）: trap frame レイアウト（§6.3）/ IRET 往復 / INTR_MASK 効果 / page fault → FAULT_ADDR / PGDIR による VA→PA。
 
 ## 9. boot / calling convention（base, 凍結）
@@ -241,7 +245,7 @@ read 専用レジスタへの write、write 専用への read、未定義オフ�
 - ELF32 LE i386, `ET_EXEC`, 静的リンク。`PT_INTERP`/`PT_DYNAMIC` 不可。
 - 初期 EIP = `e_entry`。memory は PT_LOAD + BSS をゼロ初期化。これらと PV-MMIO 領域のみがマップされる（§5）。
 - **2 種類の boot 契約**（凍結）:
-  - **program boot**（base / pv-min）: 初期スタック = SysV ABI 最小像（argc=0, argv/envp/auxv=NULL）、ESP は argc を指す。極小プログラム・L1 極小カーネル用。
+  - **program boot**（base / pv-min）: 初期スタック = SysV ABI 最小像（argc=0, argv/envp/auxv=NULL）、ESP は argc を指す。極小プログラム・L1 極小カーネル用。**boot stack は実装定義の固定領域**（base/top と extent を実装が決め、§5 のマップ集合に含める）。L0 テストの決定性のため、この領域の base/サイズを実装で固定する。
   - **kernel boot**（pv-kernel）: エントリで **DTB 物理アドレスを `EBX` に**、boot magic を `EAX` に渡す（RISC-V の `a0=hartid, a1=dtb` に相当する規約を x86mov32 用に固定）。カーネルは DTB からハードウェアを discover する（§7.10）。今この規約を固定し、将来の破壊的変更を避ける。
 - 終了 = halt、または compat profile の legacy exit。
 

@@ -135,7 +135,7 @@ spec は profile 定義（pv-kernel は PV-CPU/IRQ/MMU を *含む*）、本書�
 
 ## 6. 即時の design TODO
 
-- [ ] TODO-1: PV-MMIO アドレスマップを movie86 既存マップ（`0x1FFE_0000`）と突き合わせ確定（spec §7.1）
+- [x] TODO-1: **決定（round-5）** — pv-min console は spec アドレス `0x1FF0_1000`（PV-CONSOLE）に置く。movie86 既存 `0x1FFE_0000` は `x86mov32-compat-movfuscator` 専用として保持し、新 PV 窓と共存（spec §7.1）
 - [ ] TODO-2: 割り込み配送モデル（poll 型 → 強制ジャンプ型）の境界確定（spec §7.6）
 - [ ] TODO-3: ページテーブル形式（x86 PTE 流用可否）を L0.5 結果で判断（spec §7.7）
 - [x] TODO-4: **決定 — 自作の極小カーネル**（L1, inline asm 非依存）

@@ -100,7 +100,7 @@ sret                                  mov [PV_CPU + IRET],      0
 | 外界 device I/O（R-mmio, **x86 と共有**） | PV-CONSOLE / PV-TIMER（+任意デバイス） | 特権不要、shim ほぼ無し。ただし DMA は別（A, v0.2 外） |
 | テキストパッチの原子性/quiescence（小 M） | PV-TEXTPATCH or config-off | 部分パッチ実行回避 |
 
-→ spec §7 の PV-* は過不足ない。**特に「外界 device I/O は特権差分ではなく共有」**である点が重要（x86-host shim が要るのは MMU/protection/preempt/textpatch の機械機能 + 外部 latch だけ）。DMA を持つ実デバイスは v0.2 のスコープ外（A クラスのメモリモデルが要る）。
+→ spec §7 の PV-* は **ここで識別した差分を覆う**（pv-min 面は確定的、**pv-kernel 面（PV-CPU/IRQ/MMU）は draft で未閉** — 例: TRAP_STACK の nested trap 意味論は L2 で確定）。**特に「外界 device I/O は特権差分ではなく共有」**である点が重要（x86-host shim が要るのは MMU/protection/preempt/textpatch の機械機能 + 外部 latch だけ）。DMA を持つ実デバイスは v0.2 のスコープ外（A クラスのメモリモデルが要る）。
 
 **閉包（round-4 補正: 等号でなく包含）**: カーネルの PV M-set（`lgdt`/`lidt`/`mov CRn`/`sti`/`cli`/`iret`/`invlpg` 相当）は、x86-host substrate を mov 化したときに残る非-mov 核の **部分集合**。substrate の非-mov 集合は **真の上位集合**であり、host 固有の義務が加わる：
 
