@@ -102,6 +102,8 @@ sret                                  mov [PV_CPU + IRET],      0
 
 → spec §7 の PV-* は過不足ない。**特に「外界 device I/O は特権差分ではなく共有」**である点が重要（x86-host shim が要るのは MMU/protection/preempt/textpatch の機械機能 + 外部 latch だけ）。DMA を持つ実デバイスは v0.2 のスコープ外（A クラスのメモリモデルが要る）。
 
+**閉包**: この M セット（`lgdt`/`lidt`/`mov CRn`/`sti`/`cli`/`iret`/`invlpg` + boot stub）は、x86-host substrate を mov 化したときに **irreducible に非-mov として残る核**そのもの（DESIGN §3.5）。movie86 ではこの核を Rust で実装し、実 x86 substrate では実特権命令の最小スタブとして実装する。x86mov32 がカーネルから追い出した特権は、ここで最小化されて再出現する — ゼロにはできないが、周辺は全て mov 化できる。
+
 ## 6. L0.5 で実 Linux / arch/riscv と突き合わせる検証
 
 本分析は原理側。実装側の致命要因は別途 kill-test で確認する：

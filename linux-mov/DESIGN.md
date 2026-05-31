@@ -78,6 +78,25 @@ PV 境界は稀なので計算は全速・仲介は薄い。
 1. **qemu machine type `x86mov32`**（推奨）: guest=mov カーネル、qemu が PV-MMIO デバイス + 割り込み注入を提供。movie86 と qemu がこの spec の2実装になり conformance（spec §8）に乗る。
 2. **bare-metal monitor**: 実機 ring0 最小 firmware。純度最高だが手間。
 
+### substrate の正体 = OpenSBI 相当の薄い特権ファームウェア
+
+substrate は RISC-V の **OpenSBI（M-mode ランタイム）に相当する薄い ring0 特権レイヤ**。カーネルが特権サービスを S-mode→M-mode `ecall` で頼むのと同様に、x86mov32 ではカーネルが PV-MMIO へ `mov` したのを substrate が処理する。非-mov の特権命令（`lidt`/`mov CR3`/`sti`/`iret`/boot）はここに **隔離**され、カーネルは 100% mov のまま native 実行される。
+
+- **movie86 はこの役割をソフト（Rust）で兼ねる**ので別途 substrate 不要（movie86 = 機械）。substrate が要るのは実 x86 host のときだけ。
+- 決定的差: **movie86 は命令を*解釈*（インタプリタ）／ substrate は CPU に mov を*native 実行*させ稀な PV 境界だけ仲介**（薄い）。計算は全速。
+
+### substrate 自体の mov 化
+
+substrate の仕事の大半は **純計算** — faulting `mov` のデコード（ModRM/SIB/disp/幅）、trap frame（spec §6.3）構築、ゲストメモリ/レジスタ操作、whitelist 検証、EIP 前進。**これらは全て mov 化でき、llvm-mov でコンパイルできる**。
+
+irreducible に非-mov なのは **X86-DELTA §4 の M セットそのもの** = `lgdt`/`lidt`/`mov CRn`/`sti`/`cli`/`iret`/`invlpg` + real-mode boot stub（port I/O は MMIO デバイス採用で回避可）。数十命令オーダーの固定スタブ。
+
+→ **substrate = mov-heavy（llvm-mov 製）+ 最小の非-mov 特権スタブ**。これは会話初期の「mov-heavy + 小さな asm shim」を、*カーネル全体ではなく substrate に正しくスコープした*もの。美しい閉包: x86mov32 がカーネルから追い出した特権は、最小化されて substrate の小さな非-mov 核として再出現する。ゼロにはできない（X86-DELTA の結論）が周辺は全部 mov にできる。
+
+2つの哲学:
+- **実用（qemu/KVM）**: substrate = 既存の大きな非-mov ソフト（qemu/KVM/host Linux）。簡単だが mov でない。
+- **純粋（bare-metal mov-heavy monitor）**: llvm-mov 製 monitor + 最小非-mov スタブ。最大限 mov・プロジェクトの美学に一致。← 「substrate も mov 化」の到達目標。
+
 **既存資産**: turbo86（ptrace で mov バイナリを実 x86 に native 実行 + trap）は **userspace 版 x86-host 実行層**が既にある証拠。base/pv-min プログラム（L1 等）は turbo86 系で実 x86 に流せる。pv-kernel Linux はその system 版（qemu machine / KVM）が要る。
 
 ### substrate の必須要件（conformance gate, round-3）
