@@ -10,7 +10,8 @@ BUILD_DIR     ?= build
 
 .PHONY: help setup build build-wasm-llvm build-wasm-clang \
         build-wasm-llvm-mov-llc build-native-llvm-mov-llc \
-        test test-e2e test-e2e-dist test-e2e-dist-fzstd \
+        build-wasm-rustc \
+        test test-rust test-e2e test-e2e-dist test-e2e-dist-fzstd \
         stage-deploy serve clean distclean
 
 help:
@@ -21,6 +22,8 @@ help:
 	@echo "  build-wasm-clang            link the standalone clang driver to clang.wasm"
 	@echo "  build-wasm-llvm-mov-llc     emcmake the Mov backend + llvm-mov-llc.wasm"
 	@echo "  build-native-llvm-mov-llc   ensure ../build/bin/llvm-mov-llc exists"
+	@echo "  build-wasm-rustc            self-host rustc.wasm from bjorn3/rust wasm20 (multi-hour;"
+	@echo "                              populates 'self-bjorn3-wasm20' row in RUSTC_VERSIONS)"
 	@echo "  test                        parity test: wasm .s vs native .s (per fixture)"
 	@echo "  test-e2e                    playwright: drive the demo page in a headless browser"
 	@echo "                              and diff the rendered .s against native (needs npm + browsers)"
@@ -73,6 +76,23 @@ build-native-llvm-mov-llc:
 
 test: build
 	./tests/run.sh
+
+# Rust-frontend smoke test. Drives a wasm-hosted rustc (rubrc v0.2.0
+# artefact, Rust 1.83-dev) through `rsToIR()`. Needs `wasmtime` on
+# $PATH or at ~/.local/wasmtime/wasmtime — the driver prints an
+# install hint if neither is present. Kept off the default `test`
+# target because the artefact + sysroot fetch (~40 MB compressed,
+# one-time per version) shouldn't gate a clean `make test`.
+# See ../CLAUDE.md "Rust frontend (in progress)" §.
+test-rust:
+	./tests/run-rust.sh
+
+# Self-host rustc.wasm from bjorn3/rust:compile_rustc_for_wasm20.
+# Multi-hour build. See scripts/build-wasm-rustc.sh header for
+# resource cost / quirks; see ../CLAUDE.md "Self-hosted artefact" §
+# for why this row matters (i686 + edition 2024).
+build-wasm-rustc:
+	./scripts/build-wasm-rustc.sh
 
 # Playwright drives the demo at index.html in a real (headless) Chromium,
 # clicks Compile on every built-in example, and asserts the rendered .s

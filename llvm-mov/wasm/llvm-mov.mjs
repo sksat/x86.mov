@@ -15,12 +15,22 @@
 // exit() at the end of main (EXIT_RUNTIME=1), making the runtime
 // non-reusable. Same shape as movfuscator-wasm's wrappers.
 
-import createMovLlc from './build/llvm-mov-llc.js';
 import { CLANG_WASM_VERSION } from './wasm-config.js';
 
-// Clang is lazy-loaded so callers who only need `.ll → .s` (i.e. the
-// `compile()` API) can run without the 80 MB clang.wasm artifact
-// present. The dynamic import is cached by the host module loader.
+// Drivers are lazy-loaded so callers that only use one path (e.g.
+// `rsToIR` from the Rust frontend, with no built llvm-mov-llc.wasm
+// in the worktree yet) don't get blocked by a missing artefact on
+// the other path. The dynamic imports are cached by the host module
+// loader.
+let _createMovLlc = null;
+async function loadLlc() {
+    if (_createMovLlc === null) {
+        const m = await import('./build/llvm-mov-llc.js');
+        _createMovLlc = m.default;
+    }
+    return _createMovLlc;
+}
+
 let _createMovClang = null;
 async function loadClang() {
     if (_createMovClang === null) {
@@ -202,6 +212,7 @@ export async function compile(ir, opts = {}) {
     }
     const buf = makeBuffered();
     onProgress?.({ stage: 'instantiate-llc' });
+    const createMovLlc = await loadLlc();
     const llc = await createMovLlc(buf.opts);
     llc.FS.writeFile(`/${name}`, ir);
     onProgress?.({ stage: 'compile-ir' });
@@ -339,5 +350,172 @@ export async function compileC(source, opts = {}) {
         name: llName,
         mtriple: 'mov-unknown-linux-gnu',
         onProgress: opts.onProgress,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Rust frontend (in progress)
+// ---------------------------------------------------------------------------
+//
+// `rsToIR(source)` runs a wasm-hosted rustc on a single .rs file and
+// returns the LLVM IR text (`--emit=llvm-ir`). The downstream
+// `compile()` then takes it to mov-target asm exactly like the C path.
+//
+// Rust version is selectable via `opts.rustcVersion`, which keys into
+// `RUSTC_VERSIONS`. Adding a new rustc.wasm build means appending one
+// entry to that table — no wrapper or test changes required. See
+// ../CLAUDE.md "Rust frontend (in progress)" for the staged plan and
+// the rationale behind starting on the rubrc v0.2.0 (Rust 1.79)
+// artefact rather than building our own first.
+
+/**
+ * Catalogue of selectable rustc.wasm artefacts. Each entry is the
+ * single source of truth for *one* Rust version: where to fetch the
+ * compiler wasm and matching sysroot, which targets / editions it can
+ * cope with, and how to invoke the equivalent native rustc for parity
+ * tests. The wrapper code is intentionally agnostic about *which*
+ * version is in use — switching is a one-line opts change.
+ */
+export const RUSTC_VERSIONS = {
+    'rubrc-v0.2.0': {
+        // Reported by the artefact at startup as `1.83.0-dev`. That's
+        // a snapshot off bjorn3/rust around the 1.83 nightly (between
+        // the `compile_rustc_for_wasm16` and `wasm17` branches). The
+        // "-dev" suffix flows through to `!llvm.ident` in emitted IR,
+        // which is fine for our purposes (we strip / ignore it on the
+        // way to the mov backend).
+        rustVersion: '1.83.0-dev',
+        // Edition 2024 stabilized in 1.85; this artefact predates it.
+        editions: ['2015', '2018', '2021'],
+        // What rubrc actually ships sysroot tarballs for under
+        // rust_wasm/v0.2.0/. i686-unknown-linux-gnu is *not* one of
+        // them — that's the gap we'd close by building our own
+        // artefact from bjorn3/rust:compile_rustc_for_wasm20 once the
+        // spike confirms the rest of the wiring works.
+        supportedTargets: ['wasm32-wasip1', 'x86_64-unknown-linux-gnu'],
+        artefacts: {
+            rustcWasm: 'https://oligamiq.github.io/rust_wasm/v0.2.0/rustc_opt.wasm.br',
+            // Per-target sysroot lives at `${sysrootBase}/${triple}.tar.br`.
+            sysrootBase: 'https://oligamiq.github.io/rust_wasm/v0.2.0',
+            compression: 'brotli',
+        },
+        // Parity-test hint: tests run `rustup run <nativeRustup> rustc …`
+        // so the native reference matches the wasm artefact's Rust
+        // version exactly. `1.83.0-dev` isn't a rustup channel — the
+        // closest stable for cross-checks is `1.83.0`; full nightly
+        // match requires `rustup toolchain link nightly-2024-xx-xx`.
+        nativeRustup: '1.83.0',
+    },
+    // Self-hosted next-row. The script that populates it
+    // (scripts/build-wasm-rustc.sh) is committed; the artefact tree
+    // is not (multi-GB Rust build output). Until the script runs,
+    // calling `rsToIR(src, { rustcVersion: 'self-bjorn3-wasm20' })`
+    // throws an actionable error pointing at the build script.
+    //
+    // The closure with the rubrc row: this entry adds
+    // `i686-unknown-linux-gnu` (the ABI llvm-mov-llc actually accepts)
+    // and edition 2024, both of which rubrc lacks.
+    'self-bjorn3-wasm20': {
+        rustVersion: '1.96.0',
+        editions: ['2015', '2018', '2021', '2024'],
+        supportedTargets: [
+            'i686-unknown-linux-gnu',
+            'x86_64-unknown-linux-gnu',
+            'wasm32-wasip1',
+        ],
+        artefacts: {
+            // Sentinel: the driver skips fetch logic and expects
+            // `build/rustc-cache/self-bjorn3-wasm20/dist/` to already
+            // exist (populated by scripts/build-wasm-rustc.sh).
+            local: true,
+            // Documentary only — the cache layout the build script
+            // produces, so the registry row is self-explanatory.
+            rustcWasm: 'local:dist/bin/rustc.wasm',
+            sysrootBase: 'local:dist/lib/rustlib',
+            compression: 'none',
+        },
+        nativeRustup: '1.96.0',
+    },
+};
+
+export const DEFAULT_RUSTC_VERSION = 'rubrc-v0.2.0';
+
+// Driver is dynamic-imported so callers that don't touch the Rust path
+// (e.g. the existing C parity tests) don't pull the WASI shim in.
+// Same lazy-load pattern as `loadClang()` above.
+let _rustcDriver = null;
+async function loadRustcDriver() {
+    if (_rustcDriver === null) {
+        const m = await import('./lib/rustc-driver.mjs');
+        _rustcDriver = m.rsToIRImpl;
+    }
+    return _rustcDriver;
+}
+
+/**
+ * Compile a single Rust source file to LLVM IR text via a
+ * wasm-hosted rustc.
+ *
+ * @param {string} source Rust source text.
+ * @param {{
+ *     name?: string,
+ *     rustcVersion?: keyof typeof RUSTC_VERSIONS,
+ *     target?: string,
+ *     edition?: '2015'|'2018'|'2021'|'2024',
+ *     optLevel?: '0'|'1'|'2'|'3'|'s'|'z',
+ *     artefacts?: { rustcWasm?: string, sysrootBase?: string },
+ *     onProgress?: (ev: { stage: string }) => void,
+ * }} [opts]
+ *   - `name`: MEMFS basename for the source file. Defaults to `main.rs`.
+ *   - `rustcVersion`: registry key. Defaults to `DEFAULT_RUSTC_VERSION`.
+ *   - `target`: `--target`. Must be in the version's `supportedTargets`.
+ *     Defaults to the first entry there.
+ *   - `edition`: `--edition`. Must be in the version's `editions`.
+ *     Defaults to `2021`.
+ *   - `optLevel`: forwarded as `-C opt-level=…`. No default (rustc's
+ *     own default applies — `0` for `--crate-type=lib`).
+ *   - `artefacts`: override the version's default URLs. Use this to
+ *     point at self-hosted mirrors or to pin a specific bjorn3 build
+ *     without editing the registry.
+ *   - `onProgress`: status callback. Stages: `fetch-rustc`,
+ *     `fetch-sysroot`, `instantiate-wasi`, `run-rustc`.
+ * @returns {Promise<string>} LLVM IR text from `--emit=llvm-ir`.
+ */
+export async function rsToIR(source, opts = {}) {
+    if (typeof source !== 'string') {
+        throw new TypeError('source must be a string');
+    }
+    const verKey = opts.rustcVersion ?? DEFAULT_RUSTC_VERSION;
+    const spec = RUSTC_VERSIONS[verKey];
+    if (!spec) {
+        throw new Error(
+            `unknown rustcVersion ${JSON.stringify(verKey)}; ` +
+            `known: ${Object.keys(RUSTC_VERSIONS).join(', ')}`,
+        );
+    }
+    const target = opts.target ?? spec.supportedTargets[0];
+    if (!spec.supportedTargets.includes(target)) {
+        throw new Error(
+            `target ${JSON.stringify(target)} not supported by ${verKey} ` +
+            `(supported: ${spec.supportedTargets.join(', ')})`,
+        );
+    }
+    const edition = opts.edition ?? '2021';
+    if (!spec.editions.includes(edition)) {
+        throw new Error(
+            `edition ${edition} not supported by ${verKey} ` +
+            `(supported: ${spec.editions.join(', ')})`,
+        );
+    }
+    const name = opts.name ?? 'main.rs';
+    assertSafeName(name);
+    const driver = await loadRustcDriver();
+    return driver(source, spec, {
+        ...opts,
+        versionKey: verKey,
+        name,
+        target,
+        edition,
+        artefacts: { ...spec.artefacts, ...(opts.artefacts ?? {}) },
     });
 }
