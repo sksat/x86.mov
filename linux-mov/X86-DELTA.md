@@ -102,7 +102,12 @@ sret                                  mov [PV_CPU + IRET],      0
 
 → spec §7 の PV-* は過不足ない。**特に「外界 device I/O は特権差分ではなく共有」**である点が重要（x86-host shim が要るのは MMU/protection/preempt/textpatch の機械機能 + 外部 latch だけ）。DMA を持つ実デバイスは v0.2 のスコープ外（A クラスのメモリモデルが要る）。
 
-**閉包**: この M セット（`lgdt`/`lidt`/`mov CRn`/`sti`/`cli`/`iret`/`invlpg` + boot stub）は、x86-host substrate を mov 化したときに **irreducible に非-mov として残る核**そのもの（DESIGN §3.5）。movie86 ではこの核を Rust で実装し、実 x86 substrate では実特権命令の最小スタブとして実装する。x86mov32 がカーネルから追い出した特権は、ここで最小化されて再出現する — ゼロにはできないが、周辺は全て mov 化できる。
+**閉包（round-4 補正: 等号でなく包含）**: カーネルの PV M-set（`lgdt`/`lidt`/`mov CRn`/`sti`/`cli`/`iret`/`invlpg` 相当）は、x86-host substrate を mov 化したときに残る非-mov 核の **部分集合**。substrate の非-mov 集合は **真の上位集合**であり、host 固有の義務が加わる：
+
+- **PV M-set**（カーネルが PV-MMIO で要求する特権効果を実命令で実装）
+- **+ substrate-only**: real-mode→protected-mode boot（A20/`lgdt`/`mov CR0`/far jump）、#PF cause 読み（`mov from CR2` — カーネルは PV `FAULT_ADDR` を読むが substrate は CR2）、実 IRQ コントローラ操作（PIC=port I/O / APIC=MMIO+MSR）と EOI、whitelist/実行権限の強制フック。
+
+つまり **カーネル PV M-set ⊂ substrate irreducible set**。movie86 ではこの全体を Rust で実装、実 x86 substrate では実特権命令の最小スタブ群として実装する。x86mov32 がカーネルから追い出した特権はここで最小化されて再出現する — ゼロにはできないが、周辺は全て mov 化できる。
 
 ## 6. L0.5 で実 Linux / arch/riscv と突き合わせる検証
 

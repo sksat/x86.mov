@@ -72,7 +72,7 @@ substrate の責務（= 差分そのもの、過不足なし）:
 | 実行中 | 実 timer/IRQ を実 IDT で受け、x86mov32 trap frame（spec §6.3）合成 → PV ハンドラへ jump |
 | PV `IRET` mov | trap frame から復帰 |
 
-PV 境界は稀なので計算は全速・仲介は薄い。
+**near-native の正確な範囲（round-4）**: 通常の計算と*直接マップした*安全な MMIO は near-native。一方 not-present #PF で捕える PV 制御レジスタは **意図的に高コストな #PF+decode exit** であり、hot path に置かない（高頻度 I/O は実 MMIO ページ直マップで回避）。「near-native」は計算とマップ済み MMIO の話で、trap される PV アクセスではない。
 
 **substrate の形態**:
 1. **qemu machine type `x86mov32`**（推奨）: guest=mov カーネル、qemu が PV-MMIO デバイス + 割り込み注入を提供。movie86 と qemu がこの spec の2実装になり conformance（spec §8）に乗る。
@@ -89,9 +89,13 @@ substrate は RISC-V の **OpenSBI（M-mode ランタイム）に相当する薄
 
 substrate の仕事の大半は **純計算** — faulting `mov` のデコード（ModRM/SIB/disp/幅）、trap frame（spec §6.3）構築、ゲストメモリ/レジスタ操作、whitelist 検証、EIP 前進。**これらは全て mov 化でき、llvm-mov でコンパイルできる**。
 
-irreducible に非-mov なのは **X86-DELTA §4 の M セットそのもの** = `lgdt`/`lidt`/`mov CRn`/`sti`/`cli`/`iret`/`invlpg` + real-mode boot stub（port I/O は MMIO デバイス採用で回避可）。数十命令オーダーの固定スタブ。
+irreducible に非-mov なのは **カーネル PV M-set ⊂ substrate 集合（真の上位集合, round-4 補正）**。カーネルが PV-MMIO で要求する特権効果（`lidt`/`mov CRn`/`sti`/`iret` 等）に加え、substrate **固有**の host 義務が乗る: real-mode→protected-mode boot（A20/`lgdt`/far jump）、#PF cause 読み（`mov from CR2`）、実 IRQ コントローラ操作 + EOI、whitelist/実行権限の強制フック。数十命令オーダーの固定スタブ群。
 
-→ **substrate = mov-heavy（llvm-mov 製）+ 最小の非-mov 特権スタブ**。これは会話初期の「mov-heavy + 小さな asm shim」を、*カーネル全体ではなく substrate に正しくスコープした*もの。美しい閉包: x86mov32 がカーネルから追い出した特権は、最小化されて substrate の小さな非-mov 核として再出現する。ゼロにはできない（X86-DELTA の結論）が周辺は全部 mov にできる。
+→ **substrate = mov-heavy（llvm-mov 製ロジック）+ 最小の非-mov 特権スタブ群**。これは会話初期の「mov-heavy + 小さな asm shim」を、*カーネル全体ではなく substrate に正しくスコープした*もの。
+
+**substrate のコンパイラ要件は L0.5（guest 用）と別**（round-4）: substrate の mov ロジックから非-mov スタブを **固定 ABI で呼ぶ**手段が要る（外部 asm オブジェクト or builtin、fault-handler ABI、スタブ周りの clobber/stack/割り込みマスク制御）。これは「**guest Linux は任意 inline asm 不要 / substrate は固定の非-mov asm スタブを持ちうる**」という棲み分けで、L0.5 の結論を覆さない。
+
+美しい閉包: x86mov32 がカーネルから追い出した特権は、最小化されて substrate の非-mov 核として再出現する。ゼロにはできない（X86-DELTA の結論）が周辺は全部 mov にできる。
 
 2つの哲学:
 - **実用（qemu/KVM）**: substrate = 既存の大きな非-mov ソフト（qemu/KVM/host Linux）。簡単だが mov でない。

@@ -146,8 +146,9 @@ offset  field
 ```
 
 - **EFLAGS は含めない**（§3.4 と整合）。x86mov32 は x86 の exception frame を模さず、自前の frame を定義する。Linux/x86mov32 の `pt_regs` 相当はこの frame に合わせて新規定義する（arch/x86mov32 側の責務）。
-- `IRET`（§7.5）はこの frame から GPR/EIP/ESP を復帰する。
-- **RISC-V との対応**: `saved EIP`↔`sepc`、`trap_kind`/`error_code`↔`scause`、`fault_addr`↔`stval`、`IRET`↔`sret`。frame レイアウトの確定はこの既知モデルを踏襲しており、arch/riscv の trap 処理が移植の参考になる。
+- `IRET`（§7.5）はこの frame から GPR/EIP/ESP を復帰する。割り込みは resume 点まで masked のまま（原子的再開）。
+- **frame の置き場所と trap stack（round-4）**: 機械はゲストが事前に登録した **trap stack** に frame を積み、ハンドラ進入時に **ESP=その trap stack** とする。trap stack は PV-CPU `TRAP_STACK` レジスタ（§7.5）でゲストが設定する。これにより、割り込み元の ESP が不正/ユーザ空間でも既知良好スタックでハンドラが回り、ハンドラ本体は純 mov で書ける（ハンドラ prologue に非-mov なスタック確立は不要）。
+- **RISC-V との対応**: `saved EIP`↔`sepc`、`trap_kind`/`error_code`↔`scause`、`fault_addr`↔`stval`、`IRET`↔`sret`、`TRAP_STACK`↔`sscratch`（カーネルスタック退避）。frame レイアウトの確定はこの既知モデルを踏襲しており、arch/riscv の trap 処理が移植の参考になる。
 
 ## 7. PV-MMIO ABI
 
@@ -156,7 +157,7 @@ offset  field
 ### 7.1 アドレスマップ
 
 ```
-0x1FF0_0000 .. 0x1FF0_0FFF   PV-CPU        (pv-kernel)   IDT_BASE / INTR_MASK / IRET
+0x1FF0_0000 .. 0x1FF0_0FFF   PV-CPU        (pv-kernel)   IDT_BASE / INTR_MASK / IRET / TRAP_STACK
 0x1FF0_1000 .. 0x1FF0_1FFF   PV-CONSOLE    (pv-min)      PUTC / STATUS
 0x1FF0_2000 .. 0x1FF0_2FFF   PV-TIMER      (pv-min)      TICKS / ONESHOT
 0x1FF0_3000 .. 0x1FF0_3FFF   PV-IRQ        (pv-kernel)   PENDING / EOI
@@ -189,9 +190,9 @@ read 専用レジスタへの write、write 専用への read、未定義オフ�
 
 ### 7.5 PV-CPU（pv-kernel, draft — 意味は L0.5 後に確定）
 
-`IDT_BASE`（trap ベクタ表 base）/ `INTR_MASK`（cli/sti 相当, 0=有効）/ `IRET`（§6.3 frame から復帰）。
+`IDT_BASE`（trap ベクタ表 base）/ `INTR_MASK`（cli/sti 相当, 0=有効）/ `IRET`（§6.3 frame から復帰）/ `TRAP_STACK`（trap 進入時に機械が frame を積み ESP に据える既知良好スタック, §6.3）。
 
-> RISC-V 対応: trap CSR（`stvec`=IDT_BASE, `sstatus.SIE`=INTR_MASK, `sret`=IRET）+ SBI（カーネルがプラットフォームに特権操作を依頼する役割）に相当。SBI の構造を PV-CPU の設計参考にする。
+> RISC-V 対応: trap CSR（`stvec`=IDT_BASE, `sstatus.SIE`=INTR_MASK, `sret`=IRET, `sscratch`=TRAP_STACK）+ SBI（カーネルがプラットフォームに特権操作を依頼する役割）に相当。SBI の構造を PV-CPU の設計参考にする。
 
 ### 7.6 PV-IRQ（pv-kernel, draft）
 
