@@ -68,6 +68,27 @@ round-3 補正。「非同期制御転送が *唯一の数学的* M」は**言�
 
 MMU・保護は **原理的に reducible**（ソフトページング/SFI 計装）だが、(a) 莫大なコスト、(b) *未計装/非協調*コードを隔離できない、ため **設計選択**として機械機能（PV-MMU）にする — *必要*だからではなく*実用的かつ非協調コードを扱うため*、と正直に位置づける。
 
+## 4.5 worked example：「特権パスが mov 列」とは
+
+特権操作は RISC-V/x86 では**専用オペコード**（`csrw stvec`/`csrw satp`/`sret`、`lidt`/`mov CR3`/`iret`）で、C でも普通の load/store でも書けない。x86mov32 はこれを **MMIO レジスタへの store に定義し直す**（§1b）。entry/boot を並べると：
+
+```
+; RISC-V (専用命令, 手書き .S)        ; x86mov32 (全て mov)
+csrw  stvec, trap_handler             mov [PV_CPU + IDT_BASE],  trap_handler
+csrw  satp,  (MODE|pgdir>>12)         mov [PV_MMU + PGDIR],     pgdir_phys
+csrsi sstatus, SIE                    mov [PV_CPU + INTR_MASK], 0
+sret                                  mov [PV_CPU + IRET],      0
+```
+
+`csrw stvec, h`（専用命令）が `mov [magic], h`（ただのストア）になる。**機械**がそのアドレスへの mov を傍受して効果を実行する：
+
+- movie86: magic-address 機構（既存 `0x1FFE_0000`→AbiHost）の拡張で内部状態を操作 → guest は文字通り 100% mov。
+- 実 x86 host: PV ページを not-present にし、mov→#PF→substrate(非-mov ring0)が faulting mov をデコードして本物の `lidt`/`mov CR3` を実行。**特権命令は substrate に隔離、カーネルは純 mov**。
+
+文脈切替のレジスタ退避/復帰は元から mov+push/pop（特権ですらない）；特権なのはアドレス空間切替=PV-MMU `PGDIR` への mov だけ。
+
+**境界**: カーネルが能動的に*やる*ことは全て mov（特権効果の要求すら PV store）。mov でないのは命令ですらない2つの機械機能 — (1) trap の*配送*（§4 の M, 機械が命令列を奪い frame を積む）、(2) `IRET` の*原子的*復帰（カーネルは mov で要求、復元は機械）。**カーネルの命令ストリームは 100% mov、非-mov な部分は「機械そのもの」**。
+
 ## 5. PV surface への帰結（必要十分）
 
 | 真の性質 | PV | 理由 |
