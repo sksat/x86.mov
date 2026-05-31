@@ -130,12 +130,12 @@ spec は profile 定義（pv-kernel は PV-CPU/IRQ/MMU を *含む*）、本書�
 - **R1（最大）**: コンパイラ/カーネル意味論互換性。inline asm は氷山の一角（compiler barrier・`asm goto`・exception-table fixup・object layout…）。→ L0.5 kill-test で早期に殺す。
 - **R2**: llvm-mov の inline asm 実装コスト不明。L3 を L0.5 の優先順で段階導入。
 - **R3（host 間乖離）**: PV を movie86 だけが持つと「movie86 で動くが x86-host で落ちる」。→ (a) fault を x86-like に固定（spec §6.1）、(b) PV/プラットフォームを named profile + x86-host 実行層として明示（spec §2）、(c) conformance fixture を両 host で通す CI ゲート（spec §8）。
-- **R4（緩和）**: movie86 の機械化で userspace ランナーの単純さを失う点は、**AS-IS 維持が制約でない**ため許容（design 決定）。movie86 を x86mov32 リファレンス機械へ自由に再形成してよい（flat メモリ→interval map、userspace runner→機械、特権状態の追加）。既存 movfuscator/wasm/explorer 互換は best-effort の optional legacy モードで設計を縛らない。残る配慮は「再形成を段階的に行い各ステージを緑に保つ」ことだけ。
+- **R4（解消）**: movie86 の機械化で userspace ランナーの単純さを失う点は、**AS-IS 互換が非ゴール（best-effort ですらない）**ため問題にしない（design 決定）。movie86 を x86mov32 リファレンス機械へ自由に再形成してよい（flat メモリ→interval map、userspace runner→機械、特権状態の追加）。**旧 movfuscator 実行・`0x1FFE_0000` ABI を残す義務はなく、既存 movfuscator/wasm/explorer が壊れることは許容**。残る配慮は「再形成を段階的に行い各ステージを緑に保つ」ことだけ。
 - **R5（テキストパッチ）**: Linux の alternatives/static-keys/ftrace/kprobes/paravirt-patch は自己書き換え（spec §5 で base 不許可）。→ PV-TEXTPATCH（spec §7.8）か「対象 config で全テキスト改変無効化」のいずれか。L0.5 で現実性を判定。
 
 ## 6. 即時の design TODO
 
-- [x] TODO-1: **決定** — pv-min console は spec アドレス `0x1FF0_1000`（PV-CONSOLE）。**movie86 AS-IS は維持制約でない**ため PV-MMIO 窓は自由に設計でき、legacy `0x1FFE_0000` の共存は必須でなく best-effort（compat-movfuscator が要るときだけ供給, spec §2 design stance）
+- [x] TODO-1: **決定** — pv-min console は spec アドレス `0x1FF0_1000`（PV-CONSOLE）。**movfuscator 互換は非ゴール**なので PV-MMIO 窓は完全に自由設計。legacy `0x1FFE_0000` は予約も共存もしない（spec §2 design stance / §7.1）
 - [ ] TODO-2: 割り込み配送モデル（poll 型 → 強制ジャンプ型）の境界確定（spec §7.6）
 - [ ] TODO-3: ページテーブル形式（x86 PTE 流用可否）を L0.5 結果で判断（spec §7.7）
 - [x] TODO-4: **決定 — 自作の極小カーネル**（L1, inline asm 非依存）

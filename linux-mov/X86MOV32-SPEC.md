@@ -65,13 +65,11 @@ movie86 は base + MMIO + PV-* を直接実装するリファレンス実装。c
 | **x86mov32-base** | §3 ISA + §4 レジスタ + §5 メモリ + §6 fault + §9 boot | 計算 + halt/exit。デバイス無し |
 | **x86mov32-pv-min** | base + §7.3 PV-CONSOLE + §7.4 PV-TIMER（割り込み無しの read） | 極小カーネルが print / tick poll |
 | **x86mov32-pv-kernel** | pv-min + §7.5 PV-CPU + §7.6 PV-IRQ + §7.7 PV-MMU + §6.3 trap 配送 | Linux/x86mov32 級（demand paging・割り込み・preemption）|
-| **x86mov32-compat-movfuscator** | base + 旧 movfuscator 互換（`int 0x80` syscall・SIGILL/SIGSEGV dispatch・segment-mov 経路）| 既存 movie86 資産の互換。**optional・best-effort**（design stance 参照） |
 
 **規則**:
 - 「X は x86mov32-pv-min を狙う」と profile 名で書く。movie86 は各 profile のリファレンス実装。
 - **x86-host 実行層**は profile ではなく「実 x86/qemu 上で指定 profile を供給する層」。同名 profile の §8 テストを通すか、通らない差分を conformance gap として文書化した場合のみ「その profile を host できる」と言える。
-- 互換ハック（§3.3）は **base に入れない**。`x86mov32-compat-movfuscator` に隔離する。
-- **design stance: movie86 の AS-IS 仕様は維持制約ではない**。movie86 を x86mov32 のリファレンス機械へ再形成する際、現行の userspace-runner 挙動・movfuscator 実行・寛容な flat メモリ・`0x1FFE_0000` ABI を保存する義務はない。`x86mov32-compat-movfuscator` は **optional な legacy モード**であって x86mov32 の設計を縛らない。既存資産（movfuscator-wasm / explorer 等）の互換は best-effort で、必要になった時だけ legacy モードとして供給する。
+- **design stance: movie86 の AS-IS 仕様の互換は非ゴール（best-effort ですらない）**。movie86 を x86mov32 のリファレンス機械へ再形成する際、現行の userspace-runner 挙動・movfuscator 実行・寛容な flat メモリ・`0x1FFE_0000` ABI を保存する義務は一切ない。旧 movfuscator 互換（`int 0x80`・SIGILL/SIGSEGV dispatch・segment-mov）は **x86mov32 の一部ではない**（§3.3）。既存資産（movfuscator-wasm / explorer 等）が壊れることは許容する。
 
 ## 3. ISA サブセット（base, 凍結）
 
@@ -88,11 +86,11 @@ movie86 は base + MMIO + PV-* を直接実装するリファレンス実装。c
 
 `cmp`/`jcc`/算術命令/FP/SIMD/REX/`lock` prefix/`int`/segment-mov/control-reg-mov。条件分岐・算術・FP は llvm-mov が mov 列に lower 済み（README ステージ 7a–7h）。
 
-### 3.3 互換ハックの隔離（base から除外）
+### 3.3 x86mov32 に含まれないもの（旧 movfuscator 機構）
 
-以下は **base ではなく `x86mov32-compat-movfuscator` profile** に属する。base / pv-* には現れない：
+以下は **x86mov32 の一部ではない**（base / pv-* いずれにも現れず、互換も非ゴール §2）：
 
-- `int 0x80` syscall（base/pv では PV-MMIO + §9 の exit/halt が syscall/終了の唯一の機構）
+- `int 0x80` syscall（x86mov32 では PV-MMIO + §9 の exit/halt が syscall/終了の唯一の機構）
 - SIGILL/SIGSEGV dispatch（`mov cs, r16` 経路を含む movfuscator trampoline）
 - segment register への mov
 
@@ -167,8 +165,8 @@ offset  field
 0x1FF0_4000 .. 0x1FF0_4FFF   PV-MMU        (pv-kernel)   PGDIR / FLUSH / FAULT_ADDR
 0x1FF0_5000 .. 0x1FF0_5FFF   PV-TEXTPATCH  (pv-kernel?)  予約（§7.8, §10 未確定）
 0x1FF0_FF00 .. 0x1FF0_FFFF   PV-DISCOVERY  (all)         MAGIC / VERSION / FEATURE_BITS
-0x1FFE_0000 .. 0x1FFE_0FFF   legacy ABI    (compat)      movfuscator 互換（write/exit 等）
 ```
+（旧 movfuscator の `0x1FFE_0000` ABI は x86mov32 では予約しない。§7.1 の窓は自由に設計してよい。）
 全レジスタ 4byte 幅・自然整列アクセスのみ有効。範囲外/不正方向は fault（§6.1）。
 
 ### 7.2 アクセス規約
@@ -248,7 +246,7 @@ read 専用レジスタへの write、write 専用への read、未定義オフ�
 - **2 種類の boot 契約**（凍結）:
   - **program boot**（base / pv-min）: 初期スタック = SysV ABI 最小像（argc=0, argv/envp/auxv=NULL）、ESP は argc を指す。極小プログラム・L1 極小カーネル用。**boot stack は実装定義の固定領域**（base/top と extent を実装が決め、§5 のマップ集合に含める）。L0 テストの決定性のため、この領域の base/サイズを実装で固定する。
   - **kernel boot**（pv-kernel）: エントリで **DTB 物理アドレスを `EBX` に**、boot magic を `EAX` に渡す（RISC-V の `a0=hartid, a1=dtb` に相当する規約を x86mov32 用に固定）。カーネルは DTB からハードウェアを discover する（§7.10）。今この規約を固定し、将来の破壊的変更を避ける。
-- 終了 = halt、または compat profile の legacy exit。
+- 終了 = halt（PV exit / halt 機構, §7）。
 
 ## 10. version 方針と未確定事項
 
