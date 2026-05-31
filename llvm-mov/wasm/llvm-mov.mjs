@@ -519,3 +519,70 @@ export async function rsToIR(source, opts = {}) {
         artefacts: { ...spec.artefacts, ...(opts.artefacts ?? {}) },
     });
 }
+
+// ---------------------------------------------------------------------------
+// Rust frontend — host bypass
+// ---------------------------------------------------------------------------
+//
+// `rsHostToIR(source)` spawns the host `rustc` (whatever's on $PATH /
+// $RUSTC / opts.rustc) and returns LLVM IR text. Same shape as
+// `rsToIR()` but uses the host toolchain instead of a wasm artefact,
+// which means it works *today* for any target `rustup target add`
+// has installed (notably `i686-unknown-linux-gnu` — the one
+// `llvm-mov-llc.wasm` actually accepts).
+//
+// Use this as the explorer's Rust-frontend bypass while the in-wasm
+// rustc path (rsToIR) catches up. Node-only by construction; a
+// browser-side counterpart would need a backend service or the wasm
+// path. See `../CLAUDE.md` "Rust frontend (host bypass)" §.
+
+let _rustcHostDriver = null;
+async function loadRustcHostDriver() {
+    if (_rustcHostDriver === null) {
+        const m = await import('./lib/rustc-host-driver.mjs');
+        _rustcHostDriver = m.rsHostToIRImpl;
+    }
+    return _rustcHostDriver;
+}
+
+/**
+ * Compile a single Rust source file to LLVM IR text via the host
+ * `rustc`. The Node-side counterpart to `rsToIR` — same input/output
+ * shape but driven by a subprocess to whatever rustc is on $PATH.
+ *
+ * @param {string} source Rust source text.
+ * @param {{
+ *     name?: string,
+ *     rustc?: string,
+ *     target?: string,
+ *     edition?: '2015'|'2018'|'2021'|'2024',
+ *     crateType?: 'lib'|'staticlib'|'cdylib'|'rlib',
+ *     optLevel?: '0'|'1'|'2'|'3'|'s'|'z',
+ *     rustcFlags?: string[],
+ *     onProgress?: (ev: { stage: string }) => void,
+ * }} [opts]
+ *   - `name`: MEMFS basename for the source file. Defaults to `in.rs`.
+ *     rustc bakes the stem into `source_filename` and the output
+ *     `<stem>.ll` filename, so pick deliberately if downstream parity
+ *     matters.
+ *   - `rustc`: explicit binary path. Falls back to `$RUSTC` then `rustc`.
+ *   - `target`: `--target`. Defaults to `i686-unknown-linux-gnu`
+ *     (the one `llvm-mov-llc` accepts after `mtriple` override).
+ *     Requires the host to have run
+ *     `rustup target add <target>` for that triple.
+ *   - `edition`: `--edition`. Defaults to `2024`.
+ *   - `crateType`: `--crate-type`. Defaults to `lib`.
+ *   - `optLevel`: `-C opt-level=…`. Defaults to `2`.
+ *   - `rustcFlags`: appended verbatim to the rustc command line.
+ *   - `onProgress`: status callback. Stages: `run-host-rustc`.
+ * @returns {Promise<string>} LLVM IR text from `--emit=llvm-ir`.
+ */
+export async function rsHostToIR(source, opts = {}) {
+    if (typeof source !== 'string') {
+        throw new TypeError('source must be a string');
+    }
+    const name = opts.name ?? 'in.rs';
+    assertSafeName(name);
+    const driver = await loadRustcHostDriver();
+    return driver(source, { ...opts, name });
+}

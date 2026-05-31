@@ -11,7 +11,7 @@ BUILD_DIR     ?= build
 .PHONY: help setup build build-wasm-llvm build-wasm-clang \
         build-wasm-llvm-mov-llc build-native-llvm-mov-llc \
         build-wasm-rustc \
-        test test-rust test-e2e test-e2e-dist test-e2e-dist-fzstd \
+        test test-rust test-rust-host test-e2e test-e2e-dist test-e2e-dist-fzstd \
         stage-deploy serve clean distclean
 
 help:
@@ -25,6 +25,8 @@ help:
 	@echo "  build-wasm-rustc            self-host rustc.wasm from bjorn3/rust wasm20 (multi-hour;"
 	@echo "                              populates 'self-bjorn3-wasm20' row in RUSTC_VERSIONS)"
 	@echo "  test                        parity test: wasm .s vs native .s (per fixture)"
+	@echo "  test-rust                   smoke: rsToIR() via wasm rustc (rubrc artefact, needs wasmtime)"
+	@echo "  test-rust-host              smoke: rsHostToIR() via host rustc (i686 target, no wasm)"
 	@echo "  test-e2e                    playwright: drive the demo page in a headless browser"
 	@echo "                              and diff the rendered .s against native (needs npm + browsers)"
 	@echo "  test-e2e-dist               same as test-e2e but against the staged ../../dist/ via a"
@@ -86,6 +88,14 @@ test: build
 # See ../CLAUDE.md "Rust frontend (in progress)" §.
 test-rust:
 	./tests/run-rust.sh
+
+# Host-rustc bypass smoke. Drives the host `rustc` through
+# `rsHostToIR()` — works today, needs `rustup target add
+# i686-unknown-linux-gnu` and nothing else. The wasm bypass while the
+# in-wasm rustc story stabilises.
+# See ../CLAUDE.md "Rust frontend (host bypass)" §.
+test-rust-host:
+	./tests/run-rust-host.sh
 
 # Self-host rustc.wasm from bjorn3/rust:compile_rustc_for_wasm20.
 # Multi-hour build. See scripts/build-wasm-rustc.sh header for
