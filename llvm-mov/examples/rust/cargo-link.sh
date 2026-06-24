@@ -33,6 +33,19 @@
 # Env vars (for development; defaults assume a `make build` checkout):
 #   LLVM_MOV_LLC          — path to the driver binary
 #   LLVM_MOV_LLC_FLAGS    — extra flags to llvm-mov-llc (default: -verify-machineinstrs)
+#   LLVM_MOV_LLC_DEP_TIMEOUT
+#                         — per-dep-rlib wall-clock budget, in seconds, for
+#                           the mov-only lower attempt (default: 60). A dep
+#                           whose IR lowers in principle but blows the
+#                           mov-only legalize pass up to an impractical
+#                           runtime (e.g. crates.io `base64`: a single large
+#                           function whose byte-chain rewrite expands
+#                           super-linearly — issue #11 follow-up) is killed
+#                           at this budget and falls back to its native .o,
+#                           logged as `native(llc-timeout)`. Set to 0 to
+#                           disable the budget (run llc unbounded). Only
+#                           deps are bounded; the user crate's own llc run
+#                           (hand-written examples) is always unbounded.
 #
 # Invariants:
 #   - CWD is the crate dir (cargo invokes the linker from where `cargo
@@ -46,6 +59,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLVM_MOV_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DRIVER="${LLVM_MOV_LLC:-$LLVM_MOV_DIR/build/bin/llvm-mov-llc}"
 DRIVER_FLAGS="${LLVM_MOV_LLC_FLAGS:--verify-machineinstrs}"
+DEP_TIMEOUT="${LLVM_MOV_LLC_DEP_TIMEOUT:-60}"
 
 if ! [ -x "$DRIVER" ]; then
     echo "cargo-link.sh: llvm-mov-llc not found at $DRIVER" 1>&2
@@ -154,9 +168,28 @@ try_mov_lower_rlib() {
     local dep_o="$outdir/${crate}.mov.o"
     local llc_log="$outdir/${crate}.llc.log"
     local as_log="$outdir/${crate}.as.log"
-    if ! "$DRIVER" $DRIVER_FLAGS -mtriple=mov-unknown-linux-gnu \
-            "$sibling_ll" -o "$dep_s" 2>"$llc_log"; then
-        printf 'native(llc-fail) %s\n' "$crate" >> "$STATUS"
+    # Bound the mov-only lower attempt: a lowerable-in-principle dep can
+    # still drive the legalize pass to an impractical runtime (issue #11
+    # follow-up). `timeout` exits 124 when the budget is hit; we map that
+    # to a distinct `native(llc-timeout)` status so the deps-status
+    # report distinguishes "the backend can't lower this" (llc-fail) from
+    # "the backend lowers it too slowly to be practical" (llc-timeout).
+    # DEP_TIMEOUT=0 disables the budget (bare driver invocation).
+    local llc_rc=0
+    if [ "$DEP_TIMEOUT" = "0" ]; then
+        "$DRIVER" $DRIVER_FLAGS -mtriple=mov-unknown-linux-gnu \
+            "$sibling_ll" -o "$dep_s" 2>"$llc_log" || llc_rc=$?
+    else
+        timeout "$DEP_TIMEOUT" "$DRIVER" $DRIVER_FLAGS \
+            -mtriple=mov-unknown-linux-gnu \
+            "$sibling_ll" -o "$dep_s" 2>"$llc_log" || llc_rc=$?
+    fi
+    if [ "$llc_rc" -ne 0 ]; then
+        if [ "$llc_rc" -eq 124 ]; then
+            printf 'native(llc-timeout) %s\n' "$crate" >> "$STATUS"
+        else
+            printf 'native(llc-fail) %s\n' "$crate" >> "$STATUS"
+        fi
         return 1
     fi
     if ! as --32 -o "$dep_o" "$dep_s" 2>"$as_log"; then

@@ -1,0 +1,10 @@
+# Stage 7i / issue #11 — the only non-mov mnemonic left in a jump-table
+# `switch` is `jmp`:
+#   - JMP32r — the jump-table dispatch (`jmp eax`, brind of the loaded
+#     .rodata entry). movie86 decodes `jmp r32`; it's mov-equivalent
+#     (no flags, target read from a register).
+#   - the 7c1 dispatcher's `jmp dword ptr [ebp + next_pc]` for the
+#     switch's range-check Jcc false edge.
+# Both are accepted by the objdump gate's `jmp` line, same as every
+# other branchless-dispatcher fixture.
+jmp

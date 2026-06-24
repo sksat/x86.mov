@@ -139,6 +139,23 @@ void MovDAGToDAGISel::Select(SDNode *Node) {
     ReplaceNode(Node, MI);
     return;
   }
+  // Stage 7i — jump-table base address (issue #11). The BR_JT Expand
+  // path (MovISelLowering) leaves an ISD::JumpTable node feeding the
+  // `base + index*4` address computation. Same story as the symbol
+  // cases above: SelectCode only matches the `tjumptable` target form,
+  // so convert here and emit `mov reg, offset .LJTI<fn>_<idx>`. The
+  // referenced table is emitted by the base AsmPrinter's
+  // emitJumpTableInfo; lower()'s MO_JumpTableIndex case prints the
+  // symbol.
+  if (Node->getOpcode() == ISD::JumpTable) {
+    SDLoc DL(Node);
+    auto *JT = cast<JumpTableSDNode>(Node);
+    SDValue Sym = CurDAG->getTargetJumpTable(JT->getIndex(), MVT::i32,
+                                             JT->getTargetFlags());
+    SDNode *MI = CurDAG->getMachineNode(Mov::MOV32ri, DL, MVT::i32, Sym);
+    ReplaceNode(Node, MI);
+    return;
+  }
 
   // MovISD::CALL: emit either
   //     CALL32d <callee_symbol>     ; direct

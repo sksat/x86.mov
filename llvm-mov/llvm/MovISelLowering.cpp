@@ -124,6 +124,24 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::SELECT,    MVT::i32, Expand);
   setOperationAction(ISD::SELECT_CC, MVT::i32, Expand);
 
+  // Stage 7i — jump tables for dense `switch` (issue #11). LLVM
+  // forms a jump table whenever `areJTsAllowed()` holds, which is
+  // true here because BRIND is Legal by default and `(brind GPR32)`
+  // selects to our JMP32r. The catch: BR_JT also defaults to Legal,
+  // so the jump-table branch reaches ISel un-expanded and aborts
+  // with "Cannot select: br_jt" (the base64 / qoi deps hit exactly
+  // this inside their error enums' `Display::fmt`). Marking BR_JT
+  // Expand makes the DAG legalizer rewrite it into the portable
+  //     index*4 -> +jumptable_base -> load -> brind
+  // shape: the address arithmetic (SHL/ADD) and the load all go
+  // through the existing i32 selection + stage-7 byte-chain
+  // legalize, and only the trailing `brind` needs a target opcode
+  // (JMP32r). The jump-table data itself (one absolute MBB address
+  // per arm, EK_BlockAddress) is emitted by the base AsmPrinter's
+  // emitJumpTableInfo; ISel materialises the table base via an
+  // ISD::JumpTable -> MOV32ri in MovISelDAGToDAG.
+  setOperationAction(ISD::BR_JT, MVT::Other, Expand);
+
   // No ROL/ROR opcode and no movfuscator-style rotate trick yet.
   // DAGCombine eagerly folds `(x << k) | (x >> (32-k))` into an
   // `ISD::ROTL` node; without an Expand action that would survive

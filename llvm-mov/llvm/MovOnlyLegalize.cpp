@@ -1733,17 +1733,28 @@ private:
       // it) drive the decision.
       MachineInstr *UncondJmp = nullptr;
       bool HasReturn = false;
+      bool HasIndirectExit = false;
       for (auto It = TermIt; It != MBB->end(); ++It) {
         const unsigned Op = It->getOpcode();
         if (Op == Mov::JMP)
           UncondJmp = &*It;
         else if (Op == Mov::RET)
           HasReturn = true;
+        else if (Op == Mov::JMP32r || Op == Mov::JMP32m)
+          // Stage 7i — a block ending in a register / memory indirect
+          // jump (jump-table dispatch via JMP32r, or an already-built
+          // dispatcher JMP32m) is a self-contained barrier exit: its
+          // successors are the table arms, not a fallthrough. Leave it
+          // alone, exactly like a RET-terminated block — otherwise the
+          // "no uncond JMP" branch below would wrongly treat it as a
+          // fallthrough and splice in a dispatcher edge.
+          HasIndirectExit = true;
       }
 
-      // RET-terminated BB: leave alone. Stage 7d handles the return
-      // path; for 7c1, returning BBs don't go through the dispatcher.
-      if (HasReturn)
+      // RET- or indirect-exit-terminated BB: leave alone. Stage 7d
+      // handles the return path; for 7c1, returning BBs and jump-table
+      // dispatch BBs don't go through the dispatcher.
+      if (HasReturn || HasIndirectExit)
         continue;
 
       // Determine the rewrite target.
