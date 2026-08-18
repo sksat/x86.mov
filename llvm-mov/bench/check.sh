@@ -8,12 +8,13 @@
 #
 #   - The "Generated YYYY-MM-...Z on ..." preamble line (timestamp).
 #   - The "wall-clock runtime (hyperfine mean)" row (host-dependent).
+#   - The "total ELF (bytes)" row (host CRT / libc / rust-std sizes).
+#   - Every reference column (movfuscator, clang/rustc -O0..-O3).
 #
-# Everything else — total ELF size, .text / .rodata size, mov count
-# / total, non-mov mnemonic set — is deterministic given the same
-# toolchain (clang/as/ld/movcc versions), so any divergence is either
-# a real codegen change (intended: update the baseline) or a silent
-# regression (unintended: investigate).
+# What is left is the llvm-mov column's .text / .rodata size, mov count
+# / total and non-mov mnemonic set — the numbers our backend actually
+# controls. Divergence there is either a real codegen change (intended:
+# update the baseline) or a silent regression (unintended: investigate).
 #
 # Workflow:
 #
@@ -47,25 +48,40 @@ RESULTS_OUT="$FRESH" "$HERE/run.sh" "$@" >/dev/null
 #
 #   - The "Generated ..." preamble (timestamp).
 #   - The "wall-clock runtime (hyperfine mean)" row (host-dependent).
-#   - The movfuscator column on every data row. This is external
-#     reference data — the precise number depends on the host's gas/ld
-#     minor version (e.g. Debian 13 vs ubuntu-24.04 ld give 10221108
-#     vs 10221148 for the same return42 fixture, a 40-byte difference
-#     that isn't anything llvm-mov did). We DO care about the
-#     llvm-mov column, which our backend fully controls.
+#   - Every *reference* column: movfuscator and clang/rustc -O0..-O3.
+#     These are external data points for context, and none of them is
+#     reproducible across hosts. The host's gas/ld minor version moves
+#     the movfuscator number (Debian 13 vs ubuntu-24.04 give 10221108
+#     vs 10221148 for the same return42 fixture); a different build of
+#     the same clang release moves the reference columns (Arch vs
+#     apt.llvm.org clang-22 disagree on whether a `nop` is emitted).
+#     None of that is anything llvm-mov did.
+#
+#     An earlier version of this script kept the clang columns, on the
+#     grounds that clang is pinned to clang-22 in CI. That holds
+#     between CI runs but not between a contributor's machine and CI,
+#     which is where the baseline is actually written — so the gate
+#     failed for everyone whose distro differed from whoever last ran
+#     `make bench`.
+#
+#   - The `total ELF (bytes)` row, for the same reason one level up:
+#     it is dominated by the host's CRT / libc / rust-std, not by our
+#     output. The `.text size` and `.rodata size` rows already measure
+#     our contribution exactly, and they stay in the comparison.
 #
 # The sed picks out 7-column table rows
 # `| metric | llvm-mov | movfuscator | clang -O0 | -O1 | -O2 | -O3 |`
-# and replaces the movfuscator column (3rd cell) with `<movfuscator>`.
-# Header and separator rows get the same treatment, so before/after
-# still match exactly when only movfuscator drifts.
+# and replaces cells 3..7 with a single `<reference>`. Header and
+# separator rows get the same treatment, so before/after still match
+# exactly when only the reference columns drift.
 #
-# The clang -O0..-O3 columns are deterministic in CI (clang version
-# is pinned to apt.llvm.org clang-22) and are included in the diff,
-# so opt-level shape changes will surface as bench drift.
+# What keeps the llvm-mov column itself reproducible across hosts is
+# `examples/rust/rust-toolchain.toml`: a dep that doesn't round-trip
+# through llvm-mov-llc is linked from rustc's own objects, so rustc's
+# version would otherwise leak into the `.text` we measure.
 strip_volatile() {
-    grep -vE '^Generated [0-9]|^\| wall-clock runtime' "$1" \
-        | sed -E 's/^(\|[^|]*\|[^|]*\|)[^|]*(\|.*)$/\1 <movfuscator> \2/'
+    grep -vE '^Generated [0-9]|^\| wall-clock runtime|^\| total ELF' "$1" \
+        | sed -E 's/^(\|[^|]*\|[^|]*\|).*$/\1 <reference> |/'
 }
 
 diff_out="$(diff -u \
