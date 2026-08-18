@@ -213,8 +213,14 @@ void MovAsmPrinter::emitInstruction(const MachineInstr *MI) {
 // and words that are also binary operators (`and`, `or`, `not`, `xor`,
 // `shl`, `shr`, `mod`) — but the alias treatment covers both, so the
 // printer does not need to tell them apart.
+//
+// The match is case-insensitive because GAS's Intel-syntax keywords are:
+// `OFFSET`, `Offset` and `oFFsEt` all collide just as `offset` does
+// (measured the same way). Only the *lookup* is folded — the alias is
+// still defined against the symbol's original spelling, which is what
+// the linker sees.
 static bool isGasIntelReservedWord(StringRef Name) {
-  return llvm::StringSwitch<bool>(Name)
+  return llvm::StringSwitch<bool>(Name.lower())
       .Cases({"offset", "mod", "short", "flat", "st"}, true)
       .Cases({"and", "or", "not", "xor", "shl", "shr"}, true)
       .Default(false);

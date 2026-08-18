@@ -13,17 +13,24 @@
 ; and several of those are perfectly ordinary C identifiers. lcc's
 ; `bytecode.c` has a global called `offset`, which is how this surfaced.
 ;
-; gas_keyword_symbol(0) → 40 + 2 = 42.
+; The keywords are also **case-insensitive** — `OFFSET`, `Offset` and
+; `oFFsEt` collide exactly as `offset` does — so the fixture pins a
+; capitalised one too.
+;
+; gas_keyword_symbol(0) → 40 + 2 + 0 = 42.
 
 target triple = "mov-unknown-linux-gnu"
 
 @offset = global i32 40
 @and    = global i32 2
+@Flat   = global i32 0        ; capitalised: same keyword, different spelling
 
 define i32 @gas_keyword_symbol(i32 %n) {
 entry:
   %a = load i32, ptr @offset, align 4
   %b = load i32, ptr @and, align 4
-  %r = add i32 %a, %b
+  %c = load i32, ptr @Flat, align 4
+  %s = add i32 %a, %b
+  %r = add i32 %s, %c
   ret i32 %r
 }
