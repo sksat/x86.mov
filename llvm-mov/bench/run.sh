@@ -78,6 +78,22 @@ if [ -f "$LLVM_MOV_LLC" ]; then
 fi
 MOVCC="$MOVFUSCATOR_WASM/vendor/movfuscator/build/movcc"
 
+# movcc's linker argv is hard-coded in movfuscator/host.c and only passes
+# `-L$LCCDIR` and `-L$LCCDIR/gcc/32`. That is enough on Debian-style
+# multilib, where the 32-bit libc / libm sit in a directory ld already
+# searches. On Arch they live in /usr/lib32, which ld does not search by
+# default, and every movcc link dies with `cannot find -lm`.
+#
+# Resolve the host's 32-bit library directory and forward it through
+# lcc's `-Wl<arg>` flag passing (added by movfuscator/lcc.patch). On a
+# host where the default search path already works this just re-adds a
+# directory ld would have looked in anyway, so it is safe to always pass.
+MOVCC_LIBDIR32=""
+_libm32="$("${CC:-cc}" -m32 -print-file-name=libm.so 2>/dev/null || true)"
+if [ -f "$_libm32" ]; then
+    MOVCC_LIBDIR32="-Wl-L$(cd "$(dirname "$_libm32")" && pwd)"
+fi
+
 CLANG="${CLANG:-clang-22}"
 
 # -- fixture selection ---------------------------------------------------
@@ -293,7 +309,8 @@ STARTEOF
 build_movfuscator() {
     local src="$1" out_dir="$2"
     mkdir -p "$out_dir"
-    "$MOVCC" "$src" -o "$out_dir/elf" >"$out_dir/movcc.log" 2>&1
+    "$MOVCC" ${MOVCC_LIBDIR32:+"$MOVCC_LIBDIR32"} "$src" -o "$out_dir/elf" \
+        >"$out_dir/movcc.log" 2>&1
 }
 
 # Build the same C source as a "normal" 32-bit native binary at a
