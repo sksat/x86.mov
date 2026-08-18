@@ -8,6 +8,7 @@
 
 #include "MovISelLowering.h"
 #include "MCTargetDesc/MovMCTargetDesc.h"
+#include "MovMachineFunctionInfo.h"
 #include "MovSubtarget.h"
 #include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
@@ -362,6 +363,24 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   MaxStoresPerMemset  = MaxStoresPerMemsetOptSize  = 64;
   MaxStoresPerMemcpy  = MaxStoresPerMemcpyOptSize  = 64;
   MaxStoresPerMemmove = MaxStoresPerMemmoveOptSize = 64;
+
+  // Stage 6f — i386 SysV varargs. The ABI is the simplest one there is:
+  // every argument (named or not) is already on the stack in ascending
+  // order, and `va_list` is a bare `char *` cursor into that run. So
+  //
+  //   - VASTART is Custom: one store of "address just past the named
+  //     args" into the va_list object (see LowerVASTART),
+  //   - VAARG's generic Expand (load the cursor, load the value, bump
+  //     the cursor, store it back) is exactly right — no register-save
+  //     area, no overflow-area switch as on x86-64,
+  //   - VACOPY expands to a pointer-sized copy and VAEND to nothing.
+  //
+  // Clang expands `va_arg` in the front end for i386, so the VAARG node
+  // rarely appears; marking it Expand keeps hand-written IR working too.
+  setOperationAction(ISD::VASTART, MVT::Other, Custom);
+  setOperationAction(ISD::VAARG,   MVT::Other, Expand);
+  setOperationAction(ISD::VACOPY,  MVT::Other, Expand);
+  setOperationAction(ISD::VAEND,   MVT::Other, Expand);
 }
 
 SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
@@ -376,9 +395,33 @@ SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerTruncStoreI8(Op, DAG);
   case ISD::SETCC:
     return LowerSETCC(Op, DAG);
+  case ISD::VASTART:
+    return LowerVASTART(Op, DAG);
   default:
     llvm_unreachable("Mov: LowerOperation called on unhandled opcode");
   }
+}
+
+// Stage 6f — `va_start(ap, last_named)`. On i386 SysV this is a single
+// store: `*ap = <address of the first unnamed arg's stack slot>`. The
+// address is the FrameIndex LowerFormalArguments reserved for this
+// function (see MovMachineFunctionInfo::getVarArgsFrameIndex).
+//
+// Operands of the VASTART node are (chain, ptr, srcvalue) — `ptr` is
+// the `va_list` object the C source declared.
+SDValue MovTargetLowering::LowerVASTART(SDValue Op, SelectionDAG &DAG) const {
+  MachineFunction &MF = DAG.getMachineFunction();
+  const auto *MFuncInfo = MF.getInfo<MovMachineFunctionInfo>();
+  const std::optional<int> FI = MFuncInfo->getVarArgsFrameIndex();
+  if (!FI)
+    report_fatal_error("Mov: va_start in a non-variadic function");
+
+  const SDLoc DL(Op);
+  const EVT PtrVT = getPointerTy(DAG.getDataLayout());
+  SDValue FIN = DAG.getFrameIndex(*FI, PtrVT);
+  const Value *SV = cast<SrcValueSDNode>(Op.getOperand(2))->getValue();
+  return DAG.getStore(Op.getOperand(0), DL, FIN, Op.getOperand(1),
+                      MachinePointerInfo(SV));
 }
 
 SDValue MovTargetLowering::LowerSETCC(SDValue Op, SelectionDAG &DAG) const {
@@ -678,7 +721,7 @@ const char *MovTargetLowering::getTargetNodeName(unsigned Opcode) const {
 }
 
 SDValue MovTargetLowering::LowerFormalArguments(
-    SDValue Chain, CallingConv::ID CallConv, bool /*IsVarArg*/,
+    SDValue Chain, CallingConv::ID CallConv, bool IsVarArg,
     const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &DL,
     SelectionDAG &DAG, SmallVectorImpl<SDValue> &InVals) const {
   MachineFunction &MF = DAG.getMachineFunction();
@@ -737,6 +780,23 @@ SDValue MovTargetLowering::LowerFormalArguments(
     if (VA.getLocInfo() != CCValAssign::Full)
       Arg = DAG.getNode(ISD::TRUNCATE, DL, VA.getValVT(), Arg);
     InVals.push_back(Arg);
+  }
+
+  // Stage 6f — variadic callee. cdecl already put the unnamed arguments
+  // on the stack directly above the named ones, so there is no register
+  // save area to spill: all `va_start` needs is the address of the slot
+  // right past the last named arg. `CCInfo.getStackSize()` is the number
+  // of bytes the named args consumed, and the `+4` is the return address
+  // `call` pushed (same convention as the per-arg fixed objects above).
+  //
+  // The object is 1 byte and mutable on purpose: it is never loaded from
+  // as an object in its own right, only used for its address, and PEI
+  // must not treat it as an immutable incoming argument slot it can
+  // colour over.
+  if (IsVarArg) {
+    const int FI = MFI.CreateFixedObject(1, 4 + CCInfo.getStackSize(),
+                                         /*IsImmutable=*/false);
+    MF.getInfo<MovMachineFunctionInfo>()->setVarArgsFrameIndex(FI);
   }
   return Chain;
 }
@@ -816,11 +876,25 @@ SDValue MovTargetLowering::LowerCall(CallLoweringInfo &CLI,
   // Stage 6a scope guards. Codex's stage-6 design pass insisted on hard
   // rejection here so any out-of-scope IR fails with a readable diagnostic
   // rather than mis-compiling.
-  if (CallConv != CallingConv::C)
+  // Stage 6f — `fastcc` is accepted alongside `ccc`. It is not an
+  // exotic convention here: LLVM's GlobalOpt promotes every `internal`
+  // function whose address doesn't escape to `fastcc`, so any real C
+  // file compiled at -O1 or above arrives full of fastcc calls (14 of
+  // them in lcc's `tree.c` alone). There is only one argument-passing
+  // table in this backend (CC_Mov — everything on the stack,
+  // caller-cleaned) and both sides of a fastcc call go through it, so
+  // "supporting" fastcc means not rejecting it. A convention that
+  // genuinely differs (fastcall, thiscall, …) still needs its own
+  // table and stays rejected.
+  if (CallConv != CallingConv::C && CallConv != CallingConv::Fast)
     report_fatal_error(
-        "Mov: only CallingConv::C supported (stage 6a; fastcall/etc. later)");
-  if (CLI.IsVarArg)
-    report_fatal_error("Mov: vararg calls not yet supported (stage 6+)");
+        "Mov: only CallingConv::{C,Fast} supported (stage 6f; "
+        "fastcall/etc. later)");
+  // Stage 6f — a vararg *call* needs nothing special under cdecl: CC_Mov
+  // assigns every argument, named or not, to an ascending stack slot,
+  // and the caller cleans up. The only reason this used to be rejected
+  // was that nothing had exercised it; `test/Execution/vararg_sum.ll`
+  // now does.
   for (const ISD::OutputArg &O : Outs) {
     // Stage 6b — accept sret + byval. sret is just a pointer arg
     // (caller-allocated return slot, pushed as the first cdecl arg);

@@ -78,6 +78,11 @@ layout, the staged stage-7 plan — see [`DESIGN.md`](DESIGN.md).
 ## When in doubt, read
 
 - [`DESIGN.md`](DESIGN.md) for the architecture / staged plan.
+- [`GAP-MATRIX.md`](GAP-MATRIX.md) before assuming a C construct works
+  or doesn't — it is a *measured* table (each row is a probe that was
+  actually run through `llvm-mov-llc`), not an inventory. It also
+  records the two scale problems that only show up once you link more
+  than one translation unit.
 - [`bench/results.md`](bench/results.md) for the current bench
   numbers (auto-generated; committed for diffability).
 - Top-level [`CLAUDE.md`](../CLAUDE.md) for repo-wide conventions

@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/Register.h"
@@ -142,6 +144,21 @@ public:
   int getMulTempBufFI() const { return MulTempBufFI; }
   void setMulTempBufFI(int FI) { MulTempBufFI = FI; }
 
+  // Stage 6f — i386 SysV varargs. `va_list` on i386 is a bare `char *`
+  // pointing at the first *unnamed* argument's stack slot, so the whole
+  // of `va_start` is "store that address". LowerFormalArguments reserves
+  // a fixed object there (offset `4 + <bytes of named args>`, the `+4`
+  // being the return address `call` pushed) and stashes its FrameIndex
+  // here; LowerVASTART reads it back.
+  //
+  // Unlike every other slot above this one is a *fixed* object, and
+  // `MachineFrameInfo::CreateFixedObject` numbers those from -1
+  // downwards — so the `-1 means unset` sentinel the rest of this class
+  // uses would alias a perfectly valid FrameIndex. Hence std::optional:
+  // empty means "this function is not variadic".
+  std::optional<int> getVarArgsFrameIndex() const { return VarArgsFrameIndex; }
+  void setVarArgsFrameIndex(int FI) { VarArgsFrameIndex = FI; }
+
 private:
   // Keyed on the *parent* (full-width) physreg, e.g. Mov::ECX for the
   // slot that backs CL-uses. We don't key by the byte subreg because
@@ -160,6 +177,7 @@ private:
   int CmpMaskBufFI = -1;
   int MulRhs2BufFI = -1;
   int MulTempBufFI = -1;
+  std::optional<int> VarArgsFrameIndex;
 };
 
 } // namespace llvm
