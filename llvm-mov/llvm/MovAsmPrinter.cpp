@@ -22,6 +22,7 @@
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/IR/Module.h"
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
@@ -29,6 +30,9 @@
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
+
+// Defined below, next to the alias machinery that is its main consumer.
+static bool isGasIntelReservedWord(StringRef Name);
 
 namespace {
 class MovAsmPrinter : public AsmPrinter {
@@ -43,7 +47,46 @@ public:
 
   // Emit `.intel_syntax noprefix` once at the top of the file. Output is
   // therefore directly accepted by `as --32`.
-  void emitStartOfAsmFile(Module & /*M*/) override {
+  //
+  // While we have the Module, note whether anything in it is named after
+  // a GAS Intel-syntax reserved word — see emitGlobalVariable below for
+  // what that costs us.
+  void emitStartOfAsmFile(Module &M) override {
+    OutStreamer->emitRawText(StringRef(".intel_syntax noprefix"));
+    for (const GlobalValue &GV : M.global_values()) {
+      if (isGasIntelReservedWord(GV.getName())) {
+        HasGasKeywordSymbol = true;
+        break;
+      }
+    }
+  }
+
+  // Data initialisers that reference a reserved-word symbol are the other
+  // half of the problem `aliasIfGasKeyword` solves for instruction
+  // operands — and the nastier half, because they fail *quietly*:
+  //
+  //     @p = global ptr @offset      ->      p: .long offset
+  //
+  // assembles with only `Warning: zero assumed for missing expression`
+  // and stores 0. `as` exits 0, so nothing downstream notices that the
+  // pointer is null.
+  //
+  // The alias trick doesn't reach here: the base AsmPrinter emits
+  // initialisers itself, without going through our lower(). Rather than
+  // duplicate constant emission, emit global variables in AT&T syntax —
+  // where these words are not reserved — and switch back afterwards. The
+  // directives themselves (`.long`, `.globl`, `.p2align`, `.size`) are
+  // syntax-neutral, so nothing else changes.
+  //
+  // Only done when the module actually contains such a symbol, so the
+  // usual output is untouched.
+  void emitGlobalVariable(const GlobalVariable *GV) override {
+    if (!HasGasKeywordSymbol) {
+      AsmPrinter::emitGlobalVariable(GV);
+      return;
+    }
+    OutStreamer->emitRawText(StringRef(".att_syntax"));
+    AsmPrinter::emitGlobalVariable(GV);
     OutStreamer->emitRawText(StringRef(".intel_syntax noprefix"));
   }
 
@@ -95,6 +138,10 @@ private:
   // Original-name → alias, in insertion order so the emitted asm is
   // deterministic. Mutable because lower() is const.
   mutable SmallVector<std::pair<std::string, MCSymbol *>, 4> GasKeywordAliases;
+
+  // Set in emitStartOfAsmFile when the module names anything after a GAS
+  // Intel-syntax reserved word. Gates the data-emission workaround above.
+  bool HasGasKeywordSymbol = false;
   void emitAdd8Tables();
   void emitBitwise8Tables();
   void emitBitwise8Table(StringRef Name, uint8_t (*Op)(uint8_t, uint8_t));

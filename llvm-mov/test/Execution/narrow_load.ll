@@ -9,14 +9,18 @@
 ; the legalizer into a spin (an `Expand`ed i16 SEXTLOAD whose result feeds
 ; a `sext i16 to i32` has no terminating rewrite).
 ;
-; narrow_load(0) → sext(@s16) + zext(@u16) + zext(@flag) − zext(@pad[1]) + 7
-;                = 40 + 1 + 1 − 7 + 7 = 42.
-; The `− @pad[1] + 7` pair is there to make the GEP-offset i16 load
+; `@s16` is **negative** on purpose: with a positive value a broken
+; sign-extension would zero-extend to the same 32-bit result and the test
+; would pass anyway.
+;
+; narrow_load(0) → sext(@s16) + zext(@u16) + zext(@flag) − zext(@pad[1]) + 55
+;                = (−8) + 1 + 1 − 7 + 55 = 42.
+; The `− @pad[1] + 55` pair is there to make the GEP-offset i16 load
 ; observable in the result: get that load wrong and the answer moves.
 
 target triple = "mov-unknown-linux-gnu"
 
-@s16   = global i16 40                ; signed short, naturally aligned
+@s16   = global i16 -8                ; signed short — negative, so sext ≠ zext
 @u16   = global i16 1                 ; unsigned short
 @flag  = global i8 1                  ; a C `_Bool` in disguise
 @pad   = global [4 x i16] [i16 0, i16 7, i16 0, i16 0]
@@ -46,6 +50,6 @@ entry:
   %t1 = add i32 %as, %bz
   %t2 = add i32 %t1, %fz
   %t3 = sub i32 %t2, %cz
-  %r  = add i32 %t3, 7
+  %r  = add i32 %t3, 55
   ret i32 %r
 }

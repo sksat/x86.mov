@@ -46,6 +46,13 @@ kill-test（[`linux-mov/L0.5-KILLTEST.md`](linux-mov/L0.5-KILLTEST.md)）が挙�
 2（空のコンパイラバリア）は既に満たされていた**。2 回の volatile load が
 2 本の `mov` として残ることを asm レベルで確認している。
 
+ただし満たされていたのは**順序**の話で、**幅**は別だった。narrow load の
+lowering は囲む 4 バイトワードを読む形なので、`volatile` な i8/i16/i1 は
+1/2 バイト読みの要求に 4 バイト読みを出してしまう。MMIO では隣のレジスタを
+読む副作用になる — linux-mov の PV 面は丸ごと memory-mapped register なので
+これは直撃する。stage 6f で拒否するようにしたが（黙って壊すより落とす）、
+**正しい exact-width の narrow load は L3a に足すべき項目**として残っている。
+
 **本ブランチで対応したもの**
 
 | | |

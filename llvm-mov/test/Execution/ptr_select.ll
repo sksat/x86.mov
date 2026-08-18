@@ -15,7 +15,13 @@
 ; This fixture pins both the plain-global and the GEP-arm forms. Without
 ; the rewrite it does not fail — it never terminates.
 ;
-; ptr_select(3) → buf[3] + (x + y) = 30 + (10 + 2) = 42.
+; The GEP arm is evaluated for **both** conditions, via a helper called
+; twice: once where the `inbounds` GEP is the chosen (and valid) arm, and
+; once where the condition rejects it. The second case is the one that
+; needs `freeze` in the driver's blend — an out-of-range `inbounds` GEP is
+; poison, and `and`/`or` would propagate it through the zeroed mask.
+;
+; ptr_select(3) → pick(3) + pick(-1) + (x + y) = 30 + 0 + (10 + 2) = 42.
 
 target triple = "mov-unknown-linux-gnu"
 
@@ -35,10 +41,19 @@ entry:
   %ab = add i32 %a, %b
 
   ; one arm is a GEP off a runtime index — the shape llvm-reduce landed on
+  %hit  = call i32 @pick(i32 %n)      ; condition true  → buf[n]
+  %miss = call i32 @pick(i32 -1)      ; condition false → buf[0]; GEP is poison
+
+  %v   = add i32 %hit, %miss
+  %sum = add i32 %ab, %v
+  ret i32 %sum
+}
+
+define internal i32 @pick(i32 %n) {
+entry:
+  %c = icmp sgt i32 %n, 0
   %g = getelementptr inbounds i32, ptr @buf, i32 %n
   %r = select i1 %c, ptr %g, ptr @buf
   %v = load i32, ptr %r, align 4
-
-  %sum = add i32 %ab, %v
-  ret i32 %sum
+  ret i32 %v
 }

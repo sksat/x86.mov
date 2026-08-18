@@ -17,7 +17,8 @@ movfuscator セルフホスト（[`../movfuscator-selfhost/`](../movfuscator-sel
 
 | 構文 | 判定 | 詳細 |
 |---|---|---|
-| `volatile` load/store | ✅ | `READ_ONCE`/`WRITE_ONCE` 相当。2 回の volatile load が 2 本の `mov` として残ることを asm で確認（マージされない） |
+| `volatile` な i32 の load/store | ✅ | `READ_ONCE`/`WRITE_ONCE` 相当。2 回の volatile load が 2 本の `mov` として残ることを asm で確認（マージされない） |
+| `volatile` な i8 / i16 / i1 の load | ❌ stage 6f で**拒否するようにした** | narrow load の lowering は「囲む 4 バイトワードを読んでシフトで取り出す」形で、通常メモリなら余分なバイトは同じオブジェクトなので観測できないが、volatile では 1/2 バイト読みの要求に 4 バイト読みを出すことになる。MMIO なら隣のレジスタを読む副作用が出る（linux-mov の PV 面は丸ごと memory-mapped register）。正しい lowering が無いので `Cannot select` で落とす。**stage 6f 以前は volatile i8 が黙って 4 バイト読みになっていた**ので、これは機能の削除ではなく誤りの顕在化 |
 | 空のコンパイラバリア `asm volatile("":::"memory")` | ✅ | Linux の `barrier()` そのもの。ターゲット側の対応不要 |
 | 関数ポインタテーブル経由の間接呼び出し | ✅ | stage 6e |
 | 構造体の値渡し / 値返し（byval / sret） | ✅ | stage 6b |
