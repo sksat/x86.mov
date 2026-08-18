@@ -4233,8 +4233,32 @@ int main(int argc, char **argv) {
                       SelTy->getPointerAddressSpace()))
                 : SelTy;
       if (IsPtr) {
-        T  = B.CreatePtrToInt(T, BlendTy);
-        Fa = B.CreatePtrToInt(Fa, BlendTy);
+        // `freeze` is load-bearing, not decoration. `select` stops poison;
+        // `and` / `or` do not, so a poison arm would contaminate the blend
+        // even where the mask zeroes it out. Pointers are the shape where
+        // that actually happens — a condition-guarded `inbounds` GEP is
+        // poison exactly when the condition says not to use it:
+        //
+        //   %g = getelementptr inbounds i8, ptr %p, i32 %n
+        //   %s = select i1 %c, ptr %g, ptr %p
+        //
+        // which is the reduced case this rewrite was added for in the
+        // first place (see test/Execution/ptr_select.ll). The i64 rewrite
+        // above dodges the same problem by only firing on helpers we
+        // generate; pointers get it right instead of avoiding it.
+        //
+        // Freezing makes an unchosen poison arm an arbitrary *fixed*
+        // value, which the mask then discards. It costs nothing at
+        // codegen time (`bench-check` is byte-identical with and
+        // without it).
+        //
+        // The i32 rewrite below is still unconditional and unfrozen, so
+        // the same hole exists there for a poison arm out of e.g. an
+        // `add nsw`. That predates this pointer support and is left
+        // alone here rather than changed in passing; the fix would be
+        // the same two `CreateFreeze` calls.
+        T  = B.CreateFreeze(B.CreatePtrToInt(T, BlendTy));
+        Fa = B.CreateFreeze(B.CreatePtrToInt(Fa, BlendTy));
       }
       // Same blend shape as BlendOnCmp above — zext + sub to avoid
       // emitting `sext i1` (which dragged DAG-ISel into the
