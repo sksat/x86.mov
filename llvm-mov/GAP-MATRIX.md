@@ -38,6 +38,34 @@ movfuscator セルフホスト（[`../movfuscator-selfhost/`](../movfuscator-sel
 | i64 の比較 | ❌ | 数分オーダー。`DESIGN.md` 7h4 が記録している既知現象 |
 | GAS Intel 構文の予約語と同名のシンボル | ✅ stage 6f | `offset` という名前の C グローバル（lcc の `bytecode.c` にある）を Intel 構文では参照できず `as` が落ちていた。衝突するのは `offset mod short flat st and or not xor shl shr` の 11 語。回避形も総当たりし、`.att_syntax` 窓で `.set` エイリアスを定義するのが唯一一様に効く形だった |
 
+## 1.5 別コーパスでの裏取り — movfuscator-wasm のテストフィクスチャ
+
+rcc は「実在の C」の代表として選んだが、1 つのコーパスに寄りかかった結論に
+ならないよう、隣の [`../movfuscator-wasm/tests/fixtures/`](../movfuscator-wasm/tests/fixtures/)
+でも同じことを測った。こちらは movfuscator 自身の回帰テスト用に選ばれた
+小さな C プログラム群で、素性がまるで違う。
+
+`origin/mov` の `llvm-mov-llc` と本ブランチのものを**同一マシン**で
+全フィクスチャにかけた結果:
+
+| フィクスチャ | origin/mov | 本ブランチ |
+|---|---|---|
+| `bitops` `eq42` `fib10` `fib_rec` `lt_unsigned` `multi_call` `shift_reg` `shifts` `branch` `multi-add` `multi-add-helper` `return0` `return42` `sum10` | OK | **OK（`.s` がバイト一致）** |
+| `hello` `upstream-hanoi` `upstream-hello` `upstream-knight` `upstream-mandelbrot` `upstream-prime` | `vararg calls not yet supported` | **OK** |
+| `upstream-nqueens` `upstream-ray3` | 同上 / `unable to lower stackguard` | `unable to lower stackguard` |
+
+2 つ読み取れる。
+
+- **既に通っていたものは 1 バイトも変わっていない。** stage 6f の変更はどれも
+  「これまで落ちていた形を通す」ものであって、通っていた経路の codegen には
+  触れていない（`bench/results.md` を再生成していないのはこれが理由）。
+- **`printf` を呼ぶだけの `hello` すら通っていなかった。** varargs が無いと
+  「C の最初の一本」が書けない、という話でもある。
+
+残る `unable to lower stackguard` は clang の stack protector で、
+`-fno-stack-protector` で消える。`long double` と同じくビルドフラグの問題で、
+バックエンドの穴ではない。
+
 ## 2. 「コンパイルが遅い」は遅さではなく無限ループだった
 
 当初これを「構文次第でコンパイル時間が super-linear」と記録していた。測ったら違った。
