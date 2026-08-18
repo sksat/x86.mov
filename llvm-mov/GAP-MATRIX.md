@@ -58,7 +58,9 @@ rcc は「実在の C」の代表として選んだが、1 つのコーパスに
 
 - **既に通っていたものは 1 バイトも変わっていない。** stage 6f の変更はどれも
   「これまで落ちていた形を通す」ものであって、通っていた経路の codegen には
-  触れていない（`bench/results.md` を再生成していないのはこれが理由）。
+  触れていない。`bench/results.md` の再生成でも llvm-mov 列は動いていない
+  — 唯一の例外は `base64_decode` で、これは dep が native fallback するため
+  rustc のバージョンが `.text` に混ざる分（`rust-toolchain.toml` で固定した）。
 - **`printf` を呼ぶだけの `hello` すら通っていなかった。** varargs が無いと
   「C の最初の一本」が書けない、という話でもある。
 

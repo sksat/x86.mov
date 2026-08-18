@@ -9,8 +9,10 @@
 ; the legalizer into a spin (an `Expand`ed i16 SEXTLOAD whose result feeds
 ; a `sext i16 to i32` has no terminating rewrite).
 ;
-; narrow_load(0) → 40 (s16 sext) + 1 (i1) + 1 (u16 zext, 0x10000 wraps to
-; 1 after the mask) = 42.
+; narrow_load(0) → sext(@s16) + zext(@u16) + zext(@flag) − zext(@pad[1]) + 7
+;                = 40 + 1 + 1 − 7 + 7 = 42.
+; The `− @pad[1] + 7` pair is there to make the GEP-offset i16 load
+; observable in the result: get that load wrong and the answer moves.
 
 target triple = "mov-unknown-linux-gnu"
 

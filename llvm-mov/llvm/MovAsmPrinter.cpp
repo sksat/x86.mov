@@ -229,7 +229,12 @@ MCSymbol *MovAsmPrinter::aliasIfGasKeyword(MCSymbol *Sym) const {
     if (Orig == Name)
       return Alias;
 
-  MCSymbol *Alias = OutContext.getOrCreateSymbol(Twine(".Lmov_kw_") + Name);
+  // createTempSymbol, not getOrCreateSymbol: a fixed name like
+  // `.Lmov_kw_offset` could collide with a symbol that actually exists in
+  // the input, in which case references would silently be redirected to
+  // it and the `.set` below would redefine it. The temp-symbol counter
+  // guarantees a fresh name.
+  MCSymbol *Alias = OutContext.createTempSymbol(Twine("mov_kw_") + Name);
   GasKeywordAliases.emplace_back(Name.str(), Alias);
   return Alias;
 }

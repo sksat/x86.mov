@@ -611,6 +611,23 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
   // silently reading half a value. (No such load has turned up yet;
   // when one does, the fix is two byte-loads merged, not a wider read.)
   auto *LD = cast<LoadSDNode>(Op);
+
+  // A volatile narrow load must not be widened. The whole trick below is
+  // to read the enclosing aligned 4-byte word and shift the wanted field
+  // out of it, which is unobservable for ordinary memory — the extra
+  // bytes belong to the same object and are discarded. For a volatile
+  // access it is not: the source asked for a 1/2-byte read and this
+  // would issue a 4-byte one, touching neighbouring bytes. On MMIO
+  // (linux-mov's whole PV surface is memory-mapped registers) reading a
+  // neighbouring register can have side effects, and a 4-byte read of a
+  // 1-byte register is simply a different bus transaction.
+  //
+  // There is no correct lowering available here yet, so decline and let
+  // the default path fail loudly rather than silently emit the wrong
+  // access. Exact-width narrow loads are what a real fix needs.
+  if (LD->isVolatile())
+    return SDValue();
+
   const EVT MemVT = LD->getMemoryVT();
   unsigned MemBits;
   if (MemVT == MVT::i1)

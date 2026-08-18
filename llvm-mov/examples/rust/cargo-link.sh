@@ -185,7 +185,14 @@ try_mov_lower_rlib() {
     # own code can't be lowered we want a loud failure, not a silent
     # native binary.
     if ! (
-            if [ "$DEP_MAXMEM_KB" != 0 ]; then ulimit -v "$DEP_MAXMEM_KB"; fi
+            # Bail rather than run uncapped if the limit can't be applied
+            # (unsupported, or a lower hard limit already inherited).
+            # `set -e` does not help here: this subshell is the condition
+            # of an `if !`, which disables errexit inside it.
+            if [ "$DEP_MAXMEM_KB" != 0 ] && ! ulimit -v "$DEP_MAXMEM_KB"; then
+                echo "cargo-link: cannot apply ulimit -v $DEP_MAXMEM_KB" 1>&2
+                exit 70
+            fi
             exec "$DRIVER" $DRIVER_FLAGS -mtriple=mov-unknown-linux-gnu \
                  "$sibling_ll" -o "$dep_s"
          ) 2>"$llc_log"; then
