@@ -28,6 +28,8 @@ movfuscator セルフホスト（[`../movfuscator-selfhost/`](../movfuscator-sel
 | i64 の可変長シフト | ❌ 未対応 | `Cannot select: shl_parts`。`__ashldi3`/`__lshrdi3`/`__ashrdi3` の注入 or `shl_parts` の Expand で解決 |
 | i64 の除算・剰余 | ❌ 未対応 | `unsupported library call operation`。`__divdi3`/`__udivdi3` 等が未注入（i32 版 `__divsi3` は注入済みなので同型の作業） |
 | **i64 の比較（`icmp` on i64）** | ❌ **コンパイル時病理** | 120 秒でも終わらない。`DESIGN.md` の 7h4 が「i64 SETCC で DAG-ISel が数分かかる」と記録している既知現象が、ごく小さな関数でも出る |
+| **i16 / i1 の extload** | ❌ 未対応 | `Cannot select: load … anyext from i16` / `anyext from i1`。i8 には `LowerExtLoadI8`（アラインダウンした i32 ロード + shift-mask）という Custom 経路が既にあり、そのコメントは「i16 / i1 は Rust IR では稀なので後回し、必要になったら同じ経路を足すだけ」と書いている。**実 C ではもう稀ではない**（§後述の rcc サーベイで 32 TU 中 5 本が踏む） |
+| `long double`（`x86_fp80`） | ⚠️ 回避可 | `unsupported library call operation`。x87 80 ビットのソフトフロートは誰も書いていない。ただし `clang -mlong-double-64` で `long double` = `double` になり、既存の f64 ソフトフロートに乗る。**バックエンド作業ではなくビルドフラグの問題** |
 
 ## 表に出てこない、しかしより重い問題: バイトテーブルの TU 複製
 

@@ -117,12 +117,31 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // never reaches the legalizer here. Leaving these to their
   // defaults keeps the legalizer's i1-promotion path in charge.
 
-  // No CMOVcc — Expand SELECT / SELECT_CC into the standard
-  // branch + PHI shape (BRCOND target_bb, fallthrough). The
-  // resulting BRCOND/BR_CC pair flows back through our existing
-  // Custom hook above, so a `select` IR node ends up as a CMP +
-  // Jcc + branch sequence (eventually mov-only-legalized by 7c2).
-  setOperationAction(ISD::SELECT,    MVT::i32, Expand);
+  // No CMOVcc. SELECT is Custom-lowered to the same branchless
+  // bit-blend the driver's IR-level rewrite uses; SELECT_CC stays
+  // Expand.
+  //
+  // Stage 6f — SELECT used to be Expand too, and that was a hang.
+  // LegalizeDAG expands SELECT into SELECT_CC and SELECT_CC back
+  // into SETCC + SELECT, so with both marked Expand the legalizer
+  // ping-pongs between them and never reaches a fixed point: flat
+  // RSS, stack permanently inside `SelectionDAG::Legalize()`.
+  //
+  // The driver's IR-level rewrite hid this for a long time by
+  // deleting user-visible `select` instructions before SDAG ever saw
+  // them, so the loop only fired on SELECTs the *legalizer itself*
+  // synthesised — which is why it looked like a mysterious
+  // "compile-time pathology" on particular functions rather than an
+  // obvious cycle. The reduced case is a plain i32 counted loop
+  // whose bound comes from an if-diamond PHI (see
+  // `test/Execution/loop_diamond_bound.ll`) — no `select` anywhere
+  // in the IR. Ordinary C hits it constantly; it accounted for half
+  // the translation units of lcc that could not be compiled at all.
+  //
+  // Making SELECT Custom breaks the cycle at its natural point:
+  // SELECT_CC's expansion produces a SELECT, and that SELECT now
+  // terminates in LowerSELECT instead of bouncing back.
+  setOperationAction(ISD::SELECT,    MVT::i32, Custom);
   setOperationAction(ISD::SELECT_CC, MVT::i32, Expand);
 
   // No ROL/ROR opcode and no movfuscator-style rotate trick yet.
@@ -397,9 +416,40 @@ SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerSETCC(Op, DAG);
   case ISD::VASTART:
     return LowerVASTART(Op, DAG);
+  case ISD::SELECT:
+    return LowerSELECT(Op, DAG);
   default:
     llvm_unreachable("Mov: LowerOperation called on unhandled opcode");
   }
+}
+
+// Stage 6f — branchless `select` at the SDAG level.
+//
+//   result = (T & mask) | (F & ~mask),  mask = 0 - cond
+//
+// This is the same blend the driver applies to IR-level `select`
+// instructions; doing it here as well covers the SELECTs that
+// LegalizeDAG synthesises on its own (from SELECT_CC, from
+// LegalizeSetCCCondCode, …), which the IR pass by construction cannot
+// see. See the comment on the SELECT action for why leaving those on
+// the Expand path was an infinite loop rather than merely slow.
+//
+// `cond` arrives already promoted to the operation's type and, under
+// ZeroOrOneBooleanContent, is guaranteed to be 0 or 1 — so `0 - cond`
+// is exactly the all-ones / all-zeros mask.
+SDValue MovTargetLowering::LowerSELECT(SDValue Op, SelectionDAG &DAG) const {
+  const SDLoc DL(Op);
+  const EVT VT = Op.getValueType();
+  SDValue Cond = DAG.getZExtOrTrunc(Op.getOperand(0), DL, VT);
+  SDValue T    = Op.getOperand(1);
+  SDValue F    = Op.getOperand(2);
+
+  SDValue Mask =
+      DAG.getNode(ISD::SUB, DL, VT, DAG.getConstant(0, DL, VT), Cond);
+  SDValue NotMask = DAG.getNOT(DL, Mask, VT);
+  return DAG.getNode(ISD::OR, DL, VT,
+                     DAG.getNode(ISD::AND, DL, VT, T, Mask),
+                     DAG.getNode(ISD::AND, DL, VT, F, NotMask));
 }
 
 // Stage 6f — `va_start(ap, last_named)`. On i386 SysV this is a single
