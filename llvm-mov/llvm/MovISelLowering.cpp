@@ -53,15 +53,20 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // past the surrounding object. SEXTLOAD adds a `(x << 24) >>a 24`
   // tail to sign-extend the extracted byte to i32.
   //
-  // i16 / i1 stays Expand for now: rare in Rust IR, and adding the
-  // same Custom path is mechanical when the time comes.
-  setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MVT::i8, Custom);
-  setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MVT::i8, Custom);
-  setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MVT::i8, Custom);
-  for (MVT MemVT : {MVT::i1, MVT::i16}) {
-    setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MemVT, Expand);
-    setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MemVT, Expand);
-    setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MemVT, Expand);
+  // Stage 6f — i1 and i16 join i8 on that path. They used to be
+  // Expand with the note "rare in Rust IR, and adding the same Custom
+  // path is mechanical when the time comes". The time came with real
+  // C: `short` struct fields and `_Bool` globals are everywhere, and
+  // 11 of lcc's 32 translation units stop dead on them. Worse, the
+  // Expand path is not uniformly a clean failure — an i16 SEXTLOAD
+  // feeding a `sext i16 to i32` has no terminating rewrite and spins
+  // the legalizer instead of erroring. The one case still left out is
+  // an under-aligned i16 (it could straddle two words); see
+  // LowerExtLoadI8.
+  for (MVT MemVT : {MVT::i1, MVT::i8, MVT::i16}) {
+    setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MemVT, Custom);
+    setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MemVT, Custom);
+    setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MemVT, Custom);
   }
 
   // Stage 6d3b — truncating stores. `store i8` (trunc-from-i32 in IR)
@@ -591,9 +596,31 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
   // "scalar-only mov-only" buys us: the byte-chain mov-only legalize
   // at stage 7 already handles every op in this expansion, and the
   // resulting `.text` stays mov-only without any GR8 plumbing.
+  // Stage 6f — the same expansion now covers i1 and i16, with the
+  // width baked into the mask (and into the sign-extend shift amount).
+  //
+  //   i1  : mask 0x1     — a `_Bool` global, one byte of storage
+  //   i8  : mask 0xff    — as before
+  //   i16 : mask 0xffff  — a `short` field or global
+  //
+  // i16 is only safe on this path when the load is at least 2-aligned:
+  // a 2-aligned i16 lies wholly inside one 4-byte word, so the
+  // aligned-down read still cannot leave the object. An under-aligned
+  // i16 could straddle two words and is deliberately *not* handled —
+  // it falls back to the default path and fails loudly rather than
+  // silently reading half a value. (No such load has turned up yet;
+  // when one does, the fix is two byte-loads merged, not a wider read.)
   auto *LD = cast<LoadSDNode>(Op);
-  if (LD->getMemoryVT() != MVT::i8)
-    return SDValue(); // Only i8 ext-loads are custom-handled here.
+  const EVT MemVT = LD->getMemoryVT();
+  unsigned MemBits;
+  if (MemVT == MVT::i1)
+    MemBits = 1;
+  else if (MemVT == MVT::i8)
+    MemBits = 8;
+  else if (MemVT == MVT::i16 && LD->getAlign() >= Align(2))
+    MemBits = 16;
+  else
+    return SDValue();
 
   SDLoc DL(Op);
   SDValue Chain = LD->getChain();
@@ -617,17 +644,20 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
                              MachinePointerInfo(MMO->getPointerInfo()),
                              Align(4), MMO->getFlags());
 
-  // Extract the requested byte.
+  // Extract the requested field.
+  const uint32_t FieldMask =
+      MemBits == 32 ? 0xffffffffu : ((1u << MemBits) - 1u);
   SDValue Shifted = DAG.getNode(ISD::SRL, DL, MVT::i32, Word, BitShift);
   SDValue ByteVal = DAG.getNode(ISD::AND, DL, MVT::i32, Shifted,
-                                DAG.getConstant(0xff, DL, MVT::i32));
+                                DAG.getConstant(FieldMask, DL, MVT::i32));
 
-  // For SEXTLOAD, sign-extend the byte from 8 to 32 bits via
-  // `(x << 24) >>a 24`. Both shifts are by a compile-time constant
-  // 24, so they select to SHL32ri / SAR32ri (and survive byte-chain).
+  // For SEXTLOAD, sign-extend from MemBits to 32 via
+  // `(x << (32 - MemBits)) >>a (32 - MemBits)`. Both shifts are by a
+  // compile-time constant, so they select to SHL32ri / SAR32ri (and
+  // survive byte-chain).
   SDValue Result;
   if (LD->getExtensionType() == ISD::SEXTLOAD) {
-    SDValue Sh = DAG.getConstant(24, DL, MVT::i32);
+    SDValue Sh = DAG.getConstant(32 - MemBits, DL, MVT::i32);
     SDValue Up = DAG.getNode(ISD::SHL, DL, MVT::i32, ByteVal, Sh);
     Result     = DAG.getNode(ISD::SRA, DL, MVT::i32, Up, Sh);
   } else {
