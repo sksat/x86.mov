@@ -21,6 +21,7 @@
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
@@ -62,10 +63,38 @@ public:
     emitReturnAddrSlot();
     emitEspDecScratch();
     emitIndirectCalleeSlot();
+    emitGasKeywordAliases();
   }
 
 private:
   void lower(const MachineInstr *MI, MCInst &OutMI) const;
+
+  // GAS's Intel-syntax parser reserves a handful of words, and several of
+  // them are perfectly ordinary C identifiers — lcc has a global called
+  // `offset`. A symbol so named cannot be referenced in Intel syntax at
+  // all: `mov esi, offset offset` is "invalid expression", `mov eax,
+  // offset and` is "invalid use of operator", and every parenthesised /
+  // `flat:` / `@GOTOFF` / `+0` variant was measured to fail too (binutils
+  // 2.47).
+  //
+  // The one spelling that works is to reference an alias and define that
+  // alias in a short `.att_syntax` window, where the words are not
+  // reserved:
+  //
+  //     .att_syntax
+  //     .set .Lmov_kw_offset, offset
+  //     .intel_syntax noprefix
+  //
+  // `aliasIfGasKeyword` swaps the symbol for its alias at operand-lowering
+  // time and records it; `emitGasKeywordAliases` emits the definitions at
+  // the end of the file. Symbols with ordinary names are returned
+  // unchanged, so nothing else in the output moves.
+  MCSymbol *aliasIfGasKeyword(MCSymbol *Sym) const;
+  void emitGasKeywordAliases();
+
+  // Original-name → alias, in insertion order so the emitted asm is
+  // deterministic. Mutable because lower() is const.
+  mutable SmallVector<std::pair<std::string, MCSymbol *>, 4> GasKeywordAliases;
   void emitAdd8Tables();
   void emitBitwise8Tables();
   void emitBitwise8Table(StringRef Name, uint8_t (*Op)(uint8_t, uint8_t));
@@ -109,7 +138,7 @@ void MovAsmPrinter::lower(const MachineInstr *MI, MCInst &OutMI) const {
       // the right byte — codex's stage-5a review flagged that dropping
       // the offset would silently misaddress.
       const MCExpr *Expr = MCSymbolRefExpr::create(
-          getSymbol(MO.getGlobal()), OutContext);
+          aliasIfGasKeyword(getSymbol(MO.getGlobal())), OutContext);
       if (int64_t Off = MO.getOffset()) {
         Expr = MCBinaryExpr::createAdd(
             Expr, MCConstantExpr::create(Off, OutContext), OutContext);
@@ -119,7 +148,8 @@ void MovAsmPrinter::lower(const MachineInstr *MI, MCInst &OutMI) const {
     }
     case MachineOperand::MO_ExternalSymbol: {
       const MCExpr *Expr = MCSymbolRefExpr::create(
-          GetExternalSymbolSymbol(MO.getSymbolName()), OutContext);
+          aliasIfGasKeyword(GetExternalSymbolSymbol(MO.getSymbolName())),
+          OutContext);
       if (int64_t Off = MO.getOffset()) {
         Expr = MCBinaryExpr::createAdd(
             Expr, MCConstantExpr::create(Off, OutContext), OutContext);
@@ -177,6 +207,42 @@ void MovAsmPrinter::emitInstruction(const MachineInstr *MI) {
 // ELFs. Trivial fixtures with no ret/post-call ADD (rare) still drop
 // it. `bench/results.md`'s `.rodata` column shows which fixtures
 // retain how much of the table set.
+// The set was measured against binutils 2.47 by assembling `mov esi,
+// offset NAME` for each candidate; exactly these failed. They split into
+// two flavours — plain reserved words (`offset`, `short`, `flat`, `st`)
+// and words that are also binary operators (`and`, `or`, `not`, `xor`,
+// `shl`, `shr`, `mod`) — but the alias treatment covers both, so the
+// printer does not need to tell them apart.
+static bool isGasIntelReservedWord(StringRef Name) {
+  return llvm::StringSwitch<bool>(Name)
+      .Cases({"offset", "mod", "short", "flat", "st"}, true)
+      .Cases({"and", "or", "not", "xor", "shl", "shr"}, true)
+      .Default(false);
+}
+
+MCSymbol *MovAsmPrinter::aliasIfGasKeyword(MCSymbol *Sym) const {
+  const StringRef Name = Sym->getName();
+  if (!isGasIntelReservedWord(Name))
+    return Sym;
+
+  for (const auto &[Orig, Alias] : GasKeywordAliases)
+    if (Orig == Name)
+      return Alias;
+
+  MCSymbol *Alias = OutContext.getOrCreateSymbol(Twine(".Lmov_kw_") + Name);
+  GasKeywordAliases.emplace_back(Name.str(), Alias);
+  return Alias;
+}
+
+void MovAsmPrinter::emitGasKeywordAliases() {
+  if (GasKeywordAliases.empty())
+    return;
+  OutStreamer->emitRawText(StringRef(".att_syntax"));
+  for (const auto &[Orig, Alias] : GasKeywordAliases)
+    OutStreamer->emitRawText(Twine(".set ") + Alias->getName() + ", " + Orig);
+  OutStreamer->emitRawText(StringRef(".intel_syntax noprefix"));
+}
+
 void MovAsmPrinter::emitAdd8Tables() {
   static constexpr unsigned kSize = 2u * 256u * 256u;
   SmallVector<uint8_t, kSize> Sum;
