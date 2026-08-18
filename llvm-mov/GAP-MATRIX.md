@@ -133,3 +133,18 @@ lcc の 32 翻訳単位のうち 11 本がこの領域にいて、29 GiB のマ�
 数千 TU の Linux カーネルを語る前に、ここが解けている必要がある。
 （stage 7 の mov-only legalize が 1 命令を ~50 mov のバイトチェーンへ展開するため
 MachineFunction が巨大化することが素直な仮説だが、プロファイルは未取得。）
+
+これは C の大きな翻訳単位に限った話ではない。**2,983 行の Rust の IR 1 本**でも起きる:
+`base64` crate (v0.22.1) を rustc 1.97.1 が吐いた IR は、1 回の `llvm-mov-llc` 呼び出しで
+**27.1 GiB / 90 秒**を要求する。29 GiB のマシンには「かろうじて入る」ので長く気付かれず、
+16 GiB の GitHub runner で初めて牙を剥いた — `test-rust-example` が出力ゼロのまま
+`exit 143` で死に、CI が壊れていた (原因はカーネルの OOM killer が runner agent を
+選ぶこと)。rustc 1.96 が吐く IR ではこの経路に入らないので、runner イメージが
+更新された時点で顕在化している。
+
+対処として [`examples/rust/cargo-link.sh`](examples/rust/cargo-link.sh) は dep の
+lowering に `ulimit -v` の上限 (既定 8 GiB、`LLVM_MOV_LLC_DEP_MAXMEM_KB`) を掛け、
+超えたら既存の native fallback に落とすようにした。**時間制限では救えない**点が重要で、
+27 GiB には 1 分足らずで到達するため、タイムアウトが発火する前にマシンが死ぬ。
+これは症状を封じ込めるだけで、原因である「1 命令 = ~50 mov のバイトチェーン展開が
+MachineFunction を膨らませる」ことには手を付けていない。
