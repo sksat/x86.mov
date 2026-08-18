@@ -8,6 +8,7 @@
 
 #include "MovISelLowering.h"
 #include "MCTargetDesc/MovMCTargetDesc.h"
+#include "MovMachineFunctionInfo.h"
 #include "MovSubtarget.h"
 #include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
@@ -52,15 +53,20 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // past the surrounding object. SEXTLOAD adds a `(x << 24) >>a 24`
   // tail to sign-extend the extracted byte to i32.
   //
-  // i16 / i1 stays Expand for now: rare in Rust IR, and adding the
-  // same Custom path is mechanical when the time comes.
-  setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MVT::i8, Custom);
-  setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MVT::i8, Custom);
-  setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MVT::i8, Custom);
-  for (MVT MemVT : {MVT::i1, MVT::i16}) {
-    setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MemVT, Expand);
-    setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MemVT, Expand);
-    setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MemVT, Expand);
+  // Stage 6f — i1 and i16 join i8 on that path. They used to be
+  // Expand with the note "rare in Rust IR, and adding the same Custom
+  // path is mechanical when the time comes". The time came with real
+  // C: `short` struct fields and `_Bool` globals are everywhere, and
+  // 11 of lcc's 32 translation units stop dead on them. Worse, the
+  // Expand path is not uniformly a clean failure — an i16 SEXTLOAD
+  // feeding a `sext i16 to i32` has no terminating rewrite and spins
+  // the legalizer instead of erroring. The one case still left out is
+  // an under-aligned i16 (it could straddle two words); see
+  // LowerExtLoadI8.
+  for (MVT MemVT : {MVT::i1, MVT::i8, MVT::i16}) {
+    setLoadExtAction(ISD::EXTLOAD,  MVT::i32, MemVT, Custom);
+    setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MemVT, Custom);
+    setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MemVT, Custom);
   }
 
   // Stage 6d3b — truncating stores. `store i8` (trunc-from-i32 in IR)
@@ -116,12 +122,31 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // never reaches the legalizer here. Leaving these to their
   // defaults keeps the legalizer's i1-promotion path in charge.
 
-  // No CMOVcc — Expand SELECT / SELECT_CC into the standard
-  // branch + PHI shape (BRCOND target_bb, fallthrough). The
-  // resulting BRCOND/BR_CC pair flows back through our existing
-  // Custom hook above, so a `select` IR node ends up as a CMP +
-  // Jcc + branch sequence (eventually mov-only-legalized by 7c2).
-  setOperationAction(ISD::SELECT,    MVT::i32, Expand);
+  // No CMOVcc. SELECT is Custom-lowered to the same branchless
+  // bit-blend the driver's IR-level rewrite uses; SELECT_CC stays
+  // Expand.
+  //
+  // Stage 6f — SELECT used to be Expand too, and that was a hang.
+  // LegalizeDAG expands SELECT into SELECT_CC and SELECT_CC back
+  // into SETCC + SELECT, so with both marked Expand the legalizer
+  // ping-pongs between them and never reaches a fixed point: flat
+  // RSS, stack permanently inside `SelectionDAG::Legalize()`.
+  //
+  // The driver's IR-level rewrite hid this for a long time by
+  // deleting user-visible `select` instructions before SDAG ever saw
+  // them, so the loop only fired on SELECTs the *legalizer itself*
+  // synthesised — which is why it looked like a mysterious
+  // "compile-time pathology" on particular functions rather than an
+  // obvious cycle. The reduced case is a plain i32 counted loop
+  // whose bound comes from an if-diamond PHI (see
+  // `test/Execution/loop_diamond_bound.ll`) — no `select` anywhere
+  // in the IR. Ordinary C hits it constantly; it accounted for half
+  // the translation units of lcc that could not be compiled at all.
+  //
+  // Making SELECT Custom breaks the cycle at its natural point:
+  // SELECT_CC's expansion produces a SELECT, and that SELECT now
+  // terminates in LowerSELECT instead of bouncing back.
+  setOperationAction(ISD::SELECT,    MVT::i32, Custom);
   setOperationAction(ISD::SELECT_CC, MVT::i32, Expand);
 
   // No ROL/ROR opcode and no movfuscator-style rotate trick yet.
@@ -362,6 +387,24 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   MaxStoresPerMemset  = MaxStoresPerMemsetOptSize  = 64;
   MaxStoresPerMemcpy  = MaxStoresPerMemcpyOptSize  = 64;
   MaxStoresPerMemmove = MaxStoresPerMemmoveOptSize = 64;
+
+  // Stage 6f — i386 SysV varargs. The ABI is the simplest one there is:
+  // every argument (named or not) is already on the stack in ascending
+  // order, and `va_list` is a bare `char *` cursor into that run. So
+  //
+  //   - VASTART is Custom: one store of "address just past the named
+  //     args" into the va_list object (see LowerVASTART),
+  //   - VAARG's generic Expand (load the cursor, load the value, bump
+  //     the cursor, store it back) is exactly right — no register-save
+  //     area, no overflow-area switch as on x86-64,
+  //   - VACOPY expands to a pointer-sized copy and VAEND to nothing.
+  //
+  // Clang expands `va_arg` in the front end for i386, so the VAARG node
+  // rarely appears; marking it Expand keeps hand-written IR working too.
+  setOperationAction(ISD::VASTART, MVT::Other, Custom);
+  setOperationAction(ISD::VAARG,   MVT::Other, Expand);
+  setOperationAction(ISD::VACOPY,  MVT::Other, Expand);
+  setOperationAction(ISD::VAEND,   MVT::Other, Expand);
 }
 
 SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
@@ -376,9 +419,64 @@ SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerTruncStoreI8(Op, DAG);
   case ISD::SETCC:
     return LowerSETCC(Op, DAG);
+  case ISD::VASTART:
+    return LowerVASTART(Op, DAG);
+  case ISD::SELECT:
+    return LowerSELECT(Op, DAG);
   default:
     llvm_unreachable("Mov: LowerOperation called on unhandled opcode");
   }
+}
+
+// Stage 6f — branchless `select` at the SDAG level.
+//
+//   result = (T & mask) | (F & ~mask),  mask = 0 - cond
+//
+// This is the same blend the driver applies to IR-level `select`
+// instructions; doing it here as well covers the SELECTs that
+// LegalizeDAG synthesises on its own (from SELECT_CC, from
+// LegalizeSetCCCondCode, …), which the IR pass by construction cannot
+// see. See the comment on the SELECT action for why leaving those on
+// the Expand path was an infinite loop rather than merely slow.
+//
+// `cond` arrives already promoted to the operation's type and, under
+// ZeroOrOneBooleanContent, is guaranteed to be 0 or 1 — so `0 - cond`
+// is exactly the all-ones / all-zeros mask.
+SDValue MovTargetLowering::LowerSELECT(SDValue Op, SelectionDAG &DAG) const {
+  const SDLoc DL(Op);
+  const EVT VT = Op.getValueType();
+  SDValue Cond = DAG.getZExtOrTrunc(Op.getOperand(0), DL, VT);
+  SDValue T    = Op.getOperand(1);
+  SDValue F    = Op.getOperand(2);
+
+  SDValue Mask =
+      DAG.getNode(ISD::SUB, DL, VT, DAG.getConstant(0, DL, VT), Cond);
+  SDValue NotMask = DAG.getNOT(DL, Mask, VT);
+  return DAG.getNode(ISD::OR, DL, VT,
+                     DAG.getNode(ISD::AND, DL, VT, T, Mask),
+                     DAG.getNode(ISD::AND, DL, VT, F, NotMask));
+}
+
+// Stage 6f — `va_start(ap, last_named)`. On i386 SysV this is a single
+// store: `*ap = <address of the first unnamed arg's stack slot>`. The
+// address is the FrameIndex LowerFormalArguments reserved for this
+// function (see MovMachineFunctionInfo::getVarArgsFrameIndex).
+//
+// Operands of the VASTART node are (chain, ptr, srcvalue) — `ptr` is
+// the `va_list` object the C source declared.
+SDValue MovTargetLowering::LowerVASTART(SDValue Op, SelectionDAG &DAG) const {
+  MachineFunction &MF = DAG.getMachineFunction();
+  const auto *MFuncInfo = MF.getInfo<MovMachineFunctionInfo>();
+  const std::optional<int> FI = MFuncInfo->getVarArgsFrameIndex();
+  if (!FI)
+    report_fatal_error("Mov: va_start in a non-variadic function");
+
+  const SDLoc DL(Op);
+  const EVT PtrVT = getPointerTy(DAG.getDataLayout());
+  SDValue FIN = DAG.getFrameIndex(*FI, PtrVT);
+  const Value *SV = cast<SrcValueSDNode>(Op.getOperand(2))->getValue();
+  return DAG.getStore(Op.getOperand(0), DL, FIN, Op.getOperand(1),
+                      MachinePointerInfo(SV));
 }
 
 SDValue MovTargetLowering::LowerSETCC(SDValue Op, SelectionDAG &DAG) const {
@@ -498,9 +596,48 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
   // "scalar-only mov-only" buys us: the byte-chain mov-only legalize
   // at stage 7 already handles every op in this expansion, and the
   // resulting `.text` stays mov-only without any GR8 plumbing.
+  // Stage 6f — the same expansion now covers i1 and i16, with the
+  // width baked into the mask (and into the sign-extend shift amount).
+  //
+  //   i1  : mask 0x1     — a `_Bool` global, one byte of storage
+  //   i8  : mask 0xff    — as before
+  //   i16 : mask 0xffff  — a `short` field or global
+  //
+  // i16 is only safe on this path when the load is at least 2-aligned:
+  // a 2-aligned i16 lies wholly inside one 4-byte word, so the
+  // aligned-down read still cannot leave the object. An under-aligned
+  // i16 could straddle two words and is deliberately *not* handled —
+  // it falls back to the default path and fails loudly rather than
+  // silently reading half a value. (No such load has turned up yet;
+  // when one does, the fix is two byte-loads merged, not a wider read.)
   auto *LD = cast<LoadSDNode>(Op);
-  if (LD->getMemoryVT() != MVT::i8)
-    return SDValue(); // Only i8 ext-loads are custom-handled here.
+
+  // A volatile narrow load must not be widened. The whole trick below is
+  // to read the enclosing aligned 4-byte word and shift the wanted field
+  // out of it, which is unobservable for ordinary memory — the extra
+  // bytes belong to the same object and are discarded. For a volatile
+  // access it is not: the source asked for a 1/2-byte read and this
+  // would issue a 4-byte one, touching neighbouring bytes. On MMIO
+  // (linux-mov's whole PV surface is memory-mapped registers) reading a
+  // neighbouring register can have side effects, and a 4-byte read of a
+  // 1-byte register is simply a different bus transaction.
+  //
+  // There is no correct lowering available here yet, so decline and let
+  // the default path fail loudly rather than silently emit the wrong
+  // access. Exact-width narrow loads are what a real fix needs.
+  if (LD->isVolatile())
+    return SDValue();
+
+  const EVT MemVT = LD->getMemoryVT();
+  unsigned MemBits;
+  if (MemVT == MVT::i1)
+    MemBits = 1;
+  else if (MemVT == MVT::i8)
+    MemBits = 8;
+  else if (MemVT == MVT::i16 && LD->getAlign() >= Align(2))
+    MemBits = 16;
+  else
+    return SDValue();
 
   SDLoc DL(Op);
   SDValue Chain = LD->getChain();
@@ -524,17 +661,20 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
                              MachinePointerInfo(MMO->getPointerInfo()),
                              Align(4), MMO->getFlags());
 
-  // Extract the requested byte.
+  // Extract the requested field.
+  const uint32_t FieldMask =
+      MemBits == 32 ? 0xffffffffu : ((1u << MemBits) - 1u);
   SDValue Shifted = DAG.getNode(ISD::SRL, DL, MVT::i32, Word, BitShift);
   SDValue ByteVal = DAG.getNode(ISD::AND, DL, MVT::i32, Shifted,
-                                DAG.getConstant(0xff, DL, MVT::i32));
+                                DAG.getConstant(FieldMask, DL, MVT::i32));
 
-  // For SEXTLOAD, sign-extend the byte from 8 to 32 bits via
-  // `(x << 24) >>a 24`. Both shifts are by a compile-time constant
-  // 24, so they select to SHL32ri / SAR32ri (and survive byte-chain).
+  // For SEXTLOAD, sign-extend from MemBits to 32 via
+  // `(x << (32 - MemBits)) >>a (32 - MemBits)`. Both shifts are by a
+  // compile-time constant, so they select to SHL32ri / SAR32ri (and
+  // survive byte-chain).
   SDValue Result;
   if (LD->getExtensionType() == ISD::SEXTLOAD) {
-    SDValue Sh = DAG.getConstant(24, DL, MVT::i32);
+    SDValue Sh = DAG.getConstant(32 - MemBits, DL, MVT::i32);
     SDValue Up = DAG.getNode(ISD::SHL, DL, MVT::i32, ByteVal, Sh);
     Result     = DAG.getNode(ISD::SRA, DL, MVT::i32, Up, Sh);
   } else {
@@ -678,7 +818,7 @@ const char *MovTargetLowering::getTargetNodeName(unsigned Opcode) const {
 }
 
 SDValue MovTargetLowering::LowerFormalArguments(
-    SDValue Chain, CallingConv::ID CallConv, bool /*IsVarArg*/,
+    SDValue Chain, CallingConv::ID CallConv, bool IsVarArg,
     const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &DL,
     SelectionDAG &DAG, SmallVectorImpl<SDValue> &InVals) const {
   MachineFunction &MF = DAG.getMachineFunction();
@@ -737,6 +877,23 @@ SDValue MovTargetLowering::LowerFormalArguments(
     if (VA.getLocInfo() != CCValAssign::Full)
       Arg = DAG.getNode(ISD::TRUNCATE, DL, VA.getValVT(), Arg);
     InVals.push_back(Arg);
+  }
+
+  // Stage 6f — variadic callee. cdecl already put the unnamed arguments
+  // on the stack directly above the named ones, so there is no register
+  // save area to spill: all `va_start` needs is the address of the slot
+  // right past the last named arg. `CCInfo.getStackSize()` is the number
+  // of bytes the named args consumed, and the `+4` is the return address
+  // `call` pushed (same convention as the per-arg fixed objects above).
+  //
+  // The object is 1 byte and mutable on purpose: it is never loaded from
+  // as an object in its own right, only used for its address, and PEI
+  // must not treat it as an immutable incoming argument slot it can
+  // colour over.
+  if (IsVarArg) {
+    const int FI = MFI.CreateFixedObject(1, 4 + CCInfo.getStackSize(),
+                                         /*IsImmutable=*/false);
+    MF.getInfo<MovMachineFunctionInfo>()->setVarArgsFrameIndex(FI);
   }
   return Chain;
 }
@@ -816,11 +973,25 @@ SDValue MovTargetLowering::LowerCall(CallLoweringInfo &CLI,
   // Stage 6a scope guards. Codex's stage-6 design pass insisted on hard
   // rejection here so any out-of-scope IR fails with a readable diagnostic
   // rather than mis-compiling.
-  if (CallConv != CallingConv::C)
+  // Stage 6f — `fastcc` is accepted alongside `ccc`. It is not an
+  // exotic convention here: LLVM's GlobalOpt promotes every `internal`
+  // function whose address doesn't escape to `fastcc`, so any real C
+  // file compiled at -O1 or above arrives full of fastcc calls (14 of
+  // them in lcc's `tree.c` alone). There is only one argument-passing
+  // table in this backend (CC_Mov — everything on the stack,
+  // caller-cleaned) and both sides of a fastcc call go through it, so
+  // "supporting" fastcc means not rejecting it. A convention that
+  // genuinely differs (fastcall, thiscall, …) still needs its own
+  // table and stays rejected.
+  if (CallConv != CallingConv::C && CallConv != CallingConv::Fast)
     report_fatal_error(
-        "Mov: only CallingConv::C supported (stage 6a; fastcall/etc. later)");
-  if (CLI.IsVarArg)
-    report_fatal_error("Mov: vararg calls not yet supported (stage 6+)");
+        "Mov: only CallingConv::{C,Fast} supported (stage 6f; "
+        "fastcall/etc. later)");
+  // Stage 6f — a vararg *call* needs nothing special under cdecl: CC_Mov
+  // assigns every argument, named or not, to an ascending stack slot,
+  // and the caller cleans up. The only reason this used to be rejected
+  // was that nothing had exercised it; `test/Execution/vararg_sum.ll`
+  // now does.
   for (const ISD::OutputArg &O : Outs) {
     // Stage 6b — accept sret + byval. sret is just a pointer arg
     // (caller-allocated return slot, pushed as the first cdecl arg);

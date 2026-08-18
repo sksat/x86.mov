@@ -1,0 +1,3 @@
+# `jmp` is the branchless dispatcher / call-jmp form stage 7c1+7d3 leave
+# behind; every other mnemonic in the vararg path is a plain mov.
+jmp

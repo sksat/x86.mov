@@ -65,6 +65,8 @@ public:
   SDValue LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSETCC(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerVASTART(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerSELECT(SDValue Op, SelectionDAG &DAG) const;
 
   // Stop DAGCombiner from rewriting `(and (load i32), 0xFF)` or
   // `(lshr (load i32), 16)` into a narrow ext-load — our backend has no

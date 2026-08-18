@@ -116,14 +116,29 @@ fixtures), and `hyperfine` on PATH (for the runtime row).
 
 `bench/results.md` is **committed** and `make bench-check` re-runs the
 bench, diffs against the committed numbers, and fails on any
-divergence in the deterministic rows (ELF/section sizes, mov counts,
-non-mov mnemonic sets) — across all 7 columns. The runtime row, the
-movfuscator column (host-version sensitive), and the generation
-timestamp are excluded from the comparison.
+divergence — but only in the **llvm-mov column**: `.text` / `.rodata`
+size, mov count / total, and the non-mov mnemonic set.
+
+Everything else is excluded, because none of it is reproducible on a
+machine other than the one that last wrote the baseline:
+
+- the generation timestamp and the runtime row (obviously host-dependent);
+- the `total ELF (bytes)` row — dominated by the host's CRT / libc /
+  rust-std, not by our output, which `.text` / `.rodata` already measure;
+- every **reference column** (movfuscator, clang/rustc -O0..-O3). The
+  host's gas/ld minor version moves the movfuscator number, and a
+  different build of the same clang release moves the rest (Arch and
+  apt.llvm.org clang-22 disagree on whether a `nop` is emitted).
+
+The llvm-mov column is kept reproducible by
+[`examples/rust/rust-toolchain.toml`](../examples/rust/rust-toolchain.toml):
+a dependency that doesn't round-trip through `llvm-mov-llc` is linked
+from rustc's own objects, so rustc's version would otherwise leak into
+the `.text` we measure.
 
 `make bench-check` is wired into CI alongside the test gates, so any
 silent codegen regression (or unintended growth in `.text`/`.rodata`/
-mov count, across any of the 7 columns) blocks the PR with a diff:
+mov count) blocks the PR with a diff:
 
 ```
 bench-check: drift detected vs committed baseline

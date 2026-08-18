@@ -1,0 +1,16 @@
+# Pin the toolchain for the example crates.
+#
+# `bench/results.md` records the byte sizes of the linked ELFs, and
+# `bench/check.sh` asserts they still match. Those bytes are not purely
+# ours: whenever a dependency does not round-trip through llvm-mov-llc,
+# `cargo-link.sh` falls back to the rlib's native objects, so rustc's own
+# codegen ends up inside the `.text` we measure. `base64_decode` is the
+# live example — its `.text` moved by 404 bytes between rustc 1.96 and
+# 1.97 with no change on our side, which made `make bench-check` fail for
+# anyone whose rustc differed from whoever last regenerated the baseline.
+#
+# Pinning makes the gate mean "did *our* codegen drift" again. Bump it
+# deliberately, and regenerate `bench/results.md` in the same commit.
+[toolchain]
+channel = "1.97.1"
+targets = ["i686-unknown-linux-gnu"]

@@ -1,15 +1,29 @@
 From: x86.mov movfuscator-wasm
-Subject: [PATCH] build.sh: relax gcc 14+ default-error warnings
+Subject: [PATCH] build.sh: build LCC as C89 under modern gcc
+
+Two separate breakages, both from gcc moving its defaults forward.
 
 gcc 14 promoted -Wimplicit-int and -Wimplicit-function-declaration
 (and -Wint-conversion) from warnings to errors by default. LCC's
 src/*.c and yacc-generated y.tab.c rely on these K&R-era constructs,
-so the lcc make step fails before rcc/cpp can be built.
+so the lcc make step fails before rcc/cpp can be built. Demote these
+three back to warnings.
 
-Demote these three back to warnings on both lcc-driver and lcc-all
-make invocations so the build succeeds with modern gcc.
+gcc 15 made C23 the default dialect, which reserves `constexpr`.
+LCC declares `extern Tree constexpr(int);` in src/c.h, so every
+translation unit including it now fails to parse:
 
-Tested on Debian 13 (trixie) / gcc 14.2.0 / glibc 2.41.
+    src/c.h:516:1: error: 'constexpr' used with 'extern'
+
+`-std=gnu89` is the honest fix rather than renaming LCC's function:
+this *is* a 1990s C89 codebase, the dialect it was written for is
+exactly what it should be compiled as, and pinning it keeps the next
+default-dialect bump from breaking the build again. It also subsumes
+the three warning demotions above, which are kept so the patch still
+applies cleanly if the flag is ever dropped.
+
+Tested on Debian 13 (trixie) / gcc 14.2.0 / glibc 2.41 and on
+Arch Linux / gcc 16.2.1 / glibc 2.42.
 
 --- a/build.sh
 +++ b/build.sh
@@ -18,11 +32,11 @@ Tested on Debian 13 (trixie) / gcc 14.2.0 / glibc 2.41.
 
  # Build the compiler driver
 -make -C lcc HOSTFILE=../movfuscator/host.c CFLAGS='-g -DLCCDIR=\"$(BUILDDIR)/\"' lcc
-+make -C lcc HOSTFILE=../movfuscator/host.c CFLAGS='-g -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=int-conversion -DLCCDIR=\"$(BUILDDIR)/\"' lcc
++make -C lcc HOSTFILE=../movfuscator/host.c CFLAGS='-g -std=gnu89 -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=int-conversion -DLCCDIR=\"$(BUILDDIR)/\"' lcc
 
  # Build lcc with the M/o/Vfuscator backend
 -make -C lcc all
-+make -C lcc CFLAGS='-g -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=int-conversion' all
++make -C lcc CFLAGS='-g -std=gnu89 -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=int-conversion' all
 
  # Create movcc
  ln -sfn "$BUILDDIR/lcc" "$BUILDDIR/movcc"

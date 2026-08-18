@@ -4167,10 +4167,36 @@ int main(int argc, char **argv) {
     // graph is straight-line — DAG-ISel handles it in
     // milliseconds.
     //
-    // Only i32 (always) and i64 (helper-only) SELECTs are rewritten;
-    // i1 / pointer / aggregate SELECTs (e.g. ones SROA leaves around
-    // for control flow synthesis) keep going through the default
-    // Expand path.
+    // Only i32 (always), pointers (always), and i64 (helper-only)
+    // SELECTs are rewritten; i1 / aggregate SELECTs (e.g. ones SROA
+    // leaves around for control flow synthesis) keep going through the
+    // default Expand path.
+    //
+    // Stage 6f — pointers added. They used to be on the default path,
+    // and "the default path" here does not mean "slower": with this
+    // target's action table (SELECT Expand, SELECT_CC Expand, SETCC
+    // Custom) the SDAG legalizer ping-pongs SELECT → SELECT_CC →
+    // SELECT forever, so a pointer-typed select **hangs the compiler**.
+    // Flat memory with constant RSS, stack permanently inside
+    // `SelectionDAG::Legalize()` — not slow progress, a cycle.
+    //
+    // Rust `no_std` fixtures rarely select a pointer; C does it
+    // constantly (`p ? p : fallback`, `&a[i]` vs `&a[0]`, hash-bucket
+    // walks). Measured on lcc's sources: **16 of 32 translation units
+    // never finished compiling** because of this one shape, and the
+    // reduced case is three instructions —
+    //
+    //   %c = icmp sgt i32 %n, 0
+    //   %g = getelementptr i8, ptr %p, i32 %n
+    //   %s = select i1 %c, ptr %g, ptr %p
+    //
+    // Pointers are blended as integers (`ptrtoint` → blend →
+    // `inttoptr`), which is exact in this target's flat 32-bit address
+    // space. The round trip does discard pointer provenance, but this
+    // rewrite runs in the codegen driver — after every provenance-
+    // sensitive IR pass has already run — so nothing downstream can
+    // observe the difference. Regression fixture:
+    // `test/Execution/ptr_select.ll`.
     //
     // Stage 7h1 — i64 added so the `__extendsfdf2` body's i64-typed
     // selects (zero / Inf / NaN overrides at the tail) stay branchless.
@@ -4189,7 +4215,7 @@ int main(int argc, char **argv) {
     SmallVector<SelectInst *, 32> SelectList;
     for (Instruction &I : instructions(F))
       if (auto *S = dyn_cast<SelectInst>(&I))
-        if (S->getType()->isIntegerTy(32) ||
+        if (S->getType()->isIntegerTy(32) || S->getType()->isPointerTy() ||
             (BitBlendSafe && S->getType()->isIntegerTy(64)))
           SelectList.push_back(S);
     for (SelectInst *S : SelectList) {
@@ -4197,14 +4223,53 @@ int main(int argc, char **argv) {
       Value *Cond = S->getCondition();
       Value *T    = S->getTrueValue();
       Value *Fa   = S->getFalseValue();
+      // Pointer arms are blended through their integer representation
+      // and converted back at the end (see the note above on why the
+      // provenance round trip is unobservable here).
+      Type *const SelTy   = S->getType();
+      const bool IsPtr    = SelTy->isPointerTy();
+      Type *const BlendTy =
+          IsPtr ? B.getIntNTy(F.getDataLayout().getPointerSizeInBits(
+                      SelTy->getPointerAddressSpace()))
+                : SelTy;
+      if (IsPtr) {
+        // `freeze` is load-bearing, not decoration. `select` stops poison;
+        // `and` / `or` do not, so a poison arm would contaminate the blend
+        // even where the mask zeroes it out. Pointers are the shape where
+        // that actually happens — a condition-guarded `inbounds` GEP is
+        // poison exactly when the condition says not to use it:
+        //
+        //   %g = getelementptr inbounds i8, ptr %p, i32 %n
+        //   %s = select i1 %c, ptr %g, ptr %p
+        //
+        // which is the reduced case this rewrite was added for in the
+        // first place (see test/Execution/ptr_select.ll). The i64 rewrite
+        // above dodges the same problem by only firing on helpers we
+        // generate; pointers get it right instead of avoiding it.
+        //
+        // Freezing makes an unchosen poison arm an arbitrary *fixed*
+        // value, which the mask then discards. It costs nothing at
+        // codegen time (`bench-check` is byte-identical with and
+        // without it).
+        //
+        // The i32 rewrite below is still unconditional and unfrozen, so
+        // the same hole exists there for a poison arm out of e.g. an
+        // `add nsw`. That predates this pointer support and is left
+        // alone here rather than changed in passing; the fix would be
+        // the same two `CreateFreeze` calls.
+        T  = B.CreateFreeze(B.CreatePtrToInt(T, BlendTy));
+        Fa = B.CreateFreeze(B.CreatePtrToInt(Fa, BlendTy));
+      }
       // Same blend shape as BlendOnCmp above — zext + sub to avoid
       // emitting `sext i1` (which dragged DAG-ISel into the
       // SETCC/SELECT_CC loop on the SDAG side).
-      Value *Z01  = B.CreateZExt(Cond, T->getType());
-      Value *Zero = ConstantInt::get(T->getType(), 0);
+      Value *Z01  = B.CreateZExt(Cond, BlendTy);
+      Value *Zero = ConstantInt::get(BlendTy, 0);
       Value *M    = B.CreateSub(Zero, Z01);
       Value *NotM = B.CreateNot(M);
       Value *R    = B.CreateOr(B.CreateAnd(T, M), B.CreateAnd(Fa, NotM));
+      if (IsPtr)
+        R = B.CreateIntToPtr(R, SelTy);
       S->replaceAllUsesWith(R);
       S->eraseFromParent();
     }

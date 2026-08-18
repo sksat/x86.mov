@@ -21,6 +21,8 @@
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
+#include "llvm/ADT/StringSwitch.h"
+#include "llvm/IR/Module.h"
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
@@ -28,6 +30,9 @@
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
+
+// Defined below, next to the alias machinery that is its main consumer.
+static bool isGasIntelReservedWord(StringRef Name);
 
 namespace {
 class MovAsmPrinter : public AsmPrinter {
@@ -42,7 +47,46 @@ public:
 
   // Emit `.intel_syntax noprefix` once at the top of the file. Output is
   // therefore directly accepted by `as --32`.
-  void emitStartOfAsmFile(Module & /*M*/) override {
+  //
+  // While we have the Module, note whether anything in it is named after
+  // a GAS Intel-syntax reserved word — see emitGlobalVariable below for
+  // what that costs us.
+  void emitStartOfAsmFile(Module &M) override {
+    OutStreamer->emitRawText(StringRef(".intel_syntax noprefix"));
+    for (const GlobalValue &GV : M.global_values()) {
+      if (isGasIntelReservedWord(GV.getName())) {
+        HasGasKeywordSymbol = true;
+        break;
+      }
+    }
+  }
+
+  // Data initialisers that reference a reserved-word symbol are the other
+  // half of the problem `aliasIfGasKeyword` solves for instruction
+  // operands — and the nastier half, because they fail *quietly*:
+  //
+  //     @p = global ptr @offset      ->      p: .long offset
+  //
+  // assembles with only `Warning: zero assumed for missing expression`
+  // and stores 0. `as` exits 0, so nothing downstream notices that the
+  // pointer is null.
+  //
+  // The alias trick doesn't reach here: the base AsmPrinter emits
+  // initialisers itself, without going through our lower(). Rather than
+  // duplicate constant emission, emit global variables in AT&T syntax —
+  // where these words are not reserved — and switch back afterwards. The
+  // directives themselves (`.long`, `.globl`, `.p2align`, `.size`) are
+  // syntax-neutral, so nothing else changes.
+  //
+  // Only done when the module actually contains such a symbol, so the
+  // usual output is untouched.
+  void emitGlobalVariable(const GlobalVariable *GV) override {
+    if (!HasGasKeywordSymbol) {
+      AsmPrinter::emitGlobalVariable(GV);
+      return;
+    }
+    OutStreamer->emitRawText(StringRef(".att_syntax"));
+    AsmPrinter::emitGlobalVariable(GV);
     OutStreamer->emitRawText(StringRef(".intel_syntax noprefix"));
   }
 
@@ -62,10 +106,42 @@ public:
     emitReturnAddrSlot();
     emitEspDecScratch();
     emitIndirectCalleeSlot();
+    emitGasKeywordAliases();
   }
 
 private:
   void lower(const MachineInstr *MI, MCInst &OutMI) const;
+
+  // GAS's Intel-syntax parser reserves a handful of words, and several of
+  // them are perfectly ordinary C identifiers — lcc has a global called
+  // `offset`. A symbol so named cannot be referenced in Intel syntax at
+  // all: `mov esi, offset offset` is "invalid expression", `mov eax,
+  // offset and` is "invalid use of operator", and every parenthesised /
+  // `flat:` / `@GOTOFF` / `+0` variant was measured to fail too (binutils
+  // 2.47).
+  //
+  // The one spelling that works is to reference an alias and define that
+  // alias in a short `.att_syntax` window, where the words are not
+  // reserved:
+  //
+  //     .att_syntax
+  //     .set .Lmov_kw_offset, offset
+  //     .intel_syntax noprefix
+  //
+  // `aliasIfGasKeyword` swaps the symbol for its alias at operand-lowering
+  // time and records it; `emitGasKeywordAliases` emits the definitions at
+  // the end of the file. Symbols with ordinary names are returned
+  // unchanged, so nothing else in the output moves.
+  MCSymbol *aliasIfGasKeyword(MCSymbol *Sym) const;
+  void emitGasKeywordAliases();
+
+  // Original-name → alias, in insertion order so the emitted asm is
+  // deterministic. Mutable because lower() is const.
+  mutable SmallVector<std::pair<std::string, MCSymbol *>, 4> GasKeywordAliases;
+
+  // Set in emitStartOfAsmFile when the module names anything after a GAS
+  // Intel-syntax reserved word. Gates the data-emission workaround above.
+  bool HasGasKeywordSymbol = false;
   void emitAdd8Tables();
   void emitBitwise8Tables();
   void emitBitwise8Table(StringRef Name, uint8_t (*Op)(uint8_t, uint8_t));
@@ -109,7 +185,7 @@ void MovAsmPrinter::lower(const MachineInstr *MI, MCInst &OutMI) const {
       // the right byte — codex's stage-5a review flagged that dropping
       // the offset would silently misaddress.
       const MCExpr *Expr = MCSymbolRefExpr::create(
-          getSymbol(MO.getGlobal()), OutContext);
+          aliasIfGasKeyword(getSymbol(MO.getGlobal())), OutContext);
       if (int64_t Off = MO.getOffset()) {
         Expr = MCBinaryExpr::createAdd(
             Expr, MCConstantExpr::create(Off, OutContext), OutContext);
@@ -119,7 +195,8 @@ void MovAsmPrinter::lower(const MachineInstr *MI, MCInst &OutMI) const {
     }
     case MachineOperand::MO_ExternalSymbol: {
       const MCExpr *Expr = MCSymbolRefExpr::create(
-          GetExternalSymbolSymbol(MO.getSymbolName()), OutContext);
+          aliasIfGasKeyword(GetExternalSymbolSymbol(MO.getSymbolName())),
+          OutContext);
       if (int64_t Off = MO.getOffset()) {
         Expr = MCBinaryExpr::createAdd(
             Expr, MCConstantExpr::create(Off, OutContext), OutContext);
@@ -177,6 +254,53 @@ void MovAsmPrinter::emitInstruction(const MachineInstr *MI) {
 // ELFs. Trivial fixtures with no ret/post-call ADD (rare) still drop
 // it. `bench/results.md`'s `.rodata` column shows which fixtures
 // retain how much of the table set.
+// The set was measured against binutils 2.47 by assembling `mov esi,
+// offset NAME` for each candidate; exactly these failed. They split into
+// two flavours — plain reserved words (`offset`, `short`, `flat`, `st`)
+// and words that are also binary operators (`and`, `or`, `not`, `xor`,
+// `shl`, `shr`, `mod`) — but the alias treatment covers both, so the
+// printer does not need to tell them apart.
+//
+// The match is case-insensitive because GAS's Intel-syntax keywords are:
+// `OFFSET`, `Offset` and `oFFsEt` all collide just as `offset` does
+// (measured the same way). Only the *lookup* is folded — the alias is
+// still defined against the symbol's original spelling, which is what
+// the linker sees.
+static bool isGasIntelReservedWord(StringRef Name) {
+  return llvm::StringSwitch<bool>(Name.lower())
+      .Cases({"offset", "mod", "short", "flat", "st"}, true)
+      .Cases({"and", "or", "not", "xor", "shl", "shr"}, true)
+      .Default(false);
+}
+
+MCSymbol *MovAsmPrinter::aliasIfGasKeyword(MCSymbol *Sym) const {
+  const StringRef Name = Sym->getName();
+  if (!isGasIntelReservedWord(Name))
+    return Sym;
+
+  for (const auto &[Orig, Alias] : GasKeywordAliases)
+    if (Orig == Name)
+      return Alias;
+
+  // createTempSymbol, not getOrCreateSymbol: a fixed name like
+  // `.Lmov_kw_offset` could collide with a symbol that actually exists in
+  // the input, in which case references would silently be redirected to
+  // it and the `.set` below would redefine it. The temp-symbol counter
+  // guarantees a fresh name.
+  MCSymbol *Alias = OutContext.createTempSymbol(Twine("mov_kw_") + Name);
+  GasKeywordAliases.emplace_back(Name.str(), Alias);
+  return Alias;
+}
+
+void MovAsmPrinter::emitGasKeywordAliases() {
+  if (GasKeywordAliases.empty())
+    return;
+  OutStreamer->emitRawText(StringRef(".att_syntax"));
+  for (const auto &[Orig, Alias] : GasKeywordAliases)
+    OutStreamer->emitRawText(Twine(".set ") + Alias->getName() + ", " + Orig);
+  OutStreamer->emitRawText(StringRef(".intel_syntax noprefix"));
+}
+
 void MovAsmPrinter::emitAdd8Tables() {
   static constexpr unsigned kSize = 2u * 256u * 256u;
   SmallVector<uint8_t, kSize> Sum;

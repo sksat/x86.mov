@@ -33,6 +33,9 @@
 # Env vars (for development; defaults assume a `make build` checkout):
 #   LLVM_MOV_LLC          — path to the driver binary
 #   LLVM_MOV_LLC_FLAGS    — extra flags to llvm-mov-llc (default: -verify-machineinstrs)
+#   LLVM_MOV_LLC_DEP_MAXMEM_KB
+#                         — address-space cap for the *dep* llc calls, in KB
+#                           (default 8 GiB; 0 disables the cap). See below.
 #
 # Invariants:
 #   - CWD is the crate dir (cargo invokes the linker from where `cargo
@@ -46,6 +49,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLVM_MOV_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DRIVER="${LLVM_MOV_LLC:-$LLVM_MOV_DIR/build/bin/llvm-mov-llc}"
 DRIVER_FLAGS="${LLVM_MOV_LLC_FLAGS:--verify-machineinstrs}"
+
+# Address-space cap for the per-dep llc calls, in KB. 8 GiB by default.
+#
+# Lowering a dep is best-effort — every failure path below already falls
+# back to the rlib's native .o. But "failure" has to mean *this process
+# gives up*, not *the machine dies*: one dep can ask for far more memory
+# than the box has, and then the OOM killer decides who goes, which on a
+# CI runner is the agent rather than us. Measured case: the `base64`
+# crate's 2,983-line IR peaks at **27.1 GiB** over 90 s. That fits on a
+# 32 GiB workstation, so it went unnoticed; on a 16 GiB GitHub runner it
+# takes the whole job down with `exit 143` and no output, which is how
+# this was found.
+#
+# A time limit alone does not help here — 27 GiB is reached in well under
+# a minute, so the box is already gone before any timeout fires. The cap
+# has to be on memory.
+#
+# `ulimit -v` (address space) is the portable-enough lever: LLVM's
+# allocations are overwhelmingly touched, so RSS tracks VA closely, and
+# hitting it makes `llvm-mov-llc` die of a failed allocation — an
+# ordinary non-zero exit that the `native(llc-fail)` path already
+# handles. Set to 0 to disable.
+DEP_MAXMEM_KB="${LLVM_MOV_LLC_DEP_MAXMEM_KB:-8388608}"
 
 if ! [ -x "$DRIVER" ]; then
     echo "cargo-link.sh: llvm-mov-llc not found at $DRIVER" 1>&2
@@ -154,8 +180,22 @@ try_mov_lower_rlib() {
     local dep_o="$outdir/${crate}.mov.o"
     local llc_log="$outdir/${crate}.llc.log"
     local as_log="$outdir/${crate}.as.log"
-    if ! "$DRIVER" $DRIVER_FLAGS -mtriple=mov-unknown-linux-gnu \
-            "$sibling_ll" -o "$dep_s" 2>"$llc_log"; then
+    # Subshell so the ulimit applies to this call only — the crate's own
+    # IR (lowered further up) is deliberately left uncapped: if the user's
+    # own code can't be lowered we want a loud failure, not a silent
+    # native binary.
+    if ! (
+            # Bail rather than run uncapped if the limit can't be applied
+            # (unsupported, or a lower hard limit already inherited).
+            # `set -e` does not help here: this subshell is the condition
+            # of an `if !`, which disables errexit inside it.
+            if [ "$DEP_MAXMEM_KB" != 0 ] && ! ulimit -v "$DEP_MAXMEM_KB"; then
+                echo "cargo-link: cannot apply ulimit -v $DEP_MAXMEM_KB" 1>&2
+                exit 70
+            fi
+            exec "$DRIVER" $DRIVER_FLAGS -mtriple=mov-unknown-linux-gnu \
+                 "$sibling_ll" -o "$dep_s"
+         ) 2>"$llc_log"; then
         printf 'native(llc-fail) %s\n' "$crate" >> "$STATUS"
         return 1
     fi
