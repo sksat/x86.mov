@@ -15,8 +15,9 @@
 > 1. **「コンパイルが遅い」と思われていたものは無限ループだった。** lcc の 32 翻訳単位のうち
 >    16 本がこれで 5 分以内にコンパイルできていなかった。原因は `SELECT ↔ SELECT_CC` の
 >    相互展開で、2 つの入口を塞いだ（本ブランチで修正済み）。
-> 2. **その先に待っているのはメモリ**。無限ループを潰した後、ごく普通の C ファイル 1 本の
->    コンパイルがピーク **27.4 GiB** を要求する。数千 TU の Linux を語る前にここが要る。
+> 2. **その先に待っているのはメモリ**。無限ループを潰すと lcc の 32 翻訳単位のうち
+>    21 本が mov-only にコンパイルできるようになり、残る 11 本は機能ではなく
+>    **1 TU あたり ~27 GiB のピーク RSS** で落ちる。数千 TU の Linux を語る前にここが要る。
 
 ---
 
@@ -24,7 +25,7 @@
 
 | サブプロジェクト | 状態 |
 |---|---|
-| **llvm-mov** | stage 7h まで完了。整数・制御フロー・call/ret・f32/f64 ソフトフロートが全て mov 化済み。本環境で `make build` / `make test` (187) / `make test-mov-only` (58) すべて緑 |
+| **llvm-mov** | stage 7h まで完了。整数・制御フロー・call/ret・f32/f64 ソフトフロートが全て mov 化済み。本環境で `make build` / `make test` (188) / `make test-mov-only` (58) すべて緑 |
 | **movie86** | ELF32 i386 ランナー。mov-only ABI ページ（`ABI_BASE = 0x1FFE_0000`）に `SET_VIDEO_MODE` / `MMAP_REQUEST` / `WRITE` / `POLL_INPUT` / `EXIT` の 5 呼び出し |
 | **turbo86** | ptrace で mov バイナリを実 x86 に native 実行 + trap。userspace 版 substrate の実在証拠 |
 | **movfuscator-selfhost** (PR #84) | 36 TU 中 35 が mov-only 自己コンパイル成功。リンクも通る。実行は未達 |
@@ -53,6 +54,7 @@ kill-test（[`linux-mov/L0.5-KILLTEST.md`](linux-mov/L0.5-KILLTEST.md)）が挙�
 | **`fastcc`** | clang は -O1 以上で internal 関数を `fastcc` に昇格させる。最適化ありの実 C は必ず踏むのに `report_fatal_error` で弾いていた |
 | **`SELECT` の無限ループ 2 件** | §3 |
 | **i16 / i1 の ext-load** | i8 の Custom 経路を幅パラメータ化しただけ。実 C の `short` メンバと `_Bool` グローバルが踏む |
+| **GAS 予約語と同名のシンボル** | `offset` という名前の C グローバルが Intel 構文で参照できず `as` が落ちていた。`.att_syntax` 窓で `.set` エイリアスを定義する形に |
 
 **まだ通らないもの**
 
@@ -62,7 +64,6 @@ kill-test（[`linux-mov/L0.5-KILLTEST.md`](linux-mov/L0.5-KILLTEST.md)）が挙�
 | i64 の除算・可変長シフト・比較 | i32 版と同型の作業（比較は別途コンパイル時間の問題） |
 | atomics | UP + 割り込みマスクで純 C 化できるので config 回避可（L4） |
 | switch のジャンプテーブル | PR #73 で対応済み・未マージ |
-| AsmPrinter が `mov eax, offset 0` を吐くケース | `as` が `invalid expression` で落ちる。lcc の `bytecode.c` で再現 |
 
 ---
 
@@ -138,11 +139,30 @@ movfuscator の SIGILL ディスパッチを使わない。**native 実行に協
 | + varargs / fastcc | 7 | 16 | 9 |
 | + ポインタ `select` 修正 | 12 | 8 | 12 |
 | + レガライザ合成 `SELECT` 修正 | 13 | 7 | 12 |
-| + i16 / i1 ext-load | **20** | 1 | 11（うち大半は OOM。§5） |
+| + i16 / i1 ext-load | 20 | 1 | 11 |
+| + GAS 予約語シンボル | **21** | **0** | 11 |
 
-最後の行の「失敗 11」は並列度 8 で走らせたときの OOM がほとんどで、
-単独で走らせれば通る（`dag.c` は 104 秒・27.4 GiB で成功）。
-つまり**機能上の壁はほぼ無くなり、残りは資源の問題に変わった**。
+**無限ループは 0 になった。** 残る 11 本は機能の欠落ではない。
+1 本ずつ逐次で走らせても全て同じ落ち方をする:
+
+```
+TU            wall(s)    peakRSS  verdict
+dag                92   26.0 GiB  (OOM kill)
+dagcheck          118   25.7 GiB  (OOM kill)
+decl               98   26.0 GiB  (OOM kill)
+gen               114   25.1 GiB  (OOM kill)
+mov               200   26.0 GiB  (OOM kill)
+prof              132   26.0 GiB  (OOM kill)
+stab               63   26.0 GiB  (OOM kill)
+symbolic          106   26.0 GiB  (OOM kill)
+types             114   26.0 GiB  (OOM kill)
+```
+
+29 GiB のマシンの上限に張り付いている。実際 `dag.c` は machine が空いていた
+一度だけ **104 秒 / 27.4 GiB で成功**した。つまり要求は 27 GiB 前後で、
+このマシンでは「たまたま通る/通らない」の境界にある。
+
+**機能上の壁はほぼ無くなり、残りは資源の問題に変わった。**
 
 ### 4.4 end-to-end の確認
 
@@ -200,7 +220,8 @@ Elapsed (wall clock) time:   1:44
 Maximum resident set size:   27,435,892 kB   ← 27.4 GiB
 ```
 
-29 GiB のマシンで**並列度 2 が上限**という意味であり、`make -j` は事実上できない。
+lcc の 32 翻訳単位のうち 11 本がこの領域にいて、29 GiB のマシンでは
+**逐次に走らせても OOM で落ちる**（§4.3 の表）。`make -j` は論外。
 数千 TU の Linux カーネルを語る前にここが解けている必要がある。
 （stage 7 の mov-only legalize が 1 命令を ~50 mov のバイトチェーンへ展開するため
 MachineFunction が巨大化する、が素直な仮説。プロファイルは未取得。）
@@ -237,11 +258,11 @@ kill-test は「カーネル側に config BLOCKER は無い」を示したが、
 ### P1 — 実 C を通す（両ゴール共通）
 
 3. **PR #73 をマージ**（`br_jt`）
-4. varargs / fastcc / `SELECT` 無限ループ / i16・i1 ext-load — **本ブランチで完了**
-5. `mov eax, offset 0` を吐く AsmPrinter バグ（`bytecode.c` で再現）
-6. i64: `__divdi3`/`__udivdi3`/`__moddi3`/`__umoddi3` の注入（i32 版と同型）＋
+4. varargs / fastcc / `SELECT` 無限ループ / i16・i1 ext-load / GAS 予約語シンボル
+   — **本ブランチで完了**
+5. i64: `__divdi3`/`__udivdi3`/`__moddi3`/`__umoddi3` の注入（i32 版と同型）＋
    `shl_parts`/`srl_parts`/`sra_parts` の Expand
-7. inline asm の `"r"`/`"m"` 制約（`getRegForInlineAsmConstraint`）— `barrier_data()` に必要
+6. inline asm の `"r"`/`"m"` 制約（`getRegForInlineAsmConstraint`）— `barrier_data()` に必要
 
 ### P2 — ゴール別
 
@@ -249,7 +270,7 @@ kill-test は「カーネル側に config BLOCKER は無い」を示したが、
   §4.5 のブートストラップ鎖 → `triple` テスト
 - **Linux**: linux-mov L0（movie86 に PV-MMIO 窓 + PV-CONSOLE）→ L1（極小カーネル）
 
-P1 の 6・7 は P2 のどちらにも必須ではない（rcc は i64 も inline asm も使わない。
+P1 の 5・6 は P2 のどちらにも必須ではない（rcc は i64 も inline asm も使わない。
 最小 Linux は inline asm オペランドだけ要る）ので、**P0 → P2 を先に走らせて
 最初の旗を早く立てる**のが良い。
 

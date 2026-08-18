@@ -36,7 +36,7 @@ movfuscator セルフホスト（[`../movfuscator-selfhost/`](../movfuscator-sel
 | i64 の可変長シフト | ❌ | `Cannot select: shl_parts` |
 | i64 の除算・剰余 | ❌ | `unsupported library call operation`。`__divdi3` 等が未注入（i32 版は注入済みなので同型の作業） |
 | i64 の比較 | ❌ | 数分オーダー。`DESIGN.md` 7h4 が記録している既知現象 |
-| AsmPrinter が不正な asm を吐くケース | ❌ | `mov eax, offset 0` を吐いて `as` が `Error: invalid expression`。lcc の `bytecode.c` で再現 |
+| GAS Intel 構文の予約語と同名のシンボル | ✅ stage 6f | `offset` という名前の C グローバル（lcc の `bytecode.c` にある）を Intel 構文では参照できず `as` が落ちていた。衝突するのは `offset mod short flat st and or not xor shl shr` の 11 語。回避形も総当たりし、`.att_syntax` 窓で `.set` エイリアスを定義するのが唯一一様に効く形だった |
 
 ## 2. 「コンパイルが遅い」は遅さではなく無限ループだった
 
@@ -100,7 +100,8 @@ Elapsed (wall clock) time:   1:44
 Maximum resident set size:   27,435,892 kB   ← 27.4 GiB
 ```
 
-29 GiB のマシンで**並列度 2 が上限**という意味であり、`make -j` は事実上できない。
+lcc の 32 翻訳単位のうち 11 本がこの領域にいて、29 GiB のマシンでは
+**逐次に走らせても OOM で落ちる**。`make -j` は論外。
 数千 TU の Linux カーネルを語る前に、ここが解けている必要がある。
 （stage 7 の mov-only legalize が 1 命令を ~50 mov のバイトチェーンへ展開するため
 MachineFunction が巨大化することが素直な仮説だが、プロファイルは未取得。）
