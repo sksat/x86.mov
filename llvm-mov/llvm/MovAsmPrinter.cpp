@@ -135,6 +135,24 @@ private:
   MCSymbol *aliasIfGasKeyword(MCSymbol *Sym) const;
   void emitGasKeywordAliases();
 
+  // Switch to a COMDAT section for one lookup table (or one group of
+  // tables that are always referenced together), signed by `GroupSym`.
+  //
+  // Every object this backend emits carries the whole table set — ~860 KiB
+  // — because the mov-only legalize indexes them from any arithmetic. With
+  // plain sections and file-local symbols the linker has no way to know the
+  // copies are identical, so an N-object link pays N times: lcc's 32
+  // objects came to 55 MB, ~27 MB of it the same bytes over and over.
+  //
+  // COMDAT is the fix rather than moving the tables into a runtime archive:
+  // it needs no change to how anything links (the test runners, cargo-link.sh,
+  // the bench and the examples all keep their existing link lines), and the
+  // per-table sections still let `--gc-sections` drop tables nobody used.
+  // The symbols become weak so that "defined in several objects" is
+  // well-formed rather than a duplicate-symbol error.
+  void beginComdatTable(StringRef SecName, StringRef GroupSym);
+  void emitComdatTableLabel(MCSymbol *Sym);
+
   // Original-name → alias, in insertion order so the emitted asm is
   // deterministic. Mutable because lower() is const.
   mutable SmallVector<std::pair<std::string, MCSymbol *>, 4> GasKeywordAliases;
@@ -287,6 +305,20 @@ static bool isGasIntelReservedWord(StringRef Name) {
       .Default(false);
 }
 
+void MovAsmPrinter::beginComdatTable(StringRef SecName, StringRef GroupSym) {
+  MCSection *Sec = OutContext.getELFSection(
+      SecName, ELF::SHT_PROGBITS, ELF::SHF_ALLOC | ELF::SHF_GROUP,
+      /*EntrySize=*/0, GroupSym, /*IsComdat=*/true);
+  OutStreamer->switchSection(Sec);
+}
+
+void MovAsmPrinter::emitComdatTableLabel(MCSymbol *Sym) {
+  // Weak, not global: several objects legitimately define the same table,
+  // and the COMDAT group is what tells the linker to keep one.
+  OutStreamer->emitSymbolAttribute(Sym, MCSA_Weak);
+  OutStreamer->emitLabel(Sym);
+}
+
 MCSymbol *MovAsmPrinter::aliasIfGasKeyword(MCSymbol *Sym) const {
   const StringRef Name = Sym->getName();
   if (!isGasIntelReservedWord(Name))
@@ -331,13 +363,11 @@ void MovAsmPrinter::emitAdd8Tables() {
     }
   }
 
-  MCSection *TableSec = OutContext.getELFSection(
-      ".rodata.__mov_add8_tables", ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
-  OutStreamer->switchSection(TableSec);
+  beginComdatTable(".rodata.__mov_add8_tables", "__mov_add8_sum_table");
 
   const auto emitTable = [&](StringRef Name, ArrayRef<uint8_t> Data) {
     MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
-    OutStreamer->emitLabel(Sym);
+    emitComdatTableLabel(Sym);
     OutStreamer->emitBytes(StringRef(
         reinterpret_cast<const char *>(Data.data()), Data.size()));
   };
@@ -367,12 +397,10 @@ void MovAsmPrinter::emitBitwise8Table(StringRef Name,
   }
 
   std::string SecName = (".rodata." + Name).str();
-  MCSection *Sec = OutContext.getELFSection(SecName, ELF::SHT_PROGBITS,
-                                            ELF::SHF_ALLOC);
-  OutStreamer->switchSection(Sec);
+  beginComdatTable(SecName, Name);
 
   MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
-  OutStreamer->emitLabel(Sym);
+  emitComdatTableLabel(Sym);
   OutStreamer->emitBytes(StringRef(
       reinterpret_cast<const char *>(Data.data()), Data.size()));
 }
@@ -412,12 +440,10 @@ void MovAsmPrinter::emitUnaryByteTable(StringRef Name,
   }
 
   std::string SecName = (".rodata." + Name).str();
-  MCSection *Sec = OutContext.getELFSection(SecName, ELF::SHT_PROGBITS,
-                                            ELF::SHF_ALLOC);
-  OutStreamer->switchSection(Sec);
+  beginComdatTable(SecName, Name);
 
   MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
-  OutStreamer->emitLabel(Sym);
+  emitComdatTableLabel(Sym);
   OutStreamer->emitBytes(StringRef(
       reinterpret_cast<const char *>(Data.data()), Data.size()));
 }
@@ -510,13 +536,11 @@ void MovAsmPrinter::emitSub8Tables() {
     }
   }
 
-  MCSection *TableSec = OutContext.getELFSection(
-      ".rodata.__mov_sub8_tables", ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
-  OutStreamer->switchSection(TableSec);
+  beginComdatTable(".rodata.__mov_sub8_tables", "__mov_sub8_diff_table");
 
   const auto emitTable = [&](StringRef Name, ArrayRef<uint8_t> Data) {
     MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
-    OutStreamer->emitLabel(Sym);
+    emitComdatTableLabel(Sym);
     OutStreamer->emitBytes(StringRef(
         reinterpret_cast<const char *>(Data.data()), Data.size()));
   };
@@ -541,11 +565,10 @@ void MovAsmPrinter::emitPopcount8Table() {
     Data.push_back(pc);
   }
 
-  MCSection *Sec = OutContext.getELFSection(
-      ".rodata.__mov_popcount8_table", ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
-  OutStreamer->switchSection(Sec);
+  beginComdatTable(".rodata.__mov_popcount8_table",
+                   "__mov_popcount8_table");
   MCSymbol *Sym = OutContext.getOrCreateSymbol("__mov_popcount8_table");
-  OutStreamer->emitLabel(Sym);
+  emitComdatTableLabel(Sym);
   OutStreamer->emitBytes(StringRef(
       reinterpret_cast<const char *>(Data.data()), Data.size()));
 }
@@ -633,13 +656,11 @@ void MovAsmPrinter::emitMul8Tables() {
     }
   }
 
-  MCSection *TableSec = OutContext.getELFSection(
-      ".rodata.__mov_mul8_tables", ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
-  OutStreamer->switchSection(TableSec);
+  beginComdatTable(".rodata.__mov_mul8_tables", "__mov_mul8_lo_table");
 
   const auto emitTable = [&](StringRef Name, ArrayRef<uint8_t> Data) {
     MCSymbol *Sym = OutContext.getOrCreateSymbol(Name);
-    OutStreamer->emitLabel(Sym);
+    emitComdatTableLabel(Sym);
     OutStreamer->emitBytes(StringRef(
         reinterpret_cast<const char *>(Data.data()), Data.size()));
   };
