@@ -769,6 +769,17 @@ SDValue MovTargetLowering::LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) cons
   if (!ST->isTruncatingStore())
     return SDValue();
 
+  // Same argument as LowerExtLoadI8's volatile bail, in the other
+  // direction: a narrow store here becomes a read-modify-write of the
+  // enclosing 4-byte word (and, for i16, two of them). That reads and
+  // rewrites neighbouring bytes, which is unobservable for ordinary
+  // memory and wrong for a volatile one — on MMIO it is a read of a
+  // neighbouring register plus a write-back of whatever it happened to
+  // hold. Decline and let the default path fail loudly. Exact-width
+  // narrow stores are what a real fix needs.
+  if (ST->isVolatile())
+    return SDValue();
+
   SDLoc DL(Op);
   SDValue Chain = ST->getChain();
   SDValue Val   = ST->getValue();
@@ -816,15 +827,31 @@ SDValue MovTargetLowering::LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) cons
   // original would have MOV32rm carrying a store-flagged MMO and
   // the verifier rejects it ("Missing mayStore flag").
   MachineFunction &MF = DAG.getMachineFunction();
+  // The MMOs describe the *word* we touch, not the byte the source asked
+  // for, and we cannot name that word: its address is `ptr & ~3`, which
+  // for a symbolic pointer is not a constant offset from anything the
+  // pointer info can express. Carrying the byte's pointer info on a
+  // 4-byte access would be a lie to alias analysis — it claims bytes
+  // above the word that we never touch and omits the ones below — and
+  // AA acting on it can reorder two read-modify-writes of the same word
+  // so that one loses the other's update. That is not hypothetical: an
+  // i16 store splits into two byte stores in the same word, and with
+  // another narrow store elsewhere in the function to perturb
+  // scheduling, one byte went missing (found by
+  // `test/Execution/narrow_store.ll`).
+  //
+  // An empty MachinePointerInfo says "may touch anything", which is the
+  // truth we can actually state. It costs AA precision around narrow
+  // stores; correctness first.
   MachineMemOperand *OrigMMO = ST->getMemOperand();
   MachineMemOperand *LoadMMO = MF.getMachineMemOperand(
-      OrigMMO->getPointerInfo(),
+      MachinePointerInfo(),
       MachineMemOperand::MOLoad,
       /*size=*/4, Align(4), OrigMMO->getAAInfo(),
       OrigMMO->getRanges(), OrigMMO->getSyncScopeID(),
       OrigMMO->getSuccessOrdering(), OrigMMO->getFailureOrdering());
   MachineMemOperand *StoreMMO = MF.getMachineMemOperand(
-      OrigMMO->getPointerInfo(),
+      MachinePointerInfo(),
       MachineMemOperand::MOStore,
       /*size=*/4, Align(4), OrigMMO->getAAInfo(),
       OrigMMO->getRanges(), OrigMMO->getSyncScopeID(),
