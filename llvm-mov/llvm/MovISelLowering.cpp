@@ -621,13 +621,12 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
   //   i8  : mask 0xff    — as before
   //   i16 : mask 0xffff  — a `short` field or global
   //
-  // i16 is only safe on this path when the load is at least 2-aligned:
-  // a 2-aligned i16 lies wholly inside one 4-byte word, so the
-  // aligned-down read still cannot leave the object. An under-aligned
-  // i16 could straddle two words and is deliberately *not* handled —
-  // it falls back to the default path and fails loudly rather than
-  // silently reading half a value. (No such load has turned up yet;
-  // when one does, the fix is two byte-loads merged, not a wider read.)
+  // i16 needs care: the aligned-down word read below only works when the
+  // i16 lies wholly inside one 4-byte word, i.e. when it is 2-aligned.
+  // An under-aligned i16 can straddle two words, and is split into two
+  // byte loads instead (see below) — which is what the earlier version
+  // of this comment predicted would be needed. lcc's `types.c` is the
+  // load that turned up.
   auto *LD = cast<LoadSDNode>(Op);
 
   // A volatile narrow load must not be widened. The whole trick below is
@@ -652,7 +651,7 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
     MemBits = 1;
   else if (MemVT == MVT::i8)
     MemBits = 8;
-  else if (MemVT == MVT::i16 && LD->getAlign() >= Align(2))
+  else if (MemVT == MVT::i16)
     MemBits = 16;
   else
     return SDValue();
@@ -662,6 +661,43 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
   SDValue Ptr   = LD->getBasePtr();
   EVT PtrTy     = Ptr.getValueType();
   EVT ResTy     = Op.getValueType();
+
+  // Under-aligned i16: the two bytes can live in different 4-byte words,
+  // which one aligned-down read cannot express. Split into two byte
+  // loads and reassemble — each half then takes the word path below, so
+  // no new lowering is involved, and straddling falls out for free.
+  // Mirror image of the i16 truncating *store*, which splits the same way.
+  if (MemBits == 16 && LD->getAlign() < Align(2)) {
+    MachineMemOperand *MMO16 = LD->getMemOperand();
+    SDValue Lo = DAG.getExtLoad(ISD::ZEXTLOAD, DL, MVT::i32, Chain, Ptr,
+                                MachinePointerInfo(MMO16->getPointerInfo()),
+                                MVT::i8, LD->getBaseAlign(),
+                                MMO16->getFlags());
+    SDValue Ptr1 =
+        DAG.getMemBasePlusOffset(Ptr, TypeSize::getFixed(1), DL);
+    SDValue Hi = DAG.getExtLoad(
+        ISD::ZEXTLOAD, DL, MVT::i32, Chain, Ptr1,
+        MachinePointerInfo(MMO16->getPointerInfo()).getWithOffset(1), MVT::i8,
+        LD->getBaseAlign(), MMO16->getFlags());
+
+    SDValue Val = DAG.getNode(
+        ISD::OR, DL, MVT::i32, Lo,
+        DAG.getNode(ISD::SHL, DL, MVT::i32, Hi,
+                    DAG.getShiftAmountConstant(8, MVT::i32, DL)));
+    if (LD->getExtensionType() == ISD::SEXTLOAD) {
+      SDValue Sh = DAG.getConstant(16, DL, MVT::i32);
+      Val = DAG.getNode(ISD::SRA, DL, MVT::i32,
+                        DAG.getNode(ISD::SHL, DL, MVT::i32, Val, Sh), Sh);
+    }
+    if (Val.getValueType() != ResTy)
+      Val = DAG.getNode(ISD::TRUNCATE, DL, ResTy, Val);
+
+    // Both halves hang off the incoming chain, so join their output
+    // chains rather than serialising them.
+    SDValue OutChain = DAG.getNode(ISD::TokenFactor, DL, MVT::Other,
+                                   Lo.getValue(1), Hi.getValue(1));
+    return DAG.getMergeValues({Val, OutChain}, DL);
+  }
 
   // aligned_ptr = ptr & ~3, byte_off = ptr & 3.
   SDValue Three     = DAG.getConstant(3, DL, PtrTy);
