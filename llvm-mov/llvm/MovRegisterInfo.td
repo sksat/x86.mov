@@ -52,6 +52,14 @@ def GPR32_NOSP : RegisterClass<"Mov", [i32], 32,
   (add EAX, ECX, EDX, EBX, ESI, EDI)>;
 
 
+// Stage 6f — the GPR32s that actually have an addressable low byte.
+// Only EAX/ECX/EDX/EBX carry a sub_8bit; ESI/EDI/EBP/ESP do not. Making
+// this a class lets the STORE8 pseudo constrain its source operand, so
+// register allocation guarantees a byte-nameable register and the post-RA
+// expansion is a single `mov byte ptr [mem], <low byte>` with no spill, no
+// borrowed scratch register, and nothing to save or restore.
+def GPR32_ABCD : RegisterClass<"Mov", [i32], 32, (add EAX, ECX, EDX, EBX)>;
+
 // 8-bit register class. Stage 7-prep introduces it for the MovOnlyLegalize
 // pass to address byte-wide loads/stores into lookup tables. RA never sees
 // virtual GR8 registers — the legalize pass (post-RA) uses physreg names

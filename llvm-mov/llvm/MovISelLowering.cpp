@@ -92,7 +92,12 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // class an `Expand` action that can rebuild its own input.** `Custom`
   // does not have the problem, because LegalizeDAG only re-enters the
   // worklist when the hook returns a *different* node.
-  setTruncStoreAction(MVT::i32, MVT::i8, Custom);
+  // i8 is Legal: the STORE8 pseudo matches `truncstorei8` directly and
+  // MovOnlyLegalize expands it into a real byte store after RA. It used to
+  // be Custom, lowering to a read-modify-write of the enclosing word —
+  // correct for one narrow store, unsound for two independent ones landing
+  // in the same word (see the STORE8 comment in MovInstrInfo.td).
+  setTruncStoreAction(MVT::i32, MVT::i8, Legal);
   setTruncStoreAction(MVT::i32, MVT::i16, Custom);
   setTruncStoreAction(MVT::i32, MVT::i1,  Expand);
 
@@ -755,147 +760,49 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
 }
 
 SDValue MovTargetLowering::LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) const {
-  // Stage 6d3b — truncating store of i8 → read-modify-write on the
-  // enclosing aligned i32 word:
+  // Stage 6f — the only truncating store that still needs lowering is i16;
+  // i8 is Legal and selects straight to the STORE8 pseudo, which
+  // MovOnlyLegalize turns into a real `mov byte ptr [mem], <low byte>`.
   //
-  //   aligned_ptr  = ptr & ~3
-  //   byte_off     = ptr &  3
-  //   bit_shift    = byte_off << 3
-  //   word         = load  i32, [aligned_ptr]
-  //   cleared      = word & ~(0xff << bit_shift)
-  //   new_byte     = (val & 0xff) << bit_shift
-  //   store i32 (cleared | new_byte), [aligned_ptr]
-  //
-  // Same alignment-safety argument as LowerExtLoadI8: the i32 word
-  // we read+write straddles the original i8 byte, but always sits
-  // inside the same underlying object, so we never page-fault past
-  // its end. The op chain is heavy (load, two masks, two shifts,
-  // OR, store) but every op is i32 and selects against the existing
-  // MOV32rm / AND32ri / SHL32ri / OR32rr / MOV32mr patterns —
-  // mov-only legalize at stage 7 picks them all up.
+  // This used to be a read-modify-write of the enclosing 4-byte word, and
+  // that was unsound: two narrow stores can land in one word while the IR
+  // considers them independent (a `store i24` splits into disjoint byte
+  // ranges, so nothing chains them), and widening each to a whole word
+  // makes them overlap only *after* the fact. With no order between them,
+  // one reads the word before its neighbour's store and writes back over
+  // it — measured as a lost byte against a native i386 build. Real byte
+  // stores have nothing to read, so the hazard does not exist.
+  // Regression: test/Execution/narrow_store_same_word.ll.
   auto *ST = cast<StoreSDNode>(Op);
-  if (!ST->isTruncatingStore())
+  if (!ST->isTruncatingStore() || ST->getMemoryVT() != MVT::i16)
     return SDValue();
 
-  // Same argument as LowerExtLoadI8's volatile bail, in the other
-  // direction: a narrow store here becomes a read-modify-write of the
-  // enclosing 4-byte word (and, for i16, two of them). That reads and
-  // rewrites neighbouring bytes, which is unobservable for ordinary
-  // memory and wrong for a volatile one — on MMIO it is a read of a
-  // neighbouring register plus a write-back of whatever it happened to
-  // hold. Decline and let the default path fail loudly. Exact-width
-  // narrow stores are what a real fix needs.
+  // Volatile is declined for the same reason the load side declines it:
+  // the source asked for one 2-byte transaction and this issues two 1-byte
+  // ones, which is a different sequence of bus operations on MMIO.
   if (ST->isVolatile())
     return SDValue();
 
-  SDLoc DL(Op);
+  // Split into low byte then high byte, one address apart. Chained, so
+  // they stay in order; and because they are byte-wide, an unaligned i16
+  // whose halves straddle two words needs no special case.
+  const SDLoc DL(Op);
   SDValue Chain = ST->getChain();
   SDValue Val   = ST->getValue();
   SDValue Ptr   = ST->getBasePtr();
-  EVT PtrTy     = Ptr.getValueType();
 
-  // i16 stores are **declined**, deliberately, and the reason is worth
-  // reading before anyone re-enables the split that used to be here.
-  //
-  // The obvious lowering is two i8 stores a byte apart, each of which then
-  // takes the word read-modify-write path below. It compiles, and it is
-  // wrong. The IR can hand us narrow stores it considers independent — a
-  // `store i24` splits into disjoint byte ranges, so nothing chains them —
-  // and rewriting each into a *whole-word* RMW makes them overlap after
-  // the fact. Nothing re-establishes an order, so one RMW reads the word
-  // before its neighbour's store and then writes back over it.
-  //
-  // Measured (`llvm-reduce`, differential against a stock i386 build): an
-  // `i24` store plus a byte load from an unrelated global returns 2 where
-  // native returns 3 — the third byte of the store is gone. The emitted
-  // MIR shows the interleave directly:
-  //
-  //     %29 = MOV32rm %28, 0     ; RMW #3 reads the word
-  //     MOV32mr %17, 0, %22      ; RMW #2 writes it
-  //     MOV32mr %28, 0, %33      ; RMW #3 writes back its stale copy
-  //
-  // This is not fixable from inside this hook: the lowering sees one store
-  // at a time and cannot chain itself to a sibling it never sees. Empty
-  // MachinePointerInfo and MOVolatile on the RMW's memory operands were
-  // both tried and neither reorders the DAG, because the parallelism is in
-  // the chain topology, decided before we are called.
-  //
-  // The soundness problem is older than i16: it belongs to the word-RMW
-  // idea itself and applies to the i8 path below whenever two unchained
-  // narrow stores land in one word. A single narrow store is fine, which
-  // is why it went unnoticed. **The real fix is a real byte store** —
-  // `MOV8mr` exists but is post-RA only today (see MovRegisterInfo.td's
-  // note on GR8), so giving ISel a byte-store path is its own piece of
-  // work.
-  //
-  // Until then, decline: LegalizeDAG's Custom case returns without
-  // re-queueing, so this is a clean `Cannot select` diagnostic, not the
-  // unbounded legalizer loop that `Expand` used to cause here.
-  if (ST->getMemoryVT() == MVT::i16)
-    return SDValue();
-
-  if (ST->getMemoryVT() != MVT::i8)
-    return SDValue();
-
-  SDValue Three     = DAG.getConstant(3, DL, PtrTy);
-  SDValue InvThree  = DAG.getConstant(~3u, DL, PtrTy);
-  SDValue AlignedPt = DAG.getNode(ISD::AND, DL, PtrTy, Ptr, InvThree);
-  SDValue ByteOff   = DAG.getNode(ISD::AND, DL, PtrTy, Ptr, Three);
-  SDValue BitShift  = DAG.getNode(ISD::SHL, DL, PtrTy, ByteOff,
-                                  DAG.getConstant(3, DL, PtrTy));
-
-  // Two separate MachineMemOperands — the original store's MMO has
-  // store flags set, but we now need a load-only MMO for the
-  // pre-load and a store-only MMO for the back-store. Sharing the
-  // original would have MOV32rm carrying a store-flagged MMO and
-  // the verifier rejects it ("Missing mayStore flag").
-  MachineFunction &MF = DAG.getMachineFunction();
-  // The MMOs describe the *word* we touch, not the byte the source asked
-  // for, and we cannot name that word: its address is `ptr & ~3`, which
-  // for a symbolic pointer is not a constant offset from anything the
-  // pointer info can express. Carrying the byte's pointer info on a
-  // 4-byte access would be a lie to alias analysis — it claims bytes
-  // above the word that we never touch and omits the ones below — and
-  // AA acting on it can reorder two read-modify-writes of the same word
-  // so that one loses the other's update. That is not hypothetical: an
-  // i16 store splits into two byte stores in the same word, and with
-  // another narrow store elsewhere in the function to perturb
-  // scheduling, one byte went missing (found by
-  // `test/Execution/narrow_store.ll`).
-  //
-  // An empty MachinePointerInfo says "may touch anything", which is the
-  // truth we can actually state. It costs AA precision around narrow
-  // stores; correctness first.
-  MachineMemOperand *OrigMMO = ST->getMemOperand();
-  MachineMemOperand *LoadMMO = MF.getMachineMemOperand(
-      MachinePointerInfo(),
-      MachineMemOperand::MOLoad,
-      /*size=*/4, Align(4), OrigMMO->getAAInfo(),
-      OrigMMO->getRanges(), OrigMMO->getSyncScopeID(),
-      OrigMMO->getSuccessOrdering(), OrigMMO->getFailureOrdering());
-  MachineMemOperand *StoreMMO = MF.getMachineMemOperand(
-      MachinePointerInfo(),
-      MachineMemOperand::MOStore,
-      /*size=*/4, Align(4), OrigMMO->getAAInfo(),
-      OrigMMO->getRanges(), OrigMMO->getSyncScopeID(),
-      OrigMMO->getSuccessOrdering(), OrigMMO->getFailureOrdering());
-
-  SDValue Word = DAG.getLoad(MVT::i32, DL, Chain, AlignedPt, LoadMMO);
-
-  // ~(0xff << bit_shift) — we have no NOT opcode, so XOR with ~0.
-  SDValue ByteMask = DAG.getNode(ISD::SHL, DL, MVT::i32,
-                                 DAG.getConstant(0xff, DL, MVT::i32),
-                                 BitShift);
-  SDValue AllOnes  = DAG.getConstant(0xFFFFFFFFu, DL, MVT::i32);
-  SDValue InvMask  = DAG.getNode(ISD::XOR, DL, MVT::i32, ByteMask, AllOnes);
-  SDValue Cleared  = DAG.getNode(ISD::AND, DL, MVT::i32, Word, InvMask);
-
-  SDValue NewByte = DAG.getNode(ISD::AND, DL, MVT::i32, Val,
-                                DAG.getConstant(0xff, DL, MVT::i32));
-  SDValue Shifted = DAG.getNode(ISD::SHL, DL, MVT::i32, NewByte, BitShift);
-  SDValue Merged  = DAG.getNode(ISD::OR, DL, MVT::i32, Cleared, Shifted);
-
-  return DAG.getStore(Word.getValue(1), DL, Merged, AlignedPt, StoreMMO);
+  SDValue Lo =
+      DAG.getTruncStore(Chain, DL, Val, Ptr, ST->getPointerInfo(), MVT::i8,
+                        ST->getBaseAlign(), ST->getMemOperand()->getFlags(),
+                        ST->getAAInfo());
+  SDValue HiVal =
+      DAG.getNode(ISD::SRL, DL, Val.getValueType(), Val,
+                  DAG.getShiftAmountConstant(8, Val.getValueType(), DL));
+  SDValue Ptr1 = DAG.getMemBasePlusOffset(Ptr, TypeSize::getFixed(1), DL);
+  return DAG.getTruncStore(Lo, DL, HiVal, Ptr1,
+                           ST->getPointerInfo().getWithOffset(1), MVT::i8,
+                           ST->getBaseAlign(), ST->getMemOperand()->getFlags(),
+                           ST->getAAInfo());
 }
 
 SDValue MovTargetLowering::LowerBRCOND(SDValue Op, SelectionDAG &DAG) const {
