@@ -711,9 +711,17 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
   // still points into the same underlying object as the original
   // i8 pointer, so the original MMO's alias info applies.
   MachineMemOperand *MMO = LD->getMemOperand();
+  // Empty MachinePointerInfo, not the byte's: the address we actually
+  // load from is `ptr & ~3`, which is not a constant offset from the
+  // byte for a symbolic pointer, so the byte's pointer info would
+  // describe a range we do not touch and omit the bytes below it.
+  // Alias analysis believing that lets this word read move across a
+  // narrow store that wrote the same word — measured: with an i24 store
+  // to one global and a byte load from another in the same function,
+  // the third byte of the store came back as zero.
   SDValue Word = DAG.getLoad(MVT::i32, DL, Chain, AlignedPt,
-                             MachinePointerInfo(MMO->getPointerInfo()),
-                             Align(4), MMO->getFlags());
+                             MachinePointerInfo(), Align(4),
+                             MMO->getFlags());
 
   // Extract the requested field.
   const uint32_t FieldMask =
@@ -786,30 +794,45 @@ SDValue MovTargetLowering::LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) cons
   SDValue Ptr   = ST->getBasePtr();
   EVT PtrTy     = Ptr.getValueType();
 
-  // An i16 store becomes two i8 stores, one byte apart, and each of those
-  // then takes the word read-modify-write path below. Splitting rather
-  // than adding a 16-bit-wide RMW keeps this correct when the pointer is
-  // unaligned: at `ptr & 3 == 3` the two bytes live in *different* i32
-  // words, which a single word RMW could not express.
+  // i16 stores are **declined**, deliberately, and the reason is worth
+  // reading before anyone re-enables the split that used to be here.
   //
-  // The two halves must be chained, not issued in parallel. Under
-  // `align 1` they usually land in the same word, and two independent
-  // read-modify-writes of one word would each read the pre-store value —
-  // the second would write back a word missing the first byte.
-  if (ST->getMemoryVT() == MVT::i16) {
-    SDValue Lo =
-        DAG.getTruncStore(Chain, DL, Val, Ptr, ST->getPointerInfo(), MVT::i8,
-                          ST->getBaseAlign(), ST->getMemOperand()->getFlags(),
-                          ST->getAAInfo());
-    SDValue HiVal =
-        DAG.getNode(ISD::SRL, DL, Val.getValueType(), Val,
-                    DAG.getShiftAmountConstant(8, Val.getValueType(), DL));
-    SDValue Ptr1 = DAG.getMemBasePlusOffset(Ptr, TypeSize::getFixed(1), DL);
-    return DAG.getTruncStore(Lo, DL, HiVal, Ptr1,
-                             ST->getPointerInfo().getWithOffset(1), MVT::i8,
-                             ST->getBaseAlign(),
-                             ST->getMemOperand()->getFlags(), ST->getAAInfo());
-  }
+  // The obvious lowering is two i8 stores a byte apart, each of which then
+  // takes the word read-modify-write path below. It compiles, and it is
+  // wrong. The IR can hand us narrow stores it considers independent — a
+  // `store i24` splits into disjoint byte ranges, so nothing chains them —
+  // and rewriting each into a *whole-word* RMW makes them overlap after
+  // the fact. Nothing re-establishes an order, so one RMW reads the word
+  // before its neighbour's store and then writes back over it.
+  //
+  // Measured (`llvm-reduce`, differential against a stock i386 build): an
+  // `i24` store plus a byte load from an unrelated global returns 2 where
+  // native returns 3 — the third byte of the store is gone. The emitted
+  // MIR shows the interleave directly:
+  //
+  //     %29 = MOV32rm %28, 0     ; RMW #3 reads the word
+  //     MOV32mr %17, 0, %22      ; RMW #2 writes it
+  //     MOV32mr %28, 0, %33      ; RMW #3 writes back its stale copy
+  //
+  // This is not fixable from inside this hook: the lowering sees one store
+  // at a time and cannot chain itself to a sibling it never sees. Empty
+  // MachinePointerInfo and MOVolatile on the RMW's memory operands were
+  // both tried and neither reorders the DAG, because the parallelism is in
+  // the chain topology, decided before we are called.
+  //
+  // The soundness problem is older than i16: it belongs to the word-RMW
+  // idea itself and applies to the i8 path below whenever two unchained
+  // narrow stores land in one word. A single narrow store is fine, which
+  // is why it went unnoticed. **The real fix is a real byte store** —
+  // `MOV8mr` exists but is post-RA only today (see MovRegisterInfo.td's
+  // note on GR8), so giving ISel a byte-store path is its own piece of
+  // work.
+  //
+  // Until then, decline: LegalizeDAG's Custom case returns without
+  // re-queueing, so this is a clean `Cannot select` diagnostic, not the
+  // unbounded legalizer loop that `Expand` used to cause here.
+  if (ST->getMemoryVT() == MVT::i16)
+    return SDValue();
 
   if (ST->getMemoryVT() != MVT::i8)
     return SDValue();
