@@ -1079,8 +1079,22 @@ private:
         // SaveEdxDisp up-front so the post-chain reload at the
         // bottom restores the right value. (caller-ECX is cdecl-
         // volatile, so it's fine to keep its Undef spill below.)
+        //
+        // …but only when the return actually carries something in EDX.
+        // RetCC_Mov puts a second i32 there, and the RET's implicit-use
+        // list is what says so. In a function returning a single i32 —
+        // the common case — EDX is dead at the epilogue, and reading it
+        // here is a genuine "using an undefined physical register" that
+        // the machine verifier rejects. It went unnoticed because no
+        // fixture reached this path with `-verify-machineinstrs` until
+        // `test/Execution/narrow_store.ll`: it needs a truncating store,
+        // and the suite had none (not even an `i8` one).
+        const TargetRegisterInfo *EpiTRI = MF.getSubtarget().getRegisterInfo();
+        const bool RetKeepsEdx = RetMI.readsRegister(Mov::EDX, EpiTRI);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+            .addReg(Mov::EBP)
+            .addImm(Addr->SaveEdxDisp)
+            .addReg(Mov::EDX, RetKeepsEdx ? 0 : RegState::Undef);
 
         // Step 1: stash RA in __mov_return_addr_slot.
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)

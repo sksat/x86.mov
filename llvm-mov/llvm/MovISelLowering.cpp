@@ -74,8 +74,26 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   // enclosing i32 word. Same alignment-safety story as the load
   // path: writing the aligned-down i32 word means we never touch
   // bytes outside the original object.
+  //
+  // i16 is Custom for a sharper reason than i8: `Expand` on it does not
+  // terminate. i16 has no register class here, so LegalizeDAG takes its
+  // "the in-memory type isn't legal" arm, truncates the value to the
+  // promote type (i32 — a no-op, the value is already i32) and rebuilds a
+  // truncstore with the *same* i16 memory VT. CSE returns the node being
+  // legalized, `ReplaceNode(N, N)` drops it back out of the legalized set,
+  // and the worklist loop goes round again, leaking a MachineMemOperand
+  // per turn from the MachineFunction's BumpPtrAllocator. Peak RSS tracks
+  // whatever RAM the machine has and wall time is linear in it; a
+  // four-line module with one `store i24` is enough to trigger it.
+  //
+  // That is the third instance of the same shape in this backend — see the
+  // i16 SEXTLOAD note above and the SELECT / SELECT_CC comment below. The
+  // rule the three of them add up to: **never give a type with no register
+  // class an `Expand` action that can rebuild its own input.** `Custom`
+  // does not have the problem, because LegalizeDAG only re-enters the
+  // worklist when the hook returns a *different* node.
   setTruncStoreAction(MVT::i32, MVT::i8, Custom);
-  setTruncStoreAction(MVT::i32, MVT::i16, Expand);
+  setTruncStoreAction(MVT::i32, MVT::i16, Custom);
   setTruncStoreAction(MVT::i32, MVT::i1,  Expand);
 
   // x86 normally lowers `sign_extend_inreg` to `movsx`, which we don't
@@ -712,7 +730,7 @@ SDValue MovTargetLowering::LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) cons
   // MOV32rm / AND32ri / SHL32ri / OR32rr / MOV32mr patterns —
   // mov-only legalize at stage 7 picks them all up.
   auto *ST = cast<StoreSDNode>(Op);
-  if (ST->getMemoryVT() != MVT::i8 || !ST->isTruncatingStore())
+  if (!ST->isTruncatingStore())
     return SDValue();
 
   SDLoc DL(Op);
@@ -720,6 +738,34 @@ SDValue MovTargetLowering::LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) cons
   SDValue Val   = ST->getValue();
   SDValue Ptr   = ST->getBasePtr();
   EVT PtrTy     = Ptr.getValueType();
+
+  // An i16 store becomes two i8 stores, one byte apart, and each of those
+  // then takes the word read-modify-write path below. Splitting rather
+  // than adding a 16-bit-wide RMW keeps this correct when the pointer is
+  // unaligned: at `ptr & 3 == 3` the two bytes live in *different* i32
+  // words, which a single word RMW could not express.
+  //
+  // The two halves must be chained, not issued in parallel. Under
+  // `align 1` they usually land in the same word, and two independent
+  // read-modify-writes of one word would each read the pre-store value —
+  // the second would write back a word missing the first byte.
+  if (ST->getMemoryVT() == MVT::i16) {
+    SDValue Lo =
+        DAG.getTruncStore(Chain, DL, Val, Ptr, ST->getPointerInfo(), MVT::i8,
+                          ST->getBaseAlign(), ST->getMemOperand()->getFlags(),
+                          ST->getAAInfo());
+    SDValue HiVal =
+        DAG.getNode(ISD::SRL, DL, Val.getValueType(), Val,
+                    DAG.getShiftAmountConstant(8, Val.getValueType(), DL));
+    SDValue Ptr1 = DAG.getMemBasePlusOffset(Ptr, TypeSize::getFixed(1), DL);
+    return DAG.getTruncStore(Lo, DL, HiVal, Ptr1,
+                             ST->getPointerInfo().getWithOffset(1), MVT::i8,
+                             ST->getBaseAlign(),
+                             ST->getMemOperand()->getFlags(), ST->getAAInfo());
+  }
+
+  if (ST->getMemoryVT() != MVT::i8)
+    return SDValue();
 
   SDValue Three     = DAG.getConstant(3, DL, PtrTy);
   SDValue InvThree  = DAG.getConstant(~3u, DL, PtrTy);
