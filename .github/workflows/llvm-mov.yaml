@@ -61,6 +61,11 @@ jobs:
       - name: test (mov-only gate)
         run: make test-mov-only
 
+      # Every other gate links exactly one object, so none of them would
+      # notice the byte tables going back to one copy per object.
+      - name: test (link dedup)
+        run: make test-link-dedup
+
       # Stage 6.5 — rustc → llvm-mov-llc → ELF end-to-end. The ubuntu-24.04
       # runner already ships with a recent rustup-managed rustc, but the
       # i686 std rlibs are not preinstalled. Adding the target is ~10 MB
