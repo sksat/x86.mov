@@ -25,7 +25,7 @@
 target triple = "mov-unknown-linux-gnu"
 
 @other = global [2 x i16] zeroinitializer
-@word  = global [2 x i32] zeroinitializer
+@word  = global [2 x i32] zeroinitializer, align 4
 
 define i32 @narrow_store_same_word(i32 %n) {
 entry:

@@ -31,8 +31,11 @@ target triple = "mov-unknown-linux-gnu"
 @flag  = global i8 1                  ; a C `_Bool` in disguise
 @pad   = global [4 x i16] [i16 0, i16 7, i16 0, i16 0]
 @odd   = global [4 x i8]  [i8 0, i8 9, i8 2, i8 0]   ; i16 at offset 1 = 0x0209, high byte non-zero
+; `align 4` is what makes the crossing real: `[8 x i8]` has ABI alignment 1,
+; so without it `@xing + 3` need not sit at `ptr & 3 == 3` at all and the
+; fixture would quietly stop testing the case it is named for.
 @xing  = global [8 x i8]  [i8 0, i8 0, i8 0, i8 128,
-                           i8 255, i8 0, i8 0, i8 0]  ; i16 at offset 3 = 0xFF80 = -128, crosses a word
+                           i8 255, i8 0, i8 0, i8 0], align 4  ; i16 at +3 = 0xFF80 = -128
 
 define i32 @narrow_load(i32 %n) {
 entry:

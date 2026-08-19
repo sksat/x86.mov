@@ -214,17 +214,16 @@ rust_qoi_decode     .text 132,917 → 115,052 B  mov 23,365 → 19,129
 最大の翻訳単位 (`x86linux.c`、IR 18,826 行) でも 4 秒で終わる。
 本当に効いてくるのはカーネル規模の関数を相手にするときである。
 
-これは C の大きな翻訳単位に限った話ではない。**2,983 行の Rust の IR 1 本**でも起きる:
-`base64` crate (v0.22.1) を rustc 1.97.1 が吐いた IR は、1 回の `llvm-mov-llc` 呼び出しで
-**27.1 GiB / 90 秒**を要求する。29 GiB のマシンには「かろうじて入る」ので長く気付かれず、
-16 GiB の GitHub runner で初めて牙を剥いた — `test-rust-example` が出力ゼロのまま
-`exit 143` で死に、CI が壊れていた (原因はカーネルの OOM killer が runner agent を
-選ぶこと)。rustc 1.96 が吐く IR ではこの経路に入らないので、runner イメージが
-更新された時点で顕在化している。
+#### 経緯 (現状の説明ではない)
 
-対処として [`examples/rust/cargo-link.sh`](examples/rust/cargo-link.sh) は dep の
-lowering に `ulimit -v` の上限 (既定 8 GiB、`LLVM_MOV_LLC_DEP_MAXMEM_KB`) を掛け、
-超えたら既存の native fallback に落とすようにした。**時間制限では救えない**点が重要で、
-27 GiB には 1 分足らずで到達するため、タイムアウトが発火する前にマシンが死ぬ。
-これは症状を封じ込めるだけで、原因である「1 命令 = ~50 mov のバイトチェーン展開が
-MachineFunction を膨らませる」ことには手を付けていない。
+一時期ここには「`base64` crate の IR は 1 回の呼び出しで 27.1 GiB / 90 秒を要求し、
+29 GiB のマシンにはかろうじて入るが 16 GiB の GitHub runner では OOM killer が
+runner agent を巻き添えにする」と書いていた。**その診断は誤り**で、正しくは
+§3.2 の無限ループである。要求量ではなく機械の残量を測っていた。
+
+[`examples/rust/cargo-link.sh`](examples/rust/cargo-link.sh) が dep の lowering に
+掛けている `ulimit -v` (既定 8 GiB、`LLVM_MOV_LLC_DEP_MAXMEM_KB`) はその頃の
+対処で、無限ループが直った今は**保険として残してある**だけである
+(将来また暴走する経路が出ても CI を殺さない)。当時「時間制限では救えない」と
+書いたのは正しかった — 停止しないものにタイムアウトを掛けても、発火より先に
+マシンが死ぬからである。

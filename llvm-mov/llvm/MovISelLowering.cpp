@@ -70,7 +70,7 @@ MovTargetLowering::MovTargetLowering(const TargetMachine &TM,
   }
 
   // Stage 6d3b — truncating stores. `store i8` (trunc-from-i32 in IR)
-  // lowers in LowerTruncStoreI8 to a read-modify-write on the
+  // lowers in LowerTruncStoreI16 to a read-modify-write on the
   // enclosing i32 word. Same alignment-safety story as the load
   // path: writing the aligned-down i32 word means we never touch
   // bytes outside the original object.
@@ -439,7 +439,7 @@ SDValue MovTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
   case ISD::LOAD:
     return LowerExtLoadI8(Op, DAG);
   case ISD::STORE:
-    return LowerTruncStoreI8(Op, DAG);
+    return LowerTruncStoreI16(Op, DAG);
   case ISD::SETCC:
     return LowerSETCC(Op, DAG);
   case ISD::VASTART:
@@ -759,7 +759,7 @@ SDValue MovTargetLowering::LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const {
   return DAG.getMergeValues({Result, Word.getValue(1)}, DL);
 }
 
-SDValue MovTargetLowering::LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) const {
+SDValue MovTargetLowering::LowerTruncStoreI16(SDValue Op, SelectionDAG &DAG) const {
   // Stage 6f — the only truncating store that still needs lowering is i16;
   // i8 is Legal and selects straight to the STORE8 pseudo, which
   // MovOnlyLegalize turns into a real `mov byte ptr [mem], <low byte>`.

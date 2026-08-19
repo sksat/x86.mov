@@ -2,30 +2,29 @@
 ;
 ; This path (stage 6d3b) had **no test at all** — `grep -rl "store i8" test/`
 ; was empty before this file — which is how it kept a live machine-verifier
-; error (`MOV32mr $ebp, -20, $edx` using an undefined physical register) and
-; the soundness problem described below.
+; error (`MOV32mr $ebp, -20, $edx` using an undefined physical register) for
+; as long as it did.
 ;
-; Each store here goes to a *different* 4-byte word. That restriction is the
-; point: the lowering turns a narrow store into a read-modify-write of the
-; enclosing word, and two such RMWs in one word are only correct if something
-; orders them. Nothing does — see the `MVT::i16` decline in
-; `MovISelLowering.cpp` for the measured failure and why it cannot be fixed
-; from inside that hook. Until narrow stores become real byte stores, one
-; narrow store per word is the sound subset, and this fixture stays inside it.
+; A narrow store is now a real byte store: ISel selects `truncstorei8` to the
+; STORE8 pseudo and MovOnlyLegalize expands it, after RA, into a single
+; `mov byte ptr [mem], <low byte>`. This fixture pins that the byte lands
+; where it should and that the three bytes around it are untouched — the
+; property the old read-modify-write lowering could get wrong.
 ;
-; i16 / i24 stores are declined outright (`Cannot select`), which is a
-; deliberate step *up* from what they used to do: `Expand` on an i16
-; truncstore did not terminate, and the compiler allocated until the machine
-; died. Terminating with a diagnostic is the improvement; a correct lowering
-; is separate work.
+; Two narrow stores landing in the *same* word are covered separately by
+; `narrow_store_same_word.ll`; that is the case the RMW lowering actually
+; miscompiled.
 ;
 ; narrow_store(0) → 7 + 20 + 15 = 42.
 
 target triple = "mov-unknown-linux-gnu"
 
-@w0 = global [4 x i8] [i8 0, i8 0, i8 0, i8 0]
-@w1 = global [4 x i8] [i8 0, i8 0, i8 0, i8 0]
-@w2 = global [4 x i8] [i8 9, i8 9, i8 9, i8 9]
+; `align 4` on each: [4 x i8] has ABI alignment 1, so without it "a different
+; 4-byte word per store" is not actually guaranteed and the fixture would
+; stop testing what it claims to.
+@w0 = global [4 x i8] [i8 0, i8 0, i8 0, i8 0], align 4
+@w1 = global [4 x i8] [i8 0, i8 0, i8 0, i8 0], align 4
+@w2 = global [4 x i8] [i8 9, i8 9, i8 9, i8 9], align 4
 
 define i32 @narrow_store(i32 %n) {
 entry:
