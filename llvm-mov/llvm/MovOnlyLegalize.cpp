@@ -136,6 +136,20 @@ public:
     // shape is handled there by the existing opt-3 fold).
     Changed |= legalizeLEA32rs(MF, TII);
 
+    // Stage 6f — expand the STORE8 pseudo into a real byte store.
+    //
+    // ISel selects `truncstorei8` to STORE8 with its source constrained to
+    // GPR32_ABCD, so after RA the value is guaranteed to sit in a register
+    // that *has* a low byte. The expansion is therefore one instruction —
+    // no spill, no borrowed scratch, nothing to save or restore:
+    //
+    //     STORE8 [mem], eax    ->    mov byte ptr [mem], al
+    //
+    // Runs before the per-MI loop so the result is an ordinary MOV8mr that
+    // the mov-only gate already accepts (it is a mov).
+    Changed |= legalizeStore8s(MF, MF.getSubtarget().getRegisterInfo(),
+                               TII);
+
     for (MachineBasicBlock &MBB : MF) {
       for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
         switch (MI.getOpcode()) {
@@ -1079,8 +1093,22 @@ private:
         // SaveEdxDisp up-front so the post-chain reload at the
         // bottom restores the right value. (caller-ECX is cdecl-
         // volatile, so it's fine to keep its Undef spill below.)
+        //
+        // …but only when the return actually carries something in EDX.
+        // RetCC_Mov puts a second i32 there, and the RET's implicit-use
+        // list is what says so. In a function returning a single i32 —
+        // the common case — EDX is dead at the epilogue, and reading it
+        // here is a genuine "using an undefined physical register" that
+        // the machine verifier rejects. It went unnoticed because no
+        // fixture reached this path with `-verify-machineinstrs` until
+        // `test/Execution/narrow_store.ll`: it needs a truncating store,
+        // and the suite had none (not even an `i8` one).
+        const TargetRegisterInfo *EpiTRI = MF.getSubtarget().getRegisterInfo();
+        const bool RetKeepsEdx = RetMI.readsRegister(Mov::EDX, EpiTRI);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-            .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX);
+            .addReg(Mov::EBP)
+            .addImm(Addr->SaveEdxDisp)
+            .addReg(Mov::EDX, RetKeepsEdx ? 0 : RegState::Undef);
 
         // Step 1: stash RA in __mov_return_addr_slot.
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
@@ -1663,6 +1691,33 @@ private:
   // resolved by eliminateFrameIndex (the base operand isn't a
   // physical register), leave it alone and rely on the verifier to
   // surface the bug — no mov-only rewrite is possible.
+  // Stage 6f — see the call site. STORE8 exists only so that ISel does not
+  // have to deal in GR8 virtual registers; by the time we run, the operand
+  // is a physreg with a sub_8bit, and the pseudo is just a rename.
+  bool legalizeStore8s(MachineFunction &MF, const TargetRegisterInfo *TRI,
+                       const TargetInstrInfo &TII) const {
+    bool Changed = false;
+    for (MachineBasicBlock &MBB : MF) {
+      for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+        if (MI.getOpcode() != Mov::STORE8)
+          continue;
+        const MachineOperand &Base = MI.getOperand(0);
+        const MachineOperand &Disp = MI.getOperand(1);
+        const Register Src = MI.getOperand(2).getReg();
+        const Register Low = TRI->getSubReg(Src, llvm::sub_8bit);
+        assert(Low && "STORE8 source must come from GPR32_ABCD");
+        BuildMI(MBB, MachineBasicBlock::iterator(&MI), MI.getDebugLoc(),
+                TII.get(Mov::MOV8mr))
+            .add(Base)
+            .add(Disp)
+            .addReg(Low, 0, 0);
+        MI.eraseFromParent();
+        Changed = true;
+      }
+    }
+    return Changed;
+  }
+
   bool legalizeLEA32rs(MachineFunction &MF,
                        const TargetInstrInfo &TII) const {
     bool Changed = false;

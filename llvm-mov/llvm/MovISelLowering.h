@@ -63,7 +63,7 @@ public:
   SDValue LowerBRCOND(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerExtLoadI8(SDValue Op, SelectionDAG &DAG) const;
-  SDValue LowerTruncStoreI8(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerTruncStoreI16(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSETCC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerVASTART(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSELECT(SDValue Op, SelectionDAG &DAG) const;

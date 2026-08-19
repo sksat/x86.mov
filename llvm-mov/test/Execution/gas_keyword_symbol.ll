@@ -24,7 +24,7 @@
 ; dropped the load goes through a null pointer and the fixture faults
 ; instead of returning 42.
 ;
-; gas_keyword_symbol(0) → 40 + 2 + 0 + 0 = 42.
+; gas_keyword_symbol(0) → 40 + 2 + 0 + 0 + 0 = 42.
 
 target triple = "mov-unknown-linux-gnu"
 
@@ -32,6 +32,8 @@ target triple = "mov-unknown-linux-gnu"
 @and    = global i32 2
 @Flat   = global i32 0        ; capitalised: same keyword, different spelling
 @via_ptr = global ptr @Flat   ; data initialiser referencing a keyword symbol
+@word   = global i32 0        ; a *silent* collision: `offset word` assembles
+                              ; fine and yields 2 (the size of a word)
 
 define i32 @gas_keyword_symbol(i32 %n) {
 entry:
@@ -44,8 +46,15 @@ entry:
   %pp = load ptr, ptr @via_ptr, align 4
   %d  = load i32, ptr %pp, align 4
 
+  ; `word` assembles without complaint as the constant 2, so a wrong
+  ; address here reads garbage rather than faulting — store through it and
+  ; read back, which pins the address rather than just the encoding
+  store i32 0, ptr @word, align 4
+  %e = load i32, ptr @word, align 4
+
   %s  = add i32 %a, %b
   %s2 = add i32 %s, %c
-  %r  = add i32 %s2, %d
+  %s3 = add i32 %s2, %d
+  %r  = add i32 %s3, %e
   ret i32 %r
 }

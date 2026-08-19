@@ -254,12 +254,24 @@ void MovAsmPrinter::emitInstruction(const MachineInstr *MI) {
 // ELFs. Trivial fixtures with no ret/post-call ADD (rare) still drop
 // it. `bench/results.md`'s `.rodata` column shows which fixtures
 // retain how much of the table set.
-// The set was measured against binutils 2.47 by assembling `mov esi,
-// offset NAME` for each candidate; exactly these failed. They split into
-// two flavours — plain reserved words (`offset`, `short`, `flat`, `st`)
-// and words that are also binary operators (`and`, `or`, `not`, `xor`,
-// `shl`, `shr`, `mod`) — but the alias treatment covers both, so the
-// printer does not need to tell them apart.
+// The set was measured against binutils 2.47, and the *way* it was
+// measured matters. Asking "does `mov esi, offset NAME` fail to assemble"
+// is not enough: the size keywords assemble perfectly and quietly yield
+// their own size instead of the address —
+//
+//     mov esi, offset word    ->    mov $0x2, %esi
+//     mov esi, offset dword   ->    mov $0x4, %esi
+//     mov esi, offset near    ->    mov $0xff04, %esi
+//
+// with no diagnostic at all. The list below therefore comes from
+// comparing the *encoding* against a name that is definitely not a
+// keyword, not from whether `as` complained. A `word` or `byte` or `size`
+// in C source is ordinary, so these are not theoretical.
+//
+// Three flavours, all handled the same way by the alias: plain reserved
+// words (`offset`, `short`, `flat`, `st`), binary operators (`and`, `or`,
+// `not`, `xor`, `shl`, `shr`, `mod`), and size/distance specifiers
+// (`byte` … `ymmword`, `near`, `far`).
 //
 // The match is case-insensitive because GAS's Intel-syntax keywords are:
 // `OFFSET`, `Offset` and `oFFsEt` all collide just as `offset` does
@@ -270,6 +282,8 @@ static bool isGasIntelReservedWord(StringRef Name) {
   return llvm::StringSwitch<bool>(Name.lower())
       .Cases({"offset", "mod", "short", "flat", "st"}, true)
       .Cases({"and", "or", "not", "xor", "shl", "shr"}, true)
+      .Cases({"byte", "word", "dword", "qword", "tbyte", "fword"}, true)
+      .Cases({"oword", "xmmword", "ymmword", "near", "far"}, true)
       .Default(false);
 }
 

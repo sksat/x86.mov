@@ -196,6 +196,28 @@ let mayStore = 1 in
 def MOV8mr : MovInst<(outs), (ins MovMemOperand:$dst, GR8:$src),
                      "mov\tbyte ptr $dst, $src", []>;
 
+// Stage 6f — truncating byte store, selected straight from IR.
+//
+// The value arrives in a GPR32 (the only register class ISel works with
+// here) and only its low byte is stored. This is a pseudo rather than a
+// direct MOV8mr because MOV8mr takes GR8, and GR8 is a post-RA-only class
+// in this backend — handing ISel GR8 virtual registers was tried once and
+// tripped the post-isel scheduler (see the note above). MovOnlyLegalize
+// expands the pseudo after RA, where naming AL/CL/DL/BL is routine.
+//
+// Why not keep lowering `truncstore i8` to a read-modify-write of the
+// enclosing word, as stage 6d3b did: two *independent* narrow stores can
+// land in one word — `store i24` splits into disjoint byte ranges, so the
+// IR chains nothing — and turning each into a whole-word RMW makes them
+// overlap after the fact, with nothing to order them. One then reads the
+// word before its neighbour's store and writes back over it. A real byte
+// store cannot lose an update that way: there is nothing to read.
+// Regression: test/Execution/narrow_store_same_word.ll.
+let mayStore = 1, isCodeGenOnly = 1 in
+def STORE8 : MovInst<(outs), (ins MovMemOperand:$dst, GPR32_ABCD:$src),
+                     "# STORE8 $dst, $src",
+                     [(truncstorei8 GPR32_ABCD:$src, addr:$dst)]>;
+
 // opt 4 — store an i8 immediate to memory in one instruction.
 // Replaces the `mov dl, K; mov [m], dl` pair the byte-chain
 // legalizer emits for writing K_byte / b_byte / 0xFF constants
