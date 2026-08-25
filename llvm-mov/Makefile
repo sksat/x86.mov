@@ -23,7 +23,7 @@ BUILD_TYPE   ?= Release
 LLVM_CMAKE_DIR := $(shell $(LLVM_CONFIG) --cmakedir 2>/dev/null)
 
 .PHONY: all build configure test test-exec test-codegen test-mov-only \
-        test-rust-example test-cargo-build test-deps-mov \
+        test-rust-example test-cargo-build test-deps-mov test-link-dedup \
         bench bench-check clean distclean help
 
 all: build
@@ -115,6 +115,11 @@ test-deps-mov: build
 # 7d CALL/RET) lights up the next group.
 test-mov-only: build
 	@./test/MovOnly/run.sh $(BUILD_DIR)
+
+# The byte tables must be shared, not copied, once more than one object is
+# linked. Every other gate links exactly one, so nothing else would notice.
+test-link-dedup: build
+	@./test/LinkDedup/run.sh $(BUILD_DIR)
 
 # Side-by-side ELF comparison against movfuscator on the shared C
 # fixtures. Regenerates bench/results.md; commit the result so PRs
