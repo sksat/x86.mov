@@ -2151,21 +2151,33 @@ private:
     }
   }
 
-  // Bitwise per-byte stage: AND/OR/XOR are per-bit, so each byte is
-  // independent (no carry chain). Single table lookup, single store.
-  // The (cin, a, b) index used by ADD becomes just (a, b) here —
-  // idx[2..3] stay 0 from emitIdxZero, which is fine because the
-  // bitwise tables are indexed by `a*256 + b` (only 16 bits of idx
-  // matter, the rest is read as 0 by `mov ecx, [idx]`).
-  static void emitByteStageBitwise(MachineBasicBlock &MBB,
-                                   MachineBasicBlock::iterator I,
-                                   const DebugLoc &DL,
-                                   const TargetInstrInfo &TII,
-                                   const EbpAddr &A, unsigned ByteIdx,
-                                   ByteSource BSrc, const char *TableSym) {
-    emitIdxZero(MBB, I, DL, TII, A);
-    emitIdxPackAB(MBB, I, DL, TII, A, ByteIdx, BSrc);
-    emitTableLookupAndStore(MBB, I, DL, TII, A, ByteIdx, TableSym);
+  // Faster carry-free table index construction.  In 32-bit mode ECX's
+  // addressable halves CH:CL are exactly the 16-bit index required by the
+  // bitwise tables (a*256+b).  Keeping the pack in ECX avoids the old
+  // idx[1]/idx[0] byte stores followed by a dword reload.  The caller zeros
+  // ECX once before the four stages, keeping its upper 16 bits clear.
+  static void emitByteStageBitwiseInReg(
+      MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
+      const DebugLoc &DL, const TargetInstrInfo &TII, const EbpAddr &A,
+      unsigned ByteIdx, ByteSource BSrc, const char *TableSym) {
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::CH)
+        .addReg(Mov::EBP)
+        .addImm(A.SrcDstDisp + static_cast<int64_t>(ByteIdx));
+    if (BSrc.K == ByteSource::Kind::Imm) {
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8ri), Mov::CL)
+          .addImm(BSrc.Imm);
+    } else {
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::CL)
+          .addReg(Mov::EBP)
+          .addImm(BSrc.MemDisp + static_cast<int64_t>(ByteIdx));
+    }
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+        .addExternalSymbol(TableSym)
+        .addReg(Mov::ECX);
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
+        .addReg(Mov::EBP)
+        .addImm(A.SrcDstDisp + static_cast<int64_t>(ByteIdx))
+        .addReg(Mov::DL);
   }
 
   // Stage 7a1 — lower a single `ADD32ri DST32, DST32, IMM32` into a
@@ -3025,10 +3037,14 @@ private:
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Dst);
 
+    // CH:CL is the packed (a,b) table index; clear the unused upper half.
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
+
     // CHAIN — four independent byte stages, each a single table lookup.
     for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
-      emitByteStageBitwise(MBB, Insert, DL, TII, *Addr, ByteIdx,
-                           ByteSource::fromImm(ImmBytes[ByteIdx]), TableSym);
+      emitByteStageBitwiseInReg(MBB, Insert, DL, TII, *Addr, ByteIdx,
+                                ByteSource::fromImm(ImmBytes[ByteIdx]),
+                                TableSym);
 
     // EPILOGUE — same restore order as ADD32ri.
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
@@ -3074,9 +3090,11 @@ private:
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP).addImm(RhsDisp).addReg(Rhs);
 
+    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
+
     for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
-      emitByteStageBitwise(MBB, Insert, DL, TII, *Addr, ByteIdx,
-                           ByteSource::fromMem(RhsDisp), TableSym);
+      emitByteStageBitwiseInReg(MBB, Insert, DL, TII, *Addr, ByteIdx,
+                                ByteSource::fromMem(RhsDisp), TableSym);
 
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
         .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);

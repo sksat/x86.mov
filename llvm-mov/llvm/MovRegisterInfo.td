@@ -14,6 +14,7 @@
 
 // Sub-register index for the low 8 bits of a 32-bit register.
 def sub_8bit : SubRegIndex<8>;
+def sub_8bit_hi : SubRegIndex<8, 8>;
 
 class MovReg<bits<4> num, string n> : Register<n> {
   let Namespace          = "Mov";
@@ -25,12 +26,16 @@ def AL : Register<"al"> { let Namespace = "Mov"; let HWEncoding{2-0} = 0; }
 def CL : Register<"cl"> { let Namespace = "Mov"; let HWEncoding{2-0} = 1; }
 def DL : Register<"dl"> { let Namespace = "Mov"; let HWEncoding{2-0} = 2; }
 def BL : Register<"bl"> { let Namespace = "Mov"; let HWEncoding{2-0} = 3; }
+def AH : Register<"ah"> { let Namespace = "Mov"; let HWEncoding{2-0} = 4; }
+def CH : Register<"ch"> { let Namespace = "Mov"; let HWEncoding{2-0} = 5; }
+def DH : Register<"dh"> { let Namespace = "Mov"; let HWEncoding{2-0} = 6; }
+def BH : Register<"bh"> { let Namespace = "Mov"; let HWEncoding{2-0} = 7; }
 
-let SubRegIndices = [sub_8bit] in {
-def EAX : MovReg<0, "eax">, DwarfRegNum<[0]> { let SubRegs = [AL]; }
-def ECX : MovReg<1, "ecx">, DwarfRegNum<[1]> { let SubRegs = [CL]; }
-def EDX : MovReg<2, "edx">, DwarfRegNum<[2]> { let SubRegs = [DL]; }
-def EBX : MovReg<3, "ebx">, DwarfRegNum<[3]> { let SubRegs = [BL]; }
+let SubRegIndices = [sub_8bit, sub_8bit_hi] in {
+def EAX : MovReg<0, "eax">, DwarfRegNum<[0]> { let SubRegs = [AL, AH]; }
+def ECX : MovReg<1, "ecx">, DwarfRegNum<[1]> { let SubRegs = [CL, CH]; }
+def EDX : MovReg<2, "edx">, DwarfRegNum<[2]> { let SubRegs = [DL, DH]; }
+def EBX : MovReg<3, "ebx">, DwarfRegNum<[3]> { let SubRegs = [BL, BH]; }
 }
 
 // The remaining 32-bit regs have no 8-bit subreg in x86 (ESP/EBP/ESI/EDI
@@ -65,7 +70,8 @@ def GPR32_ABCD : RegisterClass<"Mov", [i32], 32, (add EAX, ECX, EDX, EBX)>;
 // virtual GR8 registers — the legalize pass (post-RA) uses physreg names
 // directly via BuildMI. Listing AL/CL/DL/BL in a class lets the .td-level
 // instruction patterns and MOV8 instructions name a proper RegisterClass.
-def GR8 : RegisterClass<"Mov", [i8], 8, (add AL, CL, DL, BL)>;
+def GR8 : RegisterClass<"Mov", [i8], 8,
+  (add AL, CL, DL, BL, AH, CH, DH, BH)>;
 
 // Singleton class for the shift-amount slot. x86's variable-amount shifts
 // must take their count in CL — we don't model 8-bit subregisters in the
