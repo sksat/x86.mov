@@ -492,26 +492,18 @@ private:
 
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
               .addReg(Mov::EBP).addImm(LhsByteDisp);
-          emitIdxZero(MBB, Insert, DL, TII, *Addr);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
 
           if (IsImmRhs) {
             const uint8_t RhsByte =
                 static_cast<uint8_t>((Imm >> (8u * i)) & 0xFFu);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
-                .addImm(RhsByte);
+            emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, RhsByte,
+                                          "__mov_xor8_table");
           } else {
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-                .addReg(Mov::EBP).addImm(*Addr->RhsDisp + static_cast<int64_t>(i));
+            emitBinaryByteLookupDLWithMem(
+                MBB, Insert, DL, TII,
+                *Addr->RhsDisp + static_cast<int64_t>(i),
+                "__mov_xor8_table");
           }
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-              .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
               .addReg(Mov::EBP).addImm(LhsByteDisp).addReg(Mov::DL);
         }
@@ -520,17 +512,10 @@ private:
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
             .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
         for (unsigned i = 1; i < 4; ++i) {
-          emitIdxZero(MBB, Insert, DL, TII, *Addr);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-              .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-              .addExternalSymbol("__mov_or8_table").addReg(Mov::ECX);
+          emitBinaryByteLookupDLWithMem(
+              MBB, Insert, DL, TII,
+              Addr->SrcDstDisp + static_cast<int64_t>(i),
+              "__mov_or8_table");
         }
         // DL = or_byte (0 iff lhs == rhs).
 
@@ -538,15 +523,8 @@ private:
         emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
                                  "__mov_select_mask_table", Mov::DL);
         if (IsEQ) {
-          emitIdxZero(MBB, Insert, DL, TII, *Addr);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-              .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+          emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, 0xFF,
+                                        "__mov_xor8_table");
         }
         } else {
         // === SIGNED PRE-COMPUTE (a_sign, X = a_sign XOR b_sign) ===
@@ -573,17 +551,8 @@ private:
             // and XOR via the byte-XOR table.
             const uint8_t BSign =
                 ((Imm >> 24) & 0x80u) ? 0xFFu : 0x00u;
-            emitIdxZero(MBB, Insert, DL, TII, *Addr);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
-                .addImm(BSign);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-                .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+            emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, BSign,
+                                          "__mov_xor8_table");
           } else {
             // b_sign = sar_sign[rhs[3]]
             BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
@@ -591,17 +560,9 @@ private:
             emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
                                      "__mov_sar_sign_byte", Mov::DL);
             // DL = b_sign. XOR with cmp_mask_buf[2] (a_sign).
-            emitIdxZero(MBB, Insert, DL, TII, *Addr);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-                .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 2);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-                .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+            emitBinaryByteLookupDLWithMem(
+                MBB, Insert, DL, TII, *Addr->CmpMaskBufDisp + 2,
+                "__mov_xor8_table");
           }
           // DL = X. Stash to cmp_mask_buf[3].
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
@@ -663,17 +624,10 @@ private:
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
             .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
         for (unsigned i = 1; i < 4; ++i) {
-          emitIdxZero(MBB, Insert, DL, TII, *Addr);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-              .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-              .addExternalSymbol("__mov_or8_table").addReg(Mov::ECX);
+          emitBinaryByteLookupDLWithMem(
+              MBB, Insert, DL, TII,
+              Addr->SrcDstDisp + static_cast<int64_t>(i),
+              "__mov_or8_table");
         }
         // DL = diff_or_byte (0 iff lhs == rhs).
 
@@ -685,15 +639,8 @@ private:
         emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
                                  "__mov_select_mask_table", Mov::DL);
         // Invert: DL = DL XOR 0xFF
-        emitIdxZero(MBB, Insert, DL, TII, *Addr);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-            .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+        emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, 0xFF,
+                                      "__mov_xor8_table");
         // Stash ZF_mask to cmp_mask_buf[1] (free until final stash phase).
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
             .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 1).addReg(Mov::DL);
@@ -721,72 +668,33 @@ private:
               .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp).addReg(Mov::DL);
 
           // Y = SF_mask XOR a_sign (cmp_mask_buf[2]).
-          emitIdxZero(MBB, Insert, DL, TII, *Addr);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-              .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 2);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-              .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+          emitBinaryByteLookupDLWithMem(
+              MBB, Insert, DL, TII, *Addr->CmpMaskBufDisp + 2,
+              "__mov_xor8_table");
           // DL = Y.
 
           // OF_mask = X AND Y  (X at cmp_mask_buf[3]).
-          emitIdxZero(MBB, Insert, DL, TII, *Addr);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-              .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 3);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-              .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+          emitBinaryByteLookupDLWithMem(
+              MBB, Insert, DL, TII, *Addr->CmpMaskBufDisp + 3,
+              "__mov_and8_table");
           // DL = OF_mask.
 
           // t = SF_mask XOR OF_mask  (SF_mask at cmp_mask_buf[0]).
-          emitIdxZero(MBB, Insert, DL, TII, *Addr);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-              .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-              .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+          emitBinaryByteLookupDLWithMem(
+              MBB, Insert, DL, TII, *Addr->CmpMaskBufDisp,
+              "__mov_xor8_table");
           // DL = t = SF XOR OF.
 
           if (IsLE || IsG) {
             // OR with ZF_mask (cmp_mask_buf[1]).
-            emitIdxZero(MBB, Insert, DL, TII, *Addr);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-                .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 1);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-                .addExternalSymbol("__mov_or8_table").addReg(Mov::ECX);
+            emitBinaryByteLookupDLWithMem(
+                MBB, Insert, DL, TII, *Addr->CmpMaskBufDisp + 1,
+                "__mov_or8_table");
           }
           if (IsGE || IsG) {
             // Invert: XOR with 0xFF.
-            emitIdxZero(MBB, Insert, DL, TII, *Addr);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-                .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+            emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, 0xFF,
+                                          "__mov_xor8_table");
           }
           // DL = final signed predicate mask.
         } else {
@@ -807,39 +715,17 @@ private:
 
           if (IsAE) {
             // mask = NOT CF_mask : XOR with 0xFF.
-            emitIdxZero(MBB, Insert, DL, TII, *Addr);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-                .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+            emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, 0xFF,
+                                          "__mov_xor8_table");
           } else if (IsBE || IsA) {
             // mask = CF_mask OR ZF_mask  (BE), then XOR 0xFF for A.
-            emitIdxZero(MBB, Insert, DL, TII, *Addr);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-                .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 1);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-                .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-            BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-                .addExternalSymbol("__mov_or8_table").addReg(Mov::ECX);
+            emitBinaryByteLookupDLWithMem(
+                MBB, Insert, DL, TII, *Addr->CmpMaskBufDisp + 1,
+                "__mov_or8_table");
             if (IsA) {
               // Invert the OR result via XOR 0xFF.
-              emitIdxZero(MBB, Insert, DL, TII, *Addr);
-              BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-                  .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-              BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
-                  .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
-              BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-                  .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-              BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-                  .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+              emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, 0xFF,
+                                            "__mov_xor8_table");
             }
           }
           // IsB: DL already holds CF_mask — that's the final mask.
@@ -849,15 +735,8 @@ private:
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
             .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp).addReg(Mov::DL);
         // Compute inv_mask = mask XOR 0xFF, stash at cmp_mask_buf[1]
-        emitIdxZero(MBB, Insert, DL, TII, *Addr);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-            .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+        emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, 0xFF,
+                                      "__mov_xor8_table");
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
             .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 1).addReg(Mov::DL);
 
@@ -871,50 +750,28 @@ private:
         // === PHASE 5: per-byte mask-based select into next_pc ===
         // next_pc[i] = (mask & T[i]) | (~mask & F[i])
         //
-        // opt 6 — Phase 5 idx-zero hoist: idx[2..3]=0 is the only
-        // invariant the byte-table lookups depend on (the and8 /
-        // or8 tables are indexed by `a*256 + b`, so the top two
-        // bytes of `idx` MUST stay zero). idx[0] and idx[1] get
-        // overwritten by every iteration's pack-and-store before
-        // the table read. Phase 3 above already emitted at least
-        // one emitIdxZero so idx[2..3] start at zero entering this
-        // loop, and no MI in the loop writes those bytes — they
-        // ride through all 4 iterations and the
-        // emitOrByteAndStore tail (which also touches only idx[0]
-        // and idx[1]). So the 8 per-iteration `emitIdxZero` calls
-        // the previous shape emitted are 100% redundant; drop them.
+        // All three carry-free lookups per byte build their indices in
+        // CH:CL; the memory-backed idx pack is not touched in this phase.
         for (unsigned i = 0; i < 4; ++i) {
           const int64_t NextPCByteDisp = NextPCDisp + static_cast<int64_t>(i);
 
           // (~mask & F[i]) → DL; stash to next_pc[i].
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
               .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 1);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-              .addReg(Mov::EBP).addImm(*Addr->RhsDisp + static_cast<int64_t>(i));
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-              .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+          emitBinaryByteLookupDLWithMem(
+              MBB, Insert, DL, TII,
+              *Addr->RhsDisp + static_cast<int64_t>(i),
+              "__mov_and8_table");
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
               .addReg(Mov::EBP).addImm(NextPCByteDisp).addReg(Mov::DL);
 
           // (mask & T[i]) → DL.
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
               .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-              .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-              .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+          emitBinaryByteLookupDLWithMem(
+              MBB, Insert, DL, TII,
+              Addr->SrcDstDisp + static_cast<int64_t>(i),
+              "__mov_and8_table");
 
           // OR the stashed (~mask & F[i]) at next_pc[i] with DL (mask & T[i]).
           emitOrByteAndStore(MBB, Insert, DL, TII, *Addr, NextPCDisp, i);
@@ -3200,6 +3057,34 @@ private:
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8rr), Mov::CL)
         .addReg(InputByteReg);
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), OutputByteReg)
+        .addExternalSymbol(TableSym).addReg(Mov::ECX);
+  }
+
+  // Carry-free binary lookup with one operand already in DL. The tables
+  // using this helper (AND/OR/XOR) are symmetric, so CH:CL may hold the
+  // operands in either order. Clearing ECX first makes the upper 16 bits of
+  // the address zero; CH receives the live DL value and CL receives the
+  // memory/immediate peer.
+  static void emitBinaryByteLookupDLWithMem(
+      MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
+      const DebugLoc &DL, const TargetInstrInfo &TII, int64_t OtherDisp,
+      const char *TableSym) {
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rr), Mov::CH).addReg(Mov::DL);
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::CL)
+        .addReg(Mov::EBP).addImm(OtherDisp);
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+        .addExternalSymbol(TableSym).addReg(Mov::ECX);
+  }
+
+  static void emitBinaryByteLookupDLWithImm(
+      MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
+      const DebugLoc &DL, const TargetInstrInfo &TII, uint8_t Other,
+      const char *TableSym) {
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rr), Mov::CH).addReg(Mov::DL);
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8ri), Mov::CL).addImm(Other);
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
         .addExternalSymbol(TableSym).addReg(Mov::ECX);
   }
 
