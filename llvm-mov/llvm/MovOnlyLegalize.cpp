@@ -3500,19 +3500,9 @@ private:
       // 1. amount_byte → DL
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
           .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp);
-      // 2. Pack (amount, 1<<k) into idx[1..0] and look up __mov_and8_table.
-      // (opt 6 follow-up: idx[2..3] are already 0 from the hoisted emitIdxZero
-      // before the for-loop, and no MI in this loop writes them.)
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8ri), Mov::DL)
-          .addImm(static_cast<int64_t>(1u << k));
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-          .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+      // 2. Pack (amount, 1<<k) in CH:CL and look up __mov_and8_table.
+      emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, 1u << k,
+                                    "__mov_and8_table");
       // 3. select_mask_table[DL] → DL (non-zero → 0xFF, zero → 0x00).
       emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
                                "__mov_select_mask_table", Mov::DL);
@@ -3521,18 +3511,9 @@ private:
           .addReg(Mov::EBP)
           .addImm(*Addr->AmountBufDisp + 1)
           .addReg(Mov::DL);
-      // 5. Compute inv_mask = mask XOR 0xFF (using __mov_xor8_table)
-      //    and stash at amount_buf[2].
-      // (opt 6 follow-up: emitUnaryByteLookup above leaves idx[2..3] = 0; the
-      // writes to idx[0..1] below are full overwrites.)
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0xFF);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-          .addExternalSymbol("__mov_xor8_table").addReg(Mov::ECX);
+      // 5. Compute inv_mask = mask XOR 0xFF and stash at amount_buf[2].
+      emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, 0xFF,
+                                    "__mov_xor8_table");
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP)
           .addImm(*Addr->AmountBufDisp + 2)
@@ -3547,23 +3528,13 @@ private:
       // in DL).
       for (unsigned i = 0; i < 4; ++i) {
         // (C1) Compute (~mask & srcdst[i]) → DL, stash to srcdst[i].
-        // (opt 6 follow-up: prior xor8 lookup left idx[2..3] = 0; the writes
-        // below fully overwrite idx[0..1].)
-        // idx[1] = inv_mask
+        // Load inv_mask, then pair it with srcdst[i] in CH:CL.
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
             .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp + 2);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-        // idx[0] = srcdst[i]
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-            .addReg(Mov::EBP)
-            .addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-            .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+        emitBinaryByteLookupDLWithMem(
+            MBB, Insert, DL, TII,
+            Addr->SrcDstDisp + static_cast<int64_t>(i),
+            "__mov_and8_table");
         // Stash to srcdst[i].
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
             .addReg(Mov::EBP)
@@ -3571,21 +3542,13 @@ private:
             .addReg(Mov::DL);
 
         // (C2) Compute (mask & shifted_buf[i]) → DL.
-        // (opt 6 follow-up: C1's and8 lookup left idx[2..3] = 0; the writes
-        // below fully overwrite idx[0..1].)
+        // Load mask, then pair it with shifted_buf[i] in CH:CL.
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
             .addReg(Mov::EBP).addImm(*Addr->AmountBufDisp + 1);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-            .addReg(Mov::EBP)
-            .addImm(*Addr->ShiftedBufDisp + static_cast<int64_t>(i));
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-            .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+        emitBinaryByteLookupDLWithMem(
+            MBB, Insert, DL, TII,
+            *Addr->ShiftedBufDisp + static_cast<int64_t>(i),
+            "__mov_and8_table");
 
         // (C3) OR the stashed inv_mask & srcdst (at srcdst[i]) with the
         // mask & shifted_buf (in DL), write final to srcdst[i].
