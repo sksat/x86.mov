@@ -2413,10 +2413,10 @@ private:
     }
 
     // PHASE 2 — accumulate srcdst[0] += srcdst[i] for i = 1..3 via
-    // the add8 sum table. cin is 0 throughout (emitIdxZero takes care
-    // of idx[2] = 0), and intermediate sums stay ≤ 32 so we never
-    // need the carry-out byte. Each step is one idx-pack + lookup +
-    // store-back into srcdst[0].
+    // the add8 sum table. The binary helper clears ECX and packs only the
+    // two operands in CH:CL, so cin is 0 throughout. Intermediate sums stay
+    // ≤ 32, therefore we never need the carry-out byte. Each step is one
+    // register-packed lookup plus a store-back into srcdst[0].
     for (unsigned i = 1; i < 4; ++i) {
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
           .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
