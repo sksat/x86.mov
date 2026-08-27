@@ -56,6 +56,7 @@
 #include "MovTargetMachine.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
@@ -3029,28 +3030,61 @@ private:
     auto Insert = MachineBasicBlock::iterator(&MI);
     const DebugLoc DL = MI.getDebugLoc();
 
-    // PROLOGUE — same as ADD32ri: save ECX, EDX, spill DST32.
-    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
-    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
-        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp).addReg(Mov::EDX, RegState::Undef);
+    const StringRef Table(TableSym);
+    auto IsIdentityByte = [&](uint8_t B) {
+      return (Table == "__mov_and8_table" && B == 0xFF) ||
+             ((Table == "__mov_or8_table" ||
+               Table == "__mov_xor8_table") &&
+              B == 0);
+    };
+    auto IsConstantByte = [&](uint8_t B) {
+      return (Table == "__mov_and8_table" && B == 0) ||
+             (Table == "__mov_or8_table" && B == 0xFF);
+    };
+    const bool NeedsLookup = llvm::any_of(ImmBytes, [&](uint8_t B) {
+      return !IsIdentityByte(B) && !IsConstantByte(B);
+    });
+
+    // Save table-index scratch registers only when at least one byte
+    // actually needs a lookup. Identity and constant bytes touch memory
+    // directly and do not clobber ECX/EDX.
+    if (NeedsLookup) {
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+          .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp)
+          .addReg(Mov::ECX, RegState::Undef);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
+          .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp)
+          .addReg(Mov::EDX, RegState::Undef);
+    }
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Dst);
 
-    // CH:CL is the packed (a,b) table index; clear the unused upper half.
-    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
+    if (NeedsLookup)
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
 
-    // CHAIN — four independent byte stages, each a single table lookup.
-    for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx)
+    for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx) {
+      const uint8_t B = ImmBytes[ByteIdx];
+      if (IsIdentityByte(B))
+        continue;
+      if (IsConstantByte(B)) {
+        const uint8_t Value =
+            (Table == "__mov_or8_table") ? uint8_t{0xFF} : uint8_t{0};
+        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
+            .addReg(Mov::EBP)
+            .addImm(Addr->SrcDstDisp + static_cast<int64_t>(ByteIdx))
+            .addImm(Value);
+        continue;
+      }
       emitByteStageBitwiseInReg(MBB, Insert, DL, TII, *Addr, ByteIdx,
-                                ByteSource::fromImm(ImmBytes[ByteIdx]),
-                                TableSym);
+                                ByteSource::fromImm(B), TableSym);
+    }
 
-    // EPILOGUE — same restore order as ADD32ri.
-    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-        .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
-    BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
-        .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+    if (NeedsLookup) {
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
+          .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::EDX)
+          .addReg(Mov::EBP).addImm(Addr->SaveEdxDisp);
+    }
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Dst)
         .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
 
