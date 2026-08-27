@@ -68,8 +68,9 @@ def GPR32_ABCD : RegisterClass<"Mov", [i32], 32, (add EAX, ECX, EDX, EBX)>;
 // 8-bit register class. Stage 7-prep introduces it for the MovOnlyLegalize
 // pass to address byte-wide loads/stores into lookup tables. RA never sees
 // virtual GR8 registers — the legalize pass (post-RA) uses physreg names
-// directly via BuildMI. Listing AL/CL/DL/BL in a class lets the .td-level
-// instruction patterns and MOV8 instructions name a proper RegisterClass.
+// directly via BuildMI. Listing the low and high byte names in a class lets
+// the .td-level instruction patterns and MOV8 instructions name a proper
+// RegisterClass.
 def GR8 : RegisterClass<"Mov", [i8], 8,
   (add AL, CL, DL, BL, AH, CH, DH, BH)>;
 

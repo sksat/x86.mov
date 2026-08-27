@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+# Bash glob expansion follows the process locale. Pin it so fixture rows have
+# the same order in developer shells and CI, making --check deterministic.
+export LC_ALL=C
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
