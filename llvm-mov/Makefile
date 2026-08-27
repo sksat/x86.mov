@@ -24,7 +24,8 @@ LLVM_CMAKE_DIR := $(shell $(LLVM_CONFIG) --cmakedir 2>/dev/null)
 
 .PHONY: all build configure test test-exec test-codegen test-mov-only \
         test-rust-example test-cargo-build test-deps-mov test-link-dedup \
-        bench bench-check clean distclean help
+        bench bench-check codegen-metrics codegen-metrics-update \
+        codegen-metrics-check clean distclean help
 
 all: build
 
@@ -48,6 +49,9 @@ help:
 	@echo "  bench-check        — regression test: re-run bench, diff against the"
 	@echo "                       committed bench/results.md (runtime excluded);"
 	@echo "                       fails on any deterministic-number drift"
+	@echo "  codegen-metrics    — print deterministic instruction/memory-op costs"
+	@echo "  codegen-metrics-update — refresh bench/codegen-results.md"
+	@echo "  codegen-metrics-check  — diff current costs against committed results"
 	@echo "  clean              — remove build artefacts"
 	@echo "  distclean          — also remove the build directory entirely"
 	@echo ""
@@ -136,6 +140,15 @@ bench: build
 # updated results.md alongside.
 bench-check: build
 	BUILD_DIR=$(BUILD_DIR) ./bench/check.sh
+
+codegen-metrics: build
+	BUILD_DIR=$(BUILD_DIR) ./bench/codegen-metrics.sh
+
+codegen-metrics-update: build
+	BUILD_DIR=$(BUILD_DIR) ./bench/codegen-metrics.sh --update
+
+codegen-metrics-check: build
+	BUILD_DIR=$(BUILD_DIR) ./bench/codegen-metrics.sh --check
 
 clean:
 	@[ -d $(BUILD_DIR) ] && ninja -C $(BUILD_DIR) clean || true
