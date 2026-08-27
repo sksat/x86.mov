@@ -152,7 +152,7 @@ jobs:
       # decompress) is exercised on every push — that's the prod
       # shape, and a regression there (e.g. window-size > 8 MiB)
       # only ever fires under that codepath.
-      - name: test-e2e-dist (staged deploy + Content-Encoding: zstd)
+      - name: "test-e2e-dist (staged deploy + Content-Encoding: zstd)"
         run: make test-e2e-dist
 
       # And once more with the server stripping Content-Encoding so
