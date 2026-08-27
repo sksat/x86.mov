@@ -118,7 +118,7 @@ turbo_median() {
     echo "$median"
 }
 
-fixtures=(bitops shift multiply empty fib_rec)
+read -r -a fixtures <<<"${WORKLOADS:-bitops shift multiply bitscan empty fib_rec}"
 for name in "${fixtures[@]}"; do
     case "$name" in
         bitops) expected_status=120 ;;
@@ -156,7 +156,9 @@ for name in "${fixtures[@]}"; do
         echo "turbo86 baseline median_ns: $baseline_turbo_ns"
     fi
 
-    if [ "$name" != empty ]; then
+    if [ "$name" = bitscan ]; then
+        echo "movfuscator native: skipped (__builtin_clz/ctz unsupported)"
+    elif [ "$name" != empty ]; then
         build_movfuscator "$src" "$WORK/$name/movfuscator"
         movfuscator_elf="$WORK/$name/movfuscator/program.elf"
         movfuscator_expected_status=1

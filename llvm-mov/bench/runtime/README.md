@@ -5,13 +5,18 @@ This suite complements `codegen-metrics.sh`. Static instruction counts and
 
 The workloads cover three levels:
 
-- focused shared-C kernels: bitwise, variable shift, and multiply;
+- focused shared-C kernels: bitwise, variable shift, multiply, and bit scan;
 - a matched empty loop for estimating kernel-only turbo86 time;
 - the existing practical recursive `fib(24)` application at
   `../fixtures/fib_rec.c`.
 
 Every focused kernel runs 100,000 iterations. This keeps native execution
 well above process-start noise while remaining practical under movie86.
+Select a space-separated subset with `WORKLOADS`, for example:
+
+```sh
+WORKLOADS='bitscan empty' RUNS=20 make runtime-bench
+```
 
 ## Engines and comparisons
 
@@ -20,6 +25,10 @@ well above process-start noise while remaining practical under movie86.
 - turbo86: native `Run`-to-`Exit` median via `TestRuntimeBenchELF`;
 - movfuscator: direct native execution of an ELF compiled from the exact same
   C source as llvm-mov.
+
+The bitscan kernel is an llvm-mov before/after workload only: movfuscator's
+C frontend emits unresolved `__builtin_clz`/`__builtin_ctz` calls. Other
+kernels retain the exact same-source native comparison.
 
 The turbo86 harness intentionally reports whole-run latency. For a focused
 kernel estimate, measure `empty.c` with the same compiler revision and
