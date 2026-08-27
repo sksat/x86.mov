@@ -3181,7 +3181,8 @@ private:
   // then index the 256-byte table directly.  Compared with
   // emitUnaryByteLookup this removes two scratch stores and one scratch
   // reload at the cost of two register moves (one fewer instruction, and
-  // no store-forwarding dependency).
+  // no store-forwarding dependency). This helper clobbers ECX, so the input
+  // must not alias either of ECX's addressable byte registers.
   static void emitUnaryByteLookupInReg(MachineBasicBlock &MBB,
                                        MachineBasicBlock::iterator I,
                                        const DebugLoc &DL,
@@ -3189,7 +3190,7 @@ private:
                                        Register InputByteReg,
                                        const char *TableSym,
                                        Register OutputByteReg) {
-    assert(InputByteReg != Mov::CL &&
+    assert(InputByteReg != Mov::CL && InputByteReg != Mov::CH &&
            "input must survive clearing the ECX index register");
     BuildMI(MBB, I, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8rr), Mov::CL)
