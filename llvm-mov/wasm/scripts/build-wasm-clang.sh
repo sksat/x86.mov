@@ -94,6 +94,7 @@ EMCC_FLAGS=(
     "-sINITIAL_MEMORY=128MB"
     "-sSTACK_SIZE=8MB"
     "-sEXPORTED_RUNTIME_METHODS=['callMain','FS']"
+    "-sINCOMING_MODULE_JS_API=['print','printErr','wasmBinary']"
     "--embed-file" "$resource_dir/include@/lib/clang/$resource_ver/include"
 )
 
