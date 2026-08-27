@@ -3175,6 +3175,30 @@ private:
         .addExternalSymbol(TableSym).addReg(Mov::ECX);
   }
 
+  // Register-only unary lookup for paths that do not need the legacy
+  // side-effect of clearing the memory-backed idx pack.  The input is DL
+  // at every current call site: clear ECX's upper 24 bits, copy DL into CL,
+  // then index the 256-byte table directly.  Compared with
+  // emitUnaryByteLookup this removes two scratch stores and one scratch
+  // reload at the cost of two register moves (one fewer instruction, and
+  // no store-forwarding dependency). This helper clobbers ECX, so the input
+  // must not alias either of ECX's addressable byte registers.
+  static void emitUnaryByteLookupInReg(MachineBasicBlock &MBB,
+                                       MachineBasicBlock::iterator I,
+                                       const DebugLoc &DL,
+                                       const TargetInstrInfo &TII,
+                                       Register InputByteReg,
+                                       const char *TableSym,
+                                       Register OutputByteReg) {
+    assert(InputByteReg != Mov::CL && InputByteReg != Mov::CH &&
+           "input must survive clearing the ECX index register");
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV32ri), Mov::ECX).addImm(0);
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rr), Mov::CL)
+        .addReg(InputByteReg);
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), OutputByteReg)
+        .addExternalSymbol(TableSym).addReg(Mov::ECX);
+  }
+
   // Helper: emit `srcdst[ByteIdx] = OR(low_contrib, high_contrib)`,
   // assuming the *low* contribution has been pre-stashed at
   // `srcdst[ByteIdx]` and the *high* contribution is currently in
@@ -3184,41 +3208,28 @@ private:
   //
   //   1. compute low_contrib into DL, then `mov [srcdst+i], DL`
   //   2. compute high_contrib into DL (this clobbers ECX freely)
-  //   3. emitOrByteAndStore — reads low_contrib back into CL, packs
-  //      (CL, DL) into idx[1..0], looks up the OR table, and writes
+  //   3. emitOrByteAndStore — reads low_contrib into CH, copies the
+  //      high contribution from DL to CL, looks up the OR table, and writes
   //      the result back to srcdst[ByteIdx].
   //
   // After this returns, srcdst[ByteIdx] holds the final result byte.
-  // ECX/DL/CL are trashed. idx[0..1] is left in a clobbered state
-  // (the caller writes idx[0..1] before its next table lookup).
-  // idx[2..3] is preserved as 0 throughout — this helper never
-  // writes them, so callers that established the invariant up
-  // front (e.g. opt 6 / opt 6 follow-up hoists) keep it across
-  // repeated invocations.
+  // ECX/DL/CH/CL are trashed. ECX's upper 16 bits are already zero at
+  // every caller: either the immediately preceding register-only unary
+  // lookup cleared ECX, or the rCL shift's memory index was loaded from
+  // the hoisted-zero idx pack. CH:CL therefore forms exactly the required
+  // 16-bit (low_contrib, high_contrib) table index.
   static void emitOrByteAndStore(MachineBasicBlock &MBB,
                                  MachineBasicBlock::iterator I,
                                  const DebugLoc &DL,
                                  const TargetInstrInfo &TII,
-                                 const EbpAddr &A, int64_t DstBufDisp,
+                                 const EbpAddr & /*A*/, int64_t DstBufDisp,
                                  unsigned ByteIdx) {
-    // mov cl, byte ptr [<dst_buf> + i]   ; recover low_contrib into CL
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::CL)
+    // mov ch, byte ptr [<dst_buf> + i]   ; table index high byte
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::CH)
         .addReg(Mov::EBP)
         .addImm(DstBufDisp + static_cast<int64_t>(ByteIdx));
-    // mov byte ptr [idx + 0], dl       ; idx[0] = high_contrib
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
-        .addReg(Mov::EBP).addImm(A.IdxDisp).addReg(Mov::DL);
-    // mov byte ptr [idx + 1], cl       ; idx[1] = low_contrib
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
-        .addReg(Mov::EBP).addImm(A.IdxDisp + 1).addReg(Mov::CL);
-    // idx[2..3] are 0 — guaranteed by the caller's hoisted
-    // emitIdxZero (opt 6 / opt 6 follow-up) plus the fact that
-    // nothing on the path to here writes them (emitUnaryByteLookup
-    // re-establishes the zero internally, emitOrByteAndStore only
-    // touches idx[0..1]).
-    // mov ecx, dword ptr [idx]
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-        .addReg(Mov::EBP).addImm(A.IdxDisp);
+    // mov cl, dl                         ; table index low byte
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rr), Mov::CL).addReg(Mov::DL);
     // mov dl, byte ptr [__mov_or8_table + ecx]
     BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
         .addExternalSymbol("__mov_or8_table").addReg(Mov::ECX);
@@ -3278,7 +3289,8 @@ private:
     if (LowTableSym) {
       emitLoadByteSrc(MBB, I, DL, TII, A, LowSrc, SrcBufDisp, LowSrcIdx,
                       Mov::DL);
-      emitUnaryByteLookup(MBB, I, DL, TII, A, Mov::DL, LowTableSym, Mov::DL);
+      emitUnaryByteLookupInReg(MBB, I, DL, TII, Mov::DL, LowTableSym,
+                               Mov::DL);
     } else {
       // No shift needed (bit_shift effectively 0 for this contribution —
       // shouldn't happen in this helper; included for completeness).
@@ -3293,7 +3305,8 @@ private:
     if (HighTableSym) {
       emitLoadByteSrc(MBB, I, DL, TII, A, HighSrc, SrcBufDisp, HighSrcIdx,
                       Mov::DL);
-      emitUnaryByteLookup(MBB, I, DL, TII, A, Mov::DL, HighTableSym, Mov::DL);
+      emitUnaryByteLookupInReg(MBB, I, DL, TII, Mov::DL, HighTableSym,
+                               Mov::DL);
     } else {
       emitLoadByteSrc(MBB, I, DL, TII, A, HighSrc, SrcBufDisp, HighSrcIdx,
                       Mov::DL);
@@ -3353,8 +3366,8 @@ private:
       // mov dl, byte ptr [srcdst + 3]
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
           .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + 3);
-      emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
-                          "__mov_sar_sign_byte", Mov::DL);
+      emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                               "__mov_sar_sign_byte", Mov::DL);
       // mov byte ptr [sign_buf], dl
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(*Addr->SignBufDisp).addReg(Mov::DL);
@@ -3505,8 +3518,8 @@ private:
     if (IsSAR) {
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
           .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + 3);
-      emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
-                          "__mov_sar_sign_byte", Mov::DL);
+      emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                               "__mov_sar_sign_byte", Mov::DL);
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(*Addr->SignBufDisp).addReg(Mov::DL);
     }
@@ -3612,8 +3625,8 @@ private:
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
           .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
       // 3. select_mask_table[DL] → DL (non-zero → 0xFF, zero → 0x00).
-      emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
-                          "__mov_select_mask_table", Mov::DL);
+      emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                               "__mov_select_mask_table", Mov::DL);
       // 4. Stash mask at amount_buf[1] for stable per-byte access.
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP)
