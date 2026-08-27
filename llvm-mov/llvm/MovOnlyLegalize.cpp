@@ -2749,9 +2749,9 @@ private:
     // For p == 3 we still write the byte at srcdst[3] but skip the
     // carry-out load (it would feed byte 4 which is discarded).
     auto cascadeAddDLAtPos = [&](unsigned p) {
-      // First step: srcdst[p] += DL, no cin. Pack the incoming byte and
-      // accumulator byte in CL:CH. The helper leaves ECX holding the index,
-      // so the carry table can reuse it below.
+      // First step: srcdst[p] += DL, no cin. Pack the incoming byte in CH
+      // and the accumulator byte in CL. The helper leaves their CH:CL index
+      // in ECX, so the carry table can reuse it below.
       emitBinaryByteLookupDLWithMem(
           MBB, Insert, DL, TII,
           Addr->SrcDstDisp + static_cast<int64_t>(p),
