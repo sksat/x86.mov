@@ -535,8 +535,8 @@ private:
         // DL = or_byte (0 iff lhs == rhs).
 
         // === PHASE 3: compute predicate mask + invert for EQ ===
-        emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
-                            "__mov_select_mask_table", Mov::DL);
+        emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                                 "__mov_select_mask_table", Mov::DL);
         if (IsEQ) {
           emitIdxZero(MBB, Insert, DL, TII, *Addr);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
@@ -561,8 +561,8 @@ private:
           // a_sign = sar_sign[lhs[3]]
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
               .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + 3);
-          emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
-                              "__mov_sar_sign_byte", Mov::DL);
+          emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                                   "__mov_sar_sign_byte", Mov::DL);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
               .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp + 2)
               .addReg(Mov::DL);
@@ -588,8 +588,8 @@ private:
             // b_sign = sar_sign[rhs[3]]
             BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
                 .addReg(Mov::EBP).addImm(*Addr->RhsDisp + 3);
-            emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
-                                "__mov_sar_sign_byte", Mov::DL);
+            emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                                     "__mov_sar_sign_byte", Mov::DL);
             // DL = b_sign. XOR with cmp_mask_buf[2] (a_sign).
             emitIdxZero(MBB, Insert, DL, TII, *Addr);
             BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
@@ -682,8 +682,8 @@ private:
         //   ZF_mask = (diff_or == 0) ? 0xFF : 0x00 = NOT select_mask_table[diff_or]
 
         // Compute ZF_mask from diff_or_byte (in DL): select_mask then XOR 0xFF.
-        emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
-                            "__mov_select_mask_table", Mov::DL);
+        emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                                 "__mov_select_mask_table", Mov::DL);
         // Invert: DL = DL XOR 0xFF
         emitIdxZero(MBB, Insert, DL, TII, *Addr);
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
@@ -713,8 +713,8 @@ private:
           // SF_mask = sar_sign[srcdst[3]]  (srcdst still holds diff bytes).
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
               .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + 3);
-          emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
-                              "__mov_sar_sign_byte", Mov::DL);
+          emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                                   "__mov_sar_sign_byte", Mov::DL);
           // Stash SF_mask to cmp_mask_buf[0] (scratch; final mask later
           // overwrites it).
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
@@ -801,8 +801,8 @@ private:
           // convert to CF_mask via select_mask_table. CF byte is 0 or 1.
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
               .addReg(Mov::EBP).addImm(*Addr->CmpMaskBufDisp);
-          emitUnaryByteLookup(MBB, Insert, DL, TII, *Addr, Mov::DL,
-                              "__mov_select_mask_table", Mov::DL);
+          emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                                   "__mov_select_mask_table", Mov::DL);
           // DL = CF_mask. cmp_mask_buf[1] = ZF_mask.
 
           if (IsAE) {
@@ -3182,41 +3182,11 @@ private:
     }
   }
 
-  // Helper: emit a unary byte table lookup.
-  //   1. mov ecx, 0
-  //   2. mov [idx], ecx                 ; zero the 4-byte idx slot
-  //   3. mov [idx + 0], <input_byte>    ; idx[0] = input byte, idx[1..3] = 0
-  //   4. mov ecx, [idx]                 ; ECX = input byte (low byte) | 0
-  //   5. mov <output_reg>, [<TableSym> + ecx]
-  // After this returns, <output_reg> has the table result; ECX is
-  // clobbered (low byte = table result). The caller is responsible
-  // for getting the input byte into <input_byte_reg> before calling.
-  static void emitUnaryByteLookup(MachineBasicBlock &MBB,
-                                  MachineBasicBlock::iterator I,
-                                  const DebugLoc &DL,
-                                  const TargetInstrInfo &TII,
-                                  const EbpAddr &A, Register InputByteReg,
-                                  const char *TableSym,
-                                  Register OutputByteReg) {
-    // Zero the 4-byte idx slot in one instruction (no ECX clobber).
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV32mi))
-        .addReg(Mov::EBP).addImm(A.IdxDisp).addImm(0);
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
-        .addReg(Mov::EBP).addImm(A.IdxDisp).addReg(InputByteReg);
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-        .addReg(Mov::EBP).addImm(A.IdxDisp);
-    BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), OutputByteReg)
-        .addExternalSymbol(TableSym).addReg(Mov::ECX);
-  }
-
-  // Register-only unary lookup for paths that do not need the legacy
-  // side-effect of clearing the memory-backed idx pack.  The input is DL
-  // at every current call site: clear ECX's upper 24 bits, copy DL into CL,
-  // then index the 256-byte table directly.  Compared with
-  // emitUnaryByteLookup this removes two scratch stores and one scratch
-  // reload at the cost of two register moves (one fewer instruction, and
-  // no store-forwarding dependency). This helper clobbers ECX, so the input
-  // must not alias either of ECX's addressable byte registers.
+  // Register-only unary lookup. The input is DL at every current call site:
+  // clear ECX's upper 24 bits, copy DL into CL, then index the 256-byte table
+  // directly. Callers that subsequently use the memory-backed idx pack
+  // establish its zeroed upper bytes explicitly with emitIdxZero. This helper
+  // clobbers ECX, so the input must not alias CL or CH.
   static void emitUnaryByteLookupInReg(MachineBasicBlock &MBB,
                                        MachineBasicBlock::iterator I,
                                        const DebugLoc &DL,
