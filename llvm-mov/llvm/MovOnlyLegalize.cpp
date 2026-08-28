@@ -2749,21 +2749,13 @@ private:
     // For p == 3 we still write the byte at srcdst[3] but skip the
     // carry-out load (it would feed byte 4 which is discarded).
     auto cascadeAddDLAtPos = [&](unsigned p) {
-      // First step: srcdst[p] += DL, no cin. DL still holds the
-      // byte value coming from the just-completed lookup. Pack
-      // (idx[1] = srcdst[p], idx[0] = DL), idx[2..3] = 0.
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-          .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(p));
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-          .addExternalSymbol("__mov_add8_sum_table").addReg(Mov::ECX);
+      // First step: srcdst[p] += DL, no cin. Pack the incoming byte in CH
+      // and the accumulator byte in CL. The helper leaves their CH:CL index
+      // in ECX, so the carry table can reuse it below.
+      emitBinaryByteLookupDLWithMem(
+          MBB, Insert, DL, TII,
+          Addr->SrcDstDisp + static_cast<int64_t>(p),
+          "__mov_add8_sum_table");
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(Addr->SrcDstDisp + static_cast<int64_t>(p)).addReg(Mov::DL);
       if (p < 3) {
@@ -2801,42 +2793,29 @@ private:
         if (p >= 4)
           continue;
 
-        // Build mul lookup idx: idx[2..3] = 0, idx[1] = a[i] (from
-        // rhs_buf+i), idx[0] = b[j] (from mul_rhs2_buf+j or imm).
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mi))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(0);
+        // Build the mul lookup index in CH:CL: CH = a[i], CL = b[j].
         BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
             .addReg(Mov::EBP).addImm(ADisp + static_cast<int64_t>(i));
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
         if (IsRR) {
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-              .addReg(Mov::EBP).addImm(BDisp + static_cast<int64_t>(j));
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
+          emitBinaryByteLookupDLWithMem(
+              MBB, Insert, DL, TII, BDisp + static_cast<int64_t>(j),
+              "__mov_mul8_lo_table");
         } else {
-          // MUL32ri: write the imm byte directly into idx[0].
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mi))
-              .addReg(Mov::EBP).addImm(Addr->IdxDisp).addImm(ImmBytes[j]);
+          emitBinaryByteLookupDLWithImm(MBB, Insert, DL, TII, ImmBytes[j],
+                                        "__mov_mul8_lo_table");
         }
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-            .addReg(Mov::EBP).addImm(Addr->IdxDisp);
 
         // If a high contribution exists (p + 1 < 4), look it up
-        // now and stash in mul_temp_buf[0]. ECX is still valid
-        // (table loads don't mutate it) so we can do the lo
-        // lookup right after.
+        // now and stash in mul_temp_buf[0]. ECX still holds the index;
+        // DL already contains the low contribution from the helper.
         const bool HiNeeded = (p + 1 < 4);
         if (HiNeeded) {
-          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
+          BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
               .addExternalSymbol("__mov_mul8_hi_table").addReg(Mov::ECX);
           BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-              .addReg(Mov::EBP).addImm(TempDisp).addReg(Mov::DL);
+              .addReg(Mov::EBP).addImm(TempDisp).addReg(Mov::CL);
         }
-        // Low lookup — DL now carries the lo partial product, ready
-        // for direct use by the cascade's first step.
-        BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-            .addExternalSymbol("__mov_mul8_lo_table").addReg(Mov::ECX);
+        // DL carries the low partial product, ready for the cascade.
         cascadeAddDLAtPos(p);
 
         if (HiNeeded) {
