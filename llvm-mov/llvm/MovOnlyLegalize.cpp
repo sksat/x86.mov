@@ -2400,20 +2400,11 @@ private:
     // into DL, write DL into srcdst[i]. No carry chain — popcount is
     // a pure per-byte function.
     for (unsigned ByteIdx = 0; ByteIdx < 4; ++ByteIdx) {
-      emitIdxZero(MBB, Insert, DL, TII, *Addr);
-      // mov dl, byte ptr [srcdst + i]
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
           .addReg(Mov::EBP)
           .addImm(Addr->SrcDstDisp + static_cast<int64_t>(ByteIdx));
-      // mov byte ptr [idx + 0], dl
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-      // mov ecx, dword ptr [idx]
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-      // mov dl, byte ptr [__mov_popcount8_table + ecx]
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-          .addExternalSymbol("__mov_popcount8_table").addReg(Mov::ECX);
+      emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                               "__mov_popcount8_table", Mov::DL);
       // mov byte ptr [srcdst + i], dl
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP)
@@ -2422,29 +2413,17 @@ private:
     }
 
     // PHASE 2 — accumulate srcdst[0] += srcdst[i] for i = 1..3 via
-    // the add8 sum table. cin is 0 throughout (emitIdxZero takes care
-    // of idx[2] = 0), and intermediate sums stay ≤ 32 so we never
-    // need the carry-out byte. Each step is one idx-pack + lookup +
-    // store-back into srcdst[0].
+    // the add8 sum table. The binary helper clears ECX and packs only the
+    // two operands in CH:CL, so cin is 0 throughout. Intermediate sums stay
+    // ≤ 32, therefore we never need the carry-out byte. Each step is one
+    // register-packed lookup plus a store-back into srcdst[0].
     for (unsigned i = 1; i < 4; ++i) {
-      emitIdxZero(MBB, Insert, DL, TII, *Addr);
-      // idx[1] = srcdst[0]   ; running accumulator
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
           .addReg(Mov::EBP).addImm(Addr->SrcDstDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-      // idx[0] = srcdst[i]
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-          .addReg(Mov::EBP)
-          .addImm(Addr->SrcDstDisp + static_cast<int64_t>(i));
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-      // mov ecx, dword ptr [idx]
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-      // mov dl, byte ptr [__mov_add8_sum_table + ecx]
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-          .addExternalSymbol("__mov_add8_sum_table").addReg(Mov::ECX);
+      emitBinaryByteLookupDLWithMem(
+          MBB, Insert, DL, TII,
+          Addr->SrcDstDisp + static_cast<int64_t>(i),
+          "__mov_add8_sum_table");
       // mov byte ptr [srcdst], dl
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(Addr->SrcDstDisp).addReg(Mov::DL);
