@@ -124,8 +124,13 @@ for name in "${fixtures[@]}"; do
         bitops) expected_status=120 ;;
         shift) expected_status=0 ;;
         multiply) expected_status=163 ;;
+        bitscan) expected_status=77 ;;
         empty) expected_status=160 ;;
         fib_rec) expected_status=32 ;;
+        *)
+            echo "unknown runtime benchmark workload: $name" >&2
+            exit 2
+            ;;
     esac
     if [ "$name" = fib_rec ]; then
         src="$LLVM_MOV/bench/fixtures/fib_rec.c"
