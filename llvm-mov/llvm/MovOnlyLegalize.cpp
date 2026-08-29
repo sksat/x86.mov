@@ -2511,35 +2511,6 @@ private:
     const char *PerByteTable =
         IsCTTZ ? "__mov_ctz_or_8_table" : "__mov_clz_or_8_table";
 
-    // Lambda: zero idx and load `byte ptr [base + disp]` into idx[0].
-    // Caller wants ECX = byte_value after this returns.
-    auto loadByteToIdx0 = [&](int64_t ByteDisp) {
-      emitIdxZero(MBB, Insert, DL, TII, *Addr);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-          .addReg(Mov::EBP).addImm(ByteDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-    };
-
-    // Lambda: pack idx = (0, 0, a_byte, b_byte) where both bytes
-    // come from memory (LhsDisp at idx[1], RhsDisp at idx[0]).
-    // Load ECX = idx afterwards.
-    auto packTwoBytesAndLoad = [&](int64_t LhsDisp, int64_t Rhs2Disp) {
-      emitIdxZero(MBB, Insert, DL, TII, *Addr);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-          .addReg(Mov::EBP).addImm(LhsDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp + 1).addReg(Mov::DL);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
-          .addReg(Mov::EBP).addImm(Rhs2Disp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp).addReg(Mov::DL);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32rm), Mov::ECX)
-          .addReg(Mov::EBP).addImm(Addr->IdxDisp);
-    };
-
     // PROLOGUE — save ECX/EDX, spill Src to srcdst.
     BuildMI(MBB, Insert, DL, TII.get(Mov::MOV32mr))
         .addReg(Mov::EBP).addImm(Addr->SaveEcxDisp).addReg(Mov::ECX, RegState::Undef);
@@ -2567,39 +2538,44 @@ private:
           Addr->SrcDstDisp + static_cast<int64_t>(ByteIdx);
 
       // Step 1: DL = `__mov_{clz,ctz}_or_8_table[byte]`. Save to temp.
-      loadByteToIdx0(SrcByteDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-          .addExternalSymbol(PerByteTable).addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(SrcByteDisp);
+      emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                               PerByteTable, Mov::DL);
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(TempDisp).addReg(Mov::DL);
 
       // Step 2: DL = AND(alive, choice).  idx[1] = alive, idx[0] = temp.
-      packTwoBytesAndLoad(AliveDisp, TempDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-          .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(AliveDisp);
+      emitBinaryByteLookupDLWithMem(MBB, Insert, DL, TII, TempDisp,
+                                    "__mov_and8_table");
 
       // Step 3: running += contribution.  Save contribution to temp,
       // then pack (running, contribution) and look up add8_sum.
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(TempDisp).addReg(Mov::DL);
-      packTwoBytesAndLoad(RunningDisp, TempDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-          .addExternalSymbol("__mov_add8_sum_table").addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(RunningDisp);
+      emitBinaryByteLookupDLWithMem(MBB, Insert, DL, TII, TempDisp,
+                                    "__mov_add8_sum_table");
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(RunningDisp).addReg(Mov::DL);
 
       // Step 4: DL = `__mov_zero_mask_table[byte]`. Save to temp.
-      loadByteToIdx0(SrcByteDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-          .addExternalSymbol("__mov_zero_mask_table").addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(SrcByteDisp);
+      emitUnaryByteLookupInReg(MBB, Insert, DL, TII, Mov::DL,
+                               "__mov_zero_mask_table", Mov::DL);
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(TempDisp).addReg(Mov::DL);
 
       // Step 5: alive = AND(alive, zm) — once a non-zero byte is
       // crossed, alive flips to 0x00 and stays there.
-      packTwoBytesAndLoad(AliveDisp, TempDisp);
-      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm_idx), Mov::DL)
-          .addExternalSymbol("__mov_and8_table").addReg(Mov::ECX);
+      BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP).addImm(AliveDisp);
+      emitBinaryByteLookupDLWithMem(MBB, Insert, DL, TII, TempDisp,
+                                    "__mov_and8_table");
       BuildMI(MBB, Insert, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP).addImm(AliveDisp).addReg(Mov::DL);
     }
@@ -3019,7 +2995,7 @@ private:
   }
 
   // Carry-free binary lookup with one operand already in DL. The tables
-  // using this helper (AND/OR/XOR) are symmetric, so CH:CL may hold the
+  // using this helper (AND/OR/XOR/ADD sum) are symmetric, so CH:CL may hold the
   // operands in either order. Clearing ECX first makes the upper 16 bits of
   // the address zero; CH receives the live DL value and CL receives the
   // memory/immediate peer.
