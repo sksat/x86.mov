@@ -10,6 +10,7 @@ BASELINE_LLC="${BASELINE_LLC:-}"
 MOVIE86="${MOVIE86:-$ROOT/movie86/target/release/movie86}"
 MOVCC="${MOVCC:-$ROOT/movfuscator-wasm/vendor/movfuscator/build/movcc}"
 CLANG="${CLANG:-clang-22}"
+CC="${CC:-cc}"
 RUNS="${RUNS:-10}"
 TURBO_RUNS="${TURBO_RUNS:-25}"
 
@@ -20,7 +21,7 @@ for value in RUNS TURBO_RUNS; do
     fi
 done
 
-for tool in "$CURRENT_LLC" "$MOVIE86" "$MOVCC" "$CLANG" hyperfine; do
+for tool in "$CURRENT_LLC" "$MOVIE86" "$MOVCC" "$CLANG" "$CC" hyperfine; do
     if ! command -v "$tool" >/dev/null 2>&1 && ! [ -x "$tool" ]; then
         echo "error: required tool not found: $tool" >&2
         exit 2
@@ -46,7 +47,7 @@ _start:
 EOF
 as --32 "$WORK/start.s" -o "$WORK/start.o"
 
-libm32="$(cc -m32 -print-file-name=libm.so 2>/dev/null || true)"
+libm32="$("$CC" -m32 -print-file-name=libm.so 2>/dev/null || true)"
 movcc_libarg=""
 if [ -f "$libm32" ]; then
     movcc_libarg="-Wl-L$(cd "$(dirname "$libm32")" && pwd)"
@@ -70,8 +71,12 @@ build_movfuscator() {
     if [ -n "$movcc_libarg" ]; then
         libargs+=("$movcc_libarg")
     fi
-    "$MOVCC" "${libargs[@]}" "$src" \
-        -o "$out/program.elf" >"$out/build.log" 2>&1
+    if ! "$MOVCC" "${libargs[@]}" "$src" \
+            -o "$out/program.elf" >"$out/build.log" 2>&1; then
+        echo "error: movcc failed while building $src" >&2
+        cat "$out/build.log" >&2
+        return 1
+    fi
 }
 
 movie_steps() {
@@ -101,7 +106,7 @@ turbo_median() {
         TURBO86_RUNTIME_BENCH_ELF="$elf" \
         TURBO86_RUNTIME_BENCH_RUNS="$runs" \
         TURBO86_RUNTIME_BENCH_EXPECTED_STATUS="$expected" \
-            go test ./runner -run TestRuntimeBenchELF -count=1 -v 2>&1
+            go test ./runner -run '^TestRuntimeBenchELF$' -count=1 -v 2>&1
     )"
     status=$?
     set -e

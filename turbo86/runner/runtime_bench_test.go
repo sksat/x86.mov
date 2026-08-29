@@ -6,6 +6,7 @@ import (
 	"debug/elf"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -22,7 +23,7 @@ import (
 //
 //	TURBO86_RUNTIME_BENCH_ELF=/tmp/kernel.elf \
 //	TURBO86_RUNTIME_BENCH_RUNS=25 \
-//	  go test ./runner -run TestRuntimeBenchELF -count=1 -v
+//	  go test ./runner -run '^TestRuntimeBenchELF$' -count=1 -v
 //
 // ELF parsing, segment loading, and Runner construction happen before the
 // timer. The duration starts immediately before Run and ends at the Exit
@@ -57,7 +58,11 @@ func TestRuntimeBenchELF(t *testing.T) {
 		}
 		timeout = parsed
 	}
+	runRuntimeBenchELF(t, elfPath, runs, expectedStatus, timeout)
+}
 
+func runRuntimeBenchELF(t *testing.T, elfPath string, runs, expectedStatus int, timeout time.Duration) {
+	t.Helper()
 	f, err := elf.Open(elfPath)
 	if err != nil {
 		t.Fatalf("open ELF: %v", err)
@@ -156,4 +161,21 @@ func TestRuntimeBenchELF(t *testing.T) {
 			(durations[len(durations)/2]-durations[len(durations)/2-1])/2
 	}
 	t.Logf("runtime_bench elf=%s runs=%d median_ns=%d", elfPath, runs, median.Nanoseconds())
+}
+
+func TestRuntimeBenchRegression(t *testing.T) {
+	const entry uint32 = 0x08048000
+	code := []byte{
+		0xB8, 0x2A, 0x00, 0x00, 0x00, // mov eax, 42
+		0xA3, 0xFE, 0x00, 0xFE, 0x1F, // mov [ABI exit slot], eax
+	}
+	img := buildElf32(entry, []elfSeg{
+		{vaddr: entry, data: code, memsz: uint32(len(code))},
+	})
+	path := filepath.Join(t.TempDir(), "exit42.elf")
+	if err := os.WriteFile(path, img, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	runRuntimeBenchELF(t, path, 2, 42, 2*time.Second)
 }

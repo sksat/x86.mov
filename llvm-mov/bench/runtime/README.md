@@ -31,7 +31,7 @@ TURBO86_RUNTIME_BENCH_ELF=/tmp/kernel.elf \
 TURBO86_RUNTIME_BENCH_RUNS=25 \
 TURBO86_RUNTIME_BENCH_EXPECTED_STATUS=120 \
 TURBO86_RUNTIME_BENCH_TIMEOUT=120s \
-  go test ./runner -run TestRuntimeBenchELF -count=1 -v
+  go test ./runner -run '^TestRuntimeBenchELF$' -count=1 -v
 ```
 
 `run.sh` supplies the expected low-byte result for every workload and rejects
