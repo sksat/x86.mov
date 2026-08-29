@@ -52,6 +52,10 @@ Three things shape every decision here:
 .rs ──rustc.wasm──→ .ll  ─┘   (in progress — see "Rust frontend" below)
     │
     └→ rsToIR()
+
+.rs ──host rustc──→ .ll  ─┘   (Node-only bypass — see "host bypass" below)
+    │
+    └→ rsHostToIR()
 ```
 
 - **clang.wasm**: a standalone clang driver, statically linked against
@@ -138,6 +142,7 @@ then throws an install-hint error.
 | Smoke test (`tests/run-rust.sh`) | ✅ green on `ret_42.rs` (rubrc v0.2.0) | extend fixture set |
 | `'self-bjorn3-wasm20'` registry row (Rust 1.96 / i686 / edition 2024) | ✅ slot defined; `scripts/build-wasm-rustc.sh` documented | run the script — multi-hour build |
 | Browser driver (`@oligami/rustc-browser-wasi_shim` + WASIFarm) | not started | mirror Node driver's shape for the explorer page |
+| Host-rustc bypass (`rsHostToIR` + `tests/run-rust-host.sh`) | ✅ landed (Node-only) | wire into explorer through a backend service or as a Node-side build step |
 | Explorer UI integration | not started | dropdown + dynamic-import in `explorer/src/lib/wrappers.ts` |
 
 ### Self-hosted artefact (`scripts/build-wasm-rustc.sh`)
@@ -185,6 +190,47 @@ The first-cut artefact only ships sysroots for `wasm32-wasip1` and
 `llvm-mov-llc.wasm` will fail until we land a self-hosted artefact
 with an `i686` sysroot. The `rsToIR` half is complete; the join with
 `compile()` is what's gated on the next artefact.
+
+## Rust frontend (host bypass)
+
+`rsHostToIR(source)` runs the host `rustc` as a subprocess and returns
+LLVM IR text. Same I/O shape as `rsToIR()` but no wasm artefact is
+needed — works today, on the dev box, for any `--target` that
+`rustup target add` has installed.
+
+The point of this path: until the in-wasm rustc story (`rsToIR`
+above) ships an i686-aware artefact, `rsHostToIR(..., { target:
+'i686-unknown-linux-gnu' })` is the way to get IR that
+`compile()` (wasm llvm-mov-llc) actually accepts after the usual
+`mtriple: 'mov-unknown-linux-gnu'` override — i.e. the explorer can
+expose a working Rust path *now* by sticking host-emitted IR into the
+same `.ll → .s → .o → ELF32` wasm tail the C path uses.
+
+Trade-off: Node-only by construction (spawns a subprocess + touches
+the filesystem). A browser-side bypass would need a backend service
+(e.g. a tiny `compile-server` over WebSocket that returns the IR).
+
+```js
+import { rsHostToIR, compile } from './llvm-mov.mjs';
+
+const src = `#![no_std]
+    #[panic_handler] fn p(_:&core::panic::PanicInfo)->!{loop{}}
+    #[unsafe(no_mangle)] pub extern "C" fn rust_main() -> i32 { 42 }`;
+
+const ir  = await rsHostToIR(src);  // i686-unknown-linux-gnu IR
+const asm = await compile(ir, { mtriple: 'mov-unknown-linux-gnu' });
+// → mov-target x86-32 GAS asm; ready for as.wasm / ld.wasm.
+```
+
+Prereq on the host:
+```
+rustup target add i686-unknown-linux-gnu
+```
+
+Smoke gate: [`tests/run-rust-host.sh`](tests/run-rust-host.sh) (=
+`make test-rust-host`). Asserts `rsHostToIR(host_ret_42.rs)` returns
+IR containing `define … @rust_main(`. Independent of the wasm rustc
+artefact, so doesn't need `wasmtime`.
 
 ## Build graph
 

@@ -30,7 +30,9 @@ export type ProgressEvent =
     // files in build/rustc-cache/<versionKey>/ short-circuit them).
     | { stage: 'fetch-rustc' }
     | { stage: 'fetch-sysroot' }
-    | { stage: 'run-rustc' };
+    | { stage: 'run-rustc' }
+    // Host-rustc bypass (rsHostToIR) stage.
+    | { stage: 'run-host-rustc' };
 
 export type ProgressCallback = (ev: ProgressEvent) => void;
 
@@ -168,3 +170,38 @@ export interface RsToIROptions {
  * `wasm32-wasip1` output won't lower without an i686 sysroot artefact.
  */
 export function rsToIR(source: string, opts?: RsToIROptions): Promise<string>;
+
+export interface RsHostToIROptions {
+    /** Basename for the source file written to a tempdir. Defaults to `in.rs`. */
+    name?: string;
+    /** Explicit rustc binary. Falls back to `$RUSTC` then `rustc` on PATH. */
+    rustc?: string;
+    /**
+     * `--target`. Defaults to `i686-unknown-linux-gnu` — the one
+     * `llvm-mov-llc` accepts (with an `mtriple` override). Requires
+     * `rustup target add <target>` on the host.
+     */
+    target?: string;
+    /** `--edition`. Defaults to `2024`. */
+    edition?: '2015' | '2018' | '2021' | '2024';
+    /** `--crate-type`. Defaults to `lib`. */
+    crateType?: 'lib' | 'staticlib' | 'cdylib' | 'rlib';
+    /** `-C opt-level=…`. Defaults to `'2'`. */
+    optLevel?: OptLevel;
+    /** Appended verbatim to the rustc command line. */
+    rustcFlags?: string[];
+    /** Status callback; see ProgressEvent for the stage sequence. */
+    onProgress?: ProgressCallback;
+}
+
+/**
+ * Compile a single Rust source file to LLVM IR text via the host
+ * `rustc`. Node-only — spawns a subprocess. Use as the explorer's
+ * Rust-frontend bypass while the in-wasm path (rsToIR) catches up.
+ *
+ * The emitted IR is compatible with `compile()`'s `mtriple` override
+ * exactly like clang-produced IR, so the wasm tail
+ * (`llvm-mov-llc.wasm → as.wasm → ld.wasm`) accepts it without
+ * needing the i686-aware rustc.wasm artefact.
+ */
+export function rsHostToIR(source: string, opts?: RsHostToIROptions): Promise<string>;
