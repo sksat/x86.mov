@@ -499,8 +499,9 @@ type Runner struct {
 	// eventsCh and panic with "send on closed channel" — a real
 	// hazard when a terminal event races a pending MemUpdate.
 	// Created in `New`.
-	tickerStop chan struct{}
-	tickerWg   sync.WaitGroup
+	tickerStop     chan struct{}
+	tickerWg       sync.WaitGroup
+	tickerStopOnce sync.Once
 
 	// memUpdateEnabled mirrors "the caller asked for periodic MemUpdate
 	// events" (interval > 0). When set, the terminal path flushes one
@@ -1055,8 +1056,7 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 		// makes no ordering guarantees on which case fires when
 		// multiple ready cases exist) and then panic when
 		// `close(eventsCh)` lands mid-pick.
-		close(r.tickerStop)
-		r.tickerWg.Wait()
+		r.stopMemUpdateTicker()
 		if r.cmd != nil && r.cmd.Process != nil {
 			_ = r.cmd.Process.Kill() // no-op if already dead
 			var ws syscall.WaitStatus
@@ -1262,6 +1262,14 @@ func (r *Runner) memUpdateTicker(interval time.Duration) {
 	}
 }
 
+// stopMemUpdateTicker prevents an in-flight periodic update from being
+// delivered after a terminal event. It is safe to call both from the terminal
+// path and tracerLoop's cleanup defer.
+func (r *Runner) stopMemUpdateTicker() {
+	r.tickerStopOnce.Do(func() { close(r.tickerStop) })
+	r.tickerWg.Wait()
+}
+
 func (r *Runner) bootstrap(stubBytes []byte) error {
 	// Stage the stub in a memfd and execve it via /proc/self/fd/N.
 	const mfdCloexec = 1
@@ -1337,6 +1345,7 @@ func (r *Runner) bootstrap(stubBytes []byte) error {
 }
 
 func (r *Runner) emitFault(reason string) {
+	r.stopMemUpdateTicker()
 	r.emitFinalMemUpdate()
 	r.eventsCh <- proto.Fault{Reason: reason}
 }
@@ -1489,6 +1498,7 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 		// session ends here — the next instruction never runs. Flush a
 		// final frame first (no-op unless MemUpdate was enabled) so the
 		// canvas reflects the guest's last paint before it exits.
+		r.stopMemUpdateTicker()
 		r.emitFinalMemUpdate()
 		r.eventsCh <- proto.Exit{Code: int32(call.arg)}
 		return false
