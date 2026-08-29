@@ -105,5 +105,9 @@ func TestRuntimeBenchELF(t *testing.T) {
 
 	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
 	median := durations[len(durations)/2]
+	if len(durations)%2 == 0 {
+		median = durations[len(durations)/2-1] +
+			(durations[len(durations)/2]-durations[len(durations)/2-1])/2
+	}
 	t.Logf("runtime_bench elf=%s runs=%d median_ns=%d", elfPath, runs, median.Nanoseconds())
 }

@@ -82,14 +82,11 @@ movie_steps() {
         --snapshot-on-stop "$snap" "$elf" 2>&1)"
     status=$?
     set -e
-    if [ "$status" -eq 124 ]; then
-        echo "max-steps"
-        return
-    fi
     local steps
-    steps="$(sed -n 's/.* at step \([0-9][0-9]*\)$/\1/p' <<<"$output")"
+    steps="$(sed -n 's/.*snapshot (exit) written to .* at step \([0-9][0-9]*\)$/\1/p' <<<"$output")"
     if [ -z "$steps" ]; then
-        echo "error" >&2
+        echo "error: movie86 did not run $elf to guest exit (status $status)" >&2
+        printf '%s\n' "$output" >&2
         return 1
     fi
     echo "$steps"
@@ -120,20 +117,37 @@ for name in "${fixtures[@]}"; do
     echo "== $name =="
     build_llvm_mov "$CURRENT_LLC" "$src" "$WORK/$name/current"
     current_elf="$WORK/$name/current/program.elf"
-    echo "movie86 current steps: $(movie_steps "$current_elf" "$WORK/$name/current.snap")"
-    echo "turbo86 current median_ns: $(turbo_median "$current_elf" "$turbo_runs")"
+    current_steps="$(movie_steps "$current_elf" "$WORK/$name/current.snap")"
+    current_turbo_ns="$(turbo_median "$current_elf" "$turbo_runs")"
+    [ -n "$current_turbo_ns" ] || { echo "error: turbo86 produced no timing for $current_elf" >&2; exit 1; }
+    echo "movie86 current steps: $current_steps"
+    echo "turbo86 current median_ns: $current_turbo_ns"
 
     if [ -n "$BASELINE_LLC" ]; then
         build_llvm_mov "$BASELINE_LLC" "$src" "$WORK/$name/baseline"
         baseline_elf="$WORK/$name/baseline/program.elf"
-        echo "movie86 baseline steps: $(movie_steps "$baseline_elf" "$WORK/$name/baseline.snap")"
-        echo "turbo86 baseline median_ns: $(turbo_median "$baseline_elf" "$turbo_runs")"
+        baseline_steps="$(movie_steps "$baseline_elf" "$WORK/$name/baseline.snap")"
+        baseline_turbo_ns="$(turbo_median "$baseline_elf" "$turbo_runs")"
+        [ -n "$baseline_turbo_ns" ] || { echo "error: turbo86 produced no timing for $baseline_elf" >&2; exit 1; }
+        echo "movie86 baseline steps: $baseline_steps"
+        echo "turbo86 baseline median_ns: $baseline_turbo_ns"
     fi
 
     if [ "$name" != empty ]; then
         build_movfuscator "$src" "$WORK/$name/movfuscator"
-        hyperfine --ignore-failure --shell=none --warmup 2 --runs "$RUNS" \
-            -n "llvm-mov-$name" "$current_elf" \
-            -n "movfuscator-$name" "$WORK/$name/movfuscator/program.elf"
+        movfuscator_elf="$WORK/$name/movfuscator/program.elf"
+        set +e
+        "$current_elf"
+        expected_status=$?
+        "$movfuscator_elf"
+        movfuscator_status=$?
+        set -e
+        if [ "$expected_status" -ge 126 ] || [ "$movfuscator_status" -ne "$expected_status" ]; then
+            echo "error: native preflight failed for $name (llvm-mov=$expected_status, movfuscator=$movfuscator_status)" >&2
+            exit 1
+        fi
+        hyperfine --shell=none --warmup 2 --runs "$RUNS" \
+            -n "llvm-mov-$name" "$HERE/run-expected.sh $expected_status $current_elf" \
+            -n "movfuscator-$name" "$HERE/run-expected.sh $expected_status $movfuscator_elf"
     fi
 done
