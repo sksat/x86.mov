@@ -1941,8 +1941,8 @@ private:
   // ADD per-byte stage: builds the index from (carry-in, a, b),
   // looks up the sum, writes it to srcdst[i], and loads the carry-out
   // into CL for the next stage. The boundary cases:
-  //   - byte 0 has no carry-in — skip the `mov [idx+2], cl` write.
-  //     emitIdxZero zeros idx[2] anyway.
+  //   - byte 0 has no carry-in, so it bypasses idx memory entirely and
+  //     builds the 16-bit (a,b) index in CH:CL.
   //   - byte 3 doesn't need carry-out — skip the trailing load.
   //
   // Since emitIdxZero no longer clobbers ECX, CL (carry from the
@@ -1956,15 +1956,36 @@ private:
                                const DebugLoc &DL,
                                const TargetInstrInfo &TII, const EbpAddr &A,
                                unsigned ByteIdx, ByteSource BSrc) {
-    emitIdxZero(MBB, I, DL, TII, A);
-    if (ByteIdx > 0) {
-      // mov byte ptr [idx + 2], cl   ; carry-in byte (held in CL by
-      // the previous stage's `mov cl, [carry_table + ecx]`)
+    // The least-significant byte has a known carry-in of zero, so its
+    // 17-bit (carry,a,b) index collapses to the 16-bit CH:CL form. Avoid
+    // zeroing and round-tripping through idx memory for this boundary stage.
+    if (ByteIdx == 0) {
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP)
+          .addImm(A.SrcDstDisp);
+      if (BSrc.K == ByteSource::Kind::Imm)
+        emitBinaryByteLookupDLWithImm(MBB, I, DL, TII, BSrc.Imm,
+                                      "__mov_add8_sum_table");
+      else
+        emitBinaryByteLookupDLWithMem(MBB, I, DL, TII, BSrc.MemDisp,
+                                      "__mov_add8_sum_table");
       BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP)
-          .addImm(A.IdxDisp + 2)
-          .addReg(Mov::CL);
+          .addImm(A.SrcDstDisp)
+          .addReg(Mov::DL);
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
+          .addExternalSymbol("__mov_add8_carry_table")
+          .addReg(Mov::ECX);
+      return;
     }
+
+    emitIdxZero(MBB, I, DL, TII, A);
+    // mov byte ptr [idx + 2], cl   ; carry-in byte (held in CL by
+    // the previous stage's `mov cl, [carry_table + ecx]`)
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
+        .addReg(Mov::EBP)
+        .addImm(A.IdxDisp + 2)
+        .addReg(Mov::CL);
     emitIdxPackAB(MBB, I, DL, TII, A, ByteIdx, BSrc);
     emitTableLookupAndStore(MBB, I, DL, TII, A, ByteIdx,
                             "__mov_add8_sum_table");
@@ -1989,15 +2010,35 @@ private:
                                const DebugLoc &DL,
                                const TargetInstrInfo &TII, const EbpAddr &A,
                                unsigned ByteIdx, ByteSource BSrc) {
-    emitIdxZero(MBB, I, DL, TII, A);
-    if (ByteIdx > 0) {
-      // mov byte ptr [idx + 2], cl   ; borrow-in (CL holds borrow_out
-      // from previous stage's sub8_borrow lookup)
+    // As for ADD, byte zero's borrow-in is known zero. CH:CL holds (a,b)
+    // in the sub table's required order, eliminating the idx-memory pack.
+    if (ByteIdx == 0) {
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm), Mov::DL)
+          .addReg(Mov::EBP)
+          .addImm(A.SrcDstDisp);
+      if (BSrc.K == ByteSource::Kind::Imm)
+        emitBinaryByteLookupDLWithImm(MBB, I, DL, TII, BSrc.Imm,
+                                      "__mov_sub8_diff_table");
+      else
+        emitBinaryByteLookupDLWithMem(MBB, I, DL, TII, BSrc.MemDisp,
+                                      "__mov_sub8_diff_table");
       BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
           .addReg(Mov::EBP)
-          .addImm(A.IdxDisp + 2)
-          .addReg(Mov::CL);
+          .addImm(A.SrcDstDisp)
+          .addReg(Mov::DL);
+      BuildMI(MBB, I, DL, TII.get(Mov::MOV8rm_idx), Mov::CL)
+          .addExternalSymbol("__mov_sub8_borrow_table")
+          .addReg(Mov::ECX);
+      return;
     }
+
+    emitIdxZero(MBB, I, DL, TII, A);
+    // mov byte ptr [idx + 2], cl   ; borrow-in (CL holds borrow_out
+    // from previous stage's sub8_borrow lookup)
+    BuildMI(MBB, I, DL, TII.get(Mov::MOV8mr))
+        .addReg(Mov::EBP)
+        .addImm(A.IdxDisp + 2)
+        .addReg(Mov::CL);
     emitIdxPackAB(MBB, I, DL, TII, A, ByteIdx, BSrc);
     emitTableLookupAndStore(MBB, I, DL, TII, A, ByteIdx,
                             "__mov_sub8_diff_table");
@@ -2994,11 +3035,10 @@ private:
         .addExternalSymbol(TableSym).addReg(Mov::ECX);
   }
 
-  // Carry-free binary lookup with one operand already in DL. The tables
-  // using this helper (AND/OR/XOR/ADD sum) are symmetric, so CH:CL may hold the
-  // operands in either order. Clearing ECX first makes the upper 16 bits of
-  // the address zero; CH receives the live DL value and CL receives the
-  // memory/immediate peer.
+  // Carry-free binary lookup with the first operand already in DL. Clearing
+  // ECX first makes the upper 16 bits of the address zero; CH receives that
+  // first operand and CL receives the memory/immediate peer. The order is
+  // significant for SUB and harmless for the symmetric AND/OR/XOR/ADD tables.
   static void emitBinaryByteLookupDLWithMem(
       MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
       const DebugLoc &DL, const TargetInstrInfo &TII, int64_t OtherDisp,
