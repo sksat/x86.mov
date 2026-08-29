@@ -75,7 +75,7 @@ build_movfuscator() {
 }
 
 movie_steps() {
-    local elf="$1" snap="$2"
+    local elf="$1" snap="$2" expected="$3"
     local output status
     set +e
     output="$($MOVIE86 --max-steps 2000000000 \
@@ -84,7 +84,7 @@ movie_steps() {
     set -e
     local steps
     steps="$(sed -n 's/.*snapshot (exit) written to .* at step \([0-9][0-9]*\)$/\1/p' <<<"$output")"
-    if [ -z "$steps" ]; then
+    if [ -z "$steps" ] || [ "$status" -ne "$expected" ]; then
         echo "error: movie86 did not run $elf to guest exit (status $status)" >&2
         printf '%s\n' "$output" >&2
         return 1
@@ -93,17 +93,35 @@ movie_steps() {
 }
 
 turbo_median() {
-    local elf="$1" runs="$2"
-    (
+    local elf="$1" runs="$2" expected="$3"
+    local output status median
+    set +e
+    output="$(
         cd "$ROOT/turbo86"
         TURBO86_RUNTIME_BENCH_ELF="$elf" \
         TURBO86_RUNTIME_BENCH_RUNS="$runs" \
-            go test ./runner -run TestRuntimeBenchELF -count=1 -v
-    ) | sed -n 's/.*median_ns=\([0-9][0-9]*\).*/\1/p'
+        TURBO86_RUNTIME_BENCH_EXPECTED_STATUS="$expected" \
+            go test ./runner -run TestRuntimeBenchELF -count=1 -v 2>&1
+    )"
+    status=$?
+    set -e
+    median="$(sed -n 's/.*median_ns=\([0-9][0-9]*\).*/\1/p' <<<"$output")"
+    if [ "$status" -ne 0 ] || [ -z "$median" ]; then
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+    echo "$median"
 }
 
 fixtures=(bitops shift multiply empty fib_rec)
 for name in "${fixtures[@]}"; do
+    case "$name" in
+        bitops) expected_status=120 ;;
+        shift) expected_status=0 ;;
+        multiply) expected_status=163 ;;
+        empty) expected_status=160 ;;
+        fib_rec) expected_status=32 ;;
+    esac
     if [ "$name" = fib_rec ]; then
         src="$LLVM_MOV/bench/fixtures/fib_rec.c"
         turbo_runs=15
@@ -117,8 +135,8 @@ for name in "${fixtures[@]}"; do
     echo "== $name =="
     build_llvm_mov "$CURRENT_LLC" "$src" "$WORK/$name/current"
     current_elf="$WORK/$name/current/program.elf"
-    current_steps="$(movie_steps "$current_elf" "$WORK/$name/current.snap")"
-    current_turbo_ns="$(turbo_median "$current_elf" "$turbo_runs")"
+    current_steps="$(movie_steps "$current_elf" "$WORK/$name/current.snap" "$expected_status")"
+    current_turbo_ns="$(turbo_median "$current_elf" "$turbo_runs" "$expected_status")"
     [ -n "$current_turbo_ns" ] || { echo "error: turbo86 produced no timing for $current_elf" >&2; exit 1; }
     echo "movie86 current steps: $current_steps"
     echo "turbo86 current median_ns: $current_turbo_ns"
@@ -126,8 +144,8 @@ for name in "${fixtures[@]}"; do
     if [ -n "$BASELINE_LLC" ]; then
         build_llvm_mov "$BASELINE_LLC" "$src" "$WORK/$name/baseline"
         baseline_elf="$WORK/$name/baseline/program.elf"
-        baseline_steps="$(movie_steps "$baseline_elf" "$WORK/$name/baseline.snap")"
-        baseline_turbo_ns="$(turbo_median "$baseline_elf" "$turbo_runs")"
+        baseline_steps="$(movie_steps "$baseline_elf" "$WORK/$name/baseline.snap" "$expected_status")"
+        baseline_turbo_ns="$(turbo_median "$baseline_elf" "$turbo_runs" "$expected_status")"
         [ -n "$baseline_turbo_ns" ] || { echo "error: turbo86 produced no timing for $baseline_elf" >&2; exit 1; }
         echo "movie86 baseline steps: $baseline_steps"
         echo "turbo86 baseline median_ns: $baseline_turbo_ns"
@@ -136,18 +154,20 @@ for name in "${fixtures[@]}"; do
     if [ "$name" != empty ]; then
         build_movfuscator "$src" "$WORK/$name/movfuscator"
         movfuscator_elf="$WORK/$name/movfuscator/program.elf"
+        movfuscator_expected_status=1
         set +e
         "$current_elf"
-        expected_status=$?
+        current_status=$?
         "$movfuscator_elf"
         movfuscator_status=$?
         set -e
-        if [ "$expected_status" -ge 126 ] || [ "$movfuscator_status" -ne "$expected_status" ]; then
-            echo "error: native preflight failed for $name (llvm-mov=$expected_status, movfuscator=$movfuscator_status)" >&2
+        if [ "$current_status" -ne "$expected_status" ] || \
+                [ "$movfuscator_status" -ne "$movfuscator_expected_status" ]; then
+            echo "error: native preflight failed for $name (llvm-mov=$current_status want $expected_status, movfuscator=$movfuscator_status want $movfuscator_expected_status)" >&2
             exit 1
         fi
         hyperfine --shell=none --warmup 2 --runs "$RUNS" \
             -n "llvm-mov-$name" "$HERE/run-expected.sh $expected_status $current_elf" \
-            -n "movfuscator-$name" "$HERE/run-expected.sh $expected_status $movfuscator_elf"
+            -n "movfuscator-$name" "$HERE/run-expected.sh $movfuscator_expected_status $movfuscator_elf"
     fi
 done

@@ -41,6 +41,22 @@ func TestRuntimeBenchELF(t *testing.T) {
 		}
 		runs = parsed
 	}
+	expectedStatus := -1
+	if value := os.Getenv("TURBO86_RUNTIME_BENCH_EXPECTED_STATUS"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 || parsed > 255 {
+			t.Fatalf("invalid TURBO86_RUNTIME_BENCH_EXPECTED_STATUS=%q", value)
+		}
+		expectedStatus = parsed
+	}
+	timeout := 120 * time.Second
+	if value := os.Getenv("TURBO86_RUNTIME_BENCH_TIMEOUT"); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil || parsed <= 0 {
+			t.Fatalf("invalid TURBO86_RUNTIME_BENCH_TIMEOUT=%q", value)
+		}
+		timeout = parsed
+	}
 
 	f, err := elf.Open(elfPath)
 	if err != nil {
@@ -87,14 +103,37 @@ func TestRuntimeBenchELF(t *testing.T) {
 
 		start := time.Now()
 		exited := false
-		for event := range r.Run(uint32(f.Entry), 0x701ffff0) {
-			switch value := event.(type) {
-			case proto.Exit:
-				durations = append(durations, time.Since(start))
-				exited = true
-			case proto.Fault:
+		events := r.Run(uint32(f.Entry), 0x701ffff0)
+		timer := time.NewTimer(timeout)
+	runLoop:
+		for {
+			select {
+			case event, ok := <-events:
+				if !ok {
+					break runLoop
+				}
+				switch value := event.(type) {
+				case proto.Exit:
+					status := int(uint32(value.Code) & 0xff)
+					if expectedStatus >= 0 && status != expectedStatus {
+						r.Close()
+						t.Fatalf("run %d: guest exited %d (low byte %d), want %d", run, value.Code, status, expectedStatus)
+					}
+					durations = append(durations, time.Since(start))
+					exited = true
+				case proto.Fault:
+					r.Close()
+					t.Fatalf("run %d: guest faulted: %s", run, value.Reason)
+				}
+			case <-timer.C:
 				r.Close()
-				t.Fatalf("run %d: guest faulted: %s", run, value.Reason)
+				t.Fatalf("run %d: guest did not exit within %s", run, timeout)
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
 			}
 		}
 		r.Close()

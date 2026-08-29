@@ -19,9 +19,8 @@
  * fib(10), which earlier versions of this fixture used, finished in
  * sub-millisecond and made the runtime column dominated by exec()
  * cost rather than the mov-only computation it's meant to compare.
- * The exit code wraps the i32 to a byte (46368 mod 256 = 224), but
- * the bench doesn't check it — only static shape + average runtime
- * matter here.
+ * The exit code wraps the i32 to a byte (46368 mod 256 = 32). The
+ * runtime benchmark checks it so an early exit cannot look faster.
  */
 int fib(int n) {
     if (n < 2) return n;

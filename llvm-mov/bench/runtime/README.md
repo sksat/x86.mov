@@ -29,8 +29,14 @@ are already outside the timer; ptrace start/exit remain inside it.
 ```sh
 TURBO86_RUNTIME_BENCH_ELF=/tmp/kernel.elf \
 TURBO86_RUNTIME_BENCH_RUNS=25 \
+TURBO86_RUNTIME_BENCH_EXPECTED_STATUS=120 \
+TURBO86_RUNTIME_BENCH_TIMEOUT=120s \
   go test ./runner -run TestRuntimeBenchELF -count=1 -v
 ```
+
+`run.sh` supplies the expected low-byte result for every workload and rejects
+wrong results on movie86, turbo86, and native execution. The timeout defaults
+to 120 seconds per turbo86 run and is configurable for slower hosts.
 
 Use at least 15 runs for `fib(24)`, 25 for kernels, and 51 for the matched
 empty loop. Report both adjusted and unadjusted medians: subtraction reduces
