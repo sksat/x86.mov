@@ -1350,6 +1350,17 @@ func (r *Runner) emitFault(reason string) {
 	r.eventsCh <- proto.Fault{Reason: reason}
 }
 
+func (r *Runner) emitExit(code int32) {
+	r.stopMemUpdateTicker()
+	r.emitFinalMemUpdate()
+	r.eventsCh <- proto.Exit{Code: code}
+}
+
+func (r *Runner) emitPaused(ev proto.Paused) {
+	r.stopMemUpdateTicker()
+	r.eventsCh <- ev
+}
+
 // emitFinalMemUpdate flushes one last MemUpdate so a progressive-display
 // consumer mirrors the guest's final frame at session end. Best-effort
 // and only for sessions that opted into periodic MemUpdate (interval >
@@ -1498,9 +1509,7 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 		// session ends here — the next instruction never runs. Flush a
 		// final frame first (no-op unless MemUpdate was enabled) so the
 		// canvas reflects the guest's last paint before it exits.
-		r.stopMemUpdateTicker()
-		r.emitFinalMemUpdate()
-		r.eventsCh <- proto.Exit{Code: int32(call.arg)}
+		r.emitExit(int32(call.arg))
 		return false
 	default:
 		r.emitFault(fmt.Sprintf("unknown mov-only ABI call 0x%03x at EIP=0x%x", call.num, regs.Eip))
@@ -1764,7 +1773,7 @@ func (r *Runner) syscallLoop(regs *regs32) {
 				ev.Regs = heldSnapshot.regs
 				ev.Regions = heldSnapshot.regions
 			}
-			r.eventsCh <- ev
+			r.emitPaused(ev)
 			return
 		}
 		if !ws.Stopped() {
@@ -1852,12 +1861,12 @@ func (r *Runner) syscallLoop(regs *regs32) {
 						r.emitFault(fmt.Sprintf("snapshot at unhandled trap-mode signal: %v", err))
 						return
 					}
-					r.eventsCh <- proto.Paused{
+					r.emitPaused(proto.Paused{
 						Regs:    snap.regs,
 						Regions: snap.regions,
 						Signal:  snap.signal,
 						Reason:  fmt.Sprintf("trap-mode: no handler for signal %d", sig),
-					}
+					})
 					return
 				}
 				// Host mode: only snapshot when the kernel will probably
@@ -1895,12 +1904,12 @@ func (r *Runner) syscallLoop(regs *regs32) {
 				r.emitFault(fmt.Sprintf("snapshot at non-forwardable signal: %v", err))
 				return
 			}
-			r.eventsCh <- proto.Paused{
+			r.emitPaused(proto.Paused{
 				Regs:    snap.regs,
 				Regions: snap.regions,
 				Signal:  snap.signal,
 				Reason:  fmt.Sprintf("guest received non-forwardable signal %d", sig),
-			}
+			})
 			return
 		}
 

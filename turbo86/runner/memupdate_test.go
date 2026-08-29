@@ -258,25 +258,32 @@ func TestRunner_MemUpdateAndPauseCoexist(t *testing.T) {
 
 	deadline := time.After(2 * time.Second)
 	var memUpdates int
-	var sawPaused bool
-	for !sawPaused {
+	var got []proto.Outbound
+	for {
 		select {
 		case ev, ok := <-events:
 			if !ok {
-				t.Fatalf("events channel closed before Paused (memUpdates=%d)", memUpdates)
+				goto drained
 			}
+			got = append(got, ev)
 			switch ev.(type) {
 			case proto.MemUpdate:
 				memUpdates++
-			case proto.Paused:
-				sawPaused = true
 			}
 		case <-deadline:
-			t.Fatalf("Paused did not arrive after Pause (memUpdates=%d)", memUpdates)
+			t.Fatalf("events channel did not close after Pause (memUpdates=%d)", memUpdates)
 		}
 	}
+
+drained:
 	if memUpdates == 0 {
 		t.Error("expected at least one MemUpdate before Pause (back-pressure or " +
 			"snapshotPending race ate every one)")
+	}
+	if len(got) == 0 {
+		t.Fatal("no events received")
+	}
+	if _, ok := got[len(got)-1].(proto.Paused); !ok {
+		t.Fatalf("last event = %#v, want Paused", got[len(got)-1])
 	}
 }
