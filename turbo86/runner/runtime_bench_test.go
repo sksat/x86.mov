@@ -126,7 +126,14 @@ func TestRuntimeBenchELF(t *testing.T) {
 					t.Fatalf("run %d: guest faulted: %s", run, value.Reason)
 				}
 			case <-timer.C:
+				drained := make(chan struct{})
+				go func() {
+					for range events {
+					}
+					close(drained)
+				}()
 				r.Close()
+				<-drained
 				t.Fatalf("run %d: guest did not exit within %s", run, timeout)
 			}
 		}
