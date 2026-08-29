@@ -35,8 +35,12 @@ TURBO86_RUNTIME_BENCH_TIMEOUT=120s \
 ```
 
 `run.sh` supplies the expected low-byte result for every workload and rejects
-wrong results on movie86, turbo86, and native execution. The timeout defaults
-to 120 seconds per turbo86 run and is configurable for slower hosts.
+wrong results on movie86, turbo86, and native llvm-mov execution. Upstream
+movfuscator's runtime always exits with status 1 instead of preserving
+`main`'s return value, so its native preflight verifies termination and that
+documented status, but cannot independently validate the kernel result. The
+timeout defaults to 120 seconds per turbo86 run and is configurable for slower
+hosts.
 
 Use at least 15 runs for `fib(24)`, 25 for kernels, and 51 for the matched
 empty loop. Report both adjusted and unadjusted medians: subtraction reduces

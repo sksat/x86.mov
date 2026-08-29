@@ -17,9 +17,11 @@ import (
 	"github.com/sksat/x86.mov/turbo86/stub"
 )
 
-// TestRuntimeBenchELF runs an arbitrary linked i386 ELF under turbo86 and
-// reports a median native duration. It is env-gated because it is a benchmark
-// harness, not a fixed correctness fixture:
+// TestRuntimeBenchELF runs a linked i386 ELF whose PT_LOAD segments fit in
+// turbo86's static guest arena and reports a median native duration. Segments
+// outside that already mapped arena are unsupported by this benchmark loader.
+// It is env-gated because it is a benchmark harness, not a fixed correctness
+// fixture:
 //
 //	TURBO86_RUNTIME_BENCH_ELF=/tmp/kernel.elf \
 //	TURBO86_RUNTIME_BENCH_RUNS=25 \
