@@ -15,7 +15,7 @@ well above process-start noise while remaining practical under movie86.
 Select a space-separated subset with `WORKLOADS`, for example:
 
 ```sh
-WORKLOADS='bitscan empty' RUNS=20 make runtime-bench
+WORKLOADS='bitscan empty' TURBO_RUNS=20 make runtime-bench
 ```
 
 ## Engines and comparisons
