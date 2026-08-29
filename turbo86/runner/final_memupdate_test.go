@@ -117,3 +117,47 @@ func TestRunner_FinalMemUpdate_DisabledStaysSilent(t *testing.T) {
 		t.Fatalf("event = %#v, want Exit{Code:0} (no trailing MemUpdate)", events[0])
 	}
 }
+
+// TestRunner_FinalMemUpdate_BeforeFault verifies that an in-flight periodic
+// update cannot follow a terminal Fault. A delay loop gives the ticker time to
+// become active before INT3 reaches the runner's reserved-trap fault path.
+func TestRunner_FinalMemUpdate_BeforeFault(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	const entry uint32 = 0x08048000
+	code := []byte{
+		0xB9, 0x00, 0x00, 0x00, 0x10, // mov ecx, 0x10000000
+		0x49,       // dec ecx
+		0x75, 0xFD, // jnz loop
+		0xCC, // int3: reserved SIGTRAP -> Fault
+	}
+
+	r, err := New(stub.Bytes)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := r.WriteCode(entry, code); err != nil {
+		_ = r.Close()
+		t.Fatalf("WriteCode: %v", err)
+	}
+
+	var got []proto.Outbound
+	for ev := range r.RunWithModeAndMemUpdate(
+		entry, testStackTop, proto.ModeHost, time.Millisecond,
+	) {
+		got = append(got, ev)
+	}
+	if len(got) < 2 {
+		t.Fatalf("events: got %#v, want MemUpdate followed by Fault", got)
+	}
+	if _, ok := got[len(got)-1].(proto.Fault); !ok {
+		t.Fatalf("last event = %#v, want Fault", got[len(got)-1])
+	}
+	for i := range got[:len(got)-1] {
+		if _, ok := got[i].(proto.MemUpdate); ok {
+			return
+		}
+	}
+	t.Fatalf("events before Fault contain no MemUpdate: %#v", got)
+}

@@ -499,8 +499,9 @@ type Runner struct {
 	// eventsCh and panic with "send on closed channel" — a real
 	// hazard when a terminal event races a pending MemUpdate.
 	// Created in `New`.
-	tickerStop chan struct{}
-	tickerWg   sync.WaitGroup
+	tickerStop     chan struct{}
+	tickerWg       sync.WaitGroup
+	tickerStopOnce sync.Once
 
 	// memUpdateEnabled mirrors "the caller asked for periodic MemUpdate
 	// events" (interval > 0). When set, the terminal path flushes one
@@ -1055,8 +1056,7 @@ func (r *Runner) tracerLoop(stubBytes []byte, bootErr chan<- error) {
 		// makes no ordering guarantees on which case fires when
 		// multiple ready cases exist) and then panic when
 		// `close(eventsCh)` lands mid-pick.
-		close(r.tickerStop)
-		r.tickerWg.Wait()
+		r.stopMemUpdateTicker()
 		if r.cmd != nil && r.cmd.Process != nil {
 			_ = r.cmd.Process.Kill() // no-op if already dead
 			var ws syscall.WaitStatus
@@ -1262,6 +1262,14 @@ func (r *Runner) memUpdateTicker(interval time.Duration) {
 	}
 }
 
+// stopMemUpdateTicker prevents an in-flight periodic update from being
+// delivered after a terminal event. It is safe to call both from the terminal
+// path and tracerLoop's cleanup defer.
+func (r *Runner) stopMemUpdateTicker() {
+	r.tickerStopOnce.Do(func() { close(r.tickerStop) })
+	r.tickerWg.Wait()
+}
+
 func (r *Runner) bootstrap(stubBytes []byte) error {
 	// Stage the stub in a memfd and execve it via /proc/self/fd/N.
 	const mfdCloexec = 1
@@ -1337,8 +1345,20 @@ func (r *Runner) bootstrap(stubBytes []byte) error {
 }
 
 func (r *Runner) emitFault(reason string) {
+	r.stopMemUpdateTicker()
 	r.emitFinalMemUpdate()
 	r.eventsCh <- proto.Fault{Reason: reason}
+}
+
+func (r *Runner) emitExit(code int32) {
+	r.stopMemUpdateTicker()
+	r.emitFinalMemUpdate()
+	r.eventsCh <- proto.Exit{Code: code}
+}
+
+func (r *Runner) emitPaused(ev proto.Paused) {
+	r.stopMemUpdateTicker()
+	r.eventsCh <- ev
 }
 
 // emitFinalMemUpdate flushes one last MemUpdate so a progressive-display
@@ -1489,8 +1509,7 @@ func (r *Runner) dispatchAbi(call abiCall, regs *regs32) bool {
 		// session ends here — the next instruction never runs. Flush a
 		// final frame first (no-op unless MemUpdate was enabled) so the
 		// canvas reflects the guest's last paint before it exits.
-		r.emitFinalMemUpdate()
-		r.eventsCh <- proto.Exit{Code: int32(call.arg)}
+		r.emitExit(int32(call.arg))
 		return false
 	default:
 		r.emitFault(fmt.Sprintf("unknown mov-only ABI call 0x%03x at EIP=0x%x", call.num, regs.Eip))
@@ -1754,7 +1773,7 @@ func (r *Runner) syscallLoop(regs *regs32) {
 				ev.Regs = heldSnapshot.regs
 				ev.Regions = heldSnapshot.regions
 			}
-			r.eventsCh <- ev
+			r.emitPaused(ev)
 			return
 		}
 		if !ws.Stopped() {
@@ -1842,12 +1861,12 @@ func (r *Runner) syscallLoop(regs *regs32) {
 						r.emitFault(fmt.Sprintf("snapshot at unhandled trap-mode signal: %v", err))
 						return
 					}
-					r.eventsCh <- proto.Paused{
+					r.emitPaused(proto.Paused{
 						Regs:    snap.regs,
 						Regions: snap.regions,
 						Signal:  snap.signal,
 						Reason:  fmt.Sprintf("trap-mode: no handler for signal %d", sig),
-					}
+					})
 					return
 				}
 				// Host mode: only snapshot when the kernel will probably
@@ -1885,12 +1904,12 @@ func (r *Runner) syscallLoop(regs *regs32) {
 				r.emitFault(fmt.Sprintf("snapshot at non-forwardable signal: %v", err))
 				return
 			}
-			r.eventsCh <- proto.Paused{
+			r.emitPaused(proto.Paused{
 				Regs:    snap.regs,
 				Regions: snap.regions,
 				Signal:  snap.signal,
 				Reason:  fmt.Sprintf("guest received non-forwardable signal %d", sig),
-			}
+			})
 			return
 		}
 
