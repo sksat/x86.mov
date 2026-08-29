@@ -1006,3 +1006,4 @@ pub extern "C" fn qoi_decode_main() -> i32 {
 | non-mov mnemonics | `call int jmp` | — | — | `add and call cmovb cmp dec imul inc int jae jb jbe je jmp jne js lea movaps mul nop or pop push ret shl shr sub test xchg xor xorps` | `add and call cmovb cmp dec imul inc int ja jae jb jbe je jmp jne js lea movd movdqa movdqu mul nop or pop pshufd pshuflw punpcklbw push pxor ret shl shr sub test xchg xor` | `add and call cmovb cmp dec imul inc int ja jae jb jbe je jmp jne js lea movd movdqa movdqu mul nop or paddb pop psadbw pshufd pshuflw punpcklbw push pxor ret shl shr sub test xchg xor` |
 | deps mov-lowered | 1 / 4 (mov: bytemuck; native: qoi native(llc-fail), core native(no-ir), compiler_builtins native(no-ir)) | — | — | — | — | — |
 | wall-clock runtime (hyperfine mean) | 0.591 ms | — | — | 0.140 ms | 0.141 ms | 0.145 ms |
+
